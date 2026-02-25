@@ -239,19 +239,19 @@ fn promote_temp_output(temp_output: &Path, output_xlsx: &Path) -> Result<()> {
                 output_xlsx.display()
             );
         }
-        if let Some(parent) = output_xlsx.parent() {
-            if let Err(e) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
-                if durability_strict_mode() {
-                    return Err(err(format!(
-                        "xlsx 저장 내구성 동기화 실패(폴더): {} ({e})",
-                        parent.display()
-                    )));
-                }
-                eprintln!(
-                    "[경고] 저장 내구성 동기화 실패(폴더): {} ({e})",
+        if let Some(parent) = output_xlsx.parent()
+            && let Err(e) = fs::File::open(parent).and_then(|dir| dir.sync_all())
+        {
+            if durability_strict_mode() {
+                return Err(err(format!(
+                    "xlsx 저장 내구성 동기화 실패(폴더): {} ({e})",
                     parent.display()
-                );
+                )));
             }
+            eprintln!(
+                "[경고] 저장 내구성 동기화 실패(폴더): {} ({e})",
+                parent.display()
+            );
         }
         Ok(())
     }
