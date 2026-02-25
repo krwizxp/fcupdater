@@ -2,3 +2,14 @@
 name = "fcupdater"
 version = "0.1.0"
 edition = "2024"
+description = "CLI tool to update fuel_cost_chungcheong.xlsx from regional .xls/.xlsx source files."
+license = "UNLICENSED"
+repository = "https://github.com/krwizxp/fcupdater"
+keywords = ["excel", "xlsx", "xls", "cli", "sync"]
+categories = ["command-line-utilities", "encoding"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
