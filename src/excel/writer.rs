@@ -7,12 +7,13 @@ use super::{
     },
 };
 use crate::{Result, err, parse_i32_str};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 #[derive(Debug)]
 pub struct Workbook {
     container: XlsxContainer,
     xml_text: String,
+    shared_strings_xml_text: Option<String>,
     shared_strings: Vec<String>,
     sheet_paths: HashMap<String, String>,
     sheets: HashMap<String, Worksheet>,
@@ -40,6 +41,16 @@ impl Workbook {
         let container = XlsxContainer::open_for_update(path)?;
         let catalog = load_sheet_catalog(&container)?;
         let workbook_xml = container.read_text("xl/workbook.xml")?;
+        let shared_strings_xml_text = if container
+            .unpack_dir()
+            .join("xl")
+            .join("sharedStrings.xml")
+            .is_file()
+        {
+            Some(container.read_text("xl/sharedStrings.xml")?)
+        } else {
+            None
+        };
         let shared_strings = load_shared_strings(&container)?;
         let mut sheet_paths = HashMap::new();
         let mut sheets = HashMap::new();
@@ -55,6 +66,7 @@ impl Workbook {
         Ok(Self {
             container,
             xml_text: workbook_xml,
+            shared_strings_xml_text,
             shared_strings,
             sheet_paths,
             sheets,
@@ -72,9 +84,14 @@ impl Workbook {
         let ws = sheets.get_mut(name)?;
         Some(f(ws, shared_strings))
     }
-    pub fn save_as(&self, out_path: &Path, verify_saved_file: bool) -> Result<()> {
+    pub fn save_as(&mut self, out_path: &Path, verify_saved_file: bool) -> Result<()> {
+        self.promote_safe_inline_strings_to_shared()?;
         self.container
             .write_text("xl/workbook.xml", &self.xml_text)?;
+        if let Some(shared_strings_xml) = &self.shared_strings_xml_text {
+            self.container
+                .write_text("xl/sharedStrings.xml", shared_strings_xml)?;
+        }
         for (sheet_name, sheet) in &self.sheets {
             let Some(path) = self.sheet_paths.get(sheet_name) else {
                 continue;
@@ -82,6 +99,59 @@ impl Workbook {
             self.container.write_text(path, &sheet.to_xml())?;
         }
         self.container.save_as(out_path, verify_saved_file)
+    }
+    fn promote_safe_inline_strings_to_shared(&mut self) -> Result<()> {
+        if self.shared_strings_xml_text.is_none() {
+            return Ok(());
+        }
+        let existing_total = self.shared_strings.len();
+        let existing_unique = unique_string_count(&self.shared_strings);
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        for (idx, value) in self.shared_strings.iter().enumerate() {
+            let _ = index_map.entry(value.clone()).or_insert(idx);
+        }
+        let mut newly_appended_shared_strings = Vec::new();
+        for sheet in self.sheets.values_mut() {
+            for row in sheet.rows.values_mut() {
+                for cell in row.cells.values_mut() {
+                    if get_attr(&cell.attrs, "t") != Some("inlineStr") {
+                        continue;
+                    }
+                    let Some(inner_xml) = cell.inner_xml.as_deref() else {
+                        continue;
+                    };
+                    let Some(text) = extract_plain_inline_string_text(inner_xml) else {
+                        continue;
+                    };
+                    let shared_idx = if let Some(idx) = index_map.get(&text).copied() {
+                        idx
+                    } else {
+                        let idx = self.shared_strings.len();
+                        self.shared_strings.push(text.clone());
+                        index_map.insert(text.clone(), idx);
+                        newly_appended_shared_strings.push(text);
+                        idx
+                    };
+                    set_attr(&mut cell.attrs, "t", "s".to_string());
+                    cell.inner_xml = Some(format!("<v>{shared_idx}</v>"));
+                }
+            }
+        }
+        if newly_appended_shared_strings.is_empty() {
+            return Ok(());
+        }
+        let original_xml = self
+            .shared_strings_xml_text
+            .take()
+            .ok_or_else(|| err("sharedStrings XML 상태가 비정상적입니다."))?;
+        let updated_xml = append_shared_strings_xml(
+            &original_xml,
+            &newly_appended_shared_strings,
+            existing_total,
+            existing_unique,
+        )?;
+        self.shared_strings_xml_text = Some(updated_xml);
+        Ok(())
     }
 }
 impl Worksheet {
@@ -707,6 +777,79 @@ fn xml_escape_attr(s: &str) -> String {
 }
 fn needs_xml_space_preserve(s: &str) -> bool {
     s.starts_with(' ') || s.ends_with(' ') || s.contains("  ")
+}
+fn unique_string_count(values: &[String]) -> usize {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for value in values {
+        let _ = seen.insert(value);
+    }
+    seen.len()
+}
+fn extract_plain_inline_string_text(inner_xml: &str) -> Option<String> {
+    if !inner_xml.contains("<is") {
+        return None;
+    }
+    if inner_xml.contains("<r")
+        || inner_xml.contains("<rPr")
+        || inner_xml.contains("<rPh")
+        || inner_xml.contains("<phoneticPr")
+    {
+        return None;
+    }
+    extract_all_tag_text(inner_xml, "t").map(|v| decode_xml_entities(&v))
+}
+fn append_shared_strings_xml(
+    original_xml: &str,
+    new_values: &[String],
+    existing_total: usize,
+    existing_unique: usize,
+) -> Result<String> {
+    if new_values.is_empty() {
+        return Ok(original_xml.to_string());
+    }
+    let Some(open_start) = find_start_tag(original_xml, "sst", 0) else {
+        return Err(err("sharedStrings XML에 <sst>가 없습니다."));
+    };
+    let Some(open_end) = find_tag_end(original_xml, open_start) else {
+        return Err(err("sharedStrings XML의 <sst> 시작 태그가 손상되었습니다."));
+    };
+    let open_tag = &original_xml[open_start..=open_end];
+    let mut attrs = parse_tag_attrs(open_tag)?;
+    let new_total = existing_total
+        .checked_add(new_values.len())
+        .ok_or_else(|| err("sharedStrings count 계산 중 overflow가 발생했습니다."))?;
+    let new_unique = existing_unique
+        .checked_add(new_values.len())
+        .ok_or_else(|| err("sharedStrings uniqueCount 계산 중 overflow가 발생했습니다."))?;
+    set_attr(&mut attrs, "count", new_total.to_string());
+    set_attr(&mut attrs, "uniqueCount", new_unique.to_string());
+    let mut new_si_xml = String::new();
+    for value in new_values {
+        new_si_xml.push_str(&shared_string_si_xml(value));
+    }
+    if open_tag.trim_end().ends_with("/>") {
+        let replacement = format!("<sst{}>{new_si_xml}</sst>", attrs_to_xml(&attrs));
+        let mut out = original_xml.to_string();
+        out.replace_range(open_start..=open_end, &replacement);
+        return Ok(out);
+    }
+    let new_open_tag = format!("<sst{}>", attrs_to_xml(&attrs));
+    let mut out = original_xml.to_string();
+    out.replace_range(open_start..=open_end, &new_open_tag);
+    let close_search_from = open_start + new_open_tag.len();
+    let Some(close_start) = find_end_tag(&out, "sst", close_search_from) else {
+        return Err(err("sharedStrings XML에 </sst>가 없습니다."));
+    };
+    out.insert_str(close_start, &new_si_xml);
+    Ok(out)
+}
+fn shared_string_si_xml(value: &str) -> String {
+    let text = xml_escape_text(value);
+    if needs_xml_space_preserve(value) {
+        format!("<si><t xml:space=\"preserve\">{text}</t></si>")
+    } else {
+        format!("<si><t>{text}</t></si>")
+    }
 }
 fn update_dimension_ref_xml(prefix_xml: &str, start_ref: &str, end_ref: &str) -> Result<String> {
     let mut out = prefix_xml.to_string();
