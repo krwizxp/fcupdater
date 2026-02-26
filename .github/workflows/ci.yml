@@ -7,19 +7,18 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.os }} / rust-${{ matrix.toolchain }}
+    name: ${{ matrix.os }} / rust-stable
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        toolchain: ["1.93.0"]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: stable
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --all -- --check
@@ -27,3 +26,10 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all-targets --all-features
+      - name: Build Release Binary
+        run: cargo build --release --all-features
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fcupdater-${{ matrix.os }}-rust-stable
+          path: ${{ matrix.os == 'windows-latest' && 'target/release/fcupdater.exe' || 'target/release/fcupdater' }}

@@ -15,7 +15,7 @@
 
 ## 요구사항
 
-- Rust 1.93.0 이상
+- Rust Stable (latest)
 - 압축/해제 도구
 - Windows: `pwsh` 또는 `powershell` 또는 `tar`
 - macOS/Linux: 해제는 `unzip` 또는 `python3`/`python`(zipfile), 생성은 `zip` 또는 `python3`/`python`(zipfile)
@@ -32,6 +32,14 @@ cargo build --release
 
 - Windows: `target\release\fcupdater.exe`
 - macOS/Linux: `target/release/fcupdater`
+
+## GitHub Actions 실행파일
+
+- `.github/workflows/ci.yml`에서 `ubuntu-latest`, `windows-latest` 모두 `cargo build --release --all-features`를 수행합니다.
+- 각 Job 완료 후 실행파일이 Artifact로 업로드됩니다.
+- Artifact 이름:
+- `fcupdater-ubuntu-latest-rust-stable` (Linux binary: `fcupdater`)
+- `fcupdater-windows-latest-rust-stable` (Windows binary: `fcupdater.exe`)
 
 ## 빠른 사용
 
