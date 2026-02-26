@@ -33,6 +33,8 @@ pub struct Cell {
     pub attrs: Vec<(String, String)>,
     pub inner_xml: Option<String>,
 }
+const MAX_A1_COL: u32 = 16_384;
+const MAX_A1_ROW: u32 = 1_048_576;
 impl Workbook {
     pub fn open(path: &Path) -> Result<Self> {
         let container = XlsxContainer::open_for_update(path)?;
@@ -295,6 +297,15 @@ pub fn rewrite_formula_rows(formula: &str, resolver: &dyn Fn(u32) -> u32) -> Str
             i += 1;
             continue;
         }
+        if ch == '\''
+            && let Some(next_idx) = try_parse_quoted_sheet_prefix(&chars, i)
+        {
+            for quoted in chars[i..next_idx].iter().copied() {
+                out.push(quoted);
+            }
+            i = next_idx;
+            continue;
+        }
         if is_cell_ref_start(ch)
             && let Some((end_idx, replaced)) = try_parse_and_rewrite_cell_ref(&chars, i, resolver)
         {
@@ -334,8 +345,8 @@ pub fn name_to_col(name: &str) -> Option<u32> {
         }
         let upper = ch.to_ascii_uppercase() as u8;
         out = out
-            .saturating_mul(26)
-            .saturating_add(u32::from(upper - b'A' + 1));
+            .checked_mul(26)?
+            .checked_add(u32::from(upper - b'A' + 1))?;
     }
     Some(out)
 }
@@ -852,6 +863,39 @@ fn ref_with_locks(col: u32, row: u32, col_lock: bool, row_lock: bool) -> String 
 const fn is_cell_ref_start(ch: char) -> bool {
     ch == '$' || ch.is_ascii_alphabetic()
 }
+fn try_parse_quoted_sheet_prefix(chars: &[char], start: usize) -> Option<usize> {
+    if chars.get(start) != Some(&'\'') {
+        return None;
+    }
+    let mut i = start + 1;
+    while let Some(&ch) = chars.get(i) {
+        if ch == '\'' {
+            if chars.get(i + 1) == Some(&'\'') {
+                i += 2;
+                continue;
+            }
+            if chars.get(i + 1) == Some(&'!') {
+                return Some(i + 2);
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+fn parse_a1_col_index(col_text: &str) -> Option<u32> {
+    if col_text.is_empty() || col_text.len() > 3 {
+        return None;
+    }
+    let col = name_to_col(col_text)?;
+    (1..=MAX_A1_COL).contains(&col).then_some(col)
+}
+const fn is_ref_neighbor_identifier(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'
+}
+const fn is_invalid_ref_suffix(ch: char) -> bool {
+    matches!(ch, '!' | '\'' | '(' | '[')
+}
 fn try_parse_and_rewrite_cell_ref(
     chars: &[char],
     start: usize,
@@ -876,7 +920,7 @@ fn try_parse_and_rewrite_cell_ref(
         .take(i - col_start)
         .copied()
         .collect();
-    let _ = name_to_col(&col_text)?;
+    let _ = parse_a1_col_index(&col_text)?;
     let mut row_lock = false;
     if chars.get(i) == Some(&'$') {
         row_lock = true;
@@ -890,11 +934,11 @@ fn try_parse_and_rewrite_cell_ref(
         return None;
     }
     let prev = start.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
-    if matches!(prev, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.') {
+    if matches!(prev, Some(ch) if is_ref_neighbor_identifier(ch)) {
         return None;
     }
     let next = chars.get(i).copied();
-    if matches!(next, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.') {
+    if matches!(next, Some(ch) if is_ref_neighbor_identifier(ch) || is_invalid_ref_suffix(ch)) {
         return None;
     }
     let row_text: String = chars
@@ -904,7 +948,13 @@ fn try_parse_and_rewrite_cell_ref(
         .copied()
         .collect();
     let old_row = row_text.parse::<u32>().ok()?;
+    if !(1..=MAX_A1_ROW).contains(&old_row) {
+        return None;
+    }
     let new_row = resolver(old_row);
+    if !(1..=MAX_A1_ROW).contains(&new_row) {
+        return None;
+    }
     let replaced = format!(
         "{}{}{}{}",
         if col_lock { "$" } else { "" },

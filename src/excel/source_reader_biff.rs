@@ -47,6 +47,7 @@ const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
 const CFB_END_OF_CHAIN: u32 = 0xFFFF_FFFE;
 const CFB_FAT_SECT: u32 = 0xFFFF_FFFD;
 const CFB_DIFAT_SECT: u32 = 0xFFFF_FFFC;
+const MAX_XLS_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 #[derive(Debug, Clone)]
 struct CfbDirectoryEntry {
     name: String,
@@ -80,6 +81,22 @@ struct CfbFile {
 }
 impl CfbFile {
     fn open(path: &Path) -> Result<Self> {
+        let file_size = fs::metadata(path)
+            .map_err(|e| {
+                err(format!(
+                    "xls 파일 메타데이터 조회 실패: {} ({e})",
+                    path.display()
+                ))
+            })?
+            .len();
+        if file_size > MAX_XLS_FILE_SIZE_BYTES {
+            return Err(err(format!(
+                "xls 파일이 너무 큽니다: {} ({} bytes, 최대 {} bytes)",
+                path.display(),
+                file_size,
+                MAX_XLS_FILE_SIZE_BYTES
+            )));
+        }
         let data = fs::read(path)
             .map_err(|e| err(format!("xls 파일 읽기 실패: {} ({e})", path.display())))?;
         if data.len() < 512 || data.get(..CFB_SIGNATURE.len()) != Some(CFB_SIGNATURE.as_slice()) {
@@ -89,13 +106,31 @@ impl CfbFile {
             )));
         }
         let header = parse_cfb_header(&data)?;
-        let difat_entries = collect_difat_entries(&data, &header)?;
+        let max_sector_count = max_regular_sector_count(data.len(), header.sector_size);
+        if max_sector_count == 0 {
+            return Err(err("CFB sector 개수가 비정상적입니다."));
+        }
+        let declared_fat_sectors = usize::try_from(header.num_fat_sectors)
+            .map_err(|_| err("CFB FAT sector 개수 변환에 실패했습니다."))?;
+        if declared_fat_sectors > max_sector_count {
+            return Err(err(format!(
+                "CFB FAT sector 개수가 비정상적으로 큽니다: {declared_fat_sectors} (최대 {max_sector_count})"
+            )));
+        }
+        let difat_entries = collect_difat_entries(&data, &header, max_sector_count)?;
         let fat_sector_ids: Vec<u32> = difat_entries
             .into_iter()
-            .take(header.num_fat_sectors as usize)
+            .take(declared_fat_sectors)
             .collect();
         if fat_sector_ids.is_empty() {
             return Err(err("CFB FAT 정보를 찾지 못했습니다."));
+        }
+        if fat_sector_ids.len() < declared_fat_sectors {
+            return Err(err(format!(
+                "CFB FAT 엔트리가 부족합니다: 필요 {}, 실제 {}",
+                declared_fat_sectors,
+                fat_sector_ids.len()
+            )));
         }
         let fat = build_fat_table(&data, header.sector_size, &fat_sector_ids)?;
         let dir_stream = read_stream_from_fat_chain(
@@ -119,7 +154,7 @@ impl CfbFile {
             Some(root_entry.stream_size),
             "CFB root stream",
         )?;
-        let mini_fat = build_mini_fat_table(&data, &fat, header)?;
+        let mini_fat = build_mini_fat_table(&data, &fat, header, max_sector_count)?;
         Ok(Self {
             data,
             sector_size: header.sector_size,
@@ -158,14 +193,28 @@ impl CfbFile {
         name: &str,
     ) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        let mut remaining = usize::try_from(size)
+            .map_err(|_| err(format!("mini stream 길이 변환 실패: {size} ({name})")))?;
         let mut sid = start_mini_sector;
         let mut seen: HashSet<u32> = HashSet::new();
-        while sid != CFB_END_OF_CHAIN {
+        while sid != CFB_END_OF_CHAIN && remaining > 0 {
             if !seen.insert(sid) {
                 return Err(err(format!("mini stream chain 순환 감지: {name}")));
             }
-            let offset = sid as usize * self.mini_sector_size;
-            let end = offset + self.mini_sector_size;
+            let sid_usize = usize::try_from(sid)
+                .map_err(|_| err(format!("mini stream sector 변환 실패: {sid}")))?;
+            let offset = sid_usize
+                .checked_mul(self.mini_sector_size)
+                .ok_or_else(|| {
+                    err(format!(
+                        "mini stream offset 계산 overflow: {name} (sector={sid})"
+                    ))
+                })?;
+            let end = offset.checked_add(self.mini_sector_size).ok_or_else(|| {
+                err(format!(
+                    "mini stream end 계산 overflow: {name} (sector={sid})"
+                ))
+            })?;
             if end > self.root_stream.len() {
                 return Err(err(format!(
                     "mini stream 범위를 벗어났습니다: {name} (sector={sid})"
@@ -176,17 +225,18 @@ impl CfbFile {
                     "mini stream 범위를 벗어났습니다: {name} (sector={sid})"
                 ))
             })?;
-            out.extend_from_slice(chunk);
+            let take = remaining.min(chunk.len());
+            out.extend_from_slice(&chunk[..take]);
+            remaining -= take;
             let next = *self
                 .mini_fat
-                .get(sid as usize)
+                .get(sid_usize)
                 .ok_or_else(|| err(format!("mini FAT 인덱스 범위 오류: {sid}")))?;
             if next == CFB_FREE_SECT {
                 break;
             }
             sid = next;
         }
-        truncate_to_u64(&mut out, size, "mini stream 길이")?;
         Ok(out)
     }
 }
@@ -194,10 +244,25 @@ fn parse_cfb_header(data: &[u8]) -> Result<CfbHeader> {
     let major_version = read_u16_le(data, 0x1A)?;
     let sector_shift = read_u16_le(data, 0x1E)?;
     let mini_sector_shift = read_u16_le(data, 0x20)?;
-    let sector_size = 1usize << sector_shift;
-    let mini_sector_size = 1usize << mini_sector_shift;
-    if sector_size < 512 || (sector_size & (sector_size - 1)) != 0 {
+    if !matches!(major_version, 3 | 4) {
+        return Err(err(format!(
+            "지원하지 않는 CFB major version: {major_version}"
+        )));
+    }
+    let sector_size = checked_pow2_from_shift(sector_shift, "CFB sector shift")?;
+    let mini_sector_size = checked_pow2_from_shift(mini_sector_shift, "CFB mini sector shift")?;
+    if !matches!(sector_size, 512 | 4096) {
         return Err(err(format!("지원하지 않는 CFB sector size: {sector_size}")));
+    }
+    if (major_version == 3 && sector_size != 512) || (major_version == 4 && sector_size != 4096) {
+        return Err(err(format!(
+            "CFB 헤더 버전/sector size 조합이 유효하지 않습니다: version={major_version}, sector={sector_size}"
+        )));
+    }
+    if mini_sector_size != 64 {
+        return Err(err(format!(
+            "지원하지 않는 CFB mini sector size: {mini_sector_size}"
+        )));
     }
     Ok(CfbHeader {
         major_version,
@@ -212,7 +277,28 @@ fn parse_cfb_header(data: &[u8]) -> Result<CfbHeader> {
         num_difat_sectors: read_u32_le(data, 0x48)?,
     })
 }
-fn collect_difat_entries(data: &[u8], header: &CfbHeader) -> Result<Vec<u32>> {
+fn checked_pow2_from_shift(shift: u16, context: &str) -> Result<usize> {
+    let shift_u32 = u32::from(shift);
+    if shift_u32 >= usize::BITS {
+        return Err(err(format!(
+            "{context}가 비정상적으로 큽니다: {shift_u32} (usize bits={})",
+            usize::BITS
+        )));
+    }
+    1usize
+        .checked_shl(shift_u32)
+        .ok_or_else(|| err(format!("{context} 계산에 실패했습니다: shift={shift_u32}")))
+}
+fn max_regular_sector_count(data_len: usize, sector_size: usize) -> usize {
+    data_len
+        .checked_sub(512)
+        .map_or(0, |payload| payload / sector_size)
+}
+fn collect_difat_entries(
+    data: &[u8],
+    header: &CfbHeader,
+    max_sector_count: usize,
+) -> Result<Vec<u32>> {
     let mut difat_entries: Vec<u32> = Vec::new();
     for i in 0..109usize {
         let sid = read_u32_le(data, 0x4C + i * 4)?;
@@ -223,9 +309,16 @@ fn collect_difat_entries(data: &[u8], header: &CfbHeader) -> Result<Vec<u32>> {
     if header.num_difat_sectors == 0 {
         return Ok(difat_entries);
     }
+    let num_difat_sectors = usize::try_from(header.num_difat_sectors)
+        .map_err(|_| err("CFB DIFAT sector 개수 변환에 실패했습니다."))?;
+    if num_difat_sectors > max_sector_count {
+        return Err(err(format!(
+            "CFB DIFAT sector 개수가 비정상적으로 큽니다: {num_difat_sectors} (최대 {max_sector_count})"
+        )));
+    }
     let mut sid = header.first_difat_sector;
     let mut seen: HashSet<u32> = HashSet::new();
-    for _ in 0..header.num_difat_sectors {
+    for _ in 0..num_difat_sectors {
         if !is_regular_sector_id(sid) {
             break;
         }
@@ -245,27 +338,49 @@ fn collect_difat_entries(data: &[u8], header: &CfbHeader) -> Result<Vec<u32>> {
     Ok(difat_entries)
 }
 fn build_fat_table(data: &[u8], sector_size: usize, fat_sector_ids: &[u32]) -> Result<Vec<u32>> {
+    let entries_per_sector = sector_size / 4;
+    let total_entries = fat_sector_ids
+        .len()
+        .checked_mul(entries_per_sector)
+        .ok_or_else(|| err("CFB FAT 엔트리 개수 계산 중 overflow가 발생했습니다."))?;
     let mut fat: Vec<u32> = Vec::new();
+    fat.try_reserve(total_entries)
+        .map_err(|_| err(format!("CFB FAT 메모리 확보 실패: {total_entries} entries")))?;
     for sid in fat_sector_ids {
         let sector = get_sector_slice(data, sector_size, *sid)?;
-        for i in 0..(sector_size / 4) {
+        for i in 0..entries_per_sector {
             fat.push(read_u32_le(sector, i * 4)?);
         }
     }
     Ok(fat)
 }
-fn build_mini_fat_table(data: &[u8], fat: &[u32], header: CfbHeader) -> Result<Vec<u32>> {
+fn build_mini_fat_table(
+    data: &[u8],
+    fat: &[u32],
+    header: CfbHeader,
+    max_sector_count: usize,
+) -> Result<Vec<u32>> {
     if header.num_mini_fat_sectors == 0 || !is_regular_sector_id(header.first_mini_fat_sector) {
         return Ok(Vec::new());
     }
+    let mini_fat_sector_count = usize::try_from(header.num_mini_fat_sectors)
+        .map_err(|_| err("CFB mini FAT sector 개수 변환에 실패했습니다."))?;
+    if mini_fat_sector_count > max_sector_count {
+        return Err(err(format!(
+            "CFB mini FAT sector 개수가 비정상적으로 큽니다: {mini_fat_sector_count} (최대 {max_sector_count})"
+        )));
+    }
     let sector_size_u64 = u64::try_from(header.sector_size)
         .map_err(|_| err("CFB sector size 변환에 실패했습니다."))?;
+    let mini_fat_limit = u64::from(header.num_mini_fat_sectors)
+        .checked_mul(sector_size_u64)
+        .ok_or_else(|| err("CFB mini FAT 길이 계산 중 overflow가 발생했습니다."))?;
     let mini_fat_bytes = read_stream_from_fat_chain(
         data,
         header.sector_size,
         fat,
         header.first_mini_fat_sector,
-        Some(u64::from(header.num_mini_fat_sectors).saturating_mul(sector_size_u64)),
+        Some(mini_fat_limit),
         "CFB mini FAT",
     )?;
     let mut out = Vec::new();
@@ -294,9 +409,21 @@ fn read_stream_from_fat_chain(
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
+    let mut remaining = size_limit
+        .map(|limit| {
+            usize::try_from(limit).map_err(|_| {
+                err(format!(
+                    "FAT stream 길이 변환 실패: {limit} ({stream_name})"
+                ))
+            })
+        })
+        .transpose()?;
     let mut sid = start_sector;
     let mut seen: HashSet<u32> = HashSet::new();
     while sid != CFB_END_OF_CHAIN {
+        if matches!(remaining, Some(0)) {
+            break;
+        }
         if !is_regular_sector_id(sid) {
             return Err(err(format!(
                 "FAT chain에 잘못된 sector id가 있습니다: {stream_name} ({sid:#x})"
@@ -308,34 +435,41 @@ fn read_stream_from_fat_chain(
             )));
         }
         let sector = get_sector_slice(data, sector_size, sid)?;
-        out.extend_from_slice(sector);
+        if let Some(remain) = remaining.as_mut() {
+            let take = (*remain).min(sector.len());
+            out.extend_from_slice(&sector[..take]);
+            *remain -= take;
+        } else {
+            out.extend_from_slice(sector);
+        }
+        let sid_usize = usize::try_from(sid)
+            .map_err(|_| err(format!("FAT sector 변환 실패: {sid} ({stream_name})")))?;
         let next = *fat
-            .get(sid as usize)
+            .get(sid_usize)
             .ok_or_else(|| err(format!("FAT 인덱스 범위 오류: sector={sid}")))?;
         if next == CFB_FREE_SECT {
             break;
         }
         sid = next;
     }
-    if let Some(limit) = size_limit {
-        truncate_to_u64(&mut out, limit, "FAT stream 길이")?;
-    }
     Ok(out)
 }
-fn truncate_to_u64(buf: &mut Vec<u8>, limit: u64, context: &str) -> Result<()> {
-    let limit_usize = usize::try_from(limit).map_err(|_| {
+fn get_sector_slice(data: &[u8], sector_size: usize, sector_id: u32) -> Result<&[u8]> {
+    let sector_idx = usize::try_from(sector_id)
+        .map_err(|_| err(format!("CFB sector id 변환 실패: {sector_id}")))?;
+    let start = sector_idx
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(sector_size))
+        .ok_or_else(|| {
+            err(format!(
+                "CFB sector offset 계산 overflow: sector={sector_id}, size={sector_size}"
+            ))
+        })?;
+    let end = start.checked_add(sector_size).ok_or_else(|| {
         err(format!(
-            "{context}가 현재 플랫폼에서 처리 가능한 범위를 초과했습니다."
+            "CFB sector 끝 offset 계산 overflow: sector={sector_id}, size={sector_size}"
         ))
     })?;
-    if buf.len() > limit_usize {
-        buf.truncate(limit_usize);
-    }
-    Ok(())
-}
-fn get_sector_slice(data: &[u8], sector_size: usize, sector_id: u32) -> Result<&[u8]> {
-    let start = (sector_id as usize + 1) * sector_size;
-    let end = start + sector_size;
     data.get(start..end).ok_or_else(|| {
         err(format!(
             "CFB sector 범위를 벗어났습니다: sector={sector_id}, size={sector_size}"
@@ -400,7 +534,9 @@ fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
         let record_id = read_u16_le(workbook_stream, pos)?;
         let record_len = read_u16_le(workbook_stream, pos + 2)? as usize;
         let data_start = pos + 4;
-        let data_end = data_start + record_len;
+        let data_end = data_start
+            .checked_add(record_len)
+            .ok_or_else(|| err("xls BIFF globals 레코드 길이 계산 중 overflow가 발생했습니다."))?;
         if data_end > workbook_stream.len() {
             return Err(err("xls BIFF globals 레코드가 손상되었습니다."));
         }
@@ -408,7 +544,8 @@ fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
             .get(data_start..data_end)
             .ok_or_else(|| err("xls BIFF globals 레코드 범위 오류"))?;
         if record_id == 0x0085 && data.len() >= 8 {
-            let offset = read_u32_le(data, 0)? as usize;
+            let offset = usize::try_from(read_u32_le(data, 0)?)
+                .map_err(|_| err("xls BoundSheet offset 변환에 실패했습니다."))?;
             let sheet_type = *data
                 .get(5)
                 .ok_or_else(|| err("xls BoundSheet sheet_type 범위 오류"))?;
@@ -422,7 +559,9 @@ fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
                 let next_id = read_u16_le(workbook_stream, next)?;
                 let next_len = read_u16_le(workbook_stream, next + 2)? as usize;
                 let next_data_start = next + 4;
-                let next_data_end = next_data_start + next_len;
+                let Some(next_data_end) = next_data_start.checked_add(next_len) else {
+                    break;
+                };
                 if next_data_end > workbook_stream.len() {
                     break;
                 }
@@ -524,8 +663,27 @@ impl<'a> SstChunkReader<'a> {
         let b3 = u32::from(self.read_u8()?);
         Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
     }
+    fn remaining_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for (idx, chunk) in self.chunks.iter().enumerate().skip(self.chunk_index) {
+            let consumed = if idx == self.chunk_index {
+                self.offset_in_chunk.min(chunk.len())
+            } else {
+                0
+            };
+            total = total.saturating_add(chunk.len().saturating_sub(consumed));
+        }
+        total
+    }
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(len);
+        if len > self.remaining_bytes() {
+            return Err(err(format!(
+                "SST data가 예상보다 짧습니다. (요청 {len} bytes)"
+            )));
+        }
+        let mut out = Vec::new();
+        out.try_reserve(len)
+            .map_err(|_| err(format!("SST 버퍼 메모리 확보 실패: {len} bytes")))?;
         while out.len() < len {
             self.ensure_available()?;
             let chunk = *self
@@ -596,10 +754,24 @@ fn parse_sst_from_chunks(chunks: &[&[u8]], code_page: Option<u16>) -> Result<Vec
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
+    let total_chunk_bytes = chunks.iter().try_fold(0usize, |acc, chunk| {
+        acc.checked_add(chunk.len())
+            .ok_or_else(|| err("SST chunk 총길이 계산 중 overflow가 발생했습니다."))
+    })?;
+    if total_chunk_bytes < 8 {
+        return Err(err("SST 데이터가 비정상적으로 짧습니다."));
+    }
     let mut reader = SstChunkReader::new(chunks.to_vec(), code_page);
     let _total_count = reader.read_u32()?;
-    let unique_count = reader.read_u32()? as usize;
-    let mut out = Vec::with_capacity(unique_count);
+    let unique_count = usize::try_from(reader.read_u32()?)
+        .map_err(|_| err("SST unique count 변환에 실패했습니다."))?;
+    let max_unique_count = total_chunk_bytes.saturating_sub(8) / 3;
+    if unique_count > max_unique_count {
+        return Err(err(format!(
+            "SST unique count가 비정상적으로 큽니다: {unique_count} (최대 {max_unique_count})"
+        )));
+    }
+    let mut out = Vec::new();
     for _ in 0..unique_count {
         let char_count = reader.read_u16()? as usize;
         let flags = reader.read_u8()?;
@@ -612,13 +784,17 @@ fn parse_sst_from_chunks(chunks: &[&[u8]], code_page: Option<u16>) -> Result<Vec
             0usize
         };
         let ext_len = if ext {
-            reader.read_u32()? as usize
+            usize::try_from(reader.read_u32()?)
+                .map_err(|_| err("SST ext 길이 변환에 실패했습니다."))?
         } else {
             0usize
         };
         let value = reader.read_xl_unicode_chars(char_count, high_byte)?;
         if rich_run_count > 0 {
-            let _ = reader.read_bytes(rich_run_count * 4)?;
+            let rich_bytes = rich_run_count
+                .checked_mul(4)
+                .ok_or_else(|| err("SST rich-text 길이 계산 중 overflow가 발생했습니다."))?;
+            let _ = reader.read_bytes(rich_bytes)?;
         }
         if ext_len > 0 {
             let _ = reader.read_bytes(ext_len)?;
@@ -658,7 +834,9 @@ fn read_biff_record<'a>(
     let record_id = read_u16_le(workbook_stream, *pos)?;
     let record_len = usize::from(read_u16_le(workbook_stream, *pos + 2)?);
     let data_start = *pos + 4;
-    let data_end = data_start + record_len;
+    let data_end = data_start
+        .checked_add(record_len)
+        .ok_or_else(|| err("xls worksheet 레코드 길이 계산 중 overflow가 발생했습니다."))?;
     if data_end > workbook_stream.len() {
         return Err(err("xls worksheet 레코드가 손상되었습니다."));
     }

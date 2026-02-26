@@ -157,10 +157,8 @@ fn build_source_records_from_sheet_xml_streaming(
             cursor = row_body_end + "</row>".len();
             parse_xlsx_row_cells(row_body, row_num, shared_strings)?
         };
-        if !row_tag.ends_with("/>") {
-            next_row_num = row_num.saturating_add(1);
-        } else {
-            next_row_num = row_num.saturating_add(1);
+        next_row_num = row_num.saturating_add(1);
+        if row_tag.ends_with("/>") {
             cursor = row_tag_end + 1;
         }
         if header_indices.is_none() && scanned_rows < header_scan_rows {
