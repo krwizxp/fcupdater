@@ -952,42 +952,23 @@ fn parse_range_token(token: &str) -> (String, String) {
         (token.to_string(), token.to_string())
     }
 }
+fn take_while_next_if_map(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    predicate: impl Fn(char) -> bool,
+) -> String {
+    std::iter::from_fn(|| chars.next_if_map(|ch| if predicate(ch) { Ok(ch) } else { Err(ch) }))
+        .collect()
+}
 fn parse_ref_with_locks(r: &str) -> Option<(u32, u32, bool, bool)> {
     let mut chars = r.chars().peekable();
-    let col_lock = if chars.peek() == Some(&'$') {
-        chars.next();
-        true
-    } else {
-        false
-    };
-    let mut col_s = String::new();
-    while let Some(ch) = chars.peek() {
-        if ch.is_ascii_alphabetic() {
-            col_s.push(*ch);
-            chars.next();
-        } else {
-            break;
-        }
-    }
+    let col_lock = chars.next_if_eq(&'$').is_some();
+    let col_s = take_while_next_if_map(&mut chars, |ch| ch.is_ascii_alphabetic());
     if col_s.is_empty() {
         return None;
     }
-    let row_lock = if chars.peek() == Some(&'$') {
-        chars.next();
-        true
-    } else {
-        false
-    };
-    let mut row_s = String::new();
-    while let Some(ch) = chars.peek() {
-        if ch.is_ascii_digit() {
-            row_s.push(*ch);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    if row_s.is_empty() || chars.peek().is_some() {
+    let row_lock = chars.next_if_eq(&'$').is_some();
+    let row_s = take_while_next_if_map(&mut chars, |ch| ch.is_ascii_digit());
+    if row_s.is_empty() || chars.next().is_some() {
         return None;
     }
     let col = name_to_col(&col_s)?;
