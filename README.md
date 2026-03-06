@@ -15,7 +15,8 @@
 
 ## 요구사항
 
-- Rust Stable (latest)
+- MSRV: Rust 1.94
+- 최신 Rust stable 사용 가능
 - 압축/해제 도구
 - Windows: `pwsh` 또는 `powershell` 또는 `tar`
 - macOS/Linux: 해제는 `unzip` 또는 `python3`/`python`(zipfile), 생성은 `zip` 또는 `python3`/`python`(zipfile)
