@@ -48,14 +48,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        id: toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache target directory
-        uses: actions/cache@v5
-        with:
-          path: target/
-          key: ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Use GitHub runner WebDrivers
         if: ${{ !inputs.skip_download }}
