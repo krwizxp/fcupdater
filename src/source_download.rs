@@ -1166,12 +1166,10 @@ fn webdriver_download_dir_string(path: &Path) -> String {
 fn webdriver_download_dir_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
-
 #[cfg(windows)]
 const fn os_dev_null() -> &'static str {
     "NUL"
 }
-
 #[cfg(not(windows))]
 const fn os_dev_null() -> &'static str {
     "/dev/null"

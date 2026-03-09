@@ -49,9 +49,12 @@ impl DownloadedSourceGuard {
         self.paths = paths;
     }
     fn cleanup(&mut self) -> Result<()> {
+        self.cleanup_with_message("실행 후 자동 생성 파일")
+    }
+    fn cleanup_with_message(&mut self, message: &str) -> Result<()> {
         let removed = source_download::cleanup_downloaded_sources(&self.paths)?;
         if removed > 0 {
-            eprintln!("[소스 다운로드] 실행 후 자동 생성 파일 {removed}개 정리");
+            eprintln!("[소스 다운로드] {message} {removed}개 정리");
         }
         self.paths.clear();
         Ok(())
@@ -62,11 +65,8 @@ impl Drop for DownloadedSourceGuard {
         if self.paths.is_empty() {
             return;
         }
-        match source_download::cleanup_downloaded_sources(&self.paths) {
-            Ok(removed) if removed > 0 => {
-                eprintln!("[소스 다운로드] 실행 종료 시 자동 생성 파일 {removed}개 정리");
-            }
-            Ok(_) => {}
+        match self.cleanup_with_message("실행 종료 시 자동 생성 파일") {
+            Ok(()) => {}
             Err(e) => {
                 eprintln!("[소스 다운로드] 실행 종료 시 자동 생성 파일 정리 실패: {e}");
             }
