@@ -3,6 +3,7 @@
 `fuel_cost_chungcheong.xlsx`의 주유소 정보를 `지역_위치별(주유소)*.xls/.xlsx` 소스 파일로 현행화하는 CLI 도구입니다.
 
 - Excel 미설치 환경에서 동작
+- Opinet 지역별 소스 파일 자동 다운로드(기본)
 - `.xls` / `.xlsx` 소스 입력 지원
 - 주소 기반 매칭으로 기존 행 갱신
 - 소스 파일 prefix 대소문자 구분 없이 자동 탐색
@@ -17,6 +18,9 @@
 
 - MSRV: Rust 1.94
 - 최신 Rust stable 사용 가능
+- Chrome 설치
+- `chromedriver`가 PATH에 있거나 프로젝트 내 `chromedriver/chromedriver(.exe)` 위치에 있어야 함
+- Chrome과 ChromeDriver의 메이저 버전이 서로 같아야 함
 - 압축/해제 도구
 - Windows: `pwsh` 또는 `powershell` 또는 `tar`
 - macOS/Linux: 해제는 `unzip` 또는 `python3`/`python`(zipfile), 생성은 `zip` 또는 `python3`/`python`(zipfile)
@@ -44,11 +48,11 @@ cargo build --release
 
 ## 빠른 사용
 
-1. 아래 파일들을 같은 폴더에 둡니다.
+1. 아래 파일과 실행 환경을 준비합니다.
 
 - `fuel_cost_chungcheong.xlsx`
-- `지역_위치별(주유소).xls`
-- `지역_위치별(주유소) (1)~(...).xls` 등 추가 소스 파일
+- Chrome
+- `chromedriver` (`PATH` 등록)
 
 2. 실행합니다.
 
@@ -56,15 +60,24 @@ cargo build --release
 fcupdater.exe
 ```
 
-3. 기본 출력 파일:
+3. 실행 중 Opinet에서 지역별 소스 파일을 자동 다운로드한 뒤 현행화를 진행합니다.
+
+4. 기본 출력 파일:
 
 - `fuel_cost_chungcheong_updated_YYYY-MM-DD.xlsx`
+
+수동 소스 파일만 사용하려면:
+
+```bash
+fcupdater.exe --skip-download
+```
 
 ## 옵션
 
 - `--master <PATH>`: 마스터 파일 경로
-- `--sources-dir <PATH>`: 소스 폴더 경로
+- `--sources-dir <PATH>`: 소스 폴더 경로, 자동 다운로드 저장 폴더
 - `--sources-prefix <TEXT>`: 소스 파일 prefix
+- `--skip-download`: Opinet 자동 다운로드 생략, 기존 소스 파일만 사용
 - `--output <PATH>`: 출력 파일 경로
 - `--in-place`: 마스터 파일 덮어쓰기(백업 자동 생성)
 - `--no-change-log`: `변경내역` 시트 갱신 안 함
@@ -91,10 +104,15 @@ fcupdater.exe
 
 ```bash
 fcupdater.exe --master "C:\path\fuel_cost_chungcheong.xlsx" --sources-dir "C:\path\sources" --output out.xlsx
+fcupdater.exe --skip-download --sources-dir "C:\path\manual-sources" --output out.xlsx
 ```
 
 ## 동작 기준
 
+- 기본 실행은 Opinet에서 지역별 소스를 자동 다운로드한 뒤 현행화를 진행합니다.
+- `--sources-dir`는 자동 다운로드 결과 저장 위치이기도 합니다.
+- 자동 다운로드 파일명은 `{prefix}__fcupdater_auto__...` 형식이며, 해당 파일이 있으면 그 파일들만 우선 사용합니다.
+- `--skip-download`를 지정하면 기존 `지역_위치별(주유소)*.xls/.xlsx` 파일만 사용합니다.
 - 주소 문자열은 공백/괄호/일부 시도 표기 차이를 정규화해 매칭합니다.
 - `--sources-prefix`는 파일명 접두사 매칭 시 대소문자를 구분하지 않습니다.
 - 매칭된 기존 업체는 다음 정보를 소스 기준으로 갱신합니다.

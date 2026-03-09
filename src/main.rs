@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::PathBuf};
 mod change_log;
 mod cli;
 mod defined_name;
@@ -6,6 +6,7 @@ mod excel;
 mod master_sheet;
 pub(crate) mod numeric;
 mod path_policy;
+mod source_download;
 mod source_sync;
 mod summary;
 use cli::{Args, OutputTarget, ParseAction};
@@ -39,6 +40,39 @@ struct StoreRow {
     premium: Option<i32>,
     diesel: Option<i32>,
 }
+#[derive(Debug, Default)]
+struct DownloadedSourceGuard {
+    paths: Vec<PathBuf>,
+}
+impl DownloadedSourceGuard {
+    fn track(&mut self, paths: Vec<PathBuf>) {
+        self.paths = paths;
+    }
+    fn cleanup(&mut self) -> Result<()> {
+        let removed = source_download::cleanup_downloaded_sources(&self.paths)?;
+        if removed > 0 {
+            eprintln!("[소스 다운로드] 실행 후 자동 생성 파일 {removed}개 정리");
+        }
+        self.paths.clear();
+        Ok(())
+    }
+}
+impl Drop for DownloadedSourceGuard {
+    fn drop(&mut self) {
+        if self.paths.is_empty() {
+            return;
+        }
+        match source_download::cleanup_downloaded_sources(&self.paths) {
+            Ok(removed) if removed > 0 => {
+                eprintln!("[소스 다운로드] 실행 종료 시 자동 생성 파일 {removed}개 정리");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[소스 다운로드] 실행 종료 시 자동 생성 파일 정리 실패: {e}");
+            }
+        }
+    }
+}
 fn main() -> Result<()> {
     match Args::parse_action()? {
         ParseAction::Run(args) => run(&args),
@@ -49,11 +83,31 @@ fn main() -> Result<()> {
     }
 }
 fn run(args: &Args) -> Result<()> {
-    if !args.master.exists() {
-        return Err(err(format!(
-            "마스터 파일이 없습니다: {} (같은 폴더에 두거나 --master로 경로를 지정하세요)",
-            args.master.display()
-        )));
+    match args.master.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(err(format!(
+                "마스터 파일이 없습니다: {} (같은 폴더에 두거나 --master로 경로를 지정하세요)",
+                args.master.display()
+            )));
+        }
+        Err(e) => {
+            return Err(err(format!(
+                "마스터 파일 경로 확인 실패: {} ({e})",
+                args.master.display()
+            )));
+        }
+    }
+    let mut downloaded_sources = DownloadedSourceGuard::default();
+    if !args.skip_download {
+        let downloaded = source_download::refresh_sources(&args.sources_dir, &args.sources_prefix)
+            .map_err(|e| {
+                err(format!(
+                    "{e}\n기존 수동 소스 파일만 사용하려면 --skip-download 를 지정하세요."
+                ))
+            })?;
+        eprintln!("[소스 다운로드] {}개 파일 준비 완료", downloaded.len());
+        downloaded_sources.track(downloaded);
     }
     let source_paths = find_source_files(&args.sources_dir, &args.sources_prefix)?;
     if source_paths.is_empty() {
@@ -67,6 +121,7 @@ fn run(args: &Args) -> Result<()> {
         index: source_index,
         report: source_report,
     } = build_source_index_with_report(&source_paths)?;
+    downloaded_sources.cleanup()?;
     let mut book = StdWorkbook::open(&args.master)?;
     let (changes, added, deleted) = master_sheet::update_master_sheet(&mut book, &source_index)?;
     let today = cli::local_today_yyyy_mm_dd()?;

@@ -53,6 +53,7 @@ pub fn find_source_files(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
         let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
+        let file_name = file_name.to_string();
         let file_name_fold = file_name.to_lowercase();
         if !file_name_fold.starts_with(&prefix_fold) {
             continue;
@@ -62,8 +63,12 @@ pub fn find_source_files(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
             candidates.push(SourceFileCandidate {
                 path,
                 natural_key: split_natural_parts(&file_name_fold),
+                is_auto: crate::source_download::is_auto_source_file_name(&file_name, prefix),
             });
         }
+    }
+    if candidates.iter().any(|candidate| candidate.is_auto) {
+        candidates.retain(|candidate| candidate.is_auto);
     }
     candidates.sort_by(|a, b| {
         compare_natural_parts(&a.natural_key, &b.natural_key).then_with(|| a.path.cmp(&b.path))
@@ -128,6 +133,7 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
 struct SourceFileCandidate {
     path: PathBuf,
     natural_key: Vec<NaturalPart>,
+    is_auto: bool,
 }
 fn compare_natural_parts(a_parts: &[NaturalPart], b_parts: &[NaturalPart]) -> Ordering {
     for (a_part, b_part) in a_parts.iter().zip(b_parts) {

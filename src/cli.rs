@@ -39,6 +39,7 @@ pub struct Args {
     pub master: PathBuf,
     pub sources_dir: PathBuf,
     pub sources_prefix: String,
+    pub skip_download: bool,
     pub output_target: OutputTarget,
     pub no_change_log: bool,
     pub save_mode: SaveMode,
@@ -49,6 +50,7 @@ impl Default for Args {
             master: PathBuf::from("fuel_cost_chungcheong.xlsx"),
             sources_dir: PathBuf::from("."),
             sources_prefix: "지역_위치별(주유소)".to_string(),
+            skip_download: false,
             output_target: OutputTarget::Auto,
             no_change_log: false,
             save_mode: SaveMode::Verify,
@@ -76,6 +78,8 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
             set_output_target_in_place(&mut args.output_target)?;
         } else if token == OsStr::new("--no-change-log") {
             args.no_change_log = true;
+        } else if token == OsStr::new("--skip-download") {
+            args.skip_download = true;
         } else if token == OsStr::new("--dry-run") {
             dry_run = true;
         } else if token == OsStr::new("--fast-save") {
@@ -166,7 +170,7 @@ fn usage_text() -> String {
     let mut out = format!(
         "{APP_NAME} {APP_VERSION}\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n\
 사용법:\n  {APP_NAME} [OPTIONS]\n\n\
-옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일 prefix (기본: 지역_위치별(주유소))\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음"
+옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일 prefix (기본: 지역_위치별(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음"
     );
     out.push_str(
         "\n\n환경 변수(선택):\n  FCUPDATER_SOURCE_HEADER_SCAN_ROWS\n  FCUPDATER_MASTER_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_COLS\n  FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW\n  FCUPDATER_CP949_STRICT\n  FCUPDATER_DURABILITY_STRICT",
