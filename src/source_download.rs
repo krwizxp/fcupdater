@@ -628,7 +628,7 @@ fn webdriver_new_session(
 ) -> std::result::Result<String, String> {
     let dir_str = webdriver_download_dir_string(download_dir);
     let body = format!(
-        r#"{{"capabilities":{{"alwaysMatch":{{"browserName":"{}","{}":{{"args":["start-maximized","--disable-background-networking","--disable-default-apps","--disable-sync","--log-level=3","--no-first-run"],"excludeSwitches":["enable-logging"],"prefs":{{"download.default_directory":"{}","download.prompt_for_download":false,"download.directory_upgrade":true,"safebrowsing.enabled":true,"profile.default_content_setting_values.automatic_downloads":1}}}}}}}}}}"#,
+        r#"{{"capabilities":{{"alwaysMatch":{{"browserName":"{}","{}":{{"args":["--headless=new","--window-size=1920,1080","--disable-background-networking","--disable-default-apps","--disable-gpu","--disable-sync","--log-level=3","--no-first-run"],"excludeSwitches":["enable-logging"],"prefs":{{"download.default_directory":"{}","download.prompt_for_download":false,"download.directory_upgrade":true,"safebrowsing.enabled":true,"profile.default_content_setting_values.automatic_downloads":1}}}}}}}}}}"#,
         browser.browser_name(),
         browser.options_key(),
         json_escape(&dir_str)
