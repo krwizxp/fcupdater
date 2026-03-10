@@ -232,3 +232,57 @@ fn normalize_address_key(addr: &str) -> String {
     }
     out
 }
+fn display_region_label_from_source(region: &str, address: &str) -> String {
+    parse_region_label(region)
+        .or_else(|| parse_region_label(address))
+        .unwrap_or_else(|| region.trim().to_string())
+}
+fn parse_region_label(text: &str) -> Option<String> {
+    let mut tokens = text
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let first = tokens.next()?;
+    let second = tokens.next();
+    if let Some(label) = strip_metropolitan_suffix(first) {
+        return Some(label.to_string());
+    }
+    if is_province_token(first) {
+        return second.map(normalize_basic_region_token);
+    }
+    if is_metropolitan_token(first) {
+        return Some(first.to_string());
+    }
+    strip_basic_region_suffix(first)
+        .map(ToString::to_string)
+        .or_else(|| (second.is_none()).then(|| first.to_string()))
+}
+fn normalize_basic_region_token(token: &str) -> String {
+    strip_basic_region_suffix(token).map_or_else(|| token.to_string(), ToString::to_string)
+}
+fn strip_metropolitan_suffix(token: &str) -> Option<&str> {
+    ["특별자치시", "광역시", "특별시"]
+        .iter()
+        .find_map(|suffix| token.strip_suffix(suffix))
+        .filter(|label| !label.is_empty())
+}
+fn strip_basic_region_suffix(token: &str) -> Option<&str> {
+    ["시", "군", "구"]
+        .iter()
+        .find_map(|suffix| token.strip_suffix(suffix))
+        .filter(|label| !label.is_empty())
+}
+fn is_province_token(token: &str) -> bool {
+    token.ends_with('도')
+        || token.ends_with("특별자치도")
+        || matches!(
+            token,
+            "충남" | "충북" | "경기" | "강원" | "전북" | "전남" | "경북" | "경남" | "제주"
+        )
+}
+fn is_metropolitan_token(token: &str) -> bool {
+    matches!(
+        token,
+        "서울" | "부산" | "대구" | "인천" | "광주" | "대전" | "울산" | "세종"
+    )
+}

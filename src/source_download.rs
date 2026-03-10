@@ -25,14 +25,10 @@ struct Task {
     sido: &'static str,
     sigungu: &'static str,
 }
-const TASKS: [Task; 9] = [
+const TASKS: [Task; 11] = [
     Task {
         sido: "대전광역시",
         sigungu: "대덕구",
-    },
-    Task {
-        sido: "대전광역시",
-        sigungu: "중구",
     },
     Task {
         sido: "대전광역시",
@@ -40,23 +36,35 @@ const TASKS: [Task; 9] = [
     },
     Task {
         sido: "대전광역시",
+        sigungu: "서구",
+    },
+    Task {
+        sido: "대전광역시",
         sigungu: "유성구",
     },
     Task {
         sido: "대전광역시",
-        sigungu: "서구",
+        sigungu: "중구",
     },
     Task {
         sido: "세종특별자치시",
         sigungu: "세종시",
     },
     Task {
+        sido: "충청북도",
+        sigungu: "청주시",
+    },
+    Task {
         sido: "충청남도",
         sigungu: "공주시",
     },
     Task {
-        sido: "충청북도",
-        sigungu: "청주시",
+        sido: "충청남도",
+        sigungu: "보령시",
+    },
+    Task {
+        sido: "충청남도",
+        sigungu: "아산시",
     },
     Task {
         sido: "충청남도",
