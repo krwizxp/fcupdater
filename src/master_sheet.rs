@@ -208,7 +208,6 @@ pub fn update_master_sheet(
             let added = rows_from_sources(&new_sources);
             let (filter_end_row, filter_end_col) = rebuild_master_rows(
                 ws,
-                shared_strings,
                 header_row,
                 data_start_row,
                 &old_rows,
@@ -280,8 +279,10 @@ fn collect_new_sources(
         .filter_map(|(key, rec)| (!matched_source_keys.contains(key)).then_some(rec.clone()))
         .collect();
     new_sources.sort_by(|a, b| {
-        a.region
-            .cmp(&b.region)
+        crate::display_region_label_from_source(&a.region, &a.address)
+            .cmp(&crate::display_region_label_from_source(
+                &b.region, &b.address,
+            ))
             .then(a.name.cmp(&b.name))
             .then(a.address.cmp(&b.address))
     });
@@ -291,7 +292,7 @@ fn rows_from_sources(new_sources: &[SourceRecord]) -> Vec<StoreRow> {
     new_sources
         .iter()
         .map(|src| StoreRow {
-            region: src.region.clone(),
+            region: crate::display_region_label_from_source(&src.region, &src.address),
             name: src.name.clone(),
             address: src.address.clone(),
             gasoline: src.gasoline,
@@ -302,7 +303,6 @@ fn rows_from_sources(new_sources: &[SourceRecord]) -> Vec<StoreRow> {
 }
 fn rebuild_master_rows(
     ws: &mut excel::writer::Worksheet,
-    shared_strings: &[String],
     header_row: u32,
     data_start_row: u32,
     old_rows: &[u32],
@@ -362,7 +362,7 @@ fn rebuild_master_rows(
         }
     };
     ws.rows = new_rows_map;
-    write_source_rows_to_master(ws, &kept_rows, &new_rows_from_sources, shared_strings);
+    write_source_rows_to_master(ws, &kept_rows, &new_rows_from_sources);
     let filter_end_row = if final_count == 0 {
         data_start_row
     } else {
@@ -485,7 +485,6 @@ fn write_source_rows_to_master(
     ws: &mut excel::writer::Worksheet,
     kept_rows: &[KeptMasterRow],
     new_rows_from_sources: &[(u32, SourceRecord)],
-    shared_strings: &[String],
 ) {
     for plan in kept_rows {
         if let Some(src) = &plan.src {
@@ -494,9 +493,9 @@ fn write_source_rows_to_master(
     }
     for (new_row, src) in new_rows_from_sources {
         write_master_row_from_source(ws, *new_row, src);
-        let region_cell = ws.get_display_at(2, *new_row, shared_strings);
-        if region_cell.trim().is_empty() && !src.region.trim().is_empty() {
-            ws.set_string_at(2, *new_row, &src.region);
+        let region_label = crate::display_region_label_from_source(&src.region, &src.address);
+        if !region_label.trim().is_empty() {
+            ws.set_string_at(2, *new_row, &region_label);
         }
     }
 }
