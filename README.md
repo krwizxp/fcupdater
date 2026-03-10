@@ -18,9 +18,9 @@
 
 - MSRV: Rust 1.94
 - 최신 Rust stable 사용 가능
-- Chrome 설치
-- `chromedriver`가 PATH에 있거나 프로젝트 내 `chromedriver/chromedriver(.exe)` 위치에 있어야 함
-- Chrome과 ChromeDriver의 메이저 버전이 서로 같아야 함
+- Chrome 또는 Edge 설치
+- `chromedriver` 또는 `msedgedriver`가 PATH에 있거나 프로젝트 내 `chromedriver/chromedriver(.exe)` 또는 `edgedriver/msedgedriver(.exe)` 위치에 있어야 함
+- Chrome 사용 시 Chrome과 ChromeDriver, Edge 사용 시 Edge와 EdgeDriver의 메이저 버전이 서로 같아야 함
 - 압축/해제 도구
 - Windows: `pwsh` 또는 `powershell` 또는 `tar`
 - macOS/Linux: 해제는 `unzip` 또는 `python3`/`python`(zipfile), 생성은 `zip` 또는 `python3`/`python`(zipfile)
@@ -51,8 +51,8 @@ cargo build --release
 1. 아래 파일과 실행 환경을 준비합니다.
 
 - `fuel_cost_chungcheong.xlsx`
-- Chrome
-- `chromedriver` (`PATH` 등록)
+- Chrome 또는 Edge
+- `chromedriver` 또는 `msedgedriver` (`PATH` 등록)
 
 2. 실행합니다.
 
@@ -60,7 +60,7 @@ cargo build --release
 fcupdater.exe
 ```
 
-3. 실행 중 Opinet에서 지역별 소스 파일을 자동 다운로드한 뒤 현행화를 진행합니다.
+3. 실행 중 Opinet에서 지역별 소스 파일을 자동 다운로드한 뒤 현행화를 진행합니다. 브라우저는 Chrome 우선, 실패 시 Edge로 자동 폴백합니다.
 
 4. 기본 출력 파일:
 

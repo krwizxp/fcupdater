@@ -12,6 +12,8 @@ use std::{
 const WEBDRIVER_HOST: &str = "127.0.0.1";
 const CHROMEDRIVER_CMD: &str = "chromedriver";
 const CHROMEDRIVER_DIR_NAME: &str = "chromedriver";
+const EDGEDRIVER_CMD: &str = "msedgedriver";
+const EDGEDRIVER_DIR_NAME: &str = "edgedriver";
 const OPINET_URL: &str = "https://www.opinet.co.kr/searRgSelect.do";
 pub const AUTO_SOURCE_MARKER: &str = "__fcupdater_auto__";
 const DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -20,6 +22,10 @@ const TASK_SESSION_RETRY_LIMIT: usize = 2;
 const CHROMEDRIVER_BIN_NAME: &str = "chromedriver.exe";
 #[cfg(not(windows))]
 const CHROMEDRIVER_BIN_NAME: &str = "chromedriver";
+#[cfg(windows)]
+const EDGEDRIVER_BIN_NAME: &str = "msedgedriver.exe";
+#[cfg(not(windows))]
+const EDGEDRIVER_BIN_NAME: &str = "msedgedriver";
 #[derive(Debug, Clone, Copy)]
 struct Task {
     sido: &'static str,
@@ -74,6 +80,54 @@ const TASKS: [Task; 11] = [
 struct ChildGuard {
     child: Option<Child>,
 }
+#[derive(Debug, Clone, Copy)]
+enum BrowserKind {
+    Chrome,
+    Edge,
+}
+impl BrowserKind {
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::Chrome => "Chrome",
+            Self::Edge => "Edge",
+        }
+    }
+    const fn driver_cmd(self) -> &'static str {
+        match self {
+            Self::Chrome => CHROMEDRIVER_CMD,
+            Self::Edge => EDGEDRIVER_CMD,
+        }
+    }
+    const fn driver_dir_name(self) -> &'static str {
+        match self {
+            Self::Chrome => CHROMEDRIVER_DIR_NAME,
+            Self::Edge => EDGEDRIVER_DIR_NAME,
+        }
+    }
+    const fn driver_bin_name(self) -> &'static str {
+        match self {
+            Self::Chrome => CHROMEDRIVER_BIN_NAME,
+            Self::Edge => EDGEDRIVER_BIN_NAME,
+        }
+    }
+    const fn browser_name(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Edge => "MicrosoftEdge",
+        }
+    }
+    const fn options_key(self) -> &'static str {
+        match self {
+            Self::Chrome => "goog:chromeOptions",
+            Self::Edge => "ms:edgeOptions",
+        }
+    }
+}
+struct WebDriverContext {
+    addr: String,
+    browser: BrowserKind,
+    _driver: ChildGuard,
+}
 enum JsonStringField {
     String(String),
     Null,
@@ -97,19 +151,14 @@ pub fn refresh_sources(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
     if removed > 0 {
         eprintln!("[소스 다운로드] 이전 자동 생성 파일 {removed}개 정리");
     }
-    let (webdriver_addr, _driver) = ensure_webdriver().map_err(|e| {
+    let webdriver = ensure_webdriver(&dir).map_err(|e| {
         err(format!(
-            "Chrome WebDriver 준비 실패: {e}\nChrome 설치 및 `{CHROMEDRIVER_CMD}` PATH 등록 또는 프로젝트 내 `{}` 배치를 확인하세요.",
-            project_relative_chromedriver_hint()
+            "Chrome/Edge WebDriver 준비 실패: {e}\nChrome 또는 Edge 설치 및 {}를 확인하세요.",
+            webdriver_setup_hint()
         ))
     })?;
-    probe_webdriver_session(&webdriver_addr, &dir).map_err(|e| {
-        err(format!(
-            "WebDriver 세션 생성 실패: {e}{}",
-            chromedriver_version_mismatch_hint(&e)
-        ))
-    })?;
-    run_tasks(&webdriver_addr, &dir, prefix).map_err(|e| err(format!("Opinet 다운로드 실패: {e}")))
+    run_tasks(&webdriver.addr, webdriver.browser, &dir, prefix)
+        .map_err(|e| err(format!("Opinet 다운로드 실패: {e}")))
 }
 pub fn is_auto_source_file_name(file_name: &str, prefix: &str) -> bool {
     let folded = file_name.to_lowercase();
@@ -167,12 +216,26 @@ fn is_auto_source_path(path: &Path) -> bool {
         .and_then(|s| s.to_str())
         .is_some_and(|file_name| file_name.contains(AUTO_SOURCE_MARKER))
 }
-fn ensure_webdriver() -> std::result::Result<(String, ChildGuard), String> {
+fn ensure_webdriver(download_dir: &Path) -> std::result::Result<WebDriverContext, String> {
+    let mut errors = Vec::new();
+    for browser in [BrowserKind::Chrome, BrowserKind::Edge] {
+        match ensure_webdriver_for_browser(browser, download_dir) {
+            Ok(context) => return Ok(context),
+            Err(err) => errors.push(format!("{}: {err}", browser.display_name())),
+        }
+    }
+    Err(errors.join("\n"))
+}
+fn ensure_webdriver_for_browser(
+    browser: BrowserKind,
+    download_dir: &Path,
+) -> std::result::Result<WebDriverContext, String> {
     let webdriver_addr = reserve_webdriver_addr()?;
     let webdriver_port = webdriver_port(&webdriver_addr);
-    let program = resolve_chromedriver_program()?;
+    let program = resolve_webdriver_program(browser)?;
     let child = Command::new(&program)
         .env("CHROME_LOG_FILE", os_dev_null())
+        .env("MSEDGEDRIVER_TELEMETRY_OPTOUT", "1")
         .arg(format!("--port={webdriver_port}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -180,15 +243,25 @@ fn ensure_webdriver() -> std::result::Result<(String, ChildGuard), String> {
         .map_err(|e| format!("`{}` 실행 실패: {e}", program.display()))?;
     let guard = ChildGuard { child: Some(child) };
     wait_for_webdriver_ready(&webdriver_addr, Duration::from_secs(15))?;
-    Ok((webdriver_addr, guard))
+    probe_webdriver_session(browser, &webdriver_addr, download_dir).map_err(|e| {
+        format!(
+            "WebDriver 세션 생성 실패: {e}{}",
+            webdriver_version_mismatch_hint(browser, &e)
+        )
+    })?;
+    Ok(WebDriverContext {
+        addr: webdriver_addr,
+        browser,
+        _driver: guard,
+    })
 }
-fn resolve_chromedriver_program() -> std::result::Result<PathBuf, String> {
-    if let Some(candidate) = find_relative_chromedriver()? {
+fn resolve_webdriver_program(browser: BrowserKind) -> std::result::Result<PathBuf, String> {
+    if let Some(candidate) = find_relative_webdriver(browser)? {
         return Ok(candidate);
     }
-    Ok(PathBuf::from(CHROMEDRIVER_CMD))
+    Ok(PathBuf::from(browser.driver_cmd()))
 }
-fn find_relative_chromedriver() -> std::result::Result<Option<PathBuf>, String> {
+fn find_relative_webdriver(browser: BrowserKind) -> std::result::Result<Option<PathBuf>, String> {
     let mut base_dirs = Vec::new();
     if let Ok(current_dir) = std::env::current_dir() {
         push_unique_path(&mut base_dirs, current_dir);
@@ -201,7 +274,7 @@ fn find_relative_chromedriver() -> std::result::Result<Option<PathBuf>, String> 
         }
     }
     for base_dir in base_dirs {
-        for candidate in chromedriver_candidates_from_base(&base_dir) {
+        for candidate in webdriver_candidates_from_base(browser, &base_dir) {
             if path_is_file(&candidate)? {
                 return Ok(Some(candidate));
             }
@@ -209,12 +282,12 @@ fn find_relative_chromedriver() -> std::result::Result<Option<PathBuf>, String> 
     }
     Ok(None)
 }
-fn chromedriver_candidates_from_base(base_dir: &Path) -> [PathBuf; 2] {
+fn webdriver_candidates_from_base(browser: BrowserKind, base_dir: &Path) -> [PathBuf; 2] {
     [
-        base_dir.join(CHROMEDRIVER_BIN_NAME),
+        base_dir.join(browser.driver_bin_name()),
         base_dir
-            .join(CHROMEDRIVER_DIR_NAME)
-            .join(CHROMEDRIVER_BIN_NAME),
+            .join(browser.driver_dir_name())
+            .join(browser.driver_bin_name()),
     ]
 }
 fn reserve_webdriver_addr() -> std::result::Result<String, String> {
@@ -269,12 +342,14 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
 }
 fn run_tasks(
     webdriver_addr: &str,
+    browser: BrowserKind,
     download_dir: &Path,
     prefix: &str,
 ) -> std::result::Result<Vec<PathBuf>, String> {
     let mut downloaded_paths = Vec::with_capacity(TASKS.len());
     for (idx, task) in TASKS.iter().enumerate() {
-        let new_path = run_task_with_retries(webdriver_addr, download_dir, prefix, idx, task)?;
+        let new_path =
+            run_task_with_retries(webdriver_addr, browser, download_dir, prefix, idx, task)?;
         eprintln!(
             "[소스 다운로드 {}/{}] {} {} -> {}",
             idx + 1,
@@ -289,15 +364,17 @@ fn run_tasks(
     Ok(downloaded_paths)
 }
 fn probe_webdriver_session(
+    browser: BrowserKind,
     webdriver_addr: &str,
     download_dir: &Path,
 ) -> std::result::Result<(), String> {
-    let session_id = webdriver_new_session(webdriver_addr, download_dir)?;
+    let session_id = webdriver_new_session(browser, webdriver_addr, download_dir)?;
     let _ = webdriver_delete_session(webdriver_addr, &session_id);
     Ok(())
 }
 fn run_task_with_retries(
     webdriver_addr: &str,
+    browser: BrowserKind,
     download_dir: &Path,
     prefix: &str,
     index: usize,
@@ -305,7 +382,7 @@ fn run_task_with_retries(
 ) -> std::result::Result<PathBuf, String> {
     let mut last_error = None;
     for attempt in 1..=TASK_SESSION_RETRY_LIMIT {
-        match run_task_once(webdriver_addr, download_dir, prefix, index, task) {
+        match run_task_once(webdriver_addr, browser, download_dir, prefix, index, task) {
             Ok(path) => return Ok(path),
             Err(err) => {
                 let should_retry =
@@ -327,17 +404,18 @@ fn run_task_with_retries(
 }
 fn run_task_once(
     webdriver_addr: &str,
+    browser: BrowserKind,
     download_dir: &Path,
     prefix: &str,
     index: usize,
     task: &Task,
 ) -> std::result::Result<PathBuf, String> {
-    let session_id = webdriver_new_session(webdriver_addr, download_dir).map_err(|e| {
+    let session_id = webdriver_new_session(browser, webdriver_addr, download_dir).map_err(|e| {
         format!(
             "작업 세션 생성 실패 ({} {}): {e}{}",
             task.sido,
             task.sigungu,
-            chromedriver_version_mismatch_hint(&e)
+            webdriver_version_mismatch_hint(browser, &e)
         )
     })?;
     let result = run_task_in_session(
@@ -544,12 +622,15 @@ fn webdriver_status_is_ready(response: &str) -> bool {
         || response.contains("ChromeDriver ready for new sessions")
 }
 fn webdriver_new_session(
+    browser: BrowserKind,
     webdriver_addr: &str,
     download_dir: &Path,
 ) -> std::result::Result<String, String> {
     let dir_str = webdriver_download_dir_string(download_dir);
     let body = format!(
-        r#"{{"capabilities":{{"alwaysMatch":{{"browserName":"chrome","goog:chromeOptions":{{"args":["start-maximized","--disable-background-networking","--disable-default-apps","--disable-sync","--log-level=3","--no-first-run"],"excludeSwitches":["enable-logging"],"prefs":{{"download.default_directory":"{}","download.prompt_for_download":false,"download.directory_upgrade":true,"safebrowsing.enabled":true,"profile.default_content_setting_values.automatic_downloads":1}}}}}}}}}}"#,
+        r#"{{"capabilities":{{"alwaysMatch":{{"browserName":"{}","{}":{{"args":["start-maximized","--disable-background-networking","--disable-default-apps","--disable-sync","--log-level=3","--no-first-run"],"excludeSwitches":["enable-logging"],"prefs":{{"download.default_directory":"{}","download.prompt_for_download":false,"download.directory_upgrade":true,"safebrowsing.enabled":true,"profile.default_content_setting_values.automatic_downloads":1}}}}}}}}}}"#,
+        browser.browser_name(),
+        browser.options_key(),
         json_escape(&dir_str)
     );
     let response = http_request(webdriver_addr, "POST", "/session", Some(&body))?;
@@ -1182,14 +1263,31 @@ const fn os_dev_null() -> &'static str {
 const fn os_dev_null() -> &'static str {
     "/dev/null"
 }
-fn project_relative_chromedriver_hint() -> String {
-    format!("{CHROMEDRIVER_DIR_NAME}/{CHROMEDRIVER_BIN_NAME}")
+fn project_relative_driver_hint(browser: BrowserKind) -> String {
+    format!(
+        "{}/{}",
+        browser.driver_dir_name(),
+        browser.driver_bin_name()
+    )
 }
-fn chromedriver_version_mismatch_hint(error: &str) -> &'static str {
+fn webdriver_setup_hint() -> String {
+    format!(
+        "`{}` 또는 `{}` PATH 등록, 또는 프로젝트 내 `{}` / `{}` 배치",
+        BrowserKind::Chrome.driver_cmd(),
+        BrowserKind::Edge.driver_cmd(),
+        project_relative_driver_hint(BrowserKind::Chrome),
+        project_relative_driver_hint(BrowserKind::Edge)
+    )
+}
+fn webdriver_version_mismatch_hint(browser: BrowserKind, error: &str) -> &'static str {
     if error.contains("only supports Chrome version")
         || error.contains("Current browser version is")
+        || error.contains("only supports Microsoft Edge version")
     {
-        "\n설치된 Chrome과 ChromeDriver의 메이저 버전을 맞춰 주세요."
+        match browser {
+            BrowserKind::Chrome => "\n설치된 Chrome과 ChromeDriver의 메이저 버전을 맞춰 주세요.",
+            BrowserKind::Edge => "\n설치된 Edge와 EdgeDriver의 메이저 버전을 맞춰 주세요.",
+        }
     } else {
         ""
     }
