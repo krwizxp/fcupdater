@@ -19,6 +19,10 @@ fn find_filter_database_defined_name_content_range(
     sheet_name: &str,
 ) -> Option<(usize, usize)> {
     let marker = "_xlnm._FilterDatabase";
+    let marker_attr_double = format!("name=\"{marker}\"");
+    let marker_attr_single = format!("name='{marker}'");
+    let sheet_ref_plain = format!("{sheet_name}!");
+    let sheet_ref_quoted = format!("'{sheet_name}'!");
     let mut cursor = 0usize;
     while let Some(open_rel) = workbook_xml[cursor..].find("<definedName") {
         let open_pos = cursor + open_rel;
@@ -27,9 +31,7 @@ fn find_filter_database_defined_name_content_range(
         };
         let open_end = open_pos + open_end_rel;
         let open_tag = &workbook_xml[open_pos..=open_end];
-        if !open_tag.contains(&format!("name=\"{marker}\""))
-            && !open_tag.contains(&format!("name='{marker}'"))
-        {
+        if !open_tag.contains(&marker_attr_double) && !open_tag.contains(&marker_attr_single) {
             cursor = open_end + 1;
             continue;
         }
@@ -39,9 +41,7 @@ fn find_filter_database_defined_name_content_range(
         };
         let content_end = content_start + close_rel;
         let content = &workbook_xml[content_start..content_end];
-        if content.contains(&format!("{sheet_name}!"))
-            || content.contains(&format!("'{sheet_name}'!"))
-        {
+        if content.contains(&sheet_ref_plain) || content.contains(&sheet_ref_quoted) {
             return Some((content_start, content_end));
         }
         cursor = content_end + "</definedName>".len();

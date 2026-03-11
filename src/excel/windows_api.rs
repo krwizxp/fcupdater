@@ -98,7 +98,12 @@ pub fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
 pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()> {
     let replacement_w = encode_path_wide(replacement);
     let destination_w = encode_path_wide(destination);
-    if destination.exists() {
+    if destination.try_exists().map_err(|e| {
+        err(format!(
+            "대상 파일 경로 확인 실패: {} ({e})",
+            destination.display()
+        ))
+    })? {
         let replaced = unsafe {
             ReplaceFileW(
                 destination_w.as_ptr(),

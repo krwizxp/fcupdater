@@ -1,9 +1,9 @@
 # fcupdater
 
-`fuel_cost_chungcheong.xlsx`의 주유소 정보를 `지역_위치별(주유소)*.xls/.xlsx` 소스 파일로 현행화하는 CLI 도구입니다.
+`fuel_cost_chungcheong.xlsx`의 주유소 정보를 Opinet 전국 현재 판매가격 소스와 수동 `.xls/.xlsx` 소스 파일로 현행화하는 CLI 도구입니다.
 
 - Excel 미설치 환경에서 동작
-- Opinet 지역별 소스 파일 자동 다운로드(기본)
+- Opinet 전국 단일 소스 파일 자동 다운로드(기본)
 - `.xls` / `.xlsx` 소스 입력 지원
 - 주소 기반 매칭으로 기존 행 갱신
 - 소스 파일 prefix 대소문자 구분 없이 자동 탐색
@@ -60,7 +60,7 @@ cargo build --release
 fcupdater.exe
 ```
 
-3. 실행 중 Opinet에서 지역별 소스 파일을 자동 다운로드한 뒤 현행화를 진행합니다. 브라우저는 Chrome 우선, 실패 시 Edge로 자동 폴백합니다.
+3. 실행 중 Opinet에서 전국 현재 판매가격 파일 1건을 자동 다운로드하고, 11개 대상 지역만 필터링해 현행화를 진행합니다. 기본 소스 prefix는 `현재 판매가격(주유소)`입니다. 브라우저는 Chrome 우선, 실패 시 Edge로 자동 폴백합니다.
 
 4. 기본 출력 파일:
 
@@ -76,7 +76,7 @@ fcupdater.exe --skip-download
 
 - `--master <PATH>`: 마스터 파일 경로
 - `--sources-dir <PATH>`: 소스 폴더 경로, 자동 다운로드 저장 폴더
-- `--sources-prefix <TEXT>`: 소스 파일 prefix
+- `--sources-prefix <TEXT>`: 소스 파일 prefix (기본: `현재 판매가격(주유소)`)
 - `--skip-download`: Opinet 자동 다운로드 생략, 기존 소스 파일만 사용
 - `--output <PATH>`: 출력 파일 경로
 - `--in-place`: 마스터 파일 덮어쓰기(백업 자동 생성)
@@ -109,14 +109,14 @@ fcupdater.exe --skip-download --sources-dir "C:\path\manual-sources" --output ou
 
 ## 동작 기준
 
-- 기본 실행은 Opinet에서 지역별 소스를 자동 다운로드한 뒤 현행화를 진행합니다.
+- 기본 실행은 Opinet에서 전국 현재 판매가격 파일 1건을 자동 다운로드한 뒤, 11개 대상 지역만 필터링해 현행화를 진행합니다.
 - `--sources-dir`는 자동 다운로드 결과 저장 위치이기도 합니다.
 - 자동 다운로드 파일명은 `{prefix}__fcupdater_auto__...` 형식이며, 해당 파일이 있으면 그 파일들만 우선 사용합니다.
-- `--skip-download`를 지정하면 기존 `지역_위치별(주유소)*.xls/.xlsx` 파일만 사용합니다.
+- `--skip-download`를 지정하면 기존 `현재 판매가격(주유소)*.xls/.xlsx` 파일만 사용합니다.
 - 주소 문자열은 공백/괄호/일부 시도 표기 차이를 정규화해 매칭합니다.
 - `--sources-prefix`는 파일명 접두사 매칭 시 대소문자를 구분하지 않습니다.
 - 매칭된 기존 업체는 다음 정보를 소스 기준으로 갱신합니다.
-- 상호, 상표, 셀프여부, 주소, 전화번호, 휘발유/고급유/경유 가격
+- 상호, 상표, 셀프여부, 주소, 휘발유/고급유/경유 가격
 - 소스에는 있고 기준 파일에는 없으면 신규로 추가합니다.
 - 소스에는 없고 기준 파일에는 있으면 폐업으로 간주하여 삭제합니다.
 
@@ -142,7 +142,6 @@ fcupdater.exe --skip-download --sources-dir "C:\path\manual-sources" --output ou
 - `상표변경`
 - `셀프여부변경`
 - `주소변경`
-- `전화번호변경`
 - `신규`
 - `폐업`
 

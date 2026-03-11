@@ -49,7 +49,7 @@ impl Default for Args {
         Self {
             master: PathBuf::from("fuel_cost_chungcheong.xlsx"),
             sources_dir: PathBuf::from("."),
-            sources_prefix: "지역_위치별(주유소)".to_string(),
+            sources_prefix: "현재 판매가격(주유소)".to_string(),
             skip_download: false,
             output_target: OutputTarget::Auto,
             no_change_log: false,
@@ -92,9 +92,10 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
             args.sources_dir = PathBuf::from(value);
         } else if token == OsStr::new("--sources-prefix") {
             let value = take_option_value(raw_args, &mut i, "--sources-prefix")?;
-            args.sources_prefix = value
-                .into_string()
+            let value: &str = value
+                .try_into()
                 .map_err(|_| err("--sources-prefix 값은 UTF-8 문자열이어야 합니다."))?;
+            args.sources_prefix = value.to_string();
         } else if token == OsStr::new("--output") {
             let value = take_option_value(raw_args, &mut i, "--output")?;
             set_output_target_explicit(&mut args.output_target, PathBuf::from(value))?;
@@ -150,7 +151,11 @@ fn set_output_target_explicit(output_target: &mut OutputTarget, value: PathBuf) 
     *output_target = OutputTarget::Explicit(value);
     Ok(())
 }
-fn take_option_value(raw_args: &[OsString], i: &mut usize, opt_name: &str) -> Result<OsString> {
+fn take_option_value<'a>(
+    raw_args: &'a [OsString],
+    i: &mut usize,
+    opt_name: &str,
+) -> Result<&'a OsStr> {
     *i += 1;
     let Some(value) = raw_args.get(*i) else {
         return Err(err(format!("{opt_name} 옵션에 값이 필요합니다.")));
@@ -161,7 +166,7 @@ fn take_option_value(raw_args: &[OsString], i: &mut usize, opt_name: &str) -> Re
             value.to_string_lossy()
         )));
     }
-    Ok(value.clone())
+    Ok(value.as_os_str())
 }
 fn is_long_option_token(value: &OsStr) -> bool {
     value.to_str().is_some_and(|s| s.starts_with("--"))
@@ -170,7 +175,7 @@ fn usage_text() -> String {
     let mut out = format!(
         "{APP_NAME} {APP_VERSION}\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n\
 사용법:\n  {APP_NAME} [OPTIONS]\n\n\
-옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일 prefix (기본: 지역_위치별(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음"
+옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일 접두어 (기본: 현재 판매가격(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음"
     );
     out.push_str(
         "\n\n환경 변수(선택):\n  FCUPDATER_SOURCE_HEADER_SCAN_ROWS\n  FCUPDATER_MASTER_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_COLS\n  FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW\n  FCUPDATER_CP949_STRICT\n  FCUPDATER_DURABILITY_STRICT",

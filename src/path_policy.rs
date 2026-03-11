@@ -11,13 +11,11 @@ use std::{
     time::Duration,
 };
 const RESERVATION_MAGIC: &[u8] = b"FCUPDATER_RESERVED_v1\n";
-const STALE_RESERVATION_AGE: Duration = Duration::from_secs(60 * 60);
+const STALE_RESERVATION_AGE: Duration = Duration::from_hours(1);
 const MAX_CONFLICT_ATTEMPTS: u32 = 100_000;
 pub fn decide_output_path(args: &Args, today: &str, dry_run: bool) -> Result<PathBuf> {
-    if matches!(args.output_target, OutputTarget::InPlace) {
-        return Ok(args.master.clone());
-    }
     let requested = match &args.output_target {
+        OutputTarget::InPlace => return Ok(args.master.clone()),
         OutputTarget::Auto => {
             let stem = args
                 .master
@@ -28,7 +26,6 @@ pub fn decide_output_path(args: &Args, today: &str, dry_run: bool) -> Result<Pat
             parent.join(format!("{stem}_updated_{today}.xlsx"))
         }
         OutputTarget::Explicit(path) => path.clone(),
-        OutputTarget::InPlace => args.master.clone(),
     };
     if dry_run {
         make_nonconflicting_path(&requested)
@@ -57,7 +54,12 @@ fn make_nonconflicting_path(path: &Path) -> Result<PathBuf> {
     let mut seq = 0u32;
     loop {
         let candidate = candidate_with_suffix(path, seq);
-        if !candidate.exists() {
+        if !candidate.try_exists().map_err(|e| {
+            err(format!(
+                "출력 파일 경로 확인 실패: {} ({e})",
+                candidate.display()
+            ))
+        })? {
             return Ok(candidate);
         }
         seq = seq.checked_add(1).ok_or_else(|| {

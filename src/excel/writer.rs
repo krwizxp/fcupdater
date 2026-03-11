@@ -86,6 +86,7 @@ impl Workbook {
     }
     pub fn save_as(&mut self, out_path: &Path, verify_saved_file: bool) -> Result<()> {
         self.promote_safe_inline_strings_to_shared()?;
+        self.request_full_recalculation()?;
         self.container
             .write_text("xl/workbook.xml", &self.xml_text)?;
         if let Some(shared_strings_xml) = &self.shared_strings_xml_text {
@@ -99,6 +100,10 @@ impl Workbook {
             self.container.write_text(path, &sheet.to_xml())?;
         }
         self.container.save_as(out_path, verify_saved_file)
+    }
+    pub fn request_full_recalculation(&mut self) -> Result<()> {
+        self.xml_text = update_calc_pr_xml(&self.xml_text)?;
+        Ok(())
     }
     fn promote_safe_inline_strings_to_shared(&mut self) -> Result<()> {
         if self.shared_strings_xml_text.is_none() {
@@ -236,6 +241,16 @@ impl Worksheet {
             cell.inner_xml = Some(format!("<f>{formula_text}</f><v></v>"));
         }
     }
+    pub fn get_formula_at(&self, col: u32, row: u32) -> Option<String> {
+        self.rows
+            .get(&row)?
+            .cells
+            .get(&col)?
+            .inner_xml
+            .as_deref()
+            .and_then(|inner| extract_first_tag_text(inner, "f"))
+            .map(|formula| decode_xml_entities(&formula))
+    }
     pub fn clear_cell_if_exists(&mut self, col: u32, row: u32) {
         let Some(row_obj) = self.rows.get_mut(&row) else {
             return;
@@ -245,6 +260,21 @@ impl Worksheet {
         };
         remove_attr(&mut cell.attrs, "t");
         cell.inner_xml = None;
+    }
+    pub fn clear_formula_cached_values(&mut self) {
+        for row in self.rows.values_mut() {
+            for cell in row.cells.values_mut() {
+                let Some(inner) = cell.inner_xml.as_mut() else {
+                    continue;
+                };
+                if extract_first_tag_text(inner, "f").is_some()
+                    && !replace_first_tag_text(inner, "v", "")
+                    && !inner.contains("<v")
+                {
+                    inner.push_str("<v></v>");
+                }
+            }
+        }
     }
     pub fn has_any_row_format(&self, row: u32, max_col: u32) -> bool {
         let Some(row_obj) = self.rows.get(&row) else {
@@ -720,7 +750,7 @@ fn parse_cell_ref(cell_ref: &str) -> Option<(u32, u32)> {
 }
 fn cell_display_value(cell: &Cell, shared_strings: &[String]) -> Option<String> {
     let cell_type = get_attr(&cell.attrs, "t");
-    let inner = cell.inner_xml.as_deref().unwrap_or("");
+    let inner = cell.inner_xml.as_deref().unwrap_or_default();
     if matches!(cell_type, Some("inlineStr")) {
         return extract_all_tag_text(inner, "t").map(|v| decode_xml_entities(&v));
     }
@@ -864,6 +894,43 @@ fn update_dimension_ref_xml(prefix_xml: &str, start_ref: &str, end_ref: &str) ->
         out.replace_range(dim_pos..dim_end, &new_tag);
         return Ok(out);
     }
+    Ok(out)
+}
+fn update_calc_pr_xml(workbook_xml: &str) -> Result<String> {
+    let set_calc_pr_attrs = |attrs: &mut Vec<(String, String)>| {
+        set_attr(attrs, "calcMode", "auto".to_string());
+        set_attr(attrs, "fullCalcOnLoad", "1".to_string());
+        set_attr(attrs, "forceFullCalc", "1".to_string());
+        set_attr(attrs, "calcCompleted", "0".to_string());
+    };
+    let mut out = workbook_xml.to_string();
+    if let Some(calc_pr_start) = find_start_tag(&out, "calcPr", 0) {
+        let Some(calc_pr_tag_end) = find_tag_end(&out, calc_pr_start) else {
+            return Err(err("workbook.xml의 calcPr 태그가 손상되었습니다."));
+        };
+        let calc_pr_tag = &out[calc_pr_start..=calc_pr_tag_end];
+        let mut attrs = parse_tag_attrs(calc_pr_tag)?;
+        set_calc_pr_attrs(&mut attrs);
+        if calc_pr_tag.ends_with("/>") {
+            let new_tag = format!("<calcPr{}/>", attrs_to_xml(&attrs));
+            out.replace_range(calc_pr_start..=calc_pr_tag_end, &new_tag);
+            return Ok(out);
+        }
+        let Some(calc_pr_close_start) = find_end_tag(&out, "calcPr", calc_pr_tag_end + 1) else {
+            return Err(err("workbook.xml의 calcPr 종료 태그를 찾지 못했습니다."));
+        };
+        let calc_pr_close_end = calc_pr_close_start + "</calcPr>".len();
+        let new_tag = format!("<calcPr{}></calcPr>", attrs_to_xml(&attrs));
+        out.replace_range(calc_pr_start..calc_pr_close_end, &new_tag);
+        return Ok(out);
+    }
+    let Some(workbook_close_start) = find_end_tag(&out, "workbook", 0) else {
+        return Err(err("workbook.xml의 workbook 종료 태그를 찾지 못했습니다."));
+    };
+    let mut attrs = Vec::new();
+    set_calc_pr_attrs(&mut attrs);
+    let new_tag = format!("<calcPr{}/>", attrs_to_xml(&attrs));
+    out.insert_str(workbook_close_start, &new_tag);
     Ok(out)
 }
 fn extend_conditional_formats_in_suffix(

@@ -44,11 +44,20 @@ impl Drop for WorkDirCleanup {
 }
 impl XlsxContainer {
     pub fn open_for_update(source_xlsx: &Path) -> Result<Self> {
-        if !source_xlsx.exists() {
-            return Err(err(format!(
-                "xlsx 파일이 없습니다: {}",
-                source_xlsx.display()
-            )));
+        match source_xlsx.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(err(format!(
+                    "xlsx 파일이 없습니다: {}",
+                    source_xlsx.display()
+                )));
+            }
+            Err(e) => {
+                return Err(err(format!(
+                    "xlsx 파일 경로 확인 실패: {} ({e})",
+                    source_xlsx.display()
+                )));
+            }
         }
         ensure_extract_tools_available()?;
         let cleanup = WorkDirCleanup::new(create_unique_work_dir()?);
@@ -235,7 +244,7 @@ fn promote_temp_output(temp_output: &Path, output_xlsx: &Path) -> Result<()> {
                 )));
             }
             eprintln!(
-                "[경고] 저장 내구성 동기화 실패(파일): {} ({e})",
+                "경고: 저장 내구성 동기화 실패(파일): {} ({e})",
                 output_xlsx.display()
             );
         }
@@ -249,7 +258,7 @@ fn promote_temp_output(temp_output: &Path, output_xlsx: &Path) -> Result<()> {
                 )));
             }
             eprintln!(
-                "[경고] 저장 내구성 동기화 실패(폴더): {} ({e})",
+                "경고: 저장 내구성 동기화 실패(폴더): {} ({e})",
                 parent.display()
             );
         }
@@ -447,7 +456,12 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
     }
 }
 fn create_archive(unpack_dir: &Path, archive_path: &Path) -> Result<()> {
-    if archive_path.exists() {
+    if archive_path.try_exists().map_err(|e| {
+        err(format!(
+            "archive 경로 확인 실패: {} ({e})",
+            archive_path.display()
+        ))
+    })? {
         fs::remove_file(archive_path).map_err(|e| {
             err(format!(
                 "기존 archive 삭제 실패: {} ({e})",
