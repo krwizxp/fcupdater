@@ -23,7 +23,6 @@ struct SourceHeaderIndices {
     name: usize,
     address: usize,
     brand: Option<usize>,
-    phone: Option<usize>,
     self_yn: Option<usize>,
     premium: Option<usize>,
     gasoline: Option<usize>,
@@ -47,6 +46,9 @@ impl CellValue {
             Self::Text(v) => parse_i32_str(v),
         }
     }
+}
+fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
+    value.filter(|v| *v > 0)
 }
 pub fn read_source_file(path: &Path) -> Result<Vec<SourceRecord>> {
     let ext = path
@@ -413,7 +415,6 @@ fn parse_source_header_indices(header: &[CellValue]) -> Option<SourceHeaderIndic
     let mut idx_name: Option<usize> = None;
     let mut idx_addr: Option<usize> = None;
     let mut idx_brand: Option<usize> = None;
-    let mut idx_phone: Option<usize> = None;
     let mut idx_self: Option<usize> = None;
     let mut idx_premium: Option<usize> = None;
     let mut idx_gas: Option<usize> = None;
@@ -425,7 +426,6 @@ fn parse_source_header_indices(header: &[CellValue]) -> Option<SourceHeaderIndic
             "상호" => idx_name = Some(i),
             "주소" => idx_addr = Some(i),
             "상표" => idx_brand = Some(i),
-            "전화번호" | "전화" => idx_phone = Some(i),
             "셀프여부" | "셀프" => idx_self = Some(i),
             "고급휘발유" | "고급유" => idx_premium = Some(i),
             "휘발유" | "보통휘발유" => idx_gas = Some(i),
@@ -441,7 +441,6 @@ fn parse_source_header_indices(header: &[CellValue]) -> Option<SourceHeaderIndic
         name: idx_name,
         address: idx_addr,
         brand: idx_brand,
-        phone: idx_phone,
         self_yn: idx_self,
         premium: idx_premium,
         gasoline: idx_gas,
@@ -464,17 +463,13 @@ fn build_source_record_from_row(
         .brand
         .map(|i| get_row_string(row, i))
         .unwrap_or_default();
-    let phone = header_indices
-        .phone
-        .map(|i| get_row_string(row, i))
-        .unwrap_or_default();
     let self_yn = header_indices
         .self_yn
         .map(|i| get_row_string(row, i))
         .unwrap_or_default();
-    let gasoline = header_indices.gasoline.and_then(|i| get_row_i32(row, i));
-    let premium = header_indices.premium.and_then(|i| get_row_i32(row, i));
-    let diesel = header_indices.diesel.and_then(|i| get_row_i32(row, i));
+    let gasoline = normalize_fuel_price(header_indices.gasoline.and_then(|i| get_row_i32(row, i)));
+    let premium = normalize_fuel_price(header_indices.premium.and_then(|i| get_row_i32(row, i)));
+    let diesel = normalize_fuel_price(header_indices.diesel.and_then(|i| get_row_i32(row, i)));
     let region = header_indices
         .region
         .map(|i| get_row_string(row, i))
@@ -485,7 +480,6 @@ fn build_source_record_from_row(
         brand,
         self_yn,
         address,
-        phone,
         gasoline,
         premium,
         diesel,

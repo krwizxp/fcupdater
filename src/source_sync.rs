@@ -12,7 +12,6 @@ pub struct SourceRecord {
     pub brand: String,
     pub self_yn: String,
     pub address: String,
-    pub phone: String,
     pub gasoline: Option<i32>,
     pub premium: Option<i32>,
     pub diesel: Option<i32>,
@@ -29,10 +28,9 @@ pub struct SourceConflictSample {
 }
 #[derive(Debug, Clone, Default)]
 pub struct SourceIndexBuildReport {
-    pub duplicate_address_conflicts: usize,
-    pub overwritten_conflicts: usize,
-    pub sample_conflict_addresses: Vec<String>,
-    pub sample_conflicts: Vec<SourceConflictSample>,
+    pub duplicate_addresses: usize,
+    pub replaced_entries: usize,
+    pub samples: Vec<SourceConflictSample>,
 }
 #[derive(Debug, Clone)]
 pub struct SourceIndexBuildResult {
@@ -40,7 +38,8 @@ pub struct SourceIndexBuildResult {
     pub report: SourceIndexBuildReport,
 }
 pub fn find_source_files(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
-    let mut candidates = Vec::new();
+    let mut auto_candidates = Vec::new();
+    let mut manual_candidates = Vec::new();
     let prefix_fold = prefix.to_lowercase();
     for entry in
         fs::read_dir(dir).map_err(|e| err(format!("폴더 읽기 실패: {} ({e})", dir.display())))?
@@ -50,26 +49,35 @@ pub fn find_source_files(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
         if !path.is_file() {
             continue;
         }
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if !(ext.eq_ignore_ascii_case("xls") || ext.eq_ignore_ascii_case("xlsx")) {
+            continue;
+        }
         let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        let file_name = file_name.to_string();
         let file_name_fold = file_name.to_lowercase();
         if !file_name_fold.starts_with(&prefix_fold) {
             continue;
         }
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if ext.eq_ignore_ascii_case("xls") || ext.eq_ignore_ascii_case("xlsx") {
-            candidates.push(SourceFileCandidate {
-                path,
-                natural_key: split_natural_parts(&file_name_fold),
-                is_auto: crate::source_download::is_auto_source_file_name(&file_name, prefix),
-            });
+        let is_auto =
+            crate::source_download::is_auto_source_file_name_folded(file_name, &prefix_fold);
+        let natural_key = split_natural_parts(&file_name_fold);
+        let candidate = SourceFileCandidate { path, natural_key };
+        if is_auto {
+            auto_candidates.push(candidate);
+        } else {
+            manual_candidates.push(candidate);
         }
     }
-    if candidates.iter().any(|candidate| candidate.is_auto) {
-        candidates.retain(|candidate| candidate.is_auto);
-    }
+    let mut candidates = if auto_candidates.is_empty() {
+        manual_candidates
+    } else {
+        auto_candidates
+    };
     candidates.sort_by(|a, b| {
         compare_natural_parts(&a.natural_key, &b.natural_key).then_with(|| a.path.cmp(&b.path))
     });
@@ -80,21 +88,22 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
     let mut report = SourceIndexBuildReport::default();
     let mut sampled_keys: HashSet<String> = HashSet::new();
     for (file_order, path) in paths.iter().enumerate() {
-        let recs = read_source_file(path)
-            .map_err(|e| err(format!("소스 파일 읽기 실패: {} ({e})", path.display())))?;
+        let recs = crate::source_download::filter_target_region_records(
+            read_source_file(path)
+                .map_err(|e| err(format!("소스 파일 읽기 실패: {} ({e})", path.display())))?,
+        );
         for rec in recs {
             let key = crate::normalize_address_key(&rec.address);
             let score = source_priority(&rec);
-            match map.entry(key.clone()) {
+            match map.entry(key) {
                 Entry::Vacant(vacant) => {
                     vacant.insert((rec, score, file_order));
                 }
                 Entry::Occupied(mut occupied) => {
                     let (_, prev_score, prev_order) = occupied.get();
-                    report.duplicate_address_conflicts =
-                        report.duplicate_address_conflicts.saturating_add(1);
-                    if report.sample_conflict_addresses.len() < MAX_CONFLICT_SAMPLES
-                        && sampled_keys.insert(key.clone())
+                    report.duplicate_addresses = report.duplicate_addresses.saturating_add(1);
+                    if report.samples.len() < MAX_CONFLICT_SAMPLES
+                        && sampled_keys.insert(occupied.key().clone())
                     {
                         let previous_source = paths
                             .get(*prev_order)
@@ -107,8 +116,7 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
                         } else {
                             previous_source.clone()
                         };
-                        report.sample_conflict_addresses.push(rec.address.clone());
-                        report.sample_conflicts.push(SourceConflictSample {
+                        report.samples.push(SourceConflictSample {
                             address: rec.address.clone(),
                             previous_source,
                             incoming_source,
@@ -116,8 +124,7 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
                         });
                     }
                     if score > *prev_score || (score == *prev_score && file_order >= *prev_order) {
-                        report.overwritten_conflicts =
-                            report.overwritten_conflicts.saturating_add(1);
+                        report.replaced_entries = report.replaced_entries.saturating_add(1);
                         occupied.insert((rec, score, file_order));
                     }
                 }
@@ -133,7 +140,6 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
 struct SourceFileCandidate {
     path: PathBuf,
     natural_key: Vec<NaturalPart>,
-    is_auto: bool,
 }
 fn compare_natural_parts(a_parts: &[NaturalPart], b_parts: &[NaturalPart]) -> Ordering {
     for (a_part, b_part) in a_parts.iter().zip(b_parts) {
@@ -213,8 +219,8 @@ fn compare_natural_part(a: &NaturalPart, b: &NaturalPart) -> Ordering {
 }
 fn source_priority(rec: &SourceRecord) -> SourcePriority {
     let price_count = [rec.gasoline, rec.premium, rec.diesel]
-        .iter()
-        .filter(|v| v.is_some())
+        .into_iter()
+        .flatten()
         .count();
     let text_field_count = [
         rec.region.trim(),
@@ -222,17 +228,12 @@ fn source_priority(rec: &SourceRecord) -> SourcePriority {
         rec.brand.trim(),
         rec.self_yn.trim(),
         rec.address.trim(),
-        rec.phone.trim(),
     ]
     .iter()
     .filter(|v| !v.is_empty())
     .count();
-    let text_len = rec.region.len()
-        + rec.name.len()
-        + rec.brand.len()
-        + rec.self_yn.len()
-        + rec.address.len()
-        + rec.phone.len();
+    let text_len =
+        rec.region.len() + rec.name.len() + rec.brand.len() + rec.self_yn.len() + rec.address.len();
     (price_count, text_field_count, text_len)
 }
 fn read_source_file(path: &Path) -> Result<Vec<SourceRecord>> {

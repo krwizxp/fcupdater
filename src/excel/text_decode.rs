@@ -5,7 +5,7 @@ use std::{
     io::Write,
     process::{Command, Stdio},
     sync::{
-        Mutex, OnceLock,
+        LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -15,13 +15,17 @@ const CP949_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(not(windows))]
 static WARNED_NON_WINDOWS_CP949_FALLBACK: AtomicBool = AtomicBool::new(false);
 #[cfg(not(windows))]
-static CP949_ICONV_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static CP949_ICONV_AVAILABLE: LazyLock<bool> =
+    LazyLock::new(|| command_available("iconv", &["--version"]));
 #[cfg(not(windows))]
-static CP949_PYTHON3_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static CP949_PYTHON3_AVAILABLE: LazyLock<bool> =
+    LazyLock::new(|| command_available("python3", &["-V"]));
 #[cfg(not(windows))]
-static CP949_PYTHON_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static CP949_PYTHON_AVAILABLE: LazyLock<bool> =
+    LazyLock::new(|| command_available("python", &["-V"]));
 #[cfg(not(windows))]
-static CP949_DECODE_CACHE: OnceLock<Mutex<Cp949DecodeCache>> = OnceLock::new();
+static CP949_DECODE_CACHE: LazyLock<Mutex<Cp949DecodeCache>> =
+    LazyLock::new(|| Mutex::new(Cp949DecodeCache::default()));
 #[cfg(not(windows))]
 #[derive(Default)]
 struct Cp949DecodeCache {
@@ -87,11 +91,9 @@ fn decode_cp949_non_windows(bytes: &[u8]) -> Option<String> {
     if let Some(cached) = cp949_cache_get(bytes) {
         return Some(cached);
     }
-    let decoded = decode_cp949_with_iconv(bytes).or_else(|| decode_cp949_with_python(bytes));
-    if let Some(text) = &decoded {
-        cp949_cache_put(bytes, text);
-    }
-    decoded
+    decode_cp949_with_iconv(bytes)
+        .or_else(|| decode_cp949_with_python(bytes))
+        .inspect(|text| cp949_cache_put(bytes, text))
 }
 fn cp949_strict_mode() -> bool {
     std::env::var("FCUPDATER_CP949_STRICT")
@@ -105,14 +107,12 @@ fn cp949_strict_mode() -> bool {
 }
 #[cfg(not(windows))]
 fn cp949_cache_get(bytes: &[u8]) -> Option<String> {
-    let cache = CP949_DECODE_CACHE.get_or_init(|| Mutex::new(Cp949DecodeCache::default()));
-    let guard = cache.lock().ok()?;
+    let guard = CP949_DECODE_CACHE.lock().ok()?;
     guard.map.get(bytes).cloned()
 }
 #[cfg(not(windows))]
 fn cp949_cache_put(bytes: &[u8], decoded: &str) {
-    let cache = CP949_DECODE_CACHE.get_or_init(|| Mutex::new(Cp949DecodeCache::default()));
-    if let Ok(mut guard) = cache.lock() {
+    if let Ok(mut guard) = CP949_DECODE_CACHE.lock() {
         let key = bytes.to_vec();
         let entry_size = bytes.len().saturating_add(decoded.len());
         if entry_size > CP949_CACHE_MAX_BYTES {
@@ -149,9 +149,7 @@ fn cp949_cache_put(bytes: &[u8], decoded: &str) {
 }
 #[cfg(not(windows))]
 fn decode_cp949_with_iconv(bytes: &[u8]) -> Option<String> {
-    let available =
-        *CP949_ICONV_AVAILABLE.get_or_init(|| command_available("iconv", &["--version"]));
-    if !available {
+    if !*CP949_ICONV_AVAILABLE {
         return None;
     }
     run_decoder_command("iconv", &["-f", "CP949", "-t", "UTF-8"], bytes)
@@ -159,16 +157,12 @@ fn decode_cp949_with_iconv(bytes: &[u8]) -> Option<String> {
 #[cfg(not(windows))]
 fn decode_cp949_with_python(bytes: &[u8]) -> Option<String> {
     let script = "import sys;data=sys.stdin.buffer.read();sys.stdout.buffer.write(data.decode('cp949','strict').encode('utf-8'))";
-    let python3_available =
-        *CP949_PYTHON3_AVAILABLE.get_or_init(|| command_available("python3", &["-V"]));
-    if python3_available
+    if *CP949_PYTHON3_AVAILABLE
         && let Some(decoded) = run_decoder_command("python3", &["-c", script], bytes)
     {
         return Some(decoded);
     }
-    let python_available =
-        *CP949_PYTHON_AVAILABLE.get_or_init(|| command_available("python", &["-V"]));
-    if !python_available {
+    if !*CP949_PYTHON_AVAILABLE {
         return None;
     }
     run_decoder_command("python", &["-c", script], bytes)
@@ -248,7 +242,7 @@ fn warn_non_windows_cp949_once(code_page: u16) {
         .is_ok()
     {
         eprintln!(
-            "[주의] 비Windows 환경에서 code page {code_page}는 완전 디코딩이 불가하여 비ASCII 문자를 대체문자(�)로 처리합니다."
+            "주의: 비Windows 환경에서 code page {code_page}는 완전 디코딩이 불가하여 비ASCII 문자를 대체문자(�)로 처리합니다."
         );
     }
 }

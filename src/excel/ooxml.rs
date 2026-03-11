@@ -58,7 +58,12 @@ pub fn load_shared_strings(container: &XlsxContainer) -> Result<Vec<String>> {
     let path = container
         .unpack_dir()
         .join(path_from_slashes("xl/sharedStrings.xml"));
-    if !path.exists() {
+    if !path.try_exists().map_err(|e| {
+        err(format!(
+            "sharedStrings.xml 경로 확인 실패: {} ({e})",
+            path.display()
+        ))
+    })? {
         return Ok(vec![]);
     }
     let xml = container.read_text("xl/sharedStrings.xml")?;

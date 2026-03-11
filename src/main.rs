@@ -49,12 +49,12 @@ impl DownloadedSourceGuard {
         self.paths = paths;
     }
     fn cleanup(&mut self) -> Result<()> {
-        self.cleanup_with_message("실행 후 자동 생성 파일")
+        self.cleanup_with_message("임시 소스 파일")
     }
     fn cleanup_with_message(&mut self, message: &str) -> Result<()> {
         let removed = source_download::cleanup_downloaded_sources(&self.paths)?;
         if removed > 0 {
-            eprintln!("[소스 다운로드] {message} {removed}개 정리");
+            println!("{message} {removed}개 정리");
         }
         self.paths.clear();
         Ok(())
@@ -65,10 +65,10 @@ impl Drop for DownloadedSourceGuard {
         if self.paths.is_empty() {
             return;
         }
-        match self.cleanup_with_message("실행 종료 시 자동 생성 파일") {
+        match self.cleanup_with_message("종료 중 임시 소스 파일") {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("[소스 다운로드] 실행 종료 시 자동 생성 파일 정리 실패: {e}");
+                eprintln!("종료 중 임시 소스 파일 정리 실패: {e}");
             }
         }
     }
@@ -103,10 +103,10 @@ fn run(args: &Args) -> Result<()> {
         let downloaded = source_download::refresh_sources(&args.sources_dir, &args.sources_prefix)
             .map_err(|e| {
                 err(format!(
-                    "{e}\n기존 수동 소스 파일만 사용하려면 --skip-download 를 지정하세요."
+                    "{e}\n자동 다운로드를 건너뛰려면 --skip-download 를 지정하세요."
                 ))
             })?;
-        eprintln!("[소스 다운로드] {}개 파일 준비 완료", downloaded.len());
+        println!("소스 파일 {}개 준비 완료", downloaded.len());
         downloaded_sources.track(downloaded);
     }
     let source_paths = find_source_files(&args.sources_dir, &args.sources_prefix)?;
@@ -142,7 +142,7 @@ fn run(args: &Args) -> Result<()> {
                     backup.display()
                 )));
             }
-            eprintln!("[백업 생성] {}", backup.display());
+            println!("백업 파일 생성: {}", backup.display());
         }
         if let Err(e) = book.save_as(&out_path, args.save_mode.verify_saved_file()) {
             if reserved_output {
@@ -167,18 +167,6 @@ fn canon_header(s: &str) -> String {
 }
 fn same_trimmed(a: &str, b: &str) -> bool {
     a.trim() == b.trim()
-}
-fn normalize_phone(s: &str) -> String {
-    s.chars().filter(char::is_ascii_digit).collect()
-}
-fn same_phone(a: &str, b: &str) -> bool {
-    let na = normalize_phone(a);
-    let nb = normalize_phone(b);
-    if !na.is_empty() || !nb.is_empty() {
-        na == nb
-    } else {
-        same_trimmed(a, b)
-    }
 }
 fn same_self_yn(a: &str, b: &str) -> bool {
     canon_header(a) == canon_header(b)
@@ -210,18 +198,23 @@ fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
     })
 }
 fn normalize_address_key(addr: &str) -> String {
-    let mut s = addr.trim().to_string();
-    let replacements = [
-        ("충청남도", "충남"),
-        ("충청북도", "충북"),
-        ("대전광역시", "대전"),
-        ("세종특별자치시", "세종"),
-    ];
-    for (from, to) in replacements {
-        s = s.replace(from, to);
-    }
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+    let mut rest = addr.trim();
+    let mut out = String::with_capacity(rest.len());
+    while let Some(ch) = rest.chars().next() {
+        if let Some((from, to)) = [
+            ("충청남도", "충남"),
+            ("충청북도", "충북"),
+            ("대전광역시", "대전"),
+            ("세종특별자치시", "세종"),
+        ]
+        .iter()
+        .find(|(from, _)| rest.starts_with(*from))
+        {
+            out.push_str(to);
+            rest = &rest[from.len()..];
+            continue;
+        }
+        rest = &rest[ch.len_utf8()..];
         if ch.is_whitespace() {
             continue;
         }

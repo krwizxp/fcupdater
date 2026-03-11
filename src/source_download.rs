@@ -1,4 +1,6 @@
 use crate::{Result, err};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::HashSet,
     fs,
@@ -6,18 +8,22 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::LazyLock,
     thread::sleep,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 const WEBDRIVER_HOST: &str = "127.0.0.1";
 const CHROMEDRIVER_CMD: &str = "chromedriver";
 const CHROMEDRIVER_DIR_NAME: &str = "chromedriver";
 const EDGEDRIVER_CMD: &str = "msedgedriver";
 const EDGEDRIVER_DIR_NAME: &str = "edgedriver";
-const OPINET_URL: &str = "https://www.opinet.co.kr/searRgSelect.do";
+const OPDOWNLOAD_URL: &str = "https://www.opinet.co.kr/user/opdown/opDownload.do";
 pub const AUTO_SOURCE_MARKER: &str = "__fcupdater_auto__";
-const DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+const DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_mins(3);
+const RENAME_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_SESSION_RETRY_LIMIT: usize = 2;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const CHROMEDRIVER_BIN_NAME: &str = "chromedriver.exe";
 #[cfg(not(windows))]
@@ -30,6 +36,10 @@ const EDGEDRIVER_BIN_NAME: &str = "msedgedriver";
 struct Task {
     sido: &'static str,
     sigungu: &'static str,
+}
+struct TaskMatcher {
+    sido_key: String,
+    task_keys: Vec<String>,
 }
 const TASKS: [Task; 11] = [
     Task {
@@ -125,7 +135,6 @@ impl BrowserKind {
 }
 struct WebDriverContext {
     addr: String,
-    browser: BrowserKind,
     _driver: ChildGuard,
 }
 enum JsonStringField {
@@ -149,27 +158,128 @@ pub fn refresh_sources(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
     let removed = cleanup_auto_source_files(&dir, prefix)
         .map_err(|e| err(format!("기존 자동 소스 정리 실패: {e}")))?;
     if removed > 0 {
-        eprintln!("[소스 다운로드] 이전 자동 생성 파일 {removed}개 정리");
+        println!("이전 임시 소스 파일 {removed}개 정리");
     }
-    let webdriver = ensure_webdriver(&dir).map_err(|e| {
-        err(format!(
-            "Chrome/Edge WebDriver 준비 실패: {e}\nChrome 또는 Edge 설치 및 {}를 확인하세요.",
-            webdriver_setup_hint()
-        ))
-    })?;
-    run_tasks(&webdriver.addr, webdriver.browser, &dir, prefix)
-        .map_err(|e| err(format!("Opinet 다운로드 실패: {e}")))
+    download_nationwide_source(&dir, prefix)
 }
-pub fn is_auto_source_file_name(file_name: &str, prefix: &str) -> bool {
+pub fn filter_target_region_records(
+    records: Vec<crate::source_sync::SourceRecord>,
+) -> Vec<crate::source_sync::SourceRecord> {
+    records
+        .into_iter()
+        .filter(is_target_region_record)
+        .collect()
+}
+pub fn is_target_region_record(record: &crate::source_sync::SourceRecord) -> bool {
+    task_matchers()
+        .iter()
+        .any(|matcher| record_matches_task(record, matcher))
+}
+fn download_nationwide_source(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+    let mut errors = Vec::new();
+    for browser in [BrowserKind::Chrome, BrowserKind::Edge] {
+        let webdriver = match ensure_webdriver_for_browser(browser) {
+            Ok(context) => context,
+            Err(err) => {
+                errors.push(format!(
+                    "{} WebDriver 준비 실패: {err}",
+                    browser.display_name()
+                ));
+                continue;
+            }
+        };
+        match download_nationwide_source_with_retries(&webdriver.addr, browser, dir, prefix) {
+            Ok(downloaded) => {
+                println!("다운로드 완료: {}", downloaded.display());
+                return Ok(vec![downloaded]);
+            }
+            Err(err) => {
+                errors.push(format!("{} 다운로드 실패: {err}", browser.display_name()));
+            }
+        }
+    }
+    Err(err(format!(
+        "Opinet 자동 다운로드 실패: {}\nChrome 또는 Edge 설치와 {}를 확인하세요.",
+        errors.join("\n"),
+        webdriver_setup_hint()
+    )))
+}
+pub fn is_auto_source_file_name_folded(file_name: &str, prefix_fold: &str) -> bool {
     let folded = file_name.to_lowercase();
-    folded.starts_with(&prefix.to_lowercase()) && folded.contains(AUTO_SOURCE_MARKER)
+    folded.starts_with(prefix_fold) && folded.contains(AUTO_SOURCE_MARKER)
 }
 pub fn cleanup_downloaded_sources(paths: &[PathBuf]) -> Result<usize> {
     cleanup_downloaded_source_files(paths)
         .map_err(|e| err(format!("자동 소스 파일 정리 실패: {e}")))
 }
+fn record_matches_task(record: &crate::source_sync::SourceRecord, matcher: &TaskMatcher) -> bool {
+    let region_key = crate::normalize_address_key(&record.region);
+    let matches_task = |value: &str| matcher.task_keys.iter().any(|key| value.contains(key));
+    if !region_key.is_empty() {
+        if !region_key.contains(&matcher.sido_key) {
+            return false;
+        }
+        if matches_task(&region_key) {
+            return true;
+        }
+        if region_has_explicit_sigungu(&record.region) {
+            return false;
+        }
+    }
+    let combined = crate::normalize_address_key(&format!("{} {}", record.region, record.address));
+    combined.contains(&matcher.sido_key) && matches_task(&combined)
+}
+fn region_has_explicit_sigungu(region: &str) -> bool {
+    let mut tokens = region.split_whitespace().filter(|token| !token.is_empty());
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if crate::strip_basic_region_suffix(first).is_some() {
+        return true;
+    }
+    (crate::is_province_token(first) || crate::is_metropolitan_token(first))
+        && tokens
+            .next()
+            .is_some_and(|second| crate::strip_basic_region_suffix(second).is_some())
+}
+fn task_match_keys(task: &Task) -> Vec<String> {
+    let mut keys = Vec::new();
+    for alias in sigungu_aliases(task.sigungu) {
+        let alias_key = crate::normalize_address_key(alias);
+        if !alias_key.is_empty() && !keys.contains(&alias_key) {
+            keys.push(alias_key);
+        }
+        let stripped = strip_basic_region_suffix_owned(alias);
+        if !stripped.is_empty() && !keys.contains(&stripped) {
+            keys.push(stripped);
+        }
+    }
+    let sigungu_key = crate::normalize_address_key(task.sigungu);
+    if !sigungu_key.is_empty() && !keys.contains(&sigungu_key) {
+        keys.push(sigungu_key);
+    }
+    keys
+}
+fn task_matchers() -> &'static [TaskMatcher] {
+    static TASK_MATCHERS: LazyLock<Vec<TaskMatcher>> = LazyLock::new(|| {
+        TASKS
+            .iter()
+            .map(|task| TaskMatcher {
+                sido_key: crate::normalize_address_key(task.sido),
+                task_keys: task_match_keys(task),
+            })
+            .collect()
+    });
+    TASK_MATCHERS.as_slice()
+}
+fn strip_basic_region_suffix_owned(value: &str) -> String {
+    crate::strip_basic_region_suffix(value)
+        .map(crate::normalize_address_key)
+        .unwrap_or_default()
+}
 fn cleanup_auto_source_files(dir: &Path, prefix: &str) -> std::result::Result<usize, String> {
     let mut removed = 0usize;
+    let prefix_fold = prefix.to_lowercase();
     let entries =
         fs::read_dir(dir).map_err(|e| format!("폴더 읽기 실패: {} ({e})", dir.display()))?;
     for entry in entries {
@@ -181,7 +291,7 @@ fn cleanup_auto_source_files(dir: &Path, prefix: &str) -> std::result::Result<us
         let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !is_auto_source_file_name(file_name, prefix) {
+        if !is_auto_source_file_name_folded(file_name, &prefix_fold) {
             continue;
         }
         fs::remove_file(&path)
@@ -216,42 +326,27 @@ fn is_auto_source_path(path: &Path) -> bool {
         .and_then(|s| s.to_str())
         .is_some_and(|file_name| file_name.contains(AUTO_SOURCE_MARKER))
 }
-fn ensure_webdriver(download_dir: &Path) -> std::result::Result<WebDriverContext, String> {
-    let mut errors = Vec::new();
-    for browser in [BrowserKind::Chrome, BrowserKind::Edge] {
-        match ensure_webdriver_for_browser(browser, download_dir) {
-            Ok(context) => return Ok(context),
-            Err(err) => errors.push(format!("{}: {err}", browser.display_name())),
-        }
-    }
-    Err(errors.join("\n"))
-}
 fn ensure_webdriver_for_browser(
     browser: BrowserKind,
-    download_dir: &Path,
 ) -> std::result::Result<WebDriverContext, String> {
     let webdriver_addr = reserve_webdriver_addr()?;
     let webdriver_port = webdriver_port(&webdriver_addr);
     let program = resolve_webdriver_program(browser)?;
-    let child = Command::new(&program)
-        .env("CHROME_LOG_FILE", os_dev_null())
-        .env("MSEDGEDRIVER_TELEMETRY_OPTOUT", "1")
-        .arg(format!("--port={webdriver_port}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("`{}` 실행 실패: {e}", program.display()))?;
+    let mut command = Command::new(&program);
+    let child = apply_webdriver_spawn_options(
+        command
+            .env("CHROME_LOG_FILE", os_dev_null())
+            .env("MSEDGEDRIVER_TELEMETRY_OPTOUT", "1")
+            .arg(format!("--port={webdriver_port}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .spawn()
+    .map_err(|e| format!("`{}` 실행 실패: {e}", program.display()))?;
     let guard = ChildGuard { child: Some(child) };
     wait_for_webdriver_ready(&webdriver_addr, Duration::from_secs(15))?;
-    probe_webdriver_session(browser, &webdriver_addr, download_dir).map_err(|e| {
-        format!(
-            "WebDriver 세션 생성 실패: {e}{}",
-            webdriver_version_mismatch_hint(browser, &e)
-        )
-    })?;
     Ok(WebDriverContext {
         addr: webdriver_addr,
-        browser,
         _driver: guard,
     })
 }
@@ -340,58 +435,23 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
         paths.push(candidate);
     }
 }
-fn run_tasks(
+fn download_nationwide_source_with_retries(
     webdriver_addr: &str,
     browser: BrowserKind,
     download_dir: &Path,
     prefix: &str,
-) -> std::result::Result<Vec<PathBuf>, String> {
-    let mut downloaded_paths = Vec::with_capacity(TASKS.len());
-    for (idx, task) in TASKS.iter().enumerate() {
-        let new_path =
-            run_task_with_retries(webdriver_addr, browser, download_dir, prefix, idx, task)?;
-        eprintln!(
-            "[소스 다운로드 {}/{}] {} {} -> {}",
-            idx + 1,
-            TASKS.len(),
-            task.sido,
-            task.sigungu,
-            new_path.display()
-        );
-        downloaded_paths.push(new_path);
-        sleep(Duration::from_millis(1000));
-    }
-    Ok(downloaded_paths)
-}
-fn probe_webdriver_session(
-    browser: BrowserKind,
-    webdriver_addr: &str,
-    download_dir: &Path,
-) -> std::result::Result<(), String> {
-    let session_id = webdriver_new_session(browser, webdriver_addr, download_dir)?;
-    let _ = webdriver_delete_session(webdriver_addr, &session_id);
-    Ok(())
-}
-fn run_task_with_retries(
-    webdriver_addr: &str,
-    browser: BrowserKind,
-    download_dir: &Path,
-    prefix: &str,
-    index: usize,
-    task: &Task,
 ) -> std::result::Result<PathBuf, String> {
     let mut last_error = None;
     for attempt in 1..=TASK_SESSION_RETRY_LIMIT {
-        match run_task_once(webdriver_addr, browser, download_dir, prefix, index, task) {
+        match download_nationwide_source_once(webdriver_addr, browser, download_dir, prefix) {
             Ok(path) => return Ok(path),
             Err(err) => {
                 let should_retry =
                     attempt < TASK_SESSION_RETRY_LIMIT && is_recoverable_session_error(&err);
                 last_error = Some(err);
                 if should_retry {
-                    eprintln!(
-                        "[소스 다운로드 재시도 {attempt}/{TASK_SESSION_RETRY_LIMIT}] {} {} 세션을 다시 시작합니다.",
-                        task.sido, task.sigungu
+                    println!(
+                        "다운로드 재시도 {attempt}/{TASK_SESSION_RETRY_LIMIT}: 브라우저 세션을 다시 시작합니다."
                     );
                     sleep(Duration::from_secs(2));
                     continue;
@@ -400,199 +460,84 @@ fn run_task_with_retries(
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| format!("작업 실행 실패 ({} {})", task.sido, task.sigungu)))
+    Err(last_error.unwrap_or_else(|| "다운로드 실패".to_string()))
 }
-fn run_task_once(
+fn download_nationwide_source_once(
     webdriver_addr: &str,
     browser: BrowserKind,
     download_dir: &Path,
     prefix: &str,
-    index: usize,
-    task: &Task,
 ) -> std::result::Result<PathBuf, String> {
     let session_id = webdriver_new_session(browser, webdriver_addr, download_dir).map_err(|e| {
         format!(
-            "작업 세션 생성 실패 ({} {}): {e}{}",
-            task.sido,
-            task.sigungu,
+            "브라우저 세션 생성 실패: {e}{}",
             webdriver_version_mismatch_hint(browser, &e)
         )
     })?;
-    let result = run_task_in_session(
-        webdriver_addr,
-        &session_id,
-        download_dir,
-        prefix,
-        index,
-        task,
-    );
+    let result =
+        download_nationwide_source_in_session(webdriver_addr, &session_id, download_dir, prefix);
     let _ = webdriver_delete_session(webdriver_addr, &session_id);
     result
 }
-fn run_task_in_session(
+fn download_nationwide_source_in_session(
     webdriver_addr: &str,
     session_id: &str,
     download_dir: &Path,
     prefix: &str,
-    index: usize,
-    task: &Task,
 ) -> std::result::Result<PathBuf, String> {
-    webdriver_get(webdriver_addr, session_id, OPINET_URL)?;
-    wait_for_page_ready(webdriver_addr, session_id, "페이지 초기 로딩")?;
-    select_region(webdriver_addr, session_id, task)?;
-    submit_search(webdriver_addr, session_id)?;
-    download_task_file(
-        webdriver_addr,
-        session_id,
-        download_dir,
-        prefix,
-        index,
-        task,
-    )
-}
-fn wait_for_page_ready(
-    webdriver_addr: &str,
-    session_id: &str,
-    label: &str,
-) -> std::result::Result<(), String> {
+    webdriver_get(webdriver_addr, session_id, OPDOWNLOAD_URL)?;
     wait_until(
         webdriver_addr,
         session_id,
-        PAGE_READY_SCRIPT,
+        OPDOWNLOAD_PAGE_READY_SCRIPT,
         "READY",
-        Duration::from_secs(20),
-        Duration::from_millis(300),
-        label,
-    )
-}
-fn select_region(
-    webdriver_addr: &str,
-    session_id: &str,
-    task: &Task,
-) -> std::result::Result<(), String> {
-    let sido_candidates = [task.sido];
-    let sigungu_candidates = sigungu_aliases(task.sigungu);
-    let result = webdriver_execute_string(
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        "opDownload 페이지 로딩",
+    )?;
+    sleep(Duration::from_secs(2));
+    let before = snapshot_files(download_dir)?;
+    let trigger = match webdriver_execute_optional_string(
         webdriver_addr,
         session_id,
-        &script_select_by_candidates("SIDO_NM0", &sido_candidates, true),
-    )?;
-    if result != "OK" {
-        return Err(format!("시도 선택 실패 ({}): {result}", task.sido));
-    }
-    wait_until(
-        webdriver_addr,
-        session_id,
-        &script_option_ready("SIGUNGU_NM0", &sigungu_candidates),
-        "READY",
-        Duration::from_secs(20),
-        Duration::from_millis(300),
-        &format!("시군구 목록 로딩: {} {}", task.sido, task.sigungu),
-    )?;
-    let result = webdriver_execute_string(
-        webdriver_addr,
-        session_id,
-        &script_select_by_candidates("SIGUNGU_NM0", &sigungu_candidates, false),
-    )?;
-    if result != "OK" {
+        OPDOWNLOAD_TRIGGER_SCRIPT,
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) => "OK|null".to_string(),
+        Err(e) => return Err(format!("opDownload 다운로드 트리거 실행 실패: {e}")),
+    };
+    let _ = webdriver_try_accept_alert(webdriver_addr, session_id, Duration::from_secs(5));
+    if !trigger.starts_with("OK|") {
+        let discovery =
+            webdriver_execute_string(webdriver_addr, session_id, OPDOWNLOAD_DISCOVERY_SCRIPT)
+                .unwrap_or_else(|err| format!("후보 컨트롤 조회 실패: {err}"));
         return Err(format!(
-            "시군구 선택 실패 ({} {}): {result}",
-            task.sido, task.sigungu
+            "opDownload 다운로드 트리거를 찾지 못했습니다.\n트리거 결과: {trigger}\n후보 컨트롤:\n{discovery}"
         ));
     }
-    wait_until(
-        webdriver_addr,
-        session_id,
-        &script_selected_candidate_ready("SIGUNGU_NM0", &sigungu_candidates),
-        "READY",
-        Duration::from_secs(20),
-        Duration::from_millis(300),
-        &format!("시군구 선택 반영: {} {}", task.sido, task.sigungu),
-    )?;
-    Ok(())
-}
-fn submit_search(webdriver_addr: &str, session_id: &str) -> std::result::Result<(), String> {
-    webdriver_execute_ok_or_null(
-        webdriver_addr,
-        session_id,
-        SEARCH_SUBMIT_SCRIPT,
-        "조회 제출",
-    )?;
-    sleep(Duration::from_millis(1500));
-    wait_for_page_ready(webdriver_addr, session_id, "검색 결과 로딩")
-}
-fn download_task_file(
-    webdriver_addr: &str,
-    session_id: &str,
-    download_dir: &Path,
-    prefix: &str,
-    index: usize,
-    task: &Task,
-) -> std::result::Result<PathBuf, String> {
-    let before = snapshot_files(download_dir)?;
-    webdriver_execute_ok_or_null(
-        webdriver_addr,
-        session_id,
-        EXCEL_DOWNLOAD_SCRIPT,
-        "엑셀 저장 실행",
-    )?;
-    let downloaded =
-        wait_for_task_download(webdriver_addr, session_id, download_dir, &before, task)?;
-    rename_downloaded_file(download_dir, prefix, index, task, &downloaded)
-}
-fn wait_for_task_download(
-    webdriver_addr: &str,
-    session_id: &str,
-    download_dir: &Path,
-    before: &HashSet<PathBuf>,
-    task: &Task,
-) -> std::result::Result<PathBuf, String> {
-    wait_for_new_download(download_dir, before, DOWNLOAD_WAIT_TIMEOUT).map_err(|err| {
-        let diag = webdriver_execute_string(webdriver_addr, session_id, DOWNLOAD_DIAGNOSTIC_SCRIPT)
+    let downloaded = wait_for_new_download(download_dir, &before, DOWNLOAD_WAIT_TIMEOUT).map_err(|e| {
+        let diagnostic = webdriver_execute_string(webdriver_addr, session_id, OPDOWNLOAD_DIAGNOSTIC_SCRIPT)
             .unwrap_or_else(|diag_err| format!("진단 조회 실패: {diag_err}"));
-        format!("{err} ({}, {}; {diag})", task.sido, task.sigungu)
-    })
-}
-fn rename_downloaded_file(
-    download_dir: &Path,
-    prefix: &str,
-    index: usize,
-    task: &Task,
-    downloaded: &Path,
-) -> std::result::Result<PathBuf, String> {
+        format!(
+            "opDownload 파일 다운로드 대기 실패: {e}\n트리거 결과: {trigger}\n현재 페이지: {diagnostic}"
+        )
+    })?;
     let ext = downloaded
         .extension()
         .and_then(|s| s.to_str())
-        .unwrap_or("xlsx");
-    let new_path = download_dir.join(build_auto_source_name(
-        prefix,
-        index + 1,
-        task.sido,
-        task.sigungu,
-        ext,
-    ));
-    fs::rename(downloaded, &new_path).map_err(|e| {
+        .unwrap_or("xls");
+    let renamed = download_dir.join(build_nationwide_auto_source_name(prefix, ext));
+    rename_with_retries(&downloaded, &renamed, RENAME_WAIT_TIMEOUT).map_err(|e| {
         format!(
-            "파일 이름 변경 실패: {} -> {} ({e})",
+            "전국 소스 파일 이름 변경 실패: {} -> {} ({e})",
             downloaded.display(),
-            new_path.display()
+            renamed.display()
         )
     })?;
-    Ok(new_path)
+    Ok(renamed)
 }
-fn build_auto_source_name(
-    prefix: &str,
-    order: usize,
-    sido: &str,
-    sigungu: &str,
-    ext: &str,
-) -> String {
-    format!(
-        "{prefix}{AUTO_SOURCE_MARKER}_{order:02}_{}_{}.{}",
-        safe_filename(sido),
-        safe_filename(sigungu),
-        ext
-    )
+fn build_nationwide_auto_source_name(prefix: &str, ext: &str) -> String {
+    format!("{prefix}{AUTO_SOURCE_MARKER}_opdownload_current_price.{ext}")
 }
 fn wait_for_webdriver_ready(
     webdriver_addr: &str,
@@ -657,6 +602,38 @@ fn webdriver_get(
     let _ = http_request(webdriver_addr, "POST", &path, Some(&body))?;
     Ok(())
 }
+fn webdriver_try_accept_alert(
+    webdriver_addr: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> std::result::Result<bool, String> {
+    let start = Instant::now();
+    loop {
+        match webdriver_accept_alert(webdriver_addr, session_id) {
+            Ok(()) => return Ok(true),
+            Err(err) if err.contains("no such alert") => {
+                if start.elapsed() > timeout {
+                    return Ok(false);
+                }
+                sleep(Duration::from_millis(200));
+            }
+            Err(err) => {
+                if start.elapsed() > timeout {
+                    return Err(err);
+                }
+                sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+fn webdriver_accept_alert(
+    webdriver_addr: &str,
+    session_id: &str,
+) -> std::result::Result<(), String> {
+    let path = format!("/session/{session_id}/alert/accept");
+    let _ = http_request(webdriver_addr, "POST", &path, Some("{}"))?;
+    Ok(())
+}
 fn webdriver_execute_string(
     webdriver_addr: &str,
     session_id: &str,
@@ -664,18 +641,6 @@ fn webdriver_execute_string(
 ) -> std::result::Result<String, String> {
     webdriver_execute_optional_string(webdriver_addr, session_id, script)?
         .map_or_else(|| Err("execute/sync 응답이 null 입니다.".to_string()), Ok)
-}
-fn webdriver_execute_ok_or_null(
-    webdriver_addr: &str,
-    session_id: &str,
-    script: &str,
-    label: &str,
-) -> std::result::Result<(), String> {
-    match webdriver_execute_optional_string(webdriver_addr, session_id, script)? {
-        Some(value) if value == "OK" => Ok(()),
-        Some(value) => Err(format!("{label} 실패: {value}")),
-        None => Ok(()),
-    }
 }
 fn webdriver_execute_optional_string(
     webdriver_addr: &str,
@@ -699,9 +664,9 @@ fn http_request(
 ) -> std::result::Result<String, String> {
     let mut stream =
         TcpStream::connect(webdriver_addr).map_err(|e| format!("WebDriver 연결 실패: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
-    let body = body.unwrap_or("");
+    let _ = stream.set_read_timeout(Some(Duration::from_mins(1)));
+    let _ = stream.set_write_timeout(Some(Duration::from_mins(1)));
+    let body = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: {webdriver_addr}\r\n\
@@ -773,11 +738,11 @@ fn read_http_response(stream: &mut TcpStream) -> std::result::Result<String, Str
     Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 fn find_http_header_end(raw: &[u8]) -> Option<(usize, usize)> {
-    raw.windows(4)
+    raw.array_windows::<4>()
         .position(|window| window == b"\r\n\r\n")
         .map(|pos| (pos, 4))
         .or_else(|| {
-            raw.windows(2)
+            raw.array_windows::<2>()
                 .position(|window| window == b"\n\n")
                 .map(|pos| (pos, 2))
         })
@@ -842,10 +807,19 @@ fn extract_json_optional_string_by_key(json: &str, key: &str) -> Option<JsonStri
     }
     i += 1;
     let mut out = String::new();
+    let mut segment_start = i;
     while i < bytes.len() {
         match bytes[i] {
-            b'"' => return Some(JsonStringField::String(out)),
+            b'"' => {
+                if segment_start < i {
+                    out.push_str(&String::from_utf8_lossy(&bytes[segment_start..i]));
+                }
+                return Some(JsonStringField::String(out));
+            }
             b'\\' => {
+                if segment_start < i {
+                    out.push_str(&String::from_utf8_lossy(&bytes[segment_start..i]));
+                }
                 i += 1;
                 if i >= bytes.len() {
                     return None;
@@ -871,8 +845,9 @@ fn extract_json_optional_string_by_key(json: &str, key: &str) -> Option<JsonStri
                     }
                     _ => return None,
                 }
+                segment_start = i + 1;
             }
-            b => out.push(char::from(b)),
+            _ => {}
         }
         i += 1;
     }
@@ -923,266 +898,249 @@ fn sigungu_aliases(name: &str) -> Vec<&str> {
         _ => vec![name],
     }
 }
-fn js_string_array(items: &[&str]) -> String {
-    let mut out = String::from("[");
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('"');
-        out.push_str(&json_escape(item));
-        out.push('"');
-    }
-    out.push(']');
-    out
-}
-const PAGE_READY_SCRIPT: &str = r#"return (document.readyState === "complete" && !!document.getElementById("SIDO_NM0")) ? "READY" : "";"#;
-const SEARCH_SUBMIT_SCRIPT: &str = r#"
+const OPDOWNLOAD_PAGE_READY_SCRIPT: &str = r#"
 return (function() {
-  var form = document.getElementById("searrgVO");
-  var sidoSel = document.getElementById("SIDO_NM0");
-  var sigunguSel = document.getElementById("SIGUNGU_NM0");
-  var sidoHidden = document.getElementById("SIDO_NM");
-  var sigunguHidden = document.getElementById("SIGUNGU_NM");
-  var searchMode = document.getElementById("SEARCH_MOD1");
-  var osNm = document.getElementById("OS_NM");
-  var osAddr = document.getElementById("OS_ADDR");
-  if (!form) return "ERR:NO_FORM";
-  if (!sidoSel) return "ERR:NO_SIDO";
-  if (!sigunguSel) return "ERR:NO_SIGUNGU";
-  if (sidoHidden) sidoHidden.value = (sidoSel.value || "").trim();
-  if (sigunguHidden) sigunguHidden.value = (sigunguSel.value || "").trim();
-  if (searchMode) searchMode.checked = true;
-  if (osNm) osNm.value = "";
-  if (osAddr) osAddr.value = "";
-  form.action = "/searRgSelect.do";
-  form.target = "_self";
-  form.submit();
-  return "OK";
+  if (document.readyState !== "complete") return "";
+  var bodyText = document.body ? String(document.body.innerText || document.body.textContent || "") : "";
+  bodyText = bodyText.replace(/\s+/g, " ").trim();
+  if (!bodyText) return "";
+  if (!/(사업자별|판매가격|엑셀|다운로드)/.test(bodyText)) return "";
+  return "READY";
 })();"#;
-const EXCEL_DOWNLOAD_SCRIPT: &str = r#"
+const OPDOWNLOAD_DISCOVERY_SCRIPT: &str = r#"
 return (function() {
-  var sidoSel = document.getElementById("SIDO_NM0");
-  var sigunguSel = document.getElementById("SIGUNGU_NM0");
-  var sidoHidden = document.getElementById("SIDO_NM");
-  var sigunguHidden = document.getElementById("SIGUNGU_NM");
-  var searchMode = document.getElementById("SEARCH_MOD1");
-  if (sidoHidden && sidoSel) sidoHidden.value = (sidoSel.value || "").trim();
-  if (sigunguHidden && sigunguSel) sigunguHidden.value = (sigunguSel.value || "").trim();
-  if (searchMode) searchMode.checked = true;
-  if (typeof fn_excel_download === "function") {
-    fn_excel_download("os_btn");
-    return "OK";
+  function clean(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
   }
-  var anchor = document.querySelector('a[href*="fn_excel_download"]');
-  if (!anchor) return "ERR:NO_DOWNLOAD_TRIGGER";
-  anchor.click();
-  return "OK";
-})();"#;
-const DOWNLOAD_DIAGNOSTIC_SCRIPT: &str = r#"
-return (function() {
-  function text(id) {
-    var el = document.getElementById(id);
-    return el ? (el.textContent || el.innerText || "").trim() : "";
+  function attr(el, name) {
+    return clean(el && el.getAttribute ? el.getAttribute(name) : "");
   }
-  function value(id) {
-    var el = document.getElementById(id);
-    return el ? (el.value || "").trim() : "";
+  function textOf(el) {
+    if (!el) return "";
+    return clean(el.innerText || el.textContent || el.value || attr(el, "aria-label") || attr(el, "title") || attr(el, "alt"));
   }
-  var listLen = "";
-  try {
-    if (typeof listpop !== "undefined" && listpop && typeof listpop.length === "number") {
-      listLen = String(listpop.length);
+  function isVisible(el) {
+    if (!el) return false;
+    if (el.hidden) return false;
+    var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+    return !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length));
+  }
+  function contextOf(el) {
+    var cur = el;
+    while (cur && cur !== document.body) {
+      var tag = cur.tagName ? cur.tagName.toLowerCase() : "";
+      if (/^(tr|li|dd|dt|p|div|section|article|td|th|form)$/.test(tag)) {
+        var text = clean(cur.innerText || cur.textContent || "");
+        if (text && text.length <= 260) return text;
+      }
+      cur = cur.parentElement;
     }
-  } catch (e) {}
-  var downloadAnchor = document.querySelector('a[href*="fn_excel_download"]');
+    return "";
+  }
+  function pushLine(lines, el) {
+    var text = textOf(el);
+    var href = attr(el, "href");
+    var onclick = attr(el, "onclick");
+    var ctx = contextOf(el);
+    var blob = [text, href, onclick, ctx].join(" ");
+    if (!/(사업자별|현재|판매가격|엑셀|다운로드|저장|excel|download|xls|xlsx)/i.test(blob)) return;
+    lines.push([
+      "el",
+      (el.tagName || "").toLowerCase(),
+      "id=" + attr(el, "id"),
+      "name=" + attr(el, "name"),
+      "type=" + attr(el, "type"),
+      "text=" + text,
+      "href=" + href,
+      "onclick=" + onclick,
+      "ctx=" + ctx
+    ].join(" | "));
+  }
+  var lines = [];
+  lines.push("title=" + clean(document.title));
+  lines.push("url=" + clean(location.href));
+  lines.push("body=" + clean(document.body ? (document.body.innerText || document.body.textContent || "") : "").slice(0, 400));
+  if (typeof fn_Download === "function") {
+    lines.push("fn_Download=" + clean(String(fn_Download)).slice(0, 2000));
+  }
+  var forms = Array.prototype.slice.call(document.forms || []);
+  for (var f = 0; f < forms.length; f++) {
+    var form = forms[f];
+    lines.push([
+      "form",
+      "id=" + attr(form, "id"),
+      "name=" + attr(form, "name"),
+      "method=" + attr(form, "method"),
+      "action=" + attr(form, "action"),
+      "target=" + attr(form, "target")
+    ].join(" | "));
+    var inputs = Array.prototype.slice.call(form.querySelectorAll('input[type="hidden"],input[type="text"],input[type="radio"],select'));
+    for (var p = 0; p < inputs.length; p++) {
+      var input = inputs[p];
+      lines.push([
+        "field",
+        "form=" + (attr(form, "id") || attr(form, "name")),
+        "tag=" + (input.tagName || "").toLowerCase(),
+        "type=" + attr(input, "type"),
+        "name=" + attr(input, "name"),
+        "id=" + attr(input, "id"),
+        "value=" + clean(input.value || ""),
+        "checked=" + (input.checked ? "Y" : "N")
+      ].join(" | "));
+    }
+  }
+  var all = Array.prototype.slice.call(document.querySelectorAll('a,button,input[type="button"],input[type="submit"],input[type="image"],*[onclick]'));
+  for (var i = 0; i < all.length; i++) {
+    if (!isVisible(all[i])) continue;
+    pushLine(lines, all[i]);
+  }
+  return lines.join("\n");
+})();"#;
+const OPDOWNLOAD_TRIGGER_SCRIPT: &str = r#"
+return (function() {
+  function clean(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+  function attr(el, name) {
+    return clean(el && el.getAttribute ? el.getAttribute(name) : "");
+  }
+  function textOf(el) {
+    if (!el) return "";
+    return clean(el.innerText || el.textContent || el.value || attr(el, "aria-label") || attr(el, "title") || attr(el, "alt"));
+  }
+  function isVisible(el) {
+    if (!el) return false;
+    if (el.hidden) return false;
+    var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+    return !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length));
+  }
+  function collectClickables(root) {
+    var items = [];
+    if (root && root.matches && root.matches('a,button,input[type="button"],input[type="submit"],input[type="image"],*[onclick]')) {
+      items.push(root);
+    }
+    if (root && root.querySelectorAll) {
+      var descendants = root.querySelectorAll('a,button,input[type="button"],input[type="submit"],input[type="image"],*[onclick]');
+      for (var i = 0; i < descendants.length; i++) items.push(descendants[i]);
+    }
+    return items.filter(isVisible);
+  }
+  function contextOf(el) {
+    var cur = el;
+    var fallback = "";
+    while (cur && cur !== document.body) {
+      var tag = cur.tagName ? cur.tagName.toLowerCase() : "";
+      if (/^(tr|li|dd|dt|p|div|section|article|td|th|form)$/.test(tag)) {
+        var text = clean(cur.innerText || cur.textContent || "");
+        if (text && !fallback) fallback = text;
+        if (text && text.length <= 320 && /(사업자별|판매가격|현재)/.test(text)) return text;
+      }
+      cur = cur.parentElement;
+    }
+    return fallback.slice(0, 320);
+  }
+  function score(blob) {
+    var total = 0;
+    if (/사업자별/.test(blob)) total += 25;
+    if (/현재 판매가격/.test(blob)) total += 25;
+    if (/판매가격/.test(blob)) total += 16;
+    if (/현재/.test(blob)) total += 4;
+    if (/(엑셀|excel)/i.test(blob)) total += 14;
+    if (/(다운로드|저장)/.test(blob)) total += 10;
+    if (/(download|xls|xlsx)/i.test(blob)) total += 8;
+    return total;
+  }
+  function click(el) {
+    try { el.scrollIntoView({ block: "center" }); } catch (e) {}
+    if (typeof el.click === "function") {
+      el.click();
+      return;
+    }
+    var evt = document.createEvent("MouseEvents");
+    evt.initMouseEvent("click", true, true, window, 1);
+    el.dispatchEvent(evt);
+  }
+  if (typeof fn_Download === "function") {
+    fn_Download(2);
+    return "OK|fn_Download(2)|target=사업자별 현재 판매가격 엑셀";
+  }
+  var direct = document.querySelector('a[href*="fn_Download(2)"]');
+  if (direct && isVisible(direct)) {
+    click(direct);
+    return "OK|href=fn_Download(2)|target=사업자별 현재 판매가격 엑셀";
+  }
+  var best = null;
+  var containers = Array.prototype.slice.call(document.querySelectorAll("tr,li,dd,dt,p,div,section,article,td,th,form"));
+  for (var i = 0; i < containers.length; i++) {
+    var ctx = clean(containers[i].innerText || containers[i].textContent || "");
+    if (!ctx || ctx.length > 320) continue;
+    if (!/사업자별/.test(ctx) || !/(현재 판매가격|판매가격)/.test(ctx)) continue;
+    var clickables = collectClickables(containers[i]);
+    for (var j = 0; j < clickables.length; j++) {
+      var el = clickables[j];
+      var blob = [ctx, textOf(el), attr(el, "href"), attr(el, "onclick"), attr(el, "title")].join(" ");
+      var candidate = {
+        el: el,
+        score: score(blob),
+        text: textOf(el),
+        href: attr(el, "href"),
+        onclick: attr(el, "onclick"),
+        ctx: ctx,
+        tag: (el.tagName || "").toLowerCase()
+      };
+      if (!best || candidate.score > best.score || (candidate.score === best.score && candidate.ctx.length < best.ctx.length)) {
+        best = candidate;
+      }
+    }
+  }
+  if (!best) {
+    var all = collectClickables(document);
+    for (var k = 0; k < all.length; k++) {
+      var item = all[k];
+      var ctx2 = contextOf(item);
+      var blob2 = [ctx2, textOf(item), attr(item, "href"), attr(item, "onclick"), attr(item, "title")].join(" ");
+      if (!/사업자별/.test(blob2) || !/(현재 판매가격|판매가격)/.test(blob2)) continue;
+      if (!/(엑셀|다운로드|저장|excel|download|xls|xlsx)/i.test(blob2)) continue;
+      var fallback = {
+        el: item,
+        score: score(blob2),
+        text: textOf(item),
+        href: attr(item, "href"),
+        onclick: attr(item, "onclick"),
+        ctx: ctx2,
+        tag: (item.tagName || "").toLowerCase()
+      };
+      if (!best || fallback.score > best.score) best = fallback;
+    }
+  }
+  if (!best || best.score < 25) {
+    return "ERR:NO_TARGET";
+  }
+  click(best.el);
   return [
-    "title=" + (document.title || "").trim(),
-    "ready=" + document.readyState,
-    "sido=" + value("SIDO_NM0"),
-    "sigungu=" + value("SIGUNGU_NM0"),
-    "totCnt1=" + text("totCnt1"),
-    "totCnt11=" + text("totCnt11"),
-    "listpop=" + listLen,
-    "downloadTrigger=" + (downloadAnchor ? "Y" : "N")
+    "OK",
+    "tag=" + best.tag,
+    "score=" + String(best.score),
+    "text=" + best.text,
+    "href=" + best.href,
+    "onclick=" + best.onclick,
+    "ctx=" + best.ctx
+  ].join("|");
+})();"#;
+const OPDOWNLOAD_DIAGNOSTIC_SCRIPT: &str = r#"
+return (function() {
+  function clean(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+  return [
+    "title=" + clean(document.title),
+    "url=" + clean(location.href),
+    "ready=" + clean(document.readyState),
+    "body=" + clean(document.body ? (document.body.innerText || document.body.textContent || "") : "").slice(0, 500)
   ].join(" | ");
 })();"#;
-fn script_option_ready(select_id: &str, candidates: &[&str]) -> String {
-    let template = r#"
-return (function() {
-  var sel = document.getElementById("__ID__");
-  var candidates = __CANDS__;
-  var placeholders = { "": true, "선택": true, "시/군/구": true };
-  var stateKey = "__STATE_KEY__";
-  var stableForMs = __STABLE_FOR_MS__;
-  if (!sel) return "";
-  var options = Array.prototype.slice.call(sel.options || []);
-  function norm(v) { return (v || "").trim(); }
-  function matches(candidate, opt) {
-    var t = norm(opt.text);
-    var v = norm(opt.value);
-    return t === candidate || v === candidate ||
-           (t && (t.indexOf(candidate) >= 0 || candidate.indexOf(t) >= 0)) ||
-           (v && (v.indexOf(candidate) >= 0 || candidate.indexOf(v) >= 0));
-  }
-  var hasCandidate = false;
-  for (var i = 0; i < candidates.length; i++) {
-    for (var j = 0; j < options.length; j++) {
-      if (matches(candidates[i], options[j])) hasCandidate = true;
-    }
-  }
-  var meaningful = 0;
-  for (var k = 0; k < options.length; k++) {
-    var t = norm(options[k].text);
-    var v = norm(options[k].value);
-    if (!(placeholders[t] && placeholders[v])) {
-      meaningful++;
-    }
-  }
-  if (!hasCandidate && meaningful !== 1) return "";
-  var signature = options.map(function(opt) {
-    return norm(opt.value) + "::" + norm(opt.text);
-  }).join("|");
-  var now = Date.now();
-  var state = window[stateKey];
-  if (!state || state.signature !== signature) {
-    window[stateKey] = { signature: signature, changedAt: now };
-    return "";
-  }
-  return (now - state.changedAt) >= stableForMs ? "READY" : "";
-})();"#;
-    template
-        .replace("__ID__", &json_escape(select_id))
-        .replace("__CANDS__", &js_string_array(candidates))
-        .replace(
-            "__STATE_KEY__",
-            &json_escape(&format!("__fcupdater_option_ready_{select_id}")),
-        )
-        .replace("__STABLE_FOR_MS__", "700")
-}
-fn script_selected_candidate_ready(select_id: &str, candidates: &[&str]) -> String {
-    let template = r#"
-return (function() {
-  var sel = document.getElementById("__ID__");
-  var candidates = __CANDS__;
-  var stateKey = "__STATE_KEY__";
-  var stableForMs = __STABLE_FOR_MS__;
-  if (!sel || sel.selectedIndex < 0) return "";
-  function norm(v) { return (v || "").trim(); }
-  function matches(candidate, opt) {
-    var t = norm(opt.text);
-    var v = norm(opt.value);
-    return t === candidate || v === candidate ||
-           (t && (t.indexOf(candidate) >= 0 || candidate.indexOf(t) >= 0)) ||
-           (v && (v.indexOf(candidate) >= 0 || candidate.indexOf(v) >= 0));
-  }
-  var selected = sel.options[sel.selectedIndex];
-  if (!selected) return "";
-  var matched = false;
-  for (var i = 0; i < candidates.length; i++) {
-    if (matches(candidates[i], selected)) {
-      matched = true;
-      break;
-    }
-  }
-  if (!matched) return "";
-  var signature = [
-    String(sel.selectedIndex),
-    norm(sel.value),
-    norm(selected.text)
-  ].join("::");
-  var now = Date.now();
-  var state = window[stateKey];
-  if (!state || state.signature !== signature) {
-    window[stateKey] = { signature: signature, changedAt: now };
-    return "";
-  }
-  return (now - state.changedAt) >= stableForMs ? "READY" : "";
-})();"#;
-    template
-        .replace("__ID__", &json_escape(select_id))
-        .replace("__CANDS__", &js_string_array(candidates))
-        .replace(
-            "__STATE_KEY__",
-            &json_escape(&format!("__fcupdater_selected_ready_{select_id}")),
-        )
-        .replace("__STABLE_FOR_MS__", "700")
-}
-fn script_select_by_candidates(
-    select_id: &str,
-    candidates: &[&str],
-    dispatch_change: bool,
-) -> String {
-    let template = r#"
-return (function() {
-  var sel = document.getElementById("__ID__");
-  var candidates = __CANDS__;
-  var dispatchChange = __DISPATCH_CHANGE__;
-  var placeholders = { "": true, "선택": true, "시/군/구": true };
-  if (!sel) return "ERR:NO_SELECT";
-  var options = Array.prototype.slice.call(sel.options || []);
-  function norm(v) { return (v || "").trim(); }
-  function findExact() {
-    for (var i = 0; i < candidates.length; i++) {
-      for (var j = 0; j < options.length; j++) {
-        var t = norm(options[j].text);
-        var v = norm(options[j].value);
-        if (t === candidates[i] || v === candidates[i]) {
-          return j;
-        }
-      }
-    }
-    return -1;
-  }
-  function findPartial() {
-    for (var i = 0; i < candidates.length; i++) {
-      for (var j = 0; j < options.length; j++) {
-        var t = norm(options[j].text);
-        var v = norm(options[j].value);
-        if ((t && (t.indexOf(candidates[i]) >= 0 || candidates[i].indexOf(t) >= 0)) ||
-            (v && (v.indexOf(candidates[i]) >= 0 || candidates[i].indexOf(v) >= 0))) {
-          return j;
-        }
-      }
-    }
-    return -1;
-  }
-  var idx = findExact();
-  if (idx < 0) idx = findPartial();
-  if (idx < 0) {
-    var meaningfulIndexes = [];
-    for (var k = 0; k < options.length; k++) {
-      var t = norm(options[k].text);
-      var v = norm(options[k].value);
-      if (!(placeholders[t] && placeholders[v])) {
-        meaningfulIndexes.push(k);
-      }
-    }
-    if (meaningfulIndexes.length === 1) {
-      idx = meaningfulIndexes[0];
-    }
-  }
-  if (idx < 0) return "ERR:NO_OPTION";
-  sel.selectedIndex = idx;
-  if (dispatchChange) {
-    try {
-      sel.dispatchEvent(new Event("change", { bubbles: true }));
-    } catch (e) {
-      var evt = document.createEvent("HTMLEvents");
-      evt.initEvent("change", true, false);
-      sel.dispatchEvent(evt);
-    }
-  }
-  return "OK";
-})();"#;
-    template
-        .replace("__ID__", &json_escape(select_id))
-        .replace("__CANDS__", &js_string_array(candidates))
-        .replace(
-            "__DISPATCH_CHANGE__",
-            if dispatch_change { "true" } else { "false" },
-        )
-}
 fn snapshot_files(dir: &Path) -> std::result::Result<HashSet<PathBuf>, String> {
     let mut set = HashSet::new();
     if !dir
@@ -1209,27 +1167,48 @@ fn wait_for_new_download(
 ) -> std::result::Result<PathBuf, String> {
     let start = Instant::now();
     loop {
-        let now = snapshot_files(dir)?;
-        let mut complete_files = Vec::new();
+        let mut latest_complete: Option<(Option<SystemTime>, PathBuf)> = None;
         let mut temp_exists = false;
-        for path in now.difference(before) {
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            match ext.as_str() {
-                "xls" | "xlsx" => complete_files.push(path.clone()),
-                "crdownload" | "part" | "tmp" => temp_exists = true,
-                _ => {}
+        if dir
+            .try_exists()
+            .map_err(|e| format!("다운로드 폴더 경로 확인 실패: {} ({e})", dir.display()))?
+        {
+            let entries = fs::read_dir(dir)
+                .map_err(|e| format!("다운로드 폴더 읽기 실패: {} ({e})", dir.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("디렉터리 항목 읽기 실패: {e}"))?;
+                let path = entry.path();
+                if !path.is_file() || before.contains(&path) {
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                if ext.eq_ignore_ascii_case("xls") || ext.eq_ignore_ascii_case("xlsx") {
+                    let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+                    let should_replace =
+                        latest_complete
+                            .as_ref()
+                            .is_none_or(|(best_modified, best_path)| {
+                                modified > *best_modified
+                                    || (modified == *best_modified && path > *best_path)
+                            });
+                    if should_replace {
+                        latest_complete = Some((modified, path));
+                    }
+                } else if ext.eq_ignore_ascii_case("crdownload")
+                    || ext.eq_ignore_ascii_case("part")
+                    || ext.eq_ignore_ascii_case("tmp")
+                {
+                    temp_exists = true;
+                }
             }
         }
-        if !complete_files.is_empty() && !temp_exists {
-            complete_files
-                .sort_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok());
-            return complete_files
-                .pop()
-                .ok_or_else(|| "완료 파일 선택 실패".to_string());
+        if let Some((_, path)) = latest_complete
+            && !temp_exists
+        {
+            return Ok(path);
         }
         if start.elapsed() > timeout {
             return Err("다운로드 완료 파일을 찾지 못했습니다".to_string());
@@ -1237,14 +1216,39 @@ fn wait_for_new_download(
         sleep(Duration::from_millis(500));
     }
 }
-fn safe_filename(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| match ch {
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => ch,
-        })
-        .collect()
+fn rename_with_retries(
+    source: &Path,
+    target: &Path,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let start = Instant::now();
+    let mut last_error = None;
+    loop {
+        match fs::rename(source, target) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if !is_transient_rename_error(&error) || start.elapsed() > timeout {
+                    return Err(last_error.unwrap_or_else(|| error.to_string()));
+                }
+                last_error = Some(error.to_string());
+                sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+fn is_transient_rename_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+    ) || matches!(error.raw_os_error(), Some(32 | 33))
+}
+#[cfg(windows)]
+fn apply_webdriver_spawn_options(command: &mut Command) -> &mut Command {
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+#[cfg(not(windows))]
+fn apply_webdriver_spawn_options(command: &mut Command) -> &mut Command {
+    command
 }
 #[cfg(windows)]
 fn webdriver_download_dir_string(path: &Path) -> String {

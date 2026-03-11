@@ -1,6 +1,7 @@
 /target
+__inspect_*.xlsx
 *_updated_*.xlsx
 *_backup_*.xlsx
 _verify_save.xlsx
-지역_위치별(주유소)*.xls
-지역_위치별(주유소)*.xlsx
+현재 판매가격(주유소)*.xls
+현재 판매가격(주유소)*.xlsx
