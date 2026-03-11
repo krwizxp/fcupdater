@@ -609,6 +609,9 @@ fn build_rank_sort_context(
     ws: &excel::writer::Worksheet,
     shared_strings: &[String],
 ) -> RankSortContext {
+    let gasoline_qty = get_f64_at(ws, 2, 4, shared_strings).unwrap_or(0.0);
+    let premium_qty = get_f64_at(ws, 2, 5, shared_strings).unwrap_or(0.0);
+    let diesel_qty = get_f64_at(ws, 2, 6, shared_strings).unwrap_or(0.0);
     let mut region_rates = HashMap::new();
     for row in 4..=13 {
         let region = ws.get_display_at(3, row, shared_strings).trim().to_string();
@@ -619,11 +622,17 @@ fn build_rank_sort_context(
             region_rates.insert(region, rate);
         }
     }
+    let total_qty = get_f64_at(ws, 2, 10, shared_strings)
+        .filter(|value| !is_zero(*value))
+        .or_else(|| {
+            let derived_total = gasoline_qty + premium_qty + diesel_qty;
+            (!is_zero(derived_total)).then_some(derived_total)
+        });
     RankSortContext {
-        gasoline_qty: get_f64_at(ws, 2, 4, shared_strings).unwrap_or(0.0),
-        premium_qty: get_f64_at(ws, 2, 5, shared_strings).unwrap_or(0.0),
-        diesel_qty: get_f64_at(ws, 2, 6, shared_strings).unwrap_or(0.0),
-        total_qty: get_f64_at(ws, 2, 10, shared_strings).filter(|value| !is_zero(*value)),
+        gasoline_qty,
+        premium_qty,
+        diesel_qty,
+        total_qty,
         smart_discount: get_f64_at(ws, 2, 13, shared_strings).unwrap_or(0.0),
         region_rates,
     }
@@ -700,7 +709,13 @@ fn compare_rank_sort_key(a: &RankSortKey, b: &RankSortKey) -> Ordering {
     b.has_rank_total
         .cmp(&a.has_rank_total)
         .then_with(|| a.rank_total.total_cmp(&b.rank_total))
-        .then_with(|| compare_out_of_rank_fuels(a, b))
+        .then_with(|| {
+            if !a.has_rank_total && !b.has_rank_total {
+                compare_out_of_rank_fuels(a, b)
+            } else {
+                Ordering::Equal
+            }
+        })
         .then_with(|| a.region.cmp(&b.region))
         .then_with(|| a.name.cmp(&b.name))
         .then_with(|| a.address.cmp(&b.address))
