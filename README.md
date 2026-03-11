@@ -46,6 +46,36 @@ cargo build --release
 - `fcupdater-ubuntu-latest-rust-stable` (Linux binary: `fcupdater`)
 - `fcupdater-windows-latest-rust-stable` (Windows binary: `fcupdater.exe`)
 
+## GitHub Actions 현행화 실행
+
+`.github/workflows/update_master.yml`은 GitHub Actions에서 마스터 엑셀을 직접 현행화하고 결과 `.xlsx`를 Artifact로 받는 수동 실행 워크플로입니다.
+
+- Runner: `windows-2025`
+- 브라우저/드라이버: GitHub runner에 기본 설치된 Chrome/Edge 및 WebDriver를 우선 사용
+- 결과물: `artifacts/fuel_cost_chungcheong_updated_actions.xlsx`
+
+실행 방법:
+
+1. GitHub 저장소의 `Actions` 탭에서 `Update Master Excel` 워크플로를 선택합니다.
+2. `Run workflow`를 눌러 입력값을 확인한 뒤 실행합니다.
+3. 실행 완료 후 Workflow run 화면의 `Artifacts`에서 결과 파일을 다운로드합니다.
+
+입력값:
+
+- `master_path`: 저장소 안에 있는 기준 엑셀 경로 (기본: `fuel_cost_chungcheong.xlsx`)
+- `sources_prefix`: 소스 파일 prefix (기본: `현재 판매가격(주유소)`)
+- `skip_download`: `true`이면 Opinet 자동 다운로드를 생략하고 저장소 안의 기존 소스 파일만 사용
+- `no_change_log`: `true`이면 `변경내역` 시트를 갱신하지 않음
+- `fast_save`: `true`이면 저장 후 무결성 재검증 생략
+- `artifact_name`: 업로드할 Artifact 이름
+
+주의:
+
+- 기본값(`skip_download: false`)은 runner에서 Opinet 자동 다운로드 후 바로 현행화를 수행하므로 별도 소스 파일 업로드가 필요 없습니다.
+- `skip_download: true`를 사용하려면 저장소 안에 `현재 판매가격(주유소)*.xls/.xlsx` 파일이 있어야 합니다.
+- GitHub Actions 수동 실행 화면은 임의 파일 업로드를 직접 받지 않으므로, 기준 엑셀과 수동 소스 파일을 쓰려면 먼저 저장소에 커밋해 두어야 합니다.
+- 결과 파일은 저장소에 커밋되지 않고 Artifact로만 업로드됩니다.
+
 ## 빠른 사용
 
 1. 아래 파일과 실행 환경을 준비합니다.
