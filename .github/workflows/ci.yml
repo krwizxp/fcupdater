@@ -29,7 +29,7 @@ jobs:
       - name: Build Release Binary
         run: cargo build --release --all-features
       - name: Upload Binary Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: fcupdater-${{ matrix.os }}-rust-stable
           path: ${{ matrix.os == 'windows-latest' && 'target/release/fcupdater.exe' || 'target/release/fcupdater' }}
