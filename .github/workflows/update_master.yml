@@ -51,14 +51,10 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry and target
+      - name: Cache target directory
         uses: actions/cache@v5
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
+          path: target/
           key: ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Use GitHub runner WebDrivers
