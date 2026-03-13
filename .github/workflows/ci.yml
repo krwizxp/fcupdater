@@ -5,31 +5,83 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: ${{ matrix.os }} / rust-stable
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_path: artifacts/fcupdater-linux-x64.tar.gz
+          - os: windows-latest
+            artifact_path: artifacts/fcupdater-windows-x64.exe
+
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
       - name: Install Rust
+        id: toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-
+            ${{ runner.os }}-cargo-
+
       - name: Format
         run: cargo fmt --all -- --check
+
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Test
         run: cargo test --all-targets --all-features
+
       - name: Build Release Binary
         run: cargo build --release --all-features
+
+      - name: Prepare Linux artifact
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp target/release/fcupdater artifacts/fcupdater-linux-x64
+          tar -C artifacts -czf artifacts/fcupdater-linux-x64.tar.gz fcupdater-linux-x64
+
+      - name: Prepare Windows artifact
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Copy-Item target\release\fcupdater.exe artifacts\fcupdater-windows-x64.exe -Force
+
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: fcupdater-${{ matrix.os }}-rust-stable
-          path: ${{ matrix.os == 'windows-latest' && 'target/release/fcupdater.exe' || 'target/release/fcupdater' }}
+          path: ${{ matrix.artifact_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
