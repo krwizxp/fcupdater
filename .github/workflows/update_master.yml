@@ -29,7 +29,7 @@ on:
         default: false
         type: boolean
       artifact_name:
-        description: Uploaded artifact name
+        description: Output .xlsx filename prefix for the uploaded artifact
         required: true
         default: fcupdater-result
         type: string
@@ -39,16 +39,32 @@ permissions:
 
 jobs:
   update:
-    runs-on: windows-2025
+    runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
+        id: toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-
+            ${{ runner.os }}-cargo-
 
       - name: Prefer runner WebDrivers
         shell: pwsh
@@ -79,17 +95,28 @@ jobs:
         run: cargo build --release --all-features
 
       - name: Run updater
+        id: run_updater
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
+          $artifactStem = "${{ inputs.artifact_name }}"
+          if ([string]::IsNullOrWhiteSpace($artifactStem)) {
+            $artifactStem = "fcupdater-result"
+          }
+          $artifactStem = $artifactStem.Trim()
+          $artifactStem = $artifactStem -replace '[\\/:*?"<>|]', '-'
+
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          $outputPath = Join-Path $PWD "artifacts\fuel_cost_chungcheong_updated_actions.xlsx"
+          $outputPath = Join-Path $PWD ("artifacts\{0}.xlsx" -f $artifactStem)
+
           $args = @(
             "--master", "${{ inputs.master_path }}",
             "--sources-dir", ".",
             "--sources-prefix", "${{ inputs.sources_prefix }}",
             "--output", $outputPath
           )
+
           if ("${{ inputs.skip_download }}" -eq "true") {
             $args += "--skip-download"
           }
@@ -99,12 +126,15 @@ jobs:
           if ("${{ inputs.fast_save }}" -eq "true") {
             $args += "--fast-save"
           }
+
           & .\target\release\fcupdater.exe @args
+
+          "artifact_path=$outputPath" >> $env:GITHUB_OUTPUT
 
       - name: Upload result artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.artifact_name }}
-          path: artifacts\*.xlsx
+          path: ${{ steps.run_updater.outputs.artifact_path }}
+          archive: false
           if-no-files-found: error
           retention-days: 14
