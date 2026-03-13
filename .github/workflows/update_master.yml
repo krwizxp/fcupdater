@@ -49,9 +49,7 @@ jobs:
 
       - name: Install Rust
         id: toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry and target
         uses: actions/cache@v5
@@ -62,37 +60,52 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-
-            ${{ runner.os }}-cargo-
 
-      - name: Prefer runner WebDrivers
+      - name: Use GitHub runner WebDrivers
+        if: ${{ !inputs.skip_download }}
         shell: pwsh
         run: |
-          $chromeDriver = Get-Command chromedriver -ErrorAction SilentlyContinue
-          $edgeDriver = Get-Command msedgedriver -ErrorAction SilentlyContinue
-          if ($chromeDriver) {
-            Remove-Item chromedriver\chromedriver.exe -Force -ErrorAction SilentlyContinue
-          }
-          if ($edgeDriver) {
-            Remove-Item edgedriver\msedgedriver.exe -Force -ErrorAction SilentlyContinue
-          }
-          if (-not $chromeDriver -and -not $edgeDriver) {
-            Write-Warning "Runner PATH WebDrivers not found. Repository drivers will be used."
+          $ErrorActionPreference = "Stop"
+
+          function Resolve-RunnerDriver([string] $envVarName, [string] $fileName, [string] $commandName) {
+            $envValue = [Environment]::GetEnvironmentVariable($envVarName)
+            if (-not [string]::IsNullOrWhiteSpace($envValue)) {
+              $candidate = Join-Path $envValue $fileName
+              if (Test-Path $candidate) {
+                return (Resolve-Path $candidate).Path
+              }
+            }
+
+            $cmd = Get-Command $commandName -ErrorAction SilentlyContinue
+            if ($cmd) {
+              return $cmd.Source
+            }
+
+            return $null
           }
 
-      - name: Show browser and driver versions
-        shell: pwsh
-        run: |
-          $chrome = Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"
-          $edge = Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"
-          if (Test-Path $chrome) { & $chrome --version }
-          if (Test-Path $edge) { & $edge --version }
-          if (Get-Command chromedriver -ErrorAction SilentlyContinue) { chromedriver --version }
-          if (Get-Command msedgedriver -ErrorAction SilentlyContinue) { msedgedriver --version }
+          $chromeDriverSource = Resolve-RunnerDriver "CHROMEWEBDRIVER" "chromedriver.exe" "chromedriver"
+          $edgeDriverSource = Resolve-RunnerDriver "EDGEWEBDRIVER" "msedgedriver.exe" "msedgedriver"
+
+          Remove-Item chromedriver\chromedriver.exe -Force -ErrorAction SilentlyContinue
+          Remove-Item edgedriver\msedgedriver.exe -Force -ErrorAction SilentlyContinue
+
+          if ($chromeDriverSource) {
+            New-Item -ItemType Directory -Force chromedriver | Out-Null
+            Copy-Item $chromeDriverSource chromedriver\chromedriver.exe -Force
+          }
+
+          if ($edgeDriverSource) {
+            New-Item -ItemType Directory -Force edgedriver | Out-Null
+            Copy-Item $edgeDriverSource edgedriver\msedgedriver.exe -Force
+          }
+
+          if (-not $chromeDriverSource -and -not $edgeDriverSource) {
+            throw "GitHub runner WebDrivers not found."
+          }
 
       - name: Build release binary
-        run: cargo build --release --all-features
+        run: cargo build --release --locked
 
       - name: Run updater
         id: run_updater
