@@ -24,7 +24,7 @@ jobs:
           - os: ubuntu-latest
             artifact_path: artifacts/fcupdater-linux-x64.tar.gz
           - os: windows-latest
-            artifact_path: artifacts/fcupdater-windows-x64.exe
+            artifact_path: target/release/fcupdater-windows-x64.exe
 
     steps:
       - uses: actions/checkout@v6
@@ -42,15 +42,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts
-          cp target/release/fcupdater artifacts/fcupdater-linux-x64
-          tar -C artifacts -czf artifacts/fcupdater-linux-x64.tar.gz fcupdater-linux-x64
+          tar -C target/release --transform='s|^fcupdater$|fcupdater-linux-x64|' -czf artifacts/fcupdater-linux-x64.tar.gz fcupdater
 
-      - name: Prepare Windows artifact
+      - name: Rename Windows artifact file
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force artifacts | Out-Null
-          Copy-Item target\release\fcupdater.exe artifacts\fcupdater-windows-x64.exe -Force
+          Move-Item target\release\fcupdater.exe target\release\fcupdater-windows-x64.exe -Force
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v7

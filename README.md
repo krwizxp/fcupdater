@@ -40,19 +40,23 @@ cargo build --release
 
 ## GitHub Actions 실행파일
 
-- `.github/workflows/ci.yml`에서 `ubuntu-latest`, `windows-latest` 모두 `cargo build --release --all-features`를 수행합니다.
-- 각 Job 완료 후 실행파일이 Artifact로 업로드됩니다.
-- Artifact 이름:
-- `fcupdater-ubuntu-latest-rust-stable` (Linux binary: `fcupdater`)
-- `fcupdater-windows-latest-rust-stable` (Windows binary: `fcupdater.exe`)
+`.github/workflows/ci.yml`은 `ubuntu-latest`, `windows-latest`에서 각각 `cargo build --release --locked`를 수행하고 결과 실행 파일을 Artifact로 업로드합니다.
+
+- Linux Artifact 파일: `fcupdater-linux-x64.tar.gz`
+  - 내부 실행 파일: `fcupdater-linux-x64`
+- Windows Artifact 파일: `fcupdater-windows-x64.exe`
+
+Linux는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어 업로드합니다. Windows는 빌드 결과를 `fcupdater-windows-x64.exe`로 이름만 바꿔 그대로 업로드합니다.
 
 ## GitHub Actions 현행화 실행
 
 `.github/workflows/update_master.yml`은 GitHub Actions에서 마스터 엑셀을 직접 현행화하고 결과 `.xlsx`를 Artifact로 받는 수동 실행 워크플로입니다.
 
-- Runner: `windows-2025`
-- 브라우저/드라이버: GitHub runner에 기본 설치된 Chrome/Edge 및 WebDriver를 우선 사용
-- 결과물: `artifacts/fuel_cost_chungcheong_updated_actions.xlsx`
+- Runner: `windows-latest`
+- Rust: 최신 stable을 설치해 `cargo build --release --locked` 수행
+- 캐시: `target/`만 캐시
+- 브라우저/드라이버: `skip_download: false`일 때 GitHub runner에 기본 설치된 최신 Chrome/Edge 및 대응 WebDriver를 우선 사용
+- 결과물: `artifacts/<artifact_name>.xlsx` (기본: `artifacts/fcupdater-result.xlsx`)
 
 실행 방법:
 
@@ -67,7 +71,7 @@ cargo build --release
 - `skip_download`: `true`이면 Opinet 자동 다운로드를 생략하고 저장소 안의 기존 소스 파일만 사용
 - `no_change_log`: `true`이면 `변경내역` 시트를 갱신하지 않음
 - `fast_save`: `true`이면 저장 후 무결성 재검증 생략
-- `artifact_name`: 업로드할 Artifact 이름
+- `artifact_name`: 업로드할 결과 파일 이름 prefix (`<artifact_name>.xlsx`로 업로드)
 
 주의:
 
