@@ -95,7 +95,7 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
             let value: &str = value
                 .try_into()
                 .map_err(|_| err("--sources-prefix 값은 UTF-8 문자열이어야 합니다."))?;
-            args.sources_prefix = value.to_string();
+            args.sources_prefix = parse_sources_prefix(value)?;
         } else if token == OsStr::new("--output") {
             let value = take_option_value(raw_args, &mut i, "--output")?;
             set_output_target_explicit(&mut args.output_target, PathBuf::from(value))?;
@@ -105,7 +105,7 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
             } else if let Some(v) = token_str.strip_prefix("--sources-dir=") {
                 args.sources_dir = PathBuf::from(v);
             } else if let Some(v) = token_str.strip_prefix("--sources-prefix=") {
-                args.sources_prefix = v.to_string();
+                args.sources_prefix = parse_sources_prefix(v)?;
             } else if let Some(v) = token_str.strip_prefix("--output=") {
                 set_output_target_explicit(&mut args.output_target, PathBuf::from(v))?;
             } else {
@@ -171,11 +171,44 @@ fn take_option_value<'a>(
 fn is_long_option_token(value: &OsStr) -> bool {
     value.to_str().is_some_and(|s| s.starts_with("--"))
 }
+fn parse_sources_prefix(value: &str) -> Result<String> {
+    validate_sources_prefix(value)?;
+    Ok(value.to_string())
+}
+fn validate_sources_prefix(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(err("--sources-prefix 는 비어 있을 수 없습니다."));
+    }
+    if matches!(value, "." | "..") {
+        return Err(err(
+            "--sources-prefix 에는 '.' 또는 '..' 를 사용할 수 없습니다.",
+        ));
+    }
+    if value.chars().any(|ch| matches!(ch, '/' | '\\')) {
+        return Err(err(
+            "--sources-prefix 에는 경로 구분자(/, \\\\)를 사용할 수 없습니다.",
+        ));
+    }
+    if value
+        .chars()
+        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err(err(
+            "--sources-prefix 에는 파일명에 사용할 수 없는 문자를 넣을 수 없습니다. (< > : \" | ? *)",
+        ));
+    }
+    if value.ends_with(' ') || value.ends_with('.') {
+        return Err(err(
+            "--sources-prefix 는 공백 또는 '.'으로 끝날 수 없습니다.",
+        ));
+    }
+    Ok(())
+}
 fn usage_text() -> String {
     let mut out = format!(
         "{APP_NAME} {APP_VERSION}\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n\
 사용법:\n  {APP_NAME} [OPTIONS]\n\n\
-옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일 접두어 (기본: 현재 판매가격(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음"
+옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일명 접두어 (경로 아님, 기본: 현재 판매가격(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --sources-prefix 는 파일명 접두어만 허용 (경로 구분자, Windows 금지 문자, 끝 공백/점 불가)\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음"
     );
     out.push_str(
         "\n\n환경 변수(선택):\n  FCUPDATER_SOURCE_HEADER_SCAN_ROWS\n  FCUPDATER_MASTER_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_COLS\n  FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW\n  FCUPDATER_CP949_STRICT\n  FCUPDATER_DURABILITY_STRICT",

@@ -9,7 +9,7 @@ on:
         default: fuel_cost_chungcheong.xlsx
         type: string
       sources_prefix:
-        description: Source file prefix
+        description: Source filename prefix only (not a path)
         required: true
         default: 현재 판매가격(주유소)
         type: string
