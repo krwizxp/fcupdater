@@ -1,5 +1,4 @@
 name: Update Master Excel
-
 on:
   workflow_dispatch:
     inputs:
@@ -33,29 +32,23 @@ on:
         required: true
         default: fcupdater-result
         type: string
-
 permissions:
   contents: read
-
 jobs:
   update:
     runs-on: windows-latest
     timeout-minutes: 30
-
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
       - name: Use GitHub runner WebDrivers
         if: ${{ !inputs.skip_download }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
           function Resolve-RunnerDriver([string] $envVarName, [string] $fileName, [string] $commandName) {
             $envValue = [Environment]::GetEnvironmentVariable($envVarName)
             if (-not [string]::IsNullOrWhiteSpace($envValue)) {
@@ -64,75 +57,40 @@ jobs:
                 return (Resolve-Path $candidate).Path
               }
             }
-
             $cmd = Get-Command $commandName -ErrorAction SilentlyContinue
             if ($cmd) {
               return $cmd.Source
             }
-
             return $null
           }
-
           $chromeDriverSource = Resolve-RunnerDriver "CHROMEWEBDRIVER" "chromedriver.exe" "chromedriver"
           $edgeDriverSource = Resolve-RunnerDriver "EDGEWEBDRIVER" "msedgedriver.exe" "msedgedriver"
-
           Remove-Item chromedriver\chromedriver.exe -Force -ErrorAction SilentlyContinue
           Remove-Item edgedriver\msedgedriver.exe -Force -ErrorAction SilentlyContinue
-
           if ($chromeDriverSource) {
             New-Item -ItemType Directory -Force chromedriver | Out-Null
             Copy-Item $chromeDriverSource chromedriver\chromedriver.exe -Force
           }
-
           if ($edgeDriverSource) {
             New-Item -ItemType Directory -Force edgedriver | Out-Null
             Copy-Item $edgeDriverSource edgedriver\msedgedriver.exe -Force
           }
-
           if (-not $chromeDriverSource -and -not $edgeDriverSource) {
             throw "GitHub runner WebDrivers not found."
           }
-
       - name: Build release binary
         run: cargo build --release --locked
-
       - name: Run updater
         id: run_updater
         shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $artifactStem = "${{ inputs.artifact_name }}"
-          if ([string]::IsNullOrWhiteSpace($artifactStem)) {
-            $artifactStem = "fcupdater-result"
-          }
-          $artifactStem = $artifactStem.Trim()
-          $artifactStem = $artifactStem -replace '[\\/:*?"<>|]', '-'
-
-          New-Item -ItemType Directory -Force artifacts | Out-Null
-          $outputPath = Join-Path $PWD ("artifacts\{0}.xlsx" -f $artifactStem)
-
-          $args = @(
-            "--master", "${{ inputs.master_path }}",
-            "--sources-dir", ".",
-            "--sources-prefix", "${{ inputs.sources_prefix }}",
-            "--output", $outputPath
-          )
-
-          if ("${{ inputs.skip_download }}" -eq "true") {
-            $args += "--skip-download"
-          }
-          if ("${{ inputs.no_change_log }}" -eq "true") {
-            $args += "--no-change-log"
-          }
-          if ("${{ inputs.fast_save }}" -eq "true") {
-            $args += "--fast-save"
-          }
-
-          & .\target\release\fcupdater.exe @args
-
-          "artifact_path=$outputPath" >> $env:GITHUB_OUTPUT
-
+        env:
+          FCUPDATER_MASTER_PATH: ${{ inputs.master_path }}
+          FCUPDATER_SOURCES_PREFIX: ${{ inputs.sources_prefix }}
+          FCUPDATER_SKIP_DOWNLOAD: ${{ inputs.skip_download }}
+          FCUPDATER_NO_CHANGE_LOG: ${{ inputs.no_change_log }}
+          FCUPDATER_FAST_SAVE: ${{ inputs.fast_save }}
+          FCUPDATER_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: .\.github\scripts\run-update-master.ps1
       - name: Upload result artifact
         uses: actions/upload-artifact@v7
         with:

@@ -1,17 +1,13 @@
 name: CI
-
 on:
   push:
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-
 jobs:
   build:
     name: ${{ matrix.os }} / rust-stable
@@ -25,31 +21,25 @@ jobs:
             artifact_path: artifacts/fcupdater-linux-x64.tar.gz
           - os: windows-latest
             artifact_path: target/release/fcupdater-windows-x64.exe
-
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
       - name: Build Release Binary
         run: cargo build --release --locked
-
       - name: Prepare Linux artifact
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
           mkdir -p artifacts
           tar -C target/release --transform='s|^fcupdater$|fcupdater-linux-x64|' -czf artifacts/fcupdater-linux-x64.tar.gz fcupdater
-
       - name: Rename Windows artifact file
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           Move-Item target\release\fcupdater.exe target\release\fcupdater-windows-x64.exe -Force
-
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v7
         with:

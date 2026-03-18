@@ -8,7 +8,6 @@ license = "UNLICENSED"
 repository = "https://github.com/krwizxp/fcupdater"
 keywords = ["excel", "xlsx", "xls", "cli", "sync"]
 categories = ["command-line-utilities", "encoding"]
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
