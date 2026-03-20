@@ -15,8 +15,8 @@ pub struct Workbook {
     xml_text: String,
     shared_strings_xml_text: Option<String>,
     shared_strings: Vec<String>,
-    sheet_paths: HashMap<String, String>,
-    sheets: HashMap<String, Worksheet>,
+    sheet_paths: BTreeMap<String, String>,
+    sheets: BTreeMap<String, Worksheet>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct Worksheet {
@@ -34,8 +34,8 @@ pub struct Cell {
     pub attrs: Vec<(String, String)>,
     pub inner_xml: Option<String>,
 }
-const MAX_A1_COL: u32 = 16_384;
-const MAX_A1_ROW: u32 = 1_048_576;
+const MAX_A1_COL: u32 = 0x4000;
+const MAX_A1_ROW: u32 = 0x0010_0000;
 impl Workbook {
     pub fn open(path: &Path) -> Result<Self> {
         let container = XlsxContainer::open_for_update(path)?;
@@ -52,8 +52,8 @@ impl Workbook {
             None
         };
         let shared_strings = load_shared_strings(&container)?;
-        let mut sheet_paths = HashMap::new();
-        let mut sheets = HashMap::new();
+        let mut sheet_paths = BTreeMap::new();
+        let mut sheets = BTreeMap::new();
         for sheet_name in &catalog.sheet_order {
             let Some(sheet_path) = catalog.sheet_name_to_path.get(sheet_name) else {
                 continue;
@@ -75,11 +75,10 @@ impl Workbook {
     pub const fn workbook_xml_mut(&mut self) -> &mut String {
         &mut self.xml_text
     }
-    pub fn with_sheet_mut<R>(
-        &mut self,
-        name: &str,
-        f: impl FnOnce(&mut Worksheet, &[String]) -> R,
-    ) -> Option<R> {
+    pub fn with_sheet_mut<R, F>(&mut self, name: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Worksheet, &[String]) -> R,
+    {
         let (shared_strings, sheets) = (&self.shared_strings, &mut self.sheets);
         let ws = sheets.get_mut(name)?;
         Some(f(ws, shared_strings))
@@ -89,7 +88,7 @@ impl Workbook {
         self.request_full_recalculation()?;
         self.container
             .write_text("xl/workbook.xml", &self.xml_text)?;
-        if let Some(shared_strings_xml) = &self.shared_strings_xml_text {
+        if let Some(shared_strings_xml) = self.shared_strings_xml_text.as_ref() {
             self.container
                 .write_text("xl/sharedStrings.xml", shared_strings_xml)?;
         }
@@ -113,7 +112,7 @@ impl Workbook {
         let existing_unique = unique_string_count(&self.shared_strings);
         let mut index_map: HashMap<String, usize> = HashMap::new();
         for (idx, value) in self.shared_strings.iter().enumerate() {
-            let _ = index_map.entry(value.clone()).or_insert(idx);
+            index_map.entry(value.clone()).or_insert(idx);
         }
         let mut newly_appended_shared_strings = Vec::new();
         for sheet in self.sheets.values_mut() {
@@ -137,7 +136,7 @@ impl Workbook {
                         newly_appended_shared_strings.push(text);
                         idx
                     };
-                    set_attr(&mut cell.attrs, "t", "s".to_string());
+                    set_attr(&mut cell.attrs, "t", "s".to_owned());
                     cell.inner_xml = Some(format!("<v>{shared_idx}</v>"));
                 }
             }
@@ -207,7 +206,7 @@ impl Worksheet {
     }
     pub fn set_string_at(&mut self, col: u32, row: u32, value: &str) {
         let cell = self.get_or_create_cell_mut(col, row);
-        set_attr(&mut cell.attrs, "t", "inlineStr".to_string());
+        set_attr(&mut cell.attrs, "t", "inlineStr".to_owned());
         let text = xml_escape_text(value);
         let preserve = needs_xml_space_preserve(value);
         let inner = if preserve {
@@ -343,7 +342,7 @@ impl Worksheet {
     }
     pub fn get_or_create_cell_mut(&mut self, col: u32, row: u32) -> &mut Cell {
         let row_obj = self.rows.entry(row).or_insert_with(|| Row {
-            attrs: vec![("r".to_string(), row.to_string())],
+            attrs: vec![("r".to_owned(), row.to_string())],
             cells: BTreeMap::new(),
         });
         if get_attr(&row_obj.attrs, "r").is_none() {
@@ -351,8 +350,8 @@ impl Worksheet {
         }
         row_obj.cells.entry(col).or_insert_with(|| Cell {
             attrs: vec![
-                ("r".to_string(), format!("{}{}", col_to_name(col), row)),
-                ("s".to_string(), "0".to_string()),
+                ("r".to_owned(), format!("{}{}", col_to_name(col), row)),
+                ("s".to_owned(), "0".to_owned()),
             ],
             inner_xml: None,
         })
@@ -373,7 +372,7 @@ pub fn remap_row_numbers(row: &mut Row, new_row: u32, resolver: &dyn Fn(u32) -> 
 }
 pub fn rewrite_formula_rows(formula: &str, resolver: &dyn Fn(u32) -> u32) -> String {
     let chars: Vec<char> = formula.chars().collect();
-    let mut i = 0usize;
+    let mut i = 0_usize;
     let mut out = String::with_capacity(formula.len());
     let mut in_string = false;
     while let Some(&ch) = chars.get(i) {
@@ -420,7 +419,7 @@ pub fn rewrite_formula_rows(formula: &str, resolver: &dyn Fn(u32) -> u32) -> Str
 }
 pub fn col_to_name(mut col: u32) -> String {
     if col == 0 {
-        return "A".to_string();
+        return "A".to_owned();
     }
     let mut rev = Vec::new();
     while col > 0 {
@@ -435,7 +434,7 @@ pub fn col_to_name(mut col: u32) -> String {
     out
 }
 pub fn name_to_col(name: &str) -> Option<u32> {
-    let mut out = 0u32;
+    let mut out = 0_u32;
     if name.is_empty() {
         return None;
     }
@@ -452,7 +451,7 @@ pub fn name_to_col(name: &str) -> Option<u32> {
 }
 fn parse_rows_from_sheet_data(body: &str) -> Result<BTreeMap<u32, Row>> {
     let mut rows = BTreeMap::new();
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while let Some(row_open_rel) = body[cursor..].find("<row") {
         let row_open = cursor + row_open_rel;
         let Some(row_tag_end_rel) = body[row_open..].find('>') else {
@@ -497,8 +496,8 @@ fn parse_rows_from_sheet_data(body: &str) -> Result<BTreeMap<u32, Row>> {
     Ok(rows)
 }
 fn parse_row_cells(row_body: &str, row_num: u32, row: &mut Row) -> Result<()> {
-    let mut cursor = 0usize;
-    let mut next_col = 1u32;
+    let mut cursor = 0_usize;
+    let mut next_col = 1_u32;
     while let Some(cell_open_rel) = row_body[cursor..].find("<c") {
         let cell_open = cursor + cell_open_rel;
         let Some(cell_tag_end_rel) = row_body[cell_open..].find('>') else {
@@ -568,7 +567,7 @@ fn cell_to_xml(cell: &Cell) -> String {
     let mut out = String::new();
     out.push_str("<c");
     out.push_str(&attrs_to_xml(&attrs));
-    if let Some(inner) = &cell.inner_xml {
+    if let Some(inner) = cell.inner_xml.as_ref() {
         out.push('>');
         out.push_str(inner);
         out.push_str("</c>");
@@ -604,11 +603,11 @@ fn attr_sort_key(name: &str) -> (u8, &str) {
 }
 fn attrs_to_xml(attrs: &[(String, String)]) -> String {
     let mut out = String::new();
-    for (name, value) in attrs {
+    for attr in attrs {
         out.push(' ');
-        out.push_str(name);
+        out.push_str(&attr.0);
         out.push_str("=\"");
-        out.push_str(&xml_escape_attr(value));
+        out.push_str(&xml_escape_attr(&attr.1));
         out.push('"');
     }
     out
@@ -702,7 +701,7 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<(String, String)>> {
             ))
         })?;
         let value = decode_xml_entities(raw_value);
-        out.push((key.to_string(), value));
+        out.push((key.to_owned(), value));
         if i < bytes.len() {
             i += 1;
         }
@@ -712,19 +711,19 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<(String, String)>> {
 fn get_attr<'attrs>(attrs: &'attrs [(String, String)], name: &str) -> Option<&'attrs str> {
     attrs
         .iter()
-        .find_map(|(k, v)| if k == name { Some(v.as_str()) } else { None })
+        .find_map(|attr| (attr.0 == name).then_some(attr.1.as_str()))
 }
 fn set_attr(attrs: &mut Vec<(String, String)>, name: &str, value: String) {
-    for (k, v) in attrs.iter_mut() {
-        if k == name {
-            *v = value;
+    for attr in attrs.iter_mut() {
+        if attr.0 == name {
+            attr.1 = value;
             return;
         }
     }
-    attrs.push((name.to_string(), value));
+    attrs.push((name.to_owned(), value));
 }
 fn remove_attr(attrs: &mut Vec<(String, String)>, name: &str) {
-    attrs.retain(|(k, _)| k != name);
+    attrs.retain(|attr| attr.0 != name);
 }
 fn parse_cell_ref(cell_ref: &str) -> Option<(u32, u32)> {
     let mut col_s = String::new();
@@ -762,19 +761,19 @@ fn cell_display_value(cell: &Cell, shared_strings: &[String]) -> Option<String> 
     }
     if matches!(cell_type, Some("b")) {
         return Some(if decoded == "1" {
-            "TRUE".to_string()
+            "TRUE".to_owned()
         } else {
-            "FALSE".to_string()
+            "FALSE".to_owned()
         });
     }
     Some(decoded)
 }
 fn rewrite_formula_rows_in_inner(inner_xml: &str, resolver: &dyn Fn(u32) -> u32) -> String {
-    let mut out = inner_xml.to_string();
+    let mut out = inner_xml.to_owned();
     if let Some(text) = extract_first_tag_text(&out, "f") {
         let rewritten = rewrite_formula_rows(&decode_xml_entities(&text), resolver);
         let encoded = xml_escape_text(&rewritten);
-        let _ = replace_first_tag_text(&mut out, "f", &encoded);
+        replace_first_tag_text(&mut out, "f", &encoded);
     }
     out
 }
@@ -811,7 +810,7 @@ fn needs_xml_space_preserve(s: &str) -> bool {
 fn unique_string_count(values: &[String]) -> usize {
     let mut seen: HashSet<&str> = HashSet::new();
     for value in values {
-        let _ = seen.insert(value);
+        seen.insert(value);
     }
     seen.len()
 }
@@ -835,7 +834,7 @@ fn append_shared_strings_xml(
     existing_unique: usize,
 ) -> Result<String> {
     if new_values.is_empty() {
-        return Ok(original_xml.to_string());
+        return Ok(original_xml.to_owned());
     }
     let Some(open_start) = find_start_tag(original_xml, "sst", 0) else {
         return Err(err("sharedStrings XML에 <sst>가 없습니다."));
@@ -859,12 +858,12 @@ fn append_shared_strings_xml(
     }
     if open_tag.trim_end().ends_with("/>") {
         let replacement = format!("<sst{}>{new_si_xml}</sst>", attrs_to_xml(&attrs));
-        let mut out = original_xml.to_string();
+        let mut out = original_xml.to_owned();
         out.replace_range(open_start..=open_end, &replacement);
         return Ok(out);
     }
     let new_open_tag = format!("<sst{}>", attrs_to_xml(&attrs));
-    let mut out = original_xml.to_string();
+    let mut out = original_xml.to_owned();
     out.replace_range(open_start..=open_end, &new_open_tag);
     let close_search_from = open_start + new_open_tag.len();
     let Some(close_start) = find_end_tag(&out, "sst", close_search_from) else {
@@ -882,7 +881,7 @@ fn shared_string_si_xml(value: &str) -> String {
     }
 }
 fn update_dimension_ref_xml(prefix_xml: &str, start_ref: &str, end_ref: &str) -> Result<String> {
-    let mut out = prefix_xml.to_string();
+    let mut out = prefix_xml.to_owned();
     if let Some(dim_pos) = out.find("<dimension")
         && let Some(dim_end_rel) = out[dim_pos..].find('>')
     {
@@ -898,12 +897,12 @@ fn update_dimension_ref_xml(prefix_xml: &str, start_ref: &str, end_ref: &str) ->
 }
 fn update_calc_pr_xml(workbook_xml: &str) -> Result<String> {
     let set_calc_pr_attrs = |attrs: &mut Vec<(String, String)>| {
-        set_attr(attrs, "calcMode", "auto".to_string());
-        set_attr(attrs, "fullCalcOnLoad", "1".to_string());
-        set_attr(attrs, "forceFullCalc", "1".to_string());
-        set_attr(attrs, "calcCompleted", "0".to_string());
+        set_attr(attrs, "calcMode", "auto".to_owned());
+        set_attr(attrs, "fullCalcOnLoad", "1".to_owned());
+        set_attr(attrs, "forceFullCalc", "1".to_owned());
+        set_attr(attrs, "calcCompleted", "0".to_owned());
     };
-    let mut out = workbook_xml.to_string();
+    let mut out = workbook_xml.to_owned();
     if let Some(calc_pr_start) = find_start_tag(&out, "calcPr", 0) {
         let Some(calc_pr_tag_end) = find_tag_end(&out, calc_pr_start) else {
             return Err(err("workbook.xml의 calcPr 태그가 손상되었습니다."));
@@ -939,8 +938,8 @@ fn extend_conditional_formats_in_suffix(
     target_cols: &[u32],
     data_start_row: u32,
 ) -> Result<String> {
-    let mut out = suffix.to_string();
-    let mut cursor = 0usize;
+    let mut out = suffix.to_owned();
+    let mut cursor = 0_usize;
     while let Some(cf_rel) = out[cursor..].find("<conditionalFormatting") {
         let cf_start = cursor + cf_rel;
         let Some(cf_end_rel) = out[cf_start..].find('>') else {
@@ -978,12 +977,12 @@ fn extend_sqref_ranges(
         let Some((start_col, start_row, start_col_lock, start_row_lock)) =
             parse_ref_with_locks(&start_ref)
         else {
-            ranges_out.push(token.to_string());
+            ranges_out.push(token.to_owned());
             continue;
         };
         let Some((end_col, end_row, end_col_lock, end_row_lock)) = parse_ref_with_locks(&end_ref)
         else {
-            ranges_out.push(token.to_string());
+            ranges_out.push(token.to_owned());
             continue;
         };
         let col_min = start_col.min(end_col);
@@ -993,7 +992,7 @@ fn extend_sqref_ranges(
             .iter()
             .any(|col| *col >= col_min && *col <= col_max);
         if !overlaps_target_col || row_max < data_start_row || row_max >= last_data_row {
-            ranges_out.push(token.to_string());
+            ranges_out.push(token.to_owned());
             continue;
         }
         let (new_start_row, new_end_row) = if start_row <= end_row {
@@ -1009,14 +1008,14 @@ fn extend_sqref_ranges(
     if changed {
         ranges_out.join(" ")
     } else {
-        sqref.to_string()
+        sqref.to_owned()
     }
 }
 fn parse_range_token(token: &str) -> (String, String) {
     if let Some((a, b)) = token.split_once(':') {
-        (a.to_string(), b.to_string())
+        (a.to_owned(), b.to_owned())
     } else {
-        (token.to_string(), token.to_string())
+        (token.to_owned(), token.to_owned())
     }
 }
 fn take_while_next_if_map(
@@ -1111,7 +1110,7 @@ fn try_parse_and_rewrite_cell_ref(
         .take(i - col_start)
         .copied()
         .collect();
-    let _ = parse_a1_col_index(&col_text)?;
+    parse_a1_col_index(&col_text)?;
     let mut row_lock = false;
     if chars.get(i) == Some(&'$') {
         row_lock = true;

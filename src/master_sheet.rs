@@ -54,7 +54,7 @@ struct RankSortKey {
     address: String,
 }
 fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
-    value.filter(|v| *v > 0)
+    value.filter(|v| *v > 0_i32)
 }
 fn evaluate_master_row(
     ws: &excel::writer::Worksheet,
@@ -66,15 +66,15 @@ fn evaluate_master_row(
     let region = ws
         .get_display_at(layout.region, old_row, shared_strings)
         .trim()
-        .to_string();
+        .to_owned();
     let name = ws
         .get_display_at(layout.name, old_row, shared_strings)
         .trim()
-        .to_string();
+        .to_owned();
     let addr = ws
         .get_display_at(layout.address, old_row, shared_strings)
         .trim()
-        .to_string();
+        .to_owned();
     if addr.is_empty() {
         return MasterRowDecision {
             src: None,
@@ -110,11 +110,11 @@ fn evaluate_master_row(
     let old_brand = ws
         .get_display_at(layout.brand, old_row, shared_strings)
         .trim()
-        .to_string();
+        .to_owned();
     let old_self_yn = ws
         .get_display_at(layout.self_yn, old_row, shared_strings)
         .trim()
-        .to_string();
+        .to_owned();
     let old_gas = normalize_fuel_price(ws.get_i32_at(layout.gasoline, old_row, shared_strings));
     let old_premium = normalize_fuel_price(ws.get_i32_at(layout.premium, old_row, shared_strings));
     let old_diesel = normalize_fuel_price(ws.get_i32_at(layout.diesel, old_row, shared_strings));
@@ -178,7 +178,7 @@ fn build_change_row_if_needed(
     }
     Some(ChangeRow {
         reason: reasons.join(", "),
-        region: old.region.to_string(),
+        region: old.region.to_owned(),
         name: src.name.clone(),
         address: src.address.clone(),
         old_gasoline: old.gasoline,
@@ -318,8 +318,9 @@ fn collect_new_sources(
 ) -> Vec<SourceRecord> {
     let mut new_sources: Vec<(String, SourceRecord)> = source_index
         .iter()
-        .filter(|(key, _)| !matched_source_keys.contains(*key))
-        .map(|(_, rec)| {
+        .filter(|entry| !matched_source_keys.contains(entry.0.as_str()))
+        .map(|entry| {
+            let rec = entry.1;
             (
                 crate::display_region_label_from_source(&rec.region, &rec.address),
                 rec.clone(),
@@ -441,7 +442,7 @@ fn build_deleted_rows(
     old_rows: &[u32],
     kept_source_rows: &[(u32, Option<SourceRecord>)],
 ) -> Vec<u32> {
-    let kept_old_rows: HashSet<u32> = kept_source_rows.iter().map(|(r, _)| *r).collect();
+    let kept_old_rows: HashSet<u32> = kept_source_rows.iter().map(|entry| entry.0).collect();
     let mut deleted_rows: Vec<u32> = old_rows
         .iter()
         .copied()
@@ -486,13 +487,15 @@ fn place_kept_rows(
     row_mapper: &RowMapper,
 ) -> Result<Vec<KeptMasterRow>> {
     let mut kept_rows: Vec<KeptMasterRow> = vec![];
-    for (i, (old_row, src)) in kept_source_rows.iter().enumerate() {
+    for (i, kept_source_row) in kept_source_rows.iter().enumerate() {
+        let old_row = kept_source_row.0;
+        let src = &kept_source_row.1;
         let new_row = add_row_offset(data_start_row, i, "유류비 기존행 재배치")?;
         let mut row_obj = original_rows
-            .get(old_row)
+            .get(&old_row)
             .cloned()
-            .unwrap_or_else(|| default_row(*old_row));
-        let old_row_value = *old_row;
+            .unwrap_or_else(|| default_row(old_row));
+        let old_row_value = old_row;
         let resolver = |old_ref_row: u32| {
             if old_ref_row == old_row_value {
                 new_row
@@ -545,15 +548,17 @@ fn write_source_rows_to_master(
     layout: MasterSheetLayout,
 ) {
     for plan in kept_rows {
-        if let Some(src) = &plan.src {
+        if let Some(src) = plan.src.as_ref() {
             write_master_row_from_source(ws, plan.new_row, src, layout);
         }
     }
-    for (new_row, src) in new_rows_from_sources {
-        write_master_row_from_source(ws, *new_row, src, layout);
+    for source_row in new_rows_from_sources {
+        let new_row = source_row.0;
+        let src = &source_row.1;
+        write_master_row_from_source(ws, new_row, src, layout);
         let region_label = crate::display_region_label_from_source(&src.region, &src.address);
         if !region_label.trim().is_empty() {
-            ws.set_string_at(layout.region, *new_row, &region_label);
+            ws.set_string_at(layout.region, new_row, &region_label);
         }
     }
 }
@@ -578,9 +583,10 @@ fn sort_master_rows_by_rank(
     }
     data_rows.sort_by(|a, b| compare_rank_sort_key(&a.1, &b.1));
     let mut row_mapping = HashMap::with_capacity(data_rows.len());
-    for (index, (old_row, _)) in data_rows.iter().enumerate() {
+    for (index, data_row) in data_rows.iter().enumerate() {
+        let old_row = data_row.0;
         let new_row = add_row_offset(data_start_row, index, "유류비 정렬 재배치")?;
-        row_mapping.insert(*old_row, new_row);
+        row_mapping.insert(old_row, new_row);
     }
     let mut detached_rows = HashMap::with_capacity(data_rows.len());
     for old_row in data_start_row..=data_end_row {
@@ -611,12 +617,12 @@ fn build_rank_sort_context(
     ws: &excel::writer::Worksheet,
     shared_strings: &[String],
 ) -> RankSortContext {
-    let gasoline_qty = get_f64_at(ws, 2, 4, shared_strings).unwrap_or(0.0);
-    let premium_qty = get_f64_at(ws, 2, 5, shared_strings).unwrap_or(0.0);
-    let diesel_qty = get_f64_at(ws, 2, 6, shared_strings).unwrap_or(0.0);
+    let gasoline_qty = get_f64_at(ws, 2, 4, shared_strings).unwrap_or(0.0_f64);
+    let premium_qty = get_f64_at(ws, 2, 5, shared_strings).unwrap_or(0.0_f64);
+    let diesel_qty = get_f64_at(ws, 2, 6, shared_strings).unwrap_or(0.0_f64);
     let mut region_rates = HashMap::new();
     for row in 4..=13 {
-        let region = ws.get_display_at(3, row, shared_strings).trim().to_string();
+        let region = ws.get_display_at(3, row, shared_strings).trim().to_owned();
         if region.is_empty() {
             continue;
         }
@@ -635,7 +641,7 @@ fn build_rank_sort_context(
         premium_qty,
         diesel_qty,
         total_qty,
-        smart_discount: get_f64_at(ws, 2, 13, shared_strings).unwrap_or(0.0),
+        smart_discount: get_f64_at(ws, 2, 13, shared_strings).unwrap_or(0.0_f64),
         region_rates,
     }
 }
@@ -659,7 +665,7 @@ fn compute_rank_sort_key(
     let discount = if is_direct_hyundai {
         sort_context.smart_discount
     } else {
-        0.0
+        0.0_f64
     };
     let adjusted_gasoline = gasoline.map(f64::from).map(|value| value + discount);
     let adjusted_premium = premium.map(f64::from).map(|value| value + discount);
@@ -673,13 +679,13 @@ fn compute_rank_sort_key(
             .region_rates
             .get(region.trim())
             .copied()
-            .unwrap_or(0.0)
+            .unwrap_or(0.0_f64)
     } else {
-        0.0
+        0.0_f64
     };
-    let regional_adjusted_gasoline = adjusted_gasoline.map(|value| value * (1.0 - region_rate));
-    let regional_adjusted_premium = adjusted_premium.map(|value| value * (1.0 - region_rate));
-    let regional_adjusted_diesel = adjusted_diesel.map(|value| value * (1.0 - region_rate));
+    let regional_adjusted_gasoline = adjusted_gasoline.map(|value| value * (1.0_f64 - region_rate));
+    let regional_adjusted_premium = adjusted_premium.map(|value| value * (1.0_f64 - region_rate));
+    let regional_adjusted_diesel = adjusted_diesel.map(|value| value * (1.0_f64 - region_rate));
     let rank_total = sort_context.total_qty.and_then(|total_qty| {
         (!is_zero(total_qty))
             .then_some(total_qty)
@@ -736,14 +742,14 @@ fn compute_total_price(
     diesel_qty: f64,
     adjusted_diesel: Option<f64>,
 ) -> Option<f64> {
-    let mut total = 0.0;
-    if gasoline_qty > 0.0 {
+    let mut total = 0.0_f64;
+    if gasoline_qty > 0.0_f64 {
         total += gasoline_qty * adjusted_gasoline?;
     }
-    if premium_qty > 0.0 {
+    if premium_qty > 0.0_f64 {
         total += premium_qty * adjusted_premium?;
     }
-    if diesel_qty > 0.0 {
+    if diesel_qty > 0.0_f64 {
         total += diesel_qty * adjusted_diesel?;
     }
     Some(total)
@@ -879,7 +885,7 @@ fn count_deleted_le(sorted_deleted_rows: &[u32], row: u32) -> usize {
 }
 fn default_row(row_num: u32) -> StdRow {
     StdRow {
-        attrs: vec![("r".to_string(), row_num.to_string())],
+        attrs: vec![("r".to_owned(), row_num.to_string())],
         cells: std::collections::BTreeMap::new(),
     }
 }
@@ -926,7 +932,7 @@ fn rewrite_rank_formula_range(
     let sort_key_col_name = excel::writer::col_to_name(sort_key_col);
     let range_marker = format!("${sort_key_col_name}$");
     let Some(first_col_pos) = formula.find(&range_marker) else {
-        return formula.to_string();
+        return formula.to_owned();
     };
     let start_digits_start = first_col_pos + range_marker.len();
     let start_digits_len = formula[start_digits_start..]
@@ -934,14 +940,14 @@ fn rewrite_rank_formula_range(
         .take_while(char::is_ascii_digit)
         .count();
     if start_digits_len == 0 {
-        return formula.to_string();
+        return formula.to_owned();
     }
     let second_col_pos = start_digits_start + start_digits_len + 1;
     if !formula
         .get(second_col_pos..)
         .is_some_and(|tail| tail.starts_with(&range_marker))
     {
-        return formula.to_string();
+        return formula.to_owned();
     }
     let end_digits_start = second_col_pos + range_marker.len();
     let end_digits_len = formula[end_digits_start..]
@@ -949,7 +955,7 @@ fn rewrite_rank_formula_range(
         .take_while(char::is_ascii_digit)
         .count();
     if end_digits_len == 0 {
-        return formula.to_string();
+        return formula.to_owned();
     }
     let end_digits_end = end_digits_start + end_digits_len;
     format!(

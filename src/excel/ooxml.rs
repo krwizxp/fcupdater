@@ -84,7 +84,7 @@ fn parse_relationship_targets(rels_xml: &str) -> HashMap<String, String> {
 }
 fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
     let mut out = vec![];
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while let Some(si_start) = find_start_tag(xml, "si", cursor) {
         let Some(si_tag_end) = find_tag_end(xml, si_start) else {
             break;
@@ -104,7 +104,7 @@ fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
 }
 fn iter_start_tags<'xml>(xml: &'xml str, tag_name: &str) -> Vec<&'xml str> {
     let mut out = vec![];
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while let Some(start) = find_start_tag(xml, tag_name, cursor) {
         let Some(end) = find_tag_end(xml, start) else {
             break;
@@ -116,7 +116,7 @@ fn iter_start_tags<'xml>(xml: &'xml str, tag_name: &str) -> Vec<&'xml str> {
 }
 fn resolve_ooxml_target(base_file: &str, target: &str) -> String {
     if target.starts_with('/') {
-        return target.trim_start_matches('/').to_string();
+        return target.trim_start_matches('/').to_owned();
     }
     let mut base = PathBuf::from(base_file);
     base.pop();
@@ -138,7 +138,10 @@ fn normalize_path(path: &Path) -> String {
         .components()
         .filter_map(|c| match c {
             Component::Normal(v) => Some(v.to_string_lossy().to_string()),
-            _ => None,
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => None,
         })
         .collect::<Vec<_>>()
         .join("/")

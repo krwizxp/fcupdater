@@ -1,5 +1,5 @@
 use crate::{Result, err};
-use std::{os::windows::ffi::OsStrExt, path::Path};
+use std::{os::windows::ffi::OsStrExt as _, path::Path};
 #[repr(C)]
 struct SystemTime {
     year: u16,
@@ -76,11 +76,11 @@ pub fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
             0,
         )
     };
-    if required <= 0 {
+    if required <= 0_i32 {
         return None;
     }
     let required_usize = usize::try_from(required).ok()?;
-    let mut wide = vec![0u16; required_usize];
+    let mut wide = vec![0_u16; required_usize];
     // SAFETY: `wide` is allocated for `required` UTF-16 code units and both buffers remain
     // valid for the duration of the conversion call.
     let written = unsafe {
@@ -93,7 +93,7 @@ pub fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
             required,
         )
     };
-    if written <= 0 {
+    if written <= 0_i32 {
         return None;
     }
     let written_usize = usize::try_from(written).ok()?;
@@ -121,7 +121,7 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
                 std::ptr::null_mut(),
             )
         };
-        if replaced != 0 {
+        if replaced != 0_i32 {
             return Ok(());
         }
         // SAFETY: Called immediately after the failing Windows API call on the same thread.
@@ -140,7 +140,7 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
-    if moved != 0 {
+    if moved != 0_i32 {
         return Ok(());
     }
     // SAFETY: Called immediately after the failing Windows API call on the same thread.

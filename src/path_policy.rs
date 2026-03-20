@@ -6,7 +6,7 @@ use crate::{
 use std::{
     fs,
     io::ErrorKind,
-    io::Write,
+    io::Write as _,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -14,7 +14,7 @@ const RESERVATION_MAGIC: &[u8] = b"FCUPDATER_RESERVED_v1\n";
 const STALE_RESERVATION_AGE: Duration = Duration::from_hours(1);
 const MAX_CONFLICT_ATTEMPTS: u32 = 100_000;
 pub fn decide_output_path(args: &Args, today: &str, dry_run: bool) -> Result<PathBuf> {
-    let requested = match &args.output_target {
+    let requested = match args.output_target.clone() {
         OutputTarget::InPlace => return Ok(args.master.clone()),
         OutputTarget::Auto => {
             let stem = args
@@ -25,7 +25,7 @@ pub fn decide_output_path(args: &Args, today: &str, dry_run: bool) -> Result<Pat
             let parent = args.master.parent().unwrap_or_else(|| Path::new("."));
             parent.join(format!("{stem}_updated_{today}.xlsx"))
         }
-        OutputTarget::Explicit(path) => path.clone(),
+        OutputTarget::Explicit(path) => path,
     };
     if dry_run {
         make_nonconflicting_path(&requested)
@@ -47,11 +47,11 @@ pub fn cleanup_reservation_file(path: &Path) {
         return;
     };
     if content == RESERVATION_MAGIC {
-        let _ = fs::remove_file(path);
+        let _cleanup_result = fs::remove_file(path);
     }
 }
 fn make_nonconflicting_path(path: &Path) -> Result<PathBuf> {
-    let mut seq = 0u32;
+    let mut seq = 0_u32;
     loop {
         let candidate = candidate_with_suffix(path, seq);
         if !candidate.try_exists().map_err(|e| {
@@ -78,7 +78,7 @@ fn make_nonconflicting_path(path: &Path) -> Result<PathBuf> {
 }
 fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
     ensure_parent_dir(path)?;
-    let mut seq = 0u32;
+    let mut seq = 0_u32;
     loop {
         let candidate = candidate_with_suffix(path, seq);
         match fs::OpenOptions::new()
@@ -93,7 +93,7 @@ fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
                     .and_then(|()| file.sync_all())
                 {
                     drop(file);
-                    let _ = fs::remove_file(&candidate);
+                    let _cleanup_result = fs::remove_file(&candidate);
                     return Err(err(format!(
                         "출력 파일 예약 마커 기록 실패: {} ({e})",
                         candidate.display()

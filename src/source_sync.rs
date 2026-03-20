@@ -100,17 +100,19 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
                     vacant.insert((rec, score, file_order));
                 }
                 Entry::Occupied(mut occupied) => {
-                    let (_, prev_score, prev_order) = occupied.get();
+                    let previous = occupied.get();
+                    let prev_score = previous.1;
+                    let prev_order = previous.2;
                     report.duplicate_addresses = report.duplicate_addresses.saturating_add(1);
                     if report.samples.len() < MAX_CONFLICT_SAMPLES
                         && sampled_keys.insert(occupied.key().clone())
                     {
                         let previous_source = paths
-                            .get(*prev_order)
+                            .get(prev_order)
                             .map_or_else(|| format!("#{prev_order}"), |p| source_label(p));
                         let incoming_source = source_label(path);
-                        let selected_source = if score > *prev_score
-                            || (score == *prev_score && file_order >= *prev_order)
+                        let selected_source = if score > prev_score
+                            || (score == prev_score && file_order >= prev_order)
                         {
                             incoming_source.clone()
                         } else {
@@ -123,7 +125,7 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
                             selected_source,
                         });
                     }
-                    if score > *prev_score || (score == *prev_score && file_order >= *prev_order) {
+                    if score > prev_score || (score == prev_score && file_order >= prev_order) {
                         report.replaced_entries = report.replaced_entries.saturating_add(1);
                         occupied.insert((rec, score, file_order));
                     }
@@ -155,6 +157,31 @@ enum NaturalPart {
     Number { normalized: String, raw_len: usize },
     Text(String),
 }
+impl NaturalPart {
+    #[expect(
+        clippy::ref_patterns,
+        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
+    )]
+    fn as_number(&self) -> Option<(&str, usize)> {
+        match *self {
+            Self::Number {
+                ref normalized,
+                raw_len,
+            } => Some((normalized, raw_len)),
+            Self::Text(_) => None,
+        }
+    }
+    #[expect(
+        clippy::ref_patterns,
+        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
+    )]
+    fn as_text(&self) -> Option<&str> {
+        match *self {
+            Self::Text(ref text) => Some(text),
+            Self::Number { .. } => None,
+        }
+    }
+}
 fn split_natural_parts(s: &str) -> Vec<NaturalPart> {
     let mut out = Vec::new();
     let mut buf = String::new();
@@ -184,37 +211,31 @@ fn push_natural_part(out: &mut Vec<NaturalPart>, raw: &str, digit_mode: bool) {
     if digit_mode {
         let trimmed = raw.trim_start_matches('0');
         let normalized = if trimmed.is_empty() {
-            "0".to_string()
+            "0".to_owned()
         } else {
-            trimmed.to_string()
+            trimmed.to_owned()
         };
         out.push(NaturalPart::Number {
             normalized,
             raw_len: raw.len(),
         });
     } else {
-        out.push(NaturalPart::Text(raw.to_string()));
+        out.push(NaturalPart::Text(raw.to_owned()));
     }
 }
 fn compare_natural_part(a: &NaturalPart, b: &NaturalPart) -> Ordering {
-    match (a, b) {
-        (
-            NaturalPart::Number {
-                normalized: a_num,
-                raw_len: a_raw,
-            },
-            NaturalPart::Number {
-                normalized: b_num,
-                raw_len: b_raw,
-            },
-        ) => a_num
+    if let (Some((a_num, a_raw)), Some((b_num, b_raw))) = (a.as_number(), b.as_number()) {
+        a_num
             .len()
             .cmp(&b_num.len())
             .then_with(|| a_num.cmp(b_num))
-            .then_with(|| a_raw.cmp(b_raw)),
-        (NaturalPart::Text(a_text), NaturalPart::Text(b_text)) => a_text.cmp(b_text),
-        (NaturalPart::Number { .. }, NaturalPart::Text(_)) => Ordering::Less,
-        (NaturalPart::Text(_), NaturalPart::Number { .. }) => Ordering::Greater,
+            .then_with(|| a_raw.cmp(&b_raw))
+    } else if let (Some(a_text), Some(b_text)) = (a.as_text(), b.as_text()) {
+        a_text.cmp(b_text)
+    } else if a.as_number().is_some() {
+        Ordering::Less
+    } else {
+        Ordering::Greater
     }
 }
 fn source_priority(rec: &SourceRecord) -> SourcePriority {

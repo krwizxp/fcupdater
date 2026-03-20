@@ -1,10 +1,10 @@
 use crate::{Result, err};
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
+use std::os::windows::process::CommandExt as _;
 use std::{
     collections::HashSet,
     fs,
-    io::{Read, Write},
+    io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -144,8 +144,8 @@ enum JsonStringField {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _kill_result = child.kill();
+            let _wait_result = child.wait();
         }
     }
 }
@@ -278,7 +278,7 @@ fn strip_basic_region_suffix_owned(value: &str) -> String {
         .unwrap_or_default()
 }
 fn cleanup_auto_source_files(dir: &Path, prefix: &str) -> std::result::Result<usize, String> {
-    let mut removed = 0usize;
+    let mut removed = 0_usize;
     let prefix_fold = prefix.to_lowercase();
     let entries =
         fs::read_dir(dir).map_err(|e| format!("폴더 읽기 실패: {} ({e})", dir.display()))?;
@@ -301,7 +301,7 @@ fn cleanup_auto_source_files(dir: &Path, prefix: &str) -> std::result::Result<us
     Ok(removed)
 }
 fn cleanup_downloaded_source_files(paths: &[PathBuf]) -> std::result::Result<usize, String> {
-    let mut removed = 0usize;
+    let mut removed = 0_usize;
     for path in paths {
         if !is_auto_source_path(path) {
             continue;
@@ -386,7 +386,7 @@ fn webdriver_candidates_from_base(browser: BrowserKind, base_dir: &Path) -> [Pat
     ]
 }
 fn reserve_webdriver_addr() -> std::result::Result<String, String> {
-    for _ in 0..32 {
+    for _ in 0_u32..32_u32 {
         let listener_v4 = TcpListener::bind((WEBDRIVER_HOST, 0))
             .map_err(|e| format!("빈 WebDriver 포트 확보 실패: {e}"))?;
         let port = listener_v4
@@ -402,8 +402,7 @@ fn reserve_webdriver_addr() -> std::result::Result<String, String> {
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {}
             Err(err) if err.kind() == std::io::ErrorKind::AddrNotAvailable => {
                 return Err(
-                    "IPv6 loopback(::1)을 사용할 수 없습니다. 현재 ChromeDriver는 IPv6 바인딩이 가능한 환경이 필요합니다."
-                        .to_string(),
+                    "IPv6 loopback(::1)을 사용할 수 없습니다. 현재 ChromeDriver는 IPv6 바인딩이 가능한 환경이 필요합니다.".to_owned(),
                 );
             }
             Err(err) => {
@@ -411,7 +410,7 @@ fn reserve_webdriver_addr() -> std::result::Result<String, String> {
             }
         }
     }
-    Err("사용 가능한 WebDriver 포트를 찾지 못했습니다.".to_string())
+    Err("사용 가능한 WebDriver 포트를 찾지 못했습니다.".to_owned())
 }
 fn webdriver_port(webdriver_addr: &str) -> u16 {
     webdriver_addr
@@ -460,7 +459,7 @@ fn download_nationwide_source_with_retries(
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| "다운로드 실패".to_string()))
+    Err(last_error.unwrap_or_else(|| "다운로드 실패".to_owned()))
 }
 fn download_nationwide_source_once(
     webdriver_addr: &str,
@@ -476,7 +475,7 @@ fn download_nationwide_source_once(
     })?;
     let result =
         download_nationwide_source_in_session(webdriver_addr, &session_id, download_dir, prefix);
-    let _ = webdriver_delete_session(webdriver_addr, &session_id);
+    let _delete_result = webdriver_delete_session(webdriver_addr, &session_id);
     result
 }
 fn download_nationwide_source_in_session(
@@ -503,10 +502,11 @@ fn download_nationwide_source_in_session(
         OPDOWNLOAD_TRIGGER_SCRIPT,
     ) {
         Ok(Some(value)) => value,
-        Ok(None) => "OK|null".to_string(),
+        Ok(None) => "OK|null".to_owned(),
         Err(e) => return Err(format!("opDownload 다운로드 트리거 실행 실패: {e}")),
     };
-    let _ = webdriver_try_accept_alert(webdriver_addr, session_id, Duration::from_secs(5));
+    let _alert_result =
+        webdriver_try_accept_alert(webdriver_addr, session_id, Duration::from_secs(5));
     if !trigger.starts_with("OK|") {
         let discovery =
             webdriver_execute_string(webdriver_addr, session_id, OPDOWNLOAD_DISCOVERY_SCRIPT)
@@ -589,7 +589,7 @@ fn webdriver_delete_session(
     session_id: &str,
 ) -> std::result::Result<(), String> {
     let path = format!("/session/{session_id}");
-    let _ = http_request(webdriver_addr, "DELETE", &path, None)?;
+    http_request(webdriver_addr, "DELETE", &path, None)?;
     Ok(())
 }
 fn webdriver_get(
@@ -599,7 +599,7 @@ fn webdriver_get(
 ) -> std::result::Result<(), String> {
     let path = format!("/session/{session_id}/url");
     let body = format!(r#"{{"url":"{}"}}"#, json_escape(url));
-    let _ = http_request(webdriver_addr, "POST", &path, Some(&body))?;
+    http_request(webdriver_addr, "POST", &path, Some(&body))?;
     Ok(())
 }
 fn webdriver_try_accept_alert(
@@ -631,7 +631,7 @@ fn webdriver_accept_alert(
     session_id: &str,
 ) -> std::result::Result<(), String> {
     let path = format!("/session/{session_id}/alert/accept");
-    let _ = http_request(webdriver_addr, "POST", &path, Some("{}"))?;
+    http_request(webdriver_addr, "POST", &path, Some("{}"))?;
     Ok(())
 }
 fn webdriver_execute_string(
@@ -640,7 +640,7 @@ fn webdriver_execute_string(
     script: &str,
 ) -> std::result::Result<String, String> {
     webdriver_execute_optional_string(webdriver_addr, session_id, script)?
-        .map_or_else(|| Err("execute/sync 응답이 null 입니다.".to_string()), Ok)
+        .map_or_else(|| Err("execute/sync 응답이 null 입니다.".to_owned()), Ok)
 }
 fn webdriver_execute_optional_string(
     webdriver_addr: &str,
@@ -664,8 +664,8 @@ fn http_request(
 ) -> std::result::Result<String, String> {
     let mut stream =
         TcpStream::connect(webdriver_addr).map_err(|e| format!("WebDriver 연결 실패: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_mins(1)));
-    let _ = stream.set_write_timeout(Some(Duration::from_mins(1)));
+    let _read_timeout_result = stream.set_read_timeout(Some(Duration::from_mins(1)));
+    let _write_timeout_result = stream.set_write_timeout(Some(Duration::from_mins(1)));
     let body = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
@@ -681,19 +681,19 @@ fn http_request(
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("요청 전송 실패: {e}"))?;
-    let _ = stream.flush();
+    let _flush_result = stream.flush();
     let raw = read_http_response(&mut stream)?;
     let (status, response_body) = split_http_response(&raw)?;
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status} 오류: {response_body}"));
     }
-    Ok(response_body.to_string())
+    Ok(response_body.to_owned())
 }
 fn read_http_response(stream: &mut TcpStream) -> std::result::Result<String, String> {
     let mut raw = Vec::new();
     let mut expected_total_len = None;
     loop {
-        let mut chunk = [0u8; 4096];
+        let mut chunk = [0_u8; 4096];
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
@@ -717,7 +717,7 @@ fn read_http_response(stream: &mut TcpStream) -> std::result::Result<String, Str
                 ) =>
             {
                 if raw.is_empty() {
-                    return Err("HTTP 응답이 비어 있습니다".to_string());
+                    return Err("HTTP 응답이 비어 있습니다".to_owned());
                 }
                 break;
             }
@@ -725,7 +725,7 @@ fn read_http_response(stream: &mut TcpStream) -> std::result::Result<String, Str
         }
     }
     if raw.is_empty() {
-        return Err("HTTP 응답이 비어 있습니다".to_string());
+        return Err("HTTP 응답이 비어 있습니다".to_owned());
     }
     if let Some(expected) = expected_total_len
         && raw.len() < expected
@@ -764,12 +764,12 @@ fn parse_content_length(header: &str) -> std::result::Result<Option<usize>, Stri
 }
 fn split_http_response(raw: &str) -> std::result::Result<(u16, &str), String> {
     if raw.trim().is_empty() {
-        return Err("HTTP 응답이 비어 있습니다".to_string());
+        return Err("HTTP 응답이 비어 있습니다".to_owned());
     }
     let status_line = raw
         .lines()
         .find(|line| !line.is_empty())
-        .ok_or_else(|| "HTTP 상태줄을 읽지 못했습니다".to_string())?;
+        .ok_or_else(|| "HTTP 상태줄을 읽지 못했습니다".to_owned())?;
     let mut parts = status_line.split_whitespace();
     let _http = parts.next();
     let code = parts
@@ -781,7 +781,7 @@ fn split_http_response(raw: &str) -> std::result::Result<(u16, &str), String> {
         .split_once("\r\n\r\n")
         .or_else(|| raw.split_once("\n\n"))
         .map(|(_, body)| body)
-        .ok_or_else(|| "HTTP 본문을 찾지 못했습니다".to_string())?;
+        .ok_or_else(|| "HTTP 본문을 찾지 못했습니다".to_owned())?;
     Ok((code, body))
 }
 fn extract_json_optional_string_by_key(json: &str, key: &str) -> Option<JsonStringField> {
@@ -1187,21 +1187,19 @@ fn wait_for_new_download(
                     .unwrap_or_default();
                 if ext.eq_ignore_ascii_case("xls") || ext.eq_ignore_ascii_case("xlsx") {
                     let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
-                    let should_replace =
-                        latest_complete
-                            .as_ref()
-                            .is_none_or(|(best_modified, best_path)| {
-                                modified > *best_modified
-                                    || (modified == *best_modified && path > *best_path)
-                            });
+                    let should_replace = latest_complete.as_ref().is_none_or(|best| {
+                        modified > best.0 || (modified == best.0 && path > best.1)
+                    });
                     if should_replace {
                         latest_complete = Some((modified, path));
                     }
-                } else if ext.eq_ignore_ascii_case("crdownload")
-                    || ext.eq_ignore_ascii_case("part")
-                    || ext.eq_ignore_ascii_case("tmp")
-                {
-                    temp_exists = true;
+                } else {
+                    let is_temp_download = ext.eq_ignore_ascii_case("crdownload")
+                        || ext.eq_ignore_ascii_case("part")
+                        || ext.eq_ignore_ascii_case("tmp");
+                    if is_temp_download {
+                        temp_exists = true;
+                    }
                 }
             }
         }
@@ -1211,7 +1209,7 @@ fn wait_for_new_download(
             return Ok(path);
         }
         if start.elapsed() > timeout {
-            return Err("다운로드 완료 파일을 찾지 못했습니다".to_string());
+            return Err("다운로드 완료 파일을 찾지 못했습니다".to_owned());
         }
         sleep(Duration::from_millis(500));
     }
@@ -1253,7 +1251,7 @@ fn apply_webdriver_spawn_options(command: &mut Command) -> &mut Command {
 #[cfg(windows)]
 fn webdriver_download_dir_string(path: &Path) -> String {
     let raw = path.to_string_lossy();
-    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
 }
 #[cfg(not(windows))]
 fn webdriver_download_dir_string(path: &Path) -> String {

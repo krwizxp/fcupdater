@@ -155,7 +155,7 @@ fn build_change_log_entries(
     }
     for item in added {
         out.push(ChangeLogEntry {
-            reason: "신규".to_string(),
+            reason: "신규".to_owned(),
             region: item.region.clone(),
             name: item.name.clone(),
             address: item.address.clone(),
@@ -169,7 +169,7 @@ fn build_change_log_entries(
     }
     for item in deleted {
         out.push(ChangeLogEntry {
-            reason: "폐업".to_string(),
+            reason: "폐업".to_owned(),
             region: item.region.clone(),
             name: item.name.clone(),
             address: item.address.clone(),
