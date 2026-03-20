@@ -63,7 +63,7 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
 }
 fn decode_ascii_with_replacement(bytes: &[u8], code_page: Option<u16>) -> String {
     #[cfg(windows)]
-    let _ = code_page;
+    let _: Option<u16> = code_page;
     #[cfg(not(windows))]
     warn_non_windows_cp949_once(code_page.unwrap_or(0));
     bytes

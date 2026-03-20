@@ -49,7 +49,7 @@ impl Default for Args {
         Self {
             master: PathBuf::from("fuel_cost_chungcheong.xlsx"),
             sources_dir: PathBuf::from("."),
-            sources_prefix: "현재 판매가격(주유소)".to_string(),
+            sources_prefix: "현재 판매가격(주유소)".to_owned(),
             skip_download: false,
             output_target: OutputTarget::Auto,
             no_change_log: false,
@@ -67,7 +67,7 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
     let mut args = Args::default();
     let mut dry_run = false;
     let mut fast_save = false;
-    let mut i = 0usize;
+    let mut i = 0_usize;
     while let Some(raw_token) = raw_args.get(i) {
         let token = raw_token.as_os_str();
         if token == OsStr::new("-h") || token == OsStr::new("--help") {
@@ -173,7 +173,7 @@ fn is_long_option_token(value: &OsStr) -> bool {
 }
 fn parse_sources_prefix(value: &str) -> Result<String> {
     validate_sources_prefix(value)?;
-    Ok(value.to_string())
+    Ok(value.to_owned())
 }
 fn validate_sources_prefix(value: &str) -> Result<()> {
     if value.is_empty() {

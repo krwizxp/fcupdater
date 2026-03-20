@@ -4,6 +4,10 @@ mod cli;
 mod defined_name;
 mod excel;
 mod master_sheet;
+#[expect(
+    clippy::pub_with_shorthand,
+    reason = "rustfmt rewrites root-module visibility back to pub(crate)"
+)]
 pub(crate) mod numeric;
 mod path_policy;
 mod source_download;
@@ -138,7 +142,7 @@ fn run(args: &Args) -> Result<()> {
         if matches!(args.output_target, OutputTarget::InPlace) {
             let backup = path_policy::reserve_backup_path(&args.master, &today)?;
             if let Err(e) = fs::copy(&args.master, &backup) {
-                let _ = fs::remove_file(&backup);
+                let _cleanup_result = fs::remove_file(&backup);
                 return Err(err(format!(
                     "백업 파일 생성에 실패했습니다: {} -> {} ({e})",
                     args.master.display(),
@@ -216,7 +220,8 @@ fn normalize_address_key(addr: &str) -> String {
             ("세종특별자치시", "세종"),
         ]
         .iter()
-        .find(|(from, _)| rest.starts_with(*from))
+        .copied()
+        .find(|candidate| rest.starts_with(candidate.0))
         {
             out.push_str(to);
             rest = &rest[from.len()..];
@@ -236,7 +241,7 @@ fn normalize_address_key(addr: &str) -> String {
 fn display_region_label_from_source(region: &str, address: &str) -> String {
     parse_region_label(region)
         .or_else(|| parse_region_label(address))
-        .unwrap_or_else(|| region.trim().to_string())
+        .unwrap_or_else(|| region.trim().to_owned())
 }
 fn parse_region_label(text: &str) -> Option<String> {
     let mut tokens = text
@@ -246,20 +251,20 @@ fn parse_region_label(text: &str) -> Option<String> {
     let first = tokens.next()?;
     let second = tokens.next();
     if let Some(label) = strip_metropolitan_suffix(first) {
-        return Some(label.to_string());
+        return Some(label.to_owned());
     }
     if is_province_token(first) {
         return second.map(normalize_basic_region_token);
     }
     if is_metropolitan_token(first) {
-        return Some(first.to_string());
+        return Some(first.to_owned());
     }
     strip_basic_region_suffix(first)
         .map(ToString::to_string)
-        .or_else(|| (second.is_none()).then(|| first.to_string()))
+        .or_else(|| (second.is_none()).then(|| first.to_owned()))
 }
 fn normalize_basic_region_token(token: &str) -> String {
-    strip_basic_region_suffix(token).map_or_else(|| token.to_string(), ToString::to_string)
+    strip_basic_region_suffix(token).map_or_else(|| token.to_owned(), ToString::to_string)
 }
 fn strip_metropolitan_suffix(token: &str) -> Option<&str> {
     ["특별자치시", "광역시", "특별시"]

@@ -32,23 +32,31 @@ const MAX_XLSX_ROW: u32 = 200_000;
 const MAX_XLSX_COL: usize = 1_024;
 const DEFAULT_SOURCE_HEADER_SCAN_ROWS: usize = 200;
 impl CellValue {
+    #[expect(
+        clippy::ref_patterns,
+        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
+    )]
     fn as_string(&self) -> String {
-        match self {
+        match *self {
             Self::Empty => String::new(),
-            Self::Text(v) => v.trim().to_string(),
-            Self::Number(v) => format_number(*v),
+            Self::Text(ref v) => v.trim().to_owned(),
+            Self::Number(v) => format_number(v),
         }
     }
+    #[expect(
+        clippy::ref_patterns,
+        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
+    )]
     fn as_i32(&self) -> Option<i32> {
-        match self {
+        match *self {
             Self::Empty => None,
-            Self::Number(v) => round_f64_to_i32(*v),
-            Self::Text(v) => parse_i32_str(v),
+            Self::Number(v) => round_f64_to_i32(v),
+            Self::Text(ref v) => parse_i32_str(v),
         }
     }
 }
 fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
-    value.filter(|v| *v > 0)
+    value.filter(|v| *v > 0_i32)
 }
 pub fn read_source_file(path: &Path) -> Result<Vec<SourceRecord>> {
     let ext = path
@@ -118,9 +126,9 @@ fn build_source_records_from_sheet_xml_streaming(
 ) -> Result<Vec<SourceRecord>> {
     let sheet_data = sheet_data_body(sheet_xml)?;
     let mut out = Vec::new();
-    let mut cursor = 0usize;
-    let mut next_row_num = 1usize;
-    let mut scanned_rows = 0usize;
+    let mut cursor = 0_usize;
+    let mut next_row_num = 1_usize;
+    let mut scanned_rows = 0_usize;
     let header_scan_rows = source_header_scan_rows();
     let mut header_indices: Option<SourceHeaderIndices> = None;
     while let Some(row_open_rel) = sheet_data[cursor..].find("<row") {
@@ -205,8 +213,8 @@ fn parse_xlsx_rows(
 ) -> Result<Vec<(usize, Vec<CellValue>)>> {
     let sheet_data = sheet_data_body(sheet_xml)?;
     let mut rows_map: BTreeMap<usize, Vec<CellValue>> = BTreeMap::new();
-    let mut cursor = 0usize;
-    let mut next_row_num = 1usize;
+    let mut cursor = 0_usize;
+    let mut next_row_num = 1_usize;
     while let Some(row_open_rel) = sheet_data[cursor..].find("<row") {
         let row_open = cursor + row_open_rel;
         let Some(row_tag_end_rel) = sheet_data[row_open..].find('>') else {
@@ -261,8 +269,8 @@ fn parse_xlsx_row_cells(
     shared_strings: &[String],
 ) -> Result<Vec<CellValue>> {
     let mut row_cells: Vec<CellValue> = Vec::new();
-    let mut cursor = 0usize;
-    let mut next_col = 0usize;
+    let mut cursor = 0_usize;
+    let mut next_col = 0_usize;
     while let Some(cell_open_rel) = row_xml[cursor..].find("<c") {
         let cell_open = cursor + cell_open_rel;
         let Some(cell_tag_end_rel) = row_xml[cell_open..].find('>') else {
@@ -332,9 +340,9 @@ fn parse_xlsx_cell_value(cell_tag: &str, cell_body: &str, shared_strings: &[Stri
     }
     if matches!(cell_type.as_deref(), Some("b")) {
         return CellValue::Text(if decoded == "1" {
-            "TRUE".to_string()
+            "TRUE".to_owned()
         } else {
-            "FALSE".to_string()
+            "FALSE".to_owned()
         });
     }
     if matches!(cell_type.as_deref(), Some("str")) {
@@ -346,7 +354,7 @@ fn parse_xlsx_cell_value(cell_tag: &str, cell_body: &str, shared_strings: &[Stri
     CellValue::Text(decoded)
 }
 fn cell_ref_to_col_index(cell_ref: &str) -> Option<usize> {
-    let mut col = 0usize;
+    let mut col = 0_usize;
     let mut has_alpha = false;
     for ch in cell_ref.chars() {
         if ch.is_ascii_alphabetic() {
@@ -368,11 +376,11 @@ fn read_xls_source(path: &Path) -> Result<Vec<SourceRecord>> {
     source_reader_biff::read_xls_source(path)
 }
 fn format_number(v: f64) -> String {
-    const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
-    const I64_MAX_F64: f64 = 9_223_372_036_854_775_807.0;
+    const I64_MIN_F64: f64 = -9_223_372_036_854_776_000.0;
+    const I64_MAX_F64: f64 = 9_223_372_036_854_776_000.0;
     if (v.fract() - 0.0).abs() < f64::EPSILON && (I64_MIN_F64..=I64_MAX_F64).contains(&v) {
         if v == 0.0 {
-            "0".to_string()
+            "0".to_owned()
         } else {
             format!("{v:.0}")
         }
@@ -391,7 +399,8 @@ fn format_number(v: f64) -> String {
 }
 fn build_source_records_from_rows(rows: &[(usize, Vec<CellValue>)]) -> Result<Vec<SourceRecord>> {
     let mut header_row_idx: Option<usize> = None;
-    for (idx, (_row_no, row)) in rows.iter().take(source_header_scan_rows()).enumerate() {
+    for (idx, row_entry) in rows.iter().take(source_header_scan_rows()).enumerate() {
+        let row = &row_entry.1;
         if parse_source_header_indices(row).is_some() {
             header_row_idx = Some(idx);
             break;
@@ -400,12 +409,13 @@ fn build_source_records_from_rows(rows: &[(usize, Vec<CellValue>)]) -> Result<Ve
     let header_row_idx = header_row_idx.ok_or_else(|| err("헤더 행을 찾지 못했습니다"))?;
     let header = rows
         .get(header_row_idx)
-        .map(|(_, row)| row)
+        .map(|row_entry| &row_entry.1)
         .ok_or_else(|| err("헤더 행 접근 실패"))?;
     let header_indices =
         parse_source_header_indices(header).ok_or_else(|| err("헤더 행 접근 실패"))?;
     let mut out = Vec::new();
-    for (_row_no, row) in rows.iter().skip(header_row_idx + 1) {
+    for row_entry in rows.iter().skip(header_row_idx + 1) {
+        let row = &row_entry.1;
         if let Some(record) = build_source_record_from_row(row, header_indices) {
             out.push(record);
         }

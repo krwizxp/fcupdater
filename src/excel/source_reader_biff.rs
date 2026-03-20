@@ -2,11 +2,11 @@ use super::{CellValue, MAX_XLSX_COL, MAX_XLSX_ROW, build_source_records_from_row
 use crate::source_sync::SourceRecord;
 use crate::{Result, err, err_with_source};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fs,
     path::Path,
 };
-pub(super) fn read_xls_source(path: &Path) -> Result<Vec<SourceRecord>> {
+pub(in crate::excel) fn read_xls_source(path: &Path) -> Result<Vec<SourceRecord>> {
     let cfb = CfbFile::open(path)?;
     let workbook = match cfb.read_stream_by_name("Workbook") {
         Ok(v) => v,
@@ -291,7 +291,7 @@ fn checked_pow2_from_shift(shift: u16, context: &str) -> Result<usize> {
             usize::BITS
         )));
     }
-    1usize
+    1_usize
         .checked_shl(shift_u32)
         .ok_or_else(|| err(format!("{context} 계산에 실패했습니다: shift={shift_u32}")))
 }
@@ -306,7 +306,7 @@ fn collect_difat_entries(
     max_sector_count: usize,
 ) -> Result<Vec<u32>> {
     let mut difat_entries: Vec<u32> = Vec::new();
-    for i in 0..109usize {
+    for i in 0..109_usize {
         let sid = read_u32_le(data, 0x4C + i * 4)?;
         if is_regular_sector_id(sid) {
             difat_entries.push(sid);
@@ -395,7 +395,7 @@ fn build_mini_fat_table(
         "CFB mini FAT",
     )?;
     let mut out = Vec::new();
-    let mut idx = 0usize;
+    let mut idx = 0_usize;
     while idx + 4 <= mini_fat_bytes.len() {
         out.push(read_u32_le(&mini_fat_bytes, idx)?);
         idx += 4;
@@ -498,7 +498,7 @@ fn parse_directory_entries(
     major_version: u16,
 ) -> Result<Vec<CfbDirectoryEntry>> {
     let mut entries = Vec::new();
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while cursor + 128 <= dir_stream.len() {
         let entry = dir_stream
             .get(cursor..cursor + 128)
@@ -543,7 +543,7 @@ struct BiffGlobals {
     code_page: Option<u16>,
 }
 fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
-    let mut pos = 0usize;
+    let mut pos = 0_usize;
     let mut shared_strings = Vec::new();
     let mut boundsheets: Vec<BiffBoundSheet> = Vec::new();
     let mut code_page: Option<u16> = detect_biff_code_page(workbook_stream);
@@ -560,42 +560,47 @@ fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
         let data = workbook_stream
             .get(data_start..data_end)
             .ok_or_else(|| err("xls BIFF globals 레코드 범위 오류"))?;
-        if record_id == 0x0085 && data.len() >= 8 {
-            let offset = usize::try_from(read_u32_le(data, 0)?).map_err(|source| {
-                err_with_source("xls BoundSheet offset 변환에 실패했습니다.", source)
-            })?;
-            let sheet_type = *data
-                .get(5)
-                .ok_or_else(|| err("xls BoundSheet sheet_type 범위 오류"))?;
-            boundsheets.push(BiffBoundSheet { offset, sheet_type });
-        } else if record_id == 0x0042 && data.len() >= 2 {
-            code_page = Some(read_u16_le(data, 0)?);
-        } else if record_id == 0x00FC {
-            let mut chunks: Vec<&[u8]> = vec![data];
-            let mut next = data_end;
-            while next + 4 <= workbook_stream.len() {
-                let next_id = read_u16_le(workbook_stream, next)?;
-                let next_len = read_u16_le(workbook_stream, next + 2)? as usize;
-                let next_data_start = next + 4;
-                let Some(next_data_end) = next_data_start.checked_add(next_len) else {
-                    break;
-                };
-                if next_data_end > workbook_stream.len() {
-                    break;
-                }
-                if next_id != 0x003C {
-                    break;
-                }
-                if let Some(chunk) = workbook_stream.get(next_data_start..next_data_end) {
-                    chunks.push(chunk);
-                } else {
-                    break;
-                }
-                next = next_data_end;
+        match record_id {
+            0x0085 if data.len() >= 8 => {
+                let offset = usize::try_from(read_u32_le(data, 0)?).map_err(|source| {
+                    err_with_source("xls BoundSheet offset 변환에 실패했습니다.", source)
+                })?;
+                let sheet_type = *data
+                    .get(5)
+                    .ok_or_else(|| err("xls BoundSheet sheet_type 범위 오류"))?;
+                boundsheets.push(BiffBoundSheet { offset, sheet_type });
             }
-            shared_strings = parse_sst_from_chunks(&chunks, code_page)?;
-            pos = next;
-            continue;
+            0x0042 if data.len() >= 2 => {
+                code_page = Some(read_u16_le(data, 0)?);
+            }
+            0x00FC => {
+                let mut chunks: Vec<&[u8]> = vec![data];
+                let mut next = data_end;
+                while next + 4 <= workbook_stream.len() {
+                    let next_id = read_u16_le(workbook_stream, next)?;
+                    let next_len = read_u16_le(workbook_stream, next + 2)? as usize;
+                    let next_data_start = next + 4;
+                    let Some(next_data_end) = next_data_start.checked_add(next_len) else {
+                        break;
+                    };
+                    if next_data_end > workbook_stream.len() {
+                        break;
+                    }
+                    if next_id != 0x003C {
+                        break;
+                    }
+                    if let Some(chunk) = workbook_stream.get(next_data_start..next_data_end) {
+                        chunks.push(chunk);
+                    } else {
+                        break;
+                    }
+                    next = next_data_end;
+                }
+                shared_strings = parse_sst_from_chunks(&chunks, code_page)?;
+                pos = next;
+                continue;
+            }
+            _ => {}
         }
         pos = data_end;
         if record_id == 0x000A && !boundsheets.is_empty() {
@@ -612,7 +617,7 @@ fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
     })
 }
 fn detect_biff_code_page(workbook_stream: &[u8]) -> Option<u16> {
-    let mut pos = 0usize;
+    let mut pos = 0_usize;
     while pos + 4 <= workbook_stream.len() {
         let record_id = read_u16_le(workbook_stream, pos).ok()?;
         let record_len = read_u16_le(workbook_stream, pos + 2).ok()? as usize;
@@ -682,7 +687,7 @@ impl<'chunk> SstChunkReader<'chunk> {
         Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
     }
     fn remaining_bytes(&self) -> usize {
-        let mut total = 0usize;
+        let mut total = 0_usize;
         for (idx, chunk) in self.chunks.iter().enumerate().skip(self.chunk_index) {
             let consumed = if idx == self.chunk_index {
                 self.offset_in_chunk.min(chunk.len())
@@ -773,7 +778,7 @@ fn parse_sst_from_chunks(chunks: &[&[u8]], code_page: Option<u16>) -> Result<Vec
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
-    let total_chunk_bytes = chunks.iter().try_fold(0usize, |acc, chunk| {
+    let total_chunk_bytes = chunks.iter().try_fold(0_usize, |acc, chunk| {
         acc.checked_add(chunk.len())
             .ok_or_else(|| err("SST chunk 총길이 계산 중 overflow가 발생했습니다."))
     })?;
@@ -800,23 +805,23 @@ fn parse_sst_from_chunks(chunks: &[&[u8]], code_page: Option<u16>) -> Result<Vec
         let rich_run_count = if rich {
             reader.read_u16()? as usize
         } else {
-            0usize
+            0_usize
         };
         let ext_len = if ext {
             usize::try_from(reader.read_u32()?)
                 .map_err(|source| err_with_source("SST ext 길이 변환에 실패했습니다.", source))?
         } else {
-            0usize
+            0_usize
         };
         let value = reader.read_xl_unicode_chars(char_count, high_byte)?;
         if rich_run_count > 0 {
             let rich_bytes = rich_run_count
                 .checked_mul(4)
                 .ok_or_else(|| err("SST rich-text 길이 계산 중 overflow가 발생했습니다."))?;
-            let _ = reader.read_bytes(rich_bytes)?;
+            reader.read_bytes(rich_bytes)?;
         }
         if ext_len > 0 {
-            let _ = reader.read_bytes(ext_len)?;
+            reader.read_bytes(ext_len)?;
         }
         out.push(value);
     }
@@ -834,7 +839,7 @@ fn parse_biff_worksheet_cells(
         )));
     }
     let mut pos = sheet_offset;
-    let mut rows_map: BTreeMap<usize, HashMap<usize, CellValue>> = BTreeMap::new();
+    let mut rows_map: BTreeMap<usize, BTreeMap<usize, CellValue>> = BTreeMap::new();
     while let Some((record_id, data)) = read_biff_record(workbook_stream, &mut pos)? {
         if handle_biff_worksheet_record(record_id, data, shared_strings, code_page, &mut rows_map)?
         {
@@ -870,7 +875,7 @@ fn handle_biff_worksheet_record(
     data: &[u8],
     shared_strings: &[String],
     code_page: Option<u16>,
-    rows_map: &mut BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
 ) -> Result<bool> {
     match record_id {
         0x00FD => handle_biff_label_sst_record(data, shared_strings, rows_map)?,
@@ -886,7 +891,7 @@ fn handle_biff_worksheet_record(
 fn handle_biff_label_sst_record(
     data: &[u8],
     shared_strings: &[String],
-    rows_map: &mut BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
 ) -> Result<()> {
     if data.len() < 10 {
         return Ok(());
@@ -903,7 +908,7 @@ fn handle_biff_label_sst_record(
 }
 fn handle_biff_number_record(
     data: &[u8],
-    rows_map: &mut BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
 ) -> Result<()> {
     if data.len() < 14 {
         return Ok(());
@@ -911,22 +916,17 @@ fn handle_biff_number_record(
     let row = usize::from(read_u16_le(data, 0)?) + 1;
     let col = usize::from(read_u16_le(data, 2)?);
     validate_sheet_cell_bounds(row, col)?;
-    let mut bytes = [0u8; 8];
-    let raw = data
-        .get(6..14)
-        .ok_or_else(|| err("NUMBER 레코드 숫자 범위 오류"))?;
-    bytes.copy_from_slice(raw);
     insert_sparse_cell(
         rows_map,
         row,
         col,
-        CellValue::Number(f64::from_le_bytes(bytes)),
+        CellValue::Number(f64::from_bits(read_u64_le(data, 6)?)),
     );
     Ok(())
 }
 fn handle_biff_rk_record(
     data: &[u8],
-    rows_map: &mut BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
 ) -> Result<()> {
     if data.len() < 10 {
         return Ok(());
@@ -940,7 +940,7 @@ fn handle_biff_rk_record(
 }
 fn handle_biff_mulrk_record(
     data: &[u8],
-    rows_map: &mut BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
 ) -> Result<()> {
     if data.len() < 10 {
         return Ok(());
@@ -950,7 +950,7 @@ fn handle_biff_mulrk_record(
     let col_last = usize::from(read_u16_le(data, data.len() - 2)?);
     validate_sheet_cell_bounds(row, col_first)?;
     validate_sheet_cell_bounds(row, col_last)?;
-    let mut offset = 4usize;
+    let mut offset = 4_usize;
     let mut col = col_first;
     while offset + 6 <= data.len().saturating_sub(2) && col <= col_last {
         let rk = read_u32_le(data, offset + 2)?;
@@ -963,7 +963,7 @@ fn handle_biff_mulrk_record(
 fn handle_biff_label_record(
     data: &[u8],
     code_page: Option<u16>,
-    rows_map: &mut BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
 ) -> Result<()> {
     if data.len() < 9 {
         return Ok(());
@@ -983,7 +983,7 @@ fn handle_biff_label_record(
     Ok(())
 }
 fn finalize_sparse_rows(
-    rows_map: BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: BTreeMap<usize, BTreeMap<usize, CellValue>>,
 ) -> Vec<(usize, Vec<CellValue>)> {
     if rows_map.is_empty() {
         return Vec::new();
@@ -1019,7 +1019,7 @@ fn validate_sheet_cell_bounds(row: usize, col: usize) -> Result<()> {
     Ok(())
 }
 fn insert_sparse_cell(
-    rows_map: &mut BTreeMap<usize, HashMap<usize, CellValue>>,
+    rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
     row: usize,
     col: usize,
     value: CellValue,
@@ -1058,24 +1058,24 @@ fn decode_rk_number(rk: u32) -> f64 {
     let div100 = (rk & 0x01) != 0;
     let is_int = (rk & 0x02) != 0;
     let mut value = if is_int {
-        let signed = rk.cast_signed() >> 2;
+        let signed = rk.cast_signed() >> 2_i32;
         f64::from(signed)
     } else {
-        let bits = u64::from(rk & 0xFFFF_FFFC) << 32;
+        let bits = u64::from(rk & 0xFFFF_FFFC) << 32_i32;
         f64::from_bits(bits)
     };
     if div100 {
-        value /= 100.0;
+        value /= 100.0_f64;
     }
     value
 }
 fn decode_utf16_le(bytes: &[u8]) -> String {
     let mut data = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0usize;
+    let mut i = 0_usize;
     while i + 1 < bytes.len() {
         let b0 = bytes.get(i).copied().unwrap_or_default();
         let b1 = bytes.get(i + 1).copied().unwrap_or_default();
-        data.push(u16::from_le_bytes([b0, b1]));
+        data.push(u16::from(b0) | (u16::from(b1) << 8_u32));
         i += 2;
     }
     String::from_utf16_lossy(&data)
@@ -1085,19 +1085,29 @@ fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
         .get(offset..offset + 2)
         .and_then(|s| s.as_array::<2>())
         .ok_or_else(|| err(format!("u16 read out of range at {offset}")))?;
-    Ok(u16::from_le_bytes(*arr))
+    Ok(u16::from(arr[0]) | (u16::from(arr[1]) << 8_u32))
 }
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
     let arr = bytes
         .get(offset..offset + 4)
         .and_then(|s| s.as_array::<4>())
         .ok_or_else(|| err(format!("u32 read out of range at {offset}")))?;
-    Ok(u32::from_le_bytes(*arr))
+    Ok(u32::from(arr[0])
+        | (u32::from(arr[1]) << 8_u32)
+        | (u32::from(arr[2]) << 16_u32)
+        | (u32::from(arr[3]) << 24_u32))
 }
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
     let arr = bytes
         .get(offset..offset + 8)
         .and_then(|s| s.as_array::<8>())
         .ok_or_else(|| err(format!("u64 read out of range at {offset}")))?;
-    Ok(u64::from_le_bytes(*arr))
+    Ok(u64::from(arr[0])
+        | (u64::from(arr[1]) << 8_u32)
+        | (u64::from(arr[2]) << 16_u32)
+        | (u64::from(arr[3]) << 24_u32)
+        | (u64::from(arr[4]) << 32_u32)
+        | (u64::from(arr[5]) << 40_u32)
+        | (u64::from(arr[6]) << 48_u32)
+        | (u64::from(arr[7]) << 56_u32))
 }

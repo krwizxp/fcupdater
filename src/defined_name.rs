@@ -23,7 +23,7 @@ fn find_filter_database_defined_name_content_range(
     let marker_attr_single = format!("name='{marker}'");
     let sheet_ref_plain = format!("{sheet_name}!");
     let sheet_ref_quoted = format!("'{sheet_name}'!");
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while let Some(open_rel) = workbook_xml[cursor..].find("<definedName") {
         let open_pos = cursor + open_rel;
         let Some(open_end_rel) = workbook_xml[open_pos..].find('>') else {

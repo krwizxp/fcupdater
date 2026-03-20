@@ -38,7 +38,7 @@ impl WorkDirCleanup {
 impl Drop for WorkDirCleanup {
     fn drop(&mut self) {
         if !self.keep && !self.path.as_os_str().is_empty() {
-            let _ = fs::remove_dir_all(&self.path);
+            let _cleanup_result = fs::remove_dir_all(&self.path);
         }
     }
 }
@@ -121,7 +121,7 @@ impl XlsxContainer {
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&tmp_output);
+            let _cleanup_result = fs::remove_file(&tmp_output);
         }
         result
     }
@@ -154,19 +154,19 @@ impl XlsxContainer {
 }
 impl Drop for XlsxContainer {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.work_dir);
+        let _cleanup_result = fs::remove_dir_all(&self.work_dir);
     }
 }
 fn create_unique_work_dir() -> Result<PathBuf> {
     let base = std::env::temp_dir();
     let pid = process::id();
-    for seq in 0..1024u32 {
+    for seq in 0..1024_u32 {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let path = base.join(format!("fcupdater_{pid}_{nanos}_{seq}"));
-        match fs::create_dir(&path) {
+        match fs::create_dir_all(&path) {
             Ok(()) => return Ok(path),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 thread::sleep(Duration::from_micros(50));
@@ -190,7 +190,7 @@ fn create_unique_temp_output_path(output_xlsx: &Path) -> Result<PathBuf> {
         .and_then(|s| s.to_str())
         .unwrap_or("output.xlsx");
     let pid = process::id();
-    for seq in 0..1024u32 {
+    for seq in 0..1024_u32 {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -274,7 +274,7 @@ fn ensure_extract_tools_available() -> Result<()> {
         let has_powershell = detect_powershell_program().is_some();
         let has_tar = command_exists("tar", &["--version"], None);
         if has_powershell || has_tar {
-            let _ = EXTRACT_TOOLS_READY.set(());
+            let _ready_result = EXTRACT_TOOLS_READY.set(());
             return Ok(());
         }
         Err(err(
@@ -289,7 +289,7 @@ fn ensure_extract_tools_available() -> Result<()> {
         let has_python_zipfile =
             command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None);
         if has_unzip || has_python3_zipfile || has_python_zipfile {
-            let _ = EXTRACT_TOOLS_READY.set(());
+            let _ready_result = EXTRACT_TOOLS_READY.set(());
             return Ok(());
         }
         Err(err(
@@ -306,7 +306,7 @@ fn ensure_create_tools_available() -> Result<()> {
         let has_powershell = detect_powershell_program().is_some();
         let has_tar = command_exists("tar", &["--version"], None);
         if has_powershell || has_tar {
-            let _ = CREATE_TOOLS_READY.set(());
+            let _ready_result = CREATE_TOOLS_READY.set(());
             return Ok(());
         }
         Err(err(
@@ -321,7 +321,7 @@ fn ensure_create_tools_available() -> Result<()> {
         let has_python_zipfile =
             command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None);
         if has_zip || has_python3_zipfile || has_python_zipfile {
-            let _ = CREATE_TOOLS_READY.set(());
+            let _ready_result = CREATE_TOOLS_READY.set(());
             return Ok(());
         }
         Err(err(
@@ -356,7 +356,7 @@ fn verify_saved_xlsx(output_xlsx: &Path) -> Result<()> {
         verify_saved_workbook_reopen(output_xlsx)?;
         Ok(())
     })();
-    let _ = fs::remove_dir_all(&verify_work);
+    let _cleanup_result = fs::remove_dir_all(&verify_work);
     result
 }
 fn verify_saved_workbook_reopen(output_xlsx: &Path) -> Result<()> {
@@ -571,9 +571,9 @@ fn format_process_failure(program: &str, output: &process::Output) -> String {
     let code = output
         .status
         .code()
-        .map_or_else(|| "None".to_string(), |v| v.to_string());
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        .map_or_else(|| "None".to_owned(), |v| v.to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let detail = if stderr.is_empty() { stdout } else { stderr };
     if detail.is_empty() {
         format!("{program} 비정상 종료(code={code})")
@@ -608,8 +608,8 @@ fn wait_with_optional_timeout(
             }
             Ok(None) => {
                 if start.elapsed() >= limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _kill_result = child.kill();
+                    let _wait_result = child.wait();
                     return Err(err(format!(
                         "{program} 실행 제한시간 초과: {}초",
                         limit.as_secs()
@@ -618,8 +618,8 @@ fn wait_with_optional_timeout(
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _kill_result = child.kill();
+                let _wait_result = child.wait();
                 return Err(err(format!("{program} 상태 확인 실패: {e}")));
             }
         }

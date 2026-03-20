@@ -1,7 +1,7 @@
-pub(super) fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
+pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
     let pattern = format!("{attr_name}=");
     let bytes = tag.as_bytes();
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while let Some(rel) = tag[cursor..].find(&pattern) {
         let idx = cursor + rel;
         if idx > 0 {
@@ -24,7 +24,7 @@ pub(super) fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
     }
     None
 }
-pub(super) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
+pub(in crate::excel) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     let mut cursor = from.min(xml.len());
     let wanted = local_tag_name(tag_name);
     while let Some(rel) = xml[cursor..].find('<') {
@@ -45,7 +45,7 @@ pub(super) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<u
     }
     None
 }
-pub(super) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
+pub(in crate::excel) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     let mut cursor = from.min(xml.len());
     let wanted = local_tag_name(tag_name);
     while let Some(rel) = xml[cursor..].find("</") {
@@ -62,12 +62,12 @@ pub(super) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usi
     }
     None
 }
-pub(super) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
+pub(in crate::excel) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
     xml.get(tag_start..)
         .and_then(|v| v.find('>'))
         .map(|rel| tag_start + rel)
 }
-pub(super) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Option<String> {
+pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     let open_pattern = format!("<{tag_name}");
     let open_start = xml.find(&open_pattern)?;
     let open_end = open_start + xml[open_start..].find('>')?;
@@ -77,10 +77,10 @@ pub(super) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Option<String
     let body_end = body_start + close_rel;
     Some(xml[body_start..body_end].to_string())
 }
-pub(super) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Option<String> {
+pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     let open_pattern = format!("<{tag_name}");
     let close_pattern = format!("</{tag_name}>");
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     let mut out = String::new();
     while let Some(open_rel) = xml[cursor..].find(&open_pattern) {
         let open_start = cursor + open_rel;
@@ -93,12 +93,12 @@ pub(super) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Option<String> 
     }
     if out.is_empty() { None } else { Some(out) }
 }
-pub(super) fn decode_xml_entities(s: &str) -> String {
+pub(in crate::excel) fn decode_xml_entities(s: &str) -> String {
     if !s.contains('&') {
-        return s.to_string();
+        return s.to_owned();
     }
     let mut out = String::with_capacity(s.len());
-    let mut i = 0usize;
+    let mut i = 0_usize;
     while i < s.len() {
         let rest = &s[i..];
         if rest.starts_with('&')
