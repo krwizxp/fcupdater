@@ -18,6 +18,9 @@ type Result<T> = std::result::Result<T, BoxError>;
 fn err(msg: impl Into<String>) -> BoxError {
     std::io::Error::other(msg.into()).into()
 }
+fn err_with_source(context: impl Into<String>, source: impl std::fmt::Display) -> BoxError {
+    std::io::Error::other(format!("{}: {source}", context.into())).into()
+}
 #[derive(Debug, Clone)]
 struct ChangeRow {
     reason: String,
@@ -180,7 +183,12 @@ fn parse_i32_str(s: &str) -> Option<i32> {
     t.parse::<f64>().ok().and_then(round_f64_to_i32)
 }
 fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
-    u32::try_from(value).map_err(|_| err(format!("{context} 값이 너무 큽니다. (value={value})")))
+    u32::try_from(value).map_err(|source| {
+        err_with_source(
+            format!("{context} 값이 너무 큽니다. (value={value})"),
+            source,
+        )
+    })
 }
 fn shift_row(row: u32, increase: u32, decrease: u32) -> u32 {
     if increase > 0 {

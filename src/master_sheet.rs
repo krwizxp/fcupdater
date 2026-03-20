@@ -458,16 +458,18 @@ fn build_rebased_non_data_rows(
 ) -> BTreeMap<u32, StdRow> {
     let mut new_rows_map = BTreeMap::new();
     for (r, row_obj) in original_rows {
-        let r = *r;
-        if row_mapper.has_old_rows && r >= data_start_row && r <= old_end_row {
+        let row_num = *r;
+        if row_mapper.has_old_rows && row_num >= data_start_row && row_num <= old_end_row {
             continue;
         }
         let mut row_obj = row_obj.clone();
-        if r < data_start_row {
-            remap_row_numbers(&mut row_obj, r, &|old_ref_row| row_mapper.map(old_ref_row));
-            new_rows_map.insert(r, row_obj);
+        if row_num < data_start_row {
+            remap_row_numbers(&mut row_obj, row_num, &|old_ref_row| {
+                row_mapper.map(old_ref_row)
+            });
+            new_rows_map.insert(row_num, row_obj);
         } else {
-            let shifted = row_mapper.shift(r);
+            let shifted = row_mapper.shift(row_num);
             remap_row_numbers(&mut row_obj, shifted, &|old_ref_row| {
                 row_mapper.map(old_ref_row)
             });

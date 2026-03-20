@@ -1,4 +1,4 @@
-use crate::{Result, err};
+use crate::{Result, err, err_with_source};
 #[cfg(not(windows))]
 use std::process;
 use std::{
@@ -92,9 +92,9 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
             args.sources_dir = PathBuf::from(value);
         } else if token == OsStr::new("--sources-prefix") {
             let value = take_option_value(raw_args, &mut i, "--sources-prefix")?;
-            let value: &str = value
-                .try_into()
-                .map_err(|_| err("--sources-prefix 값은 UTF-8 문자열이어야 합니다."))?;
+            let value: &str = value.try_into().map_err(|source| {
+                err_with_source("--sources-prefix 값은 UTF-8 문자열이어야 합니다.", source)
+            })?;
             args.sources_prefix = parse_sources_prefix(value)?;
         } else if token == OsStr::new("--output") {
             let value = take_option_value(raw_args, &mut i, "--output")?;
