@@ -1,4 +1,4 @@
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "rounded value is clamped to the i32 range before casting"
 )]

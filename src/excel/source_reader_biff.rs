@@ -631,14 +631,14 @@ fn detect_biff_code_page(workbook_stream: &[u8]) -> Option<u16> {
     }
     None
 }
-struct SstChunkReader<'a> {
-    chunks: Vec<&'a [u8]>,
+struct SstChunkReader<'chunk> {
+    chunks: Vec<&'chunk [u8]>,
     chunk_index: usize,
     offset_in_chunk: usize,
     code_page: Option<u16>,
 }
-impl<'a> SstChunkReader<'a> {
-    const fn new(chunks: Vec<&'a [u8]>, code_page: Option<u16>) -> Self {
+impl<'chunk> SstChunkReader<'chunk> {
+    const fn new(chunks: Vec<&'chunk [u8]>, code_page: Option<u16>) -> Self {
         Self {
             chunks,
             chunk_index: 0,
@@ -843,10 +843,10 @@ fn parse_biff_worksheet_cells(
     }
     Ok(finalize_sparse_rows(rows_map))
 }
-fn read_biff_record<'a>(
-    workbook_stream: &'a [u8],
+fn read_biff_record<'stream>(
+    workbook_stream: &'stream [u8],
     pos: &mut usize,
-) -> Result<Option<(u16, &'a [u8])>> {
+) -> Result<Option<(u16, &'stream [u8])>> {
     if *pos + 4 > workbook_stream.len() {
         return Ok(None);
     }

@@ -151,11 +151,11 @@ fn set_output_target_explicit(output_target: &mut OutputTarget, value: PathBuf) 
     *output_target = OutputTarget::Explicit(value);
     Ok(())
 }
-fn take_option_value<'a>(
-    raw_args: &'a [OsString],
+fn take_option_value<'args>(
+    raw_args: &'args [OsString],
     i: &mut usize,
     opt_name: &str,
-) -> Result<&'a OsStr> {
+) -> Result<&'args OsStr> {
     *i += 1;
     let Some(value) = raw_args.get(*i) else {
         return Err(err(format!("{opt_name} 옵션에 값이 필요합니다.")));
