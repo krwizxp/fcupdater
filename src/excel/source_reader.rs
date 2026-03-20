@@ -7,7 +7,7 @@ use super::{
     },
 };
 use crate::source_sync::SourceRecord;
-use crate::{Result, canon_header, err, numeric::round_f64_to_i32, parse_i32_str};
+use crate::{Result, canon_header, err, err_with_source, numeric::round_f64_to_i32, parse_i32_str};
 use std::{collections::BTreeMap, path::Path};
 #[path = "source_reader_biff.rs"]
 mod source_reader_biff;
@@ -143,8 +143,9 @@ fn build_source_records_from_sheet_xml_streaming(
             cursor = row_tag_end + 1;
             continue;
         }
-        let row_num = usize::try_from(row_num_u32)
-            .map_err(|_| err(format!("xlsx 행 인덱스 변환 실패: {row_num_u32}")))?;
+        let row_num = usize::try_from(row_num_u32).map_err(|source| {
+            err_with_source(format!("xlsx 행 인덱스 변환 실패: {row_num_u32}"), source)
+        })?;
         let row_cells = if row_tag.ends_with("/>") {
             Vec::new()
         } else {
@@ -226,8 +227,9 @@ fn parse_xlsx_rows(
             cursor = row_tag_end + 1;
             continue;
         }
-        let row_num = usize::try_from(row_num_u32)
-            .map_err(|_| err(format!("xlsx 행 인덱스 변환 실패: {row_num_u32}")))?;
+        let row_num = usize::try_from(row_num_u32).map_err(|source| {
+            err_with_source(format!("xlsx 행 인덱스 변환 실패: {row_num_u32}"), source)
+        })?;
         if row_tag.ends_with("/>") {
             rows_map.insert(row_num, Vec::new());
             next_row_num = row_num.saturating_add(1);

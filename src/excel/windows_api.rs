@@ -47,6 +47,7 @@ pub fn local_date_yyyy_mm_dd() -> Result<String> {
         second: 0,
         milliseconds: 0,
     };
+    // SAFETY: `st` points to a valid writable `SystemTime` value for the duration of the call.
     unsafe {
         GetLocalTime(&raw mut st);
     }
@@ -63,6 +64,8 @@ pub fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
         return Some(String::new());
     }
     let src_len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: `bytes.as_ptr()` is valid for `src_len` bytes and a null destination requests
+    // only the required UTF-16 output length.
     let required = unsafe {
         MultiByteToWideChar(
             code_page,
@@ -78,6 +81,8 @@ pub fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
     }
     let required_usize = usize::try_from(required).ok()?;
     let mut wide = vec![0u16; required_usize];
+    // SAFETY: `wide` is allocated for `required` UTF-16 code units and both buffers remain
+    // valid for the duration of the conversion call.
     let written = unsafe {
         MultiByteToWideChar(
             code_page,
@@ -104,6 +109,8 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
             destination.display()
         ))
     })? {
+        // SAFETY: Both UTF-16 path buffers are NUL-terminated and live across the call; the
+        // optional backup, exclude, and reserved pointers are intentionally null.
         let replaced = unsafe {
             ReplaceFileW(
                 destination_w.as_ptr(),
@@ -117,6 +124,7 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
         if replaced != 0 {
             return Ok(());
         }
+        // SAFETY: Called immediately after the failing Windows API call on the same thread.
         let code = unsafe { GetLastError() };
         return Err(err(format!(
             "파일 교체 실패(ReplaceFileW): {} <- {} (GetLastError={code})",
@@ -124,6 +132,7 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
             replacement.display()
         )));
     }
+    // SAFETY: Both UTF-16 path buffers are NUL-terminated and valid for the duration of the call.
     let moved = unsafe {
         MoveFileExW(
             replacement_w.as_ptr(),
@@ -134,6 +143,7 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
     if moved != 0 {
         return Ok(());
     }
+    // SAFETY: Called immediately after the failing Windows API call on the same thread.
     let code = unsafe { GetLastError() };
     Err(err(format!(
         "파일 이동 실패(MoveFileExW): {} -> {} (GetLastError={code})",
