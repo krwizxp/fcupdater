@@ -135,11 +135,11 @@ fn evaluate_master_row(
         deleted: None,
     }
 }
-struct ExistingMasterRow<'a> {
-    region: &'a str,
-    name: &'a str,
-    brand: &'a str,
-    self_yn: &'a str,
+struct ExistingMasterRow<'row> {
+    region: &'row str,
+    name: &'row str,
+    brand: &'row str,
+    self_yn: &'row str,
     gasoline: Option<i32>,
     premium: Option<i32>,
     diesel: Option<i32>,

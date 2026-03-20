@@ -709,7 +709,7 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<(String, String)>> {
     }
     Ok(out)
 }
-fn get_attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+fn get_attr<'attrs>(attrs: &'attrs [(String, String)], name: &str) -> Option<&'attrs str> {
     attrs
         .iter()
         .find_map(|(k, v)| if k == name { Some(v.as_str()) } else { None })

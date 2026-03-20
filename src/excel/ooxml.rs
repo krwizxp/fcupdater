@@ -102,7 +102,7 @@ fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
     }
     out
 }
-fn iter_start_tags<'a>(xml: &'a str, tag_name: &str) -> Vec<&'a str> {
+fn iter_start_tags<'xml>(xml: &'xml str, tag_name: &str) -> Vec<&'xml str> {
     let mut out = vec![];
     let mut cursor = 0usize;
     while let Some(start) = find_start_tag(xml, tag_name, cursor) {
