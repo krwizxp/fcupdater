@@ -1,4 +1,3 @@
-use std::{fs, path::PathBuf};
 mod change_log;
 mod cli;
 mod defined_name;
@@ -13,17 +12,24 @@ mod path_policy;
 mod source_download;
 mod source_sync;
 mod summary;
-use cli::{Args, OutputTarget, ParseAction};
-use excel::writer::Workbook as StdWorkbook;
-use numeric::round_f64_to_i32;
-use source_sync::{build_source_index_with_report, find_source_files};
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type Result<T> = std::result::Result<T, BoxError>;
+use crate::{
+    cli::{Args, OutputTarget, ParseAction},
+    excel::writer::Workbook as StdWorkbook,
+    numeric::round_f64_to_i32,
+    source_sync::{build_source_index_with_report, find_source_files},
+};
+use std::{
+    error::Error, fmt::Display, fs, io::Error as IoError, path::PathBuf,
+    result::Result as StdResult,
+};
+type BoxError = Box<dyn Error + Send + Sync>;
+type Result<T> = StdResult<T, BoxError>;
 fn err(msg: impl Into<String>) -> BoxError {
-    std::io::Error::other(msg.into()).into()
+    IoError::other(msg.into()).into()
 }
-fn err_with_source(context: impl Into<String>, source: impl std::fmt::Display) -> BoxError {
-    std::io::Error::other(format!("{}: {source}", context.into())).into()
+fn err_with_source(context: impl Into<String>, source: impl Display) -> BoxError {
+    let context_text = context.into();
+    IoError::other(format!("{context_text}: {source}")).into()
 }
 #[derive(Debug, Clone)]
 struct ChangeRow {
@@ -72,11 +78,8 @@ impl Drop for DownloadedSourceGuard {
         if self.paths.is_empty() {
             return;
         }
-        match self.cleanup_with_message("종료 중 임시 소스 파일") {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("종료 중 임시 소스 파일 정리 실패: {e}");
-            }
+        if let Err(e) = self.cleanup_with_message("종료 중 임시 소스 파일") {
+            eprintln!("종료 중 임시 소스 파일 정리 실패: {e}");
         }
     }
 }
@@ -90,20 +93,17 @@ fn main() -> Result<()> {
     }
 }
 fn run(args: &Args) -> Result<()> {
-    match args.master.try_exists() {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(err(format!(
-                "마스터 파일이 없습니다: {} (같은 폴더에 두거나 --master로 경로를 지정하세요)",
-                args.master.display()
-            )));
-        }
-        Err(e) => {
-            return Err(err(format!(
-                "마스터 파일 경로 확인 실패: {} ({e})",
-                args.master.display()
-            )));
-        }
+    let master_exists = args.master.try_exists().map_err(|e| {
+        err(format!(
+            "마스터 파일 경로 확인 실패: {master_path} ({e})",
+            master_path = args.master.display()
+        ))
+    })?;
+    if !master_exists {
+        return Err(err(format!(
+            "마스터 파일이 없습니다: {master_path} (같은 폴더에 두거나 --master로 경로를 지정하세요)",
+            master_path = args.master.display()
+        )));
     }
     let mut downloaded_sources = DownloadedSourceGuard::default();
     if !args.skip_download {
@@ -113,15 +113,18 @@ fn run(args: &Args) -> Result<()> {
                     "{e}\n자동 다운로드를 건너뛰려면 --skip-download 를 지정하세요."
                 ))
             })?;
-        println!("소스 파일 {}개 준비 완료", downloaded.len());
+        println!(
+            "소스 파일 {downloaded_count}개 준비 완료",
+            downloaded_count = downloaded.len()
+        );
         downloaded_sources.track(downloaded);
     }
     let source_paths = find_source_files(&args.sources_dir, &args.sources_prefix)?;
     if source_paths.is_empty() {
         return Err(err(format!(
-            "소스 파일을 찾지 못했습니다. 폴더: {} / prefix: {} / 확장자: .xls,.xlsx",
-            args.sources_dir.display(),
-            args.sources_prefix
+            "소스 파일을 찾지 못했습니다. 폴더: {sources_dir} / prefix: {sources_prefix} / 확장자: .xls,.xlsx",
+            sources_dir = args.sources_dir.display(),
+            sources_prefix = args.sources_prefix
         )));
     }
     let source_sync::SourceIndexBuildResult {
@@ -144,12 +147,15 @@ fn run(args: &Args) -> Result<()> {
             if let Err(e) = fs::copy(&args.master, &backup) {
                 let _cleanup_result = fs::remove_file(&backup);
                 return Err(err(format!(
-                    "백업 파일 생성에 실패했습니다: {} -> {} ({e})",
-                    args.master.display(),
-                    backup.display()
+                    "백업 파일 생성에 실패했습니다: {master_path} -> {backup_path} ({e})",
+                    master_path = args.master.display(),
+                    backup_path = backup.display()
                 )));
             }
-            println!("백업 파일 생성: {}", backup.display());
+            println!(
+                "백업 파일 생성: {backup_path}",
+                backup_path = backup.display()
+            );
         }
         if let Err(e) = book.save_as(&out_path, args.save_mode.verify_saved_file()) {
             if reserved_output {
@@ -179,12 +185,12 @@ fn same_self_yn(a: &str, b: &str) -> bool {
     canon_header(a) == canon_header(b)
 }
 fn parse_i32_str(s: &str) -> Option<i32> {
-    let t = s.trim();
-    if t.is_empty() || t == "-" {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "-" {
         return None;
     }
-    let t = t.replace(',', "");
-    t.parse::<f64>().ok().and_then(round_f64_to_i32)
+    let normalized = trimmed.replace(',', "");
+    normalized.parse::<f64>().ok().and_then(round_f64_to_i32)
 }
 fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
     u32::try_from(value).map_err(|source| {
@@ -224,10 +230,10 @@ fn normalize_address_key(addr: &str) -> String {
         .find(|candidate| rest.starts_with(candidate.0))
         {
             out.push_str(to);
-            rest = &rest[from.len()..];
+            rest = rest.get(from.len()..).unwrap_or_default();
             continue;
         }
-        rest = &rest[ch.len_utf8()..];
+        rest = rest.get(ch.len_utf8()..).unwrap_or_default();
         if ch.is_whitespace() {
             continue;
         }

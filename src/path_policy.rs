@@ -56,22 +56,22 @@ fn make_nonconflicting_path(path: &Path) -> Result<PathBuf> {
         let candidate = candidate_with_suffix(path, seq);
         if !candidate.try_exists().map_err(|e| {
             err(format!(
-                "출력 파일 경로 확인 실패: {} ({e})",
-                candidate.display()
+                "출력 파일 경로 확인 실패: {candidate_path} ({e})",
+                candidate_path = candidate.display()
             ))
         })? {
             return Ok(candidate);
         }
         seq = seq.checked_add(1).ok_or_else(|| {
             err(format!(
-                "출력 파일명 시퀀스 계산 overflow: {}",
-                path.display()
+                "출력 파일명 시퀀스 계산 overflow: {path_display}",
+                path_display = path.display()
             ))
         })?;
         if seq > MAX_CONFLICT_ATTEMPTS {
             return Err(err(format!(
-                "출력 파일명 충돌이 너무 많아 경로를 확정할 수 없습니다: {}",
-                path.display()
+                "출력 파일명 충돌이 너무 많아 경로를 확정할 수 없습니다: {path_display}",
+                path_display = path.display()
             )));
         }
     }
@@ -95,8 +95,8 @@ fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
                     drop(file);
                     let _cleanup_result = fs::remove_file(&candidate);
                     return Err(err(format!(
-                        "출력 파일 예약 마커 기록 실패: {} ({e})",
-                        candidate.display()
+                        "출력 파일 예약 마커 기록 실패: {candidate_path} ({e})",
+                        candidate_path = candidate.display()
                     )));
                 }
                 return Ok(candidate);
@@ -107,21 +107,21 @@ fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
                 }
                 seq = seq.checked_add(1).ok_or_else(|| {
                     err(format!(
-                        "출력 파일 예약 시퀀스 계산 overflow: {}",
-                        path.display()
+                        "출력 파일 예약 시퀀스 계산 overflow: {path_display}",
+                        path_display = path.display()
                     ))
                 })?;
                 if seq > MAX_CONFLICT_ATTEMPTS {
                     return Err(err(format!(
-                        "출력 파일 예약 충돌이 너무 많아 경로를 확정할 수 없습니다: {}",
-                        path.display()
+                        "출력 파일 예약 충돌이 너무 많아 경로를 확정할 수 없습니다: {path_display}",
+                        path_display = path.display()
                     )));
                 }
             }
             Err(e) => {
                 return Err(err(format!(
-                    "출력 파일 예약 실패: {} ({e})",
-                    candidate.display()
+                    "출력 파일 예약 실패: {candidate_path} ({e})",
+                    candidate_path = candidate.display()
                 )));
             }
         }
@@ -129,8 +129,12 @@ fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
 }
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|e| err(format!("출력 폴더 생성 실패: {} ({e})", parent.display())))
+    fs::create_dir_all(parent).map_err(|e| {
+        err(format!(
+            "출력 폴더 생성 실패: {parent_path} ({e})",
+            parent_path = parent.display()
+        ))
+    })
 }
 fn try_remove_stale_reservation(path: &Path) -> bool {
     let Ok(meta) = fs::metadata(path) else {
@@ -168,7 +172,7 @@ fn candidate_with_suffix(path: &Path, seq: u32) -> PathBuf {
     let ext = path.extension().and_then(|s| s.to_str());
     let file_name = ext.map_or_else(
         || format!("{stem}_{seq}"),
-        |ext| format!("{stem}_{seq}.{ext}"),
+        |file_ext| format!("{stem}_{seq}.{file_ext}"),
     );
     parent.join(file_name)
 }

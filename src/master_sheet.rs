@@ -1,13 +1,15 @@
-use crate::excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers};
 use crate::{
-    ChangeRow, Result, StoreRow, add_row_offset, canon_header, defined_name, err, excel,
-    normalize_address_key, same_self_yn, same_trimmed, shift_row, source_sync::SourceRecord,
+    ChangeRow, Result, StoreRow, add_row_offset, canon_header, defined_name,
+    display_region_label_from_source, err, excel,
+    excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
+    normalize_address_key, same_self_yn, same_trimmed, shift_row,
+    source_sync::SourceRecord,
     usize_to_u32,
 };
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
-    env,
+    env, mem,
 };
 struct MasterRowDecision {
     src: Option<SourceRecord>,
@@ -300,8 +302,8 @@ fn evaluate_master_rows(
         if let Some(key) = matched_key {
             matched_source_keys.insert(key);
         }
-        if let Some(change) = change {
-            changes.push(change);
+        if let Some(row_change) = change {
+            changes.push(row_change);
         }
         kept_source_rows.push((old_row, src));
     }
@@ -322,7 +324,7 @@ fn collect_new_sources(
         .map(|entry| {
             let rec = entry.1;
             (
-                crate::display_region_label_from_source(&rec.region, &rec.address),
+                display_region_label_from_source(&rec.region, &rec.address),
                 rec.clone(),
             )
         })
@@ -338,7 +340,7 @@ fn rows_from_sources(new_sources: &[SourceRecord]) -> Vec<StoreRow> {
     new_sources
         .iter()
         .map(|src| StoreRow {
-            region: crate::display_region_label_from_source(&src.region, &src.address),
+            region: display_region_label_from_source(&src.region, &src.address),
             name: src.name.clone(),
             address: src.address.clone(),
             gasoline: src.gasoline,
@@ -365,7 +367,7 @@ fn rebuild_master_rows(
         .last()
         .copied()
         .unwrap_or_else(|| data_start_row.saturating_sub(1));
-    let original_rows = std::mem::take(&mut ws.rows);
+    let original_rows = mem::take(&mut ws.rows);
     let deleted_rows = build_deleted_rows(old_rows, kept_source_rows);
     let final_count = kept_source_rows.len() + new_sources.len();
     let old_count_u32 = usize_to_u32(old_count, "기존 유류비 행 수")?;
@@ -426,6 +428,10 @@ fn rebuild_master_rows(
         repair_rank_formulas(ws, data_start_row, filter_end_row, layout);
     }
     ws.clear_formula_cached_values();
+    if let Err(e) = ws.update_auto_filter_ref(header_row, filter_end_row) {
+        ws.rows = original_rows;
+        return Err(e);
+    }
     let filter_end_col = ws
         .rows
         .get(&header_row)
@@ -463,18 +469,18 @@ fn build_rebased_non_data_rows(
         if row_mapper.has_old_rows && row_num >= data_start_row && row_num <= old_end_row {
             continue;
         }
-        let mut row_obj = row_obj.clone();
+        let mut cloned_row = row_obj.clone();
         if row_num < data_start_row {
-            remap_row_numbers(&mut row_obj, row_num, &|old_ref_row| {
+            remap_row_numbers(&mut cloned_row, row_num, &|old_ref_row| {
                 row_mapper.map(old_ref_row)
             });
-            new_rows_map.insert(row_num, row_obj);
+            new_rows_map.insert(row_num, cloned_row);
         } else {
             let shifted = row_mapper.shift(row_num);
-            remap_row_numbers(&mut row_obj, shifted, &|old_ref_row| {
+            remap_row_numbers(&mut cloned_row, shifted, &|old_ref_row| {
                 row_mapper.map(old_ref_row)
             });
-            new_rows_map.insert(shifted, row_obj);
+            new_rows_map.insert(shifted, cloned_row);
         }
     }
     new_rows_map
@@ -556,7 +562,7 @@ fn write_source_rows_to_master(
         let new_row = source_row.0;
         let src = &source_row.1;
         write_master_row_from_source(ws, new_row, src, layout);
-        let region_label = crate::display_region_label_from_source(&src.region, &src.address);
+        let region_label = display_region_label_from_source(&src.region, &src.address);
         if !region_label.trim().is_empty() {
             ws.set_string_at(layout.region, new_row, &region_label);
         }
@@ -886,7 +892,7 @@ fn count_deleted_le(sorted_deleted_rows: &[u32], row: u32) -> usize {
 fn default_row(row_num: u32) -> StdRow {
     StdRow {
         attrs: vec![("r".to_owned(), row_num.to_string())],
-        cells: std::collections::BTreeMap::new(),
+        cells: BTreeMap::new(),
     }
 }
 fn write_master_row_from_source(
@@ -935,7 +941,10 @@ fn rewrite_rank_formula_range(
         return formula.to_owned();
     };
     let start_digits_start = first_col_pos + range_marker.len();
-    let start_digits_len = formula[start_digits_start..]
+    let Some(start_digits_tail) = formula.get(start_digits_start..) else {
+        return formula.to_owned();
+    };
+    let start_digits_len = start_digits_tail
         .chars()
         .take_while(char::is_ascii_digit)
         .count();
@@ -950,7 +959,10 @@ fn rewrite_rank_formula_range(
         return formula.to_owned();
     }
     let end_digits_start = second_col_pos + range_marker.len();
-    let end_digits_len = formula[end_digits_start..]
+    let Some(end_digits_tail) = formula.get(end_digits_start..) else {
+        return formula.to_owned();
+    };
+    let end_digits_len = end_digits_tail
         .chars()
         .take_while(char::is_ascii_digit)
         .count();
@@ -958,14 +970,14 @@ fn rewrite_rank_formula_range(
         return formula.to_owned();
     }
     let end_digits_end = end_digits_start + end_digits_len;
+    let Some(prefix) = formula.get(..first_col_pos) else {
+        return formula.to_owned();
+    };
+    let Some(suffix) = formula.get(end_digits_end..) else {
+        return formula.to_owned();
+    };
     format!(
-        "{}${}${}:$${}${}{}",
-        &formula[..first_col_pos],
-        sort_key_col_name,
-        data_start_row,
-        sort_key_col_name,
-        data_end_row,
-        &formula[end_digits_end..]
+        "{prefix}${sort_key_col_name}${data_start_row}:$${sort_key_col_name}${data_end_row}{suffix}"
     )
     .replace("$$", "$")
 }

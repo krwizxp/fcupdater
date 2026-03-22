@@ -1,5 +1,11 @@
 use crate::{Result, err};
-use std::{os::windows::ffi::OsStrExt as _, path::Path};
+use core::ffi::c_void;
+use std::{
+    iter::once,
+    os::windows::ffi::OsStrExt as _,
+    path::Path,
+    ptr::{null, null_mut},
+};
 #[repr(C)]
 struct SystemTime {
     year: u16,
@@ -27,8 +33,8 @@ unsafe extern "system" {
         replacement_file_name: *const u16,
         backup_file_name: *const u16,
         replace_flags: u32,
-        exclude: *mut core::ffi::c_void,
-        reserved: *mut core::ffi::c_void,
+        exclude: *mut c_void,
+        reserved: *mut c_void,
     ) -> i32;
     fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
 }
@@ -72,7 +78,7 @@ pub fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
             MB_ERR_INVALID_CHARS,
             bytes.as_ptr(),
             src_len,
-            std::ptr::null_mut(),
+            null_mut(),
             0,
         )
     };
@@ -105,8 +111,8 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
     let destination_w = encode_path_wide(destination);
     if destination.try_exists().map_err(|e| {
         err(format!(
-            "대상 파일 경로 확인 실패: {} ({e})",
-            destination.display()
+            "대상 파일 경로 확인 실패: {destination_path} ({e})",
+            destination_path = destination.display()
         ))
     })? {
         // SAFETY: Both UTF-16 path buffers are NUL-terminated and live across the call; the
@@ -115,10 +121,10 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
             ReplaceFileW(
                 destination_w.as_ptr(),
                 replacement_w.as_ptr(),
-                std::ptr::null(),
+                null(),
                 REPLACEFILE_WRITE_THROUGH,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                null_mut(),
+                null_mut(),
             )
         };
         if replaced != 0_i32 {
@@ -127,9 +133,9 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
         // SAFETY: Called immediately after the failing Windows API call on the same thread.
         let code = unsafe { GetLastError() };
         return Err(err(format!(
-            "파일 교체 실패(ReplaceFileW): {} <- {} (GetLastError={code})",
-            destination.display(),
-            replacement.display()
+            "파일 교체 실패(ReplaceFileW): {destination_path} <- {replacement_path} (GetLastError={code})",
+            destination_path = destination.display(),
+            replacement_path = replacement.display()
         )));
     }
     // SAFETY: Both UTF-16 path buffers are NUL-terminated and valid for the duration of the call.
@@ -146,14 +152,11 @@ pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()>
     // SAFETY: Called immediately after the failing Windows API call on the same thread.
     let code = unsafe { GetLastError() };
     Err(err(format!(
-        "파일 이동 실패(MoveFileExW): {} -> {} (GetLastError={code})",
-        replacement.display(),
-        destination.display()
+        "파일 이동 실패(MoveFileExW): {replacement_path} -> {destination_path} (GetLastError={code})",
+        replacement_path = replacement.display(),
+        destination_path = destination.display()
     )))
 }
 fn encode_path_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+    path.as_os_str().encode_wide().chain(once(0)).collect()
 }

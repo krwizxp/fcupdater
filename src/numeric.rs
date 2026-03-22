@@ -1,4 +1,8 @@
 #[expect(
+    clippy::as_conversions,
+    reason = "rounded value is range-checked before conversion"
+)]
+#[expect(
     clippy::cast_possible_truncation,
     reason = "rounded value is clamped to the i32 range before casting"
 )]

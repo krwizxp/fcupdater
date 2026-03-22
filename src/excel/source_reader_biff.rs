@@ -1,8 +1,8 @@
 use super::{CellValue, MAX_XLSX_COL, MAX_XLSX_ROW, build_source_records_from_rows};
-use crate::source_sync::SourceRecord;
-use crate::{Result, err, err_with_source};
+use crate::{Result, err, err_with_source, source_sync::SourceRecord};
 use std::{
     collections::{BTreeMap, HashSet},
+    error::Error,
     fs,
     path::Path,
 };
@@ -14,7 +14,7 @@ pub(in crate::excel) fn read_xls_source(path: &Path) -> Result<Vec<SourceRecord>
     };
     let globals = parse_biff_globals(&workbook)?;
     let mut all = Vec::new();
-    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    let mut last_err: Option<Box<dyn Error + Send + Sync>> = None;
     for sheet in globals
         .boundsheets
         .iter()
@@ -84,25 +84,28 @@ impl CfbFile {
         let file_size = fs::metadata(path)
             .map_err(|e| {
                 err(format!(
-                    "xls 파일 메타데이터 조회 실패: {} ({e})",
-                    path.display()
+                    "xls 파일 메타데이터 조회 실패: {path_display} ({e})",
+                    path_display = path.display()
                 ))
             })?
             .len();
         if file_size > MAX_XLS_FILE_SIZE_BYTES {
             return Err(err(format!(
-                "xls 파일이 너무 큽니다: {} ({} bytes, 최대 {} bytes)",
-                path.display(),
-                file_size,
-                MAX_XLS_FILE_SIZE_BYTES
+                "xls 파일이 너무 큽니다: {path_display} ({file_size} bytes, 최대 {max_size} bytes)",
+                path_display = path.display(),
+                max_size = MAX_XLS_FILE_SIZE_BYTES
             )));
         }
-        let data = fs::read(path)
-            .map_err(|e| err(format!("xls 파일 읽기 실패: {} ({e})", path.display())))?;
+        let data = fs::read(path).map_err(|e| {
+            err(format!(
+                "xls 파일 읽기 실패: {path_display} ({e})",
+                path_display = path.display()
+            ))
+        })?;
         if data.len() < 512 || data.get(..CFB_SIGNATURE.len()) != Some(CFB_SIGNATURE.as_slice()) {
             return Err(err(format!(
-                "유효한 OLE2(CFB) xls 파일이 아닙니다: {}",
-                path.display()
+                "유효한 OLE2(CFB) xls 파일이 아닙니다: {path_display}",
+                path_display = path.display()
             )));
         }
         let header = parse_cfb_header(&data)?;
@@ -128,9 +131,9 @@ impl CfbFile {
         }
         if fat_sector_ids.len() < declared_fat_sectors {
             return Err(err(format!(
-                "CFB FAT 엔트리가 부족합니다: 필요 {}, 실제 {}",
-                declared_fat_sectors,
-                fat_sector_ids.len()
+                "CFB FAT 엔트리가 부족합니다: 필요 {required}, 실제 {actual}",
+                required = declared_fat_sectors,
+                actual = fat_sector_ids.len()
             )));
         }
         let fat = build_fat_table(&data, header.sector_size, &fat_sector_ids)?;
@@ -232,7 +235,11 @@ impl CfbFile {
                 ))
             })?;
             let take = remaining.min(chunk.len());
-            out.extend_from_slice(&chunk[..take]);
+            out.extend_from_slice(
+                chunk
+                    .get(..take)
+                    .ok_or_else(|| err("mini stream 슬라이스 범위 오류"))?,
+            );
             remaining -= take;
             let next = *self
                 .mini_fat
@@ -287,8 +294,8 @@ fn checked_pow2_from_shift(shift: u16, context: &str) -> Result<usize> {
     let shift_u32 = u32::from(shift);
     if shift_u32 >= usize::BITS {
         return Err(err(format!(
-            "{context}가 비정상적으로 큽니다: {shift_u32} (usize bits={})",
-            usize::BITS
+            "{context}가 비정상적으로 큽니다: {shift_u32} (usize bits={usize_bits})",
+            usize_bits = usize::BITS
         )));
     }
     1_usize
@@ -300,6 +307,23 @@ fn max_regular_sector_count(data_len: usize, sector_size: usize) -> usize {
         .checked_sub(512)
         .map_or(0, |payload| payload / sector_size)
 }
+fn checked_offset_add(offset: usize, add: usize, context: &str) -> Result<usize> {
+    offset.checked_add(add).ok_or_else(|| {
+        err(format!(
+            "{context} 오프셋 계산 중 overflow가 발생했습니다. (offset={offset}, add={add})"
+        ))
+    })
+}
+fn checked_index_offset(base: usize, index: usize, stride: usize, context: &str) -> Result<usize> {
+    index
+        .checked_mul(stride)
+        .and_then(|delta| base.checked_add(delta))
+        .ok_or_else(|| {
+            err(format!(
+                "{context} 오프셋 계산 중 overflow가 발생했습니다. (base={base}, index={index}, stride={stride})"
+            ))
+        })
+}
 fn collect_difat_entries(
     data: &[u8],
     header: &CfbHeader,
@@ -307,7 +331,8 @@ fn collect_difat_entries(
 ) -> Result<Vec<u32>> {
     let mut difat_entries: Vec<u32> = Vec::new();
     for i in 0..109_usize {
-        let sid = read_u32_le(data, 0x4C + i * 4)?;
+        let sid_offset = checked_index_offset(0x4C, i, 4, "CFB DIFAT 헤더")?;
+        let sid = read_u32_le(data, sid_offset)?;
         if is_regular_sector_id(sid) {
             difat_entries.push(sid);
         }
@@ -332,19 +357,28 @@ fn collect_difat_entries(
             break;
         }
         let sector = get_sector_slice(data, header.sector_size, sid)?;
-        let entries_per_sector = header.sector_size / 4 - 1;
+        let entries_per_sector = header
+            .sector_size
+            .checked_div(4)
+            .and_then(|word_count| word_count.checked_sub(1))
+            .ok_or_else(|| err("CFB DIFAT sector 크기가 비정상적입니다."))?;
         for idx in 0..entries_per_sector {
-            let entry = read_u32_le(sector, idx * 4)?;
+            let entry_offset = checked_index_offset(0, idx, 4, "CFB DIFAT sector")?;
+            let entry = read_u32_le(sector, entry_offset)?;
             if is_regular_sector_id(entry) {
                 difat_entries.push(entry);
             }
         }
-        sid = read_u32_le(sector, entries_per_sector * 4)?;
+        let next_sid_offset = checked_index_offset(0, entries_per_sector, 4, "CFB DIFAT sector")?;
+        sid = read_u32_le(sector, next_sid_offset)?;
     }
     Ok(difat_entries)
 }
 fn build_fat_table(data: &[u8], sector_size: usize, fat_sector_ids: &[u32]) -> Result<Vec<u32>> {
     let entries_per_sector = sector_size / 4;
+    if entries_per_sector == 0 {
+        return Err(err("CFB FAT sector 크기가 비정상적입니다."));
+    }
     let total_entries = fat_sector_ids
         .len()
         .checked_mul(entries_per_sector)
@@ -359,7 +393,8 @@ fn build_fat_table(data: &[u8], sector_size: usize, fat_sector_ids: &[u32]) -> R
     for sid in fat_sector_ids {
         let sector = get_sector_slice(data, sector_size, *sid)?;
         for i in 0..entries_per_sector {
-            fat.push(read_u32_le(sector, i * 4)?);
+            let entry_offset = checked_index_offset(0, i, 4, "CFB FAT sector")?;
+            fat.push(read_u32_le(sector, entry_offset)?);
         }
     }
     Ok(fat)
@@ -396,9 +431,12 @@ fn build_mini_fat_table(
     )?;
     let mut out = Vec::new();
     let mut idx = 0_usize;
-    while idx + 4 <= mini_fat_bytes.len() {
+    while let Some(next_idx) = idx.checked_add(4) {
+        if next_idx > mini_fat_bytes.len() {
+            break;
+        }
         out.push(read_u32_le(&mini_fat_bytes, idx)?);
-        idx += 4;
+        idx = next_idx;
     }
     Ok(out)
 }
@@ -449,7 +487,11 @@ fn read_stream_from_fat_chain(
         let sector = get_sector_slice(data, sector_size, sid)?;
         if let Some(remain) = remaining.as_mut() {
             let take = (*remain).min(sector.len());
-            out.extend_from_slice(&sector[..take]);
+            out.extend_from_slice(
+                sector
+                    .get(..take)
+                    .ok_or_else(|| err("sector 슬라이스 범위 오류"))?,
+            );
             *remain -= take;
         } else {
             out.extend_from_slice(sector);
@@ -503,7 +545,7 @@ fn parse_directory_entries(
         let entry = dir_stream
             .get(cursor..cursor + 128)
             .ok_or_else(|| err("CFB 디렉터리 엔트리 범위 오류"))?;
-        let name_len = read_u16_le(entry, 0x40)? as usize;
+        let name_len = usize::from(read_u16_le(entry, 0x40)?);
         let object_type = *entry
             .get(0x42)
             .ok_or_else(|| err("CFB 디렉터리 object_type 범위 오류"))?;
@@ -549,7 +591,7 @@ fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
     let mut code_page: Option<u16> = detect_biff_code_page(workbook_stream);
     while pos + 4 <= workbook_stream.len() {
         let record_id = read_u16_le(workbook_stream, pos)?;
-        let record_len = read_u16_le(workbook_stream, pos + 2)? as usize;
+        let record_len = usize::from(read_u16_le(workbook_stream, pos + 2)?);
         let data_start = pos + 4;
         let data_end = data_start
             .checked_add(record_len)
@@ -578,7 +620,7 @@ fn parse_biff_globals(workbook_stream: &[u8]) -> Result<BiffGlobals> {
                 let mut next = data_end;
                 while next + 4 <= workbook_stream.len() {
                     let next_id = read_u16_le(workbook_stream, next)?;
-                    let next_len = read_u16_le(workbook_stream, next + 2)? as usize;
+                    let next_len = usize::from(read_u16_le(workbook_stream, next + 2)?);
                     let next_data_start = next + 4;
                     let Some(next_data_end) = next_data_start.checked_add(next_len) else {
                         break;
@@ -620,7 +662,7 @@ fn detect_biff_code_page(workbook_stream: &[u8]) -> Option<u16> {
     let mut pos = 0_usize;
     while pos + 4 <= workbook_stream.len() {
         let record_id = read_u16_le(workbook_stream, pos).ok()?;
-        let record_len = read_u16_le(workbook_stream, pos + 2).ok()? as usize;
+        let record_len = usize::from(read_u16_le(workbook_stream, pos + 2).ok()?);
         let data_start = pos + 4;
         let data_end = data_start.checked_add(record_len)?;
         if data_end > workbook_stream.len() {
@@ -797,13 +839,13 @@ fn parse_sst_from_chunks(chunks: &[&[u8]], code_page: Option<u16>) -> Result<Vec
     }
     let mut out = Vec::new();
     for _ in 0..unique_count {
-        let char_count = reader.read_u16()? as usize;
+        let char_count = usize::from(reader.read_u16()?);
         let flags = reader.read_u8()?;
         let high_byte = (flags & 0x01) != 0;
         let rich = (flags & 0x08) != 0;
         let ext = (flags & 0x04) != 0;
         let rich_run_count = if rich {
-            reader.read_u16()? as usize
+            usize::from(reader.read_u16()?)
         } else {
             0_usize
         };
@@ -947,16 +989,29 @@ fn handle_biff_mulrk_record(
     }
     let row = usize::from(read_u16_le(data, 0)?) + 1;
     let col_first = usize::from(read_u16_le(data, 2)?);
-    let col_last = usize::from(read_u16_le(data, data.len() - 2)?);
+    let Some(last_col_offset) = data.len().checked_sub(2) else {
+        return Ok(());
+    };
+    let col_last = usize::from(read_u16_le(data, last_col_offset)?);
     validate_sheet_cell_bounds(row, col_first)?;
     validate_sheet_cell_bounds(row, col_last)?;
     let mut offset = 4_usize;
     let mut col = col_first;
-    while offset + 6 <= data.len().saturating_sub(2) && col <= col_last {
-        let rk = read_u32_le(data, offset + 2)?;
+    while col <= col_last {
+        let Some(next_offset) = offset.checked_add(6) else {
+            break;
+        };
+        if next_offset > last_col_offset {
+            break;
+        }
+        let rk_offset = checked_offset_add(offset, 2, "MULRK 레코드")?;
+        let rk = read_u32_le(data, rk_offset)?;
         insert_sparse_cell(rows_map, row, col, CellValue::Number(decode_rk_number(rk)));
-        offset += 6;
-        col += 1;
+        offset = next_offset;
+        let Some(next_col) = col.checked_add(1) else {
+            break;
+        };
+        col = next_col;
     }
     Ok(())
 }
@@ -1005,15 +1060,16 @@ fn finalize_sparse_rows(
     rows
 }
 fn validate_sheet_cell_bounds(row: usize, col: usize) -> Result<()> {
-    if row == 0 || row > MAX_XLSX_ROW as usize {
+    let row_u32 = u32::try_from(row).unwrap_or(MAX_XLSX_ROW.saturating_add(1));
+    if row_u32 == 0 || row_u32 > MAX_XLSX_ROW {
         return Err(err(format!(
             "시트 행 인덱스가 비정상적으로 큽니다: {row} (최대 {MAX_XLSX_ROW})"
         )));
     }
     if col >= MAX_XLSX_COL {
         return Err(err(format!(
-            "시트 열 인덱스가 비정상적으로 큽니다: {}",
-            col + 1
+            "시트 열 인덱스가 비정상적으로 큽니다: {col_num}",
+            col_num = col + 1
         )));
     }
     Ok(())
@@ -1040,11 +1096,14 @@ fn parse_biff8_label(data: &[u8], code_page: Option<u16>) -> Result<Option<Strin
     } else {
         cch
     };
-    if data.len() < 3 + byte_len {
+    let Some(text_end) = 3_usize.checked_add(byte_len) else {
+        return Ok(None);
+    };
+    if data.len() < text_end {
         return Ok(None);
     }
     let text_bytes = data
-        .get(3..3 + byte_len)
+        .get(3..text_end)
         .ok_or_else(|| err("LABEL 문자열 범위 오류"))?;
     if high_byte {
         Ok(Some(decode_utf16_le(text_bytes)))
@@ -1081,15 +1140,17 @@ fn decode_utf16_le(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&data)
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
+    let end = checked_offset_add(offset, 2, "u16 read")?;
     let arr = bytes
-        .get(offset..offset + 2)
+        .get(offset..end)
         .and_then(|s| s.as_array::<2>())
         .ok_or_else(|| err(format!("u16 read out of range at {offset}")))?;
     Ok(u16::from(arr[0]) | (u16::from(arr[1]) << 8_u32))
 }
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = checked_offset_add(offset, 4, "u32 read")?;
     let arr = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .and_then(|s| s.as_array::<4>())
         .ok_or_else(|| err(format!("u32 read out of range at {offset}")))?;
     Ok(u32::from(arr[0])
@@ -1098,8 +1159,9 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
         | (u32::from(arr[3]) << 24_u32))
 }
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
+    let end = checked_offset_add(offset, 8, "u64 read")?;
     let arr = bytes
-        .get(offset..offset + 8)
+        .get(offset..end)
         .and_then(|s| s.as_array::<8>())
         .ok_or_else(|| err(format!("u64 read out of range at {offset}")))?;
     Ok(u64::from(arr[0])

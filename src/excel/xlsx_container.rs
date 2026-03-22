@@ -1,9 +1,11 @@
 use super::path_util::path_from_slashes;
 use crate::{Result, err};
 use std::{
+    env,
     ffi::OsString,
     fs,
     io::ErrorKind,
+    mem,
     path::{Component, Path, PathBuf},
     process::{self, Stdio},
     sync::OnceLock,
@@ -32,7 +34,7 @@ impl WorkDirCleanup {
     }
     fn into_path(mut self) -> PathBuf {
         self.keep = true;
-        std::mem::take(&mut self.path)
+        mem::take(&mut self.path)
     }
 }
 impl Drop for WorkDirCleanup {
@@ -44,20 +46,17 @@ impl Drop for WorkDirCleanup {
 }
 impl XlsxContainer {
     pub fn open_for_update(source_xlsx: &Path) -> Result<Self> {
-        match source_xlsx.try_exists() {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(err(format!(
-                    "xlsx 파일이 없습니다: {}",
-                    source_xlsx.display()
-                )));
-            }
-            Err(e) => {
-                return Err(err(format!(
-                    "xlsx 파일 경로 확인 실패: {} ({e})",
-                    source_xlsx.display()
-                )));
-            }
+        let source_exists = source_xlsx.try_exists().map_err(|e| {
+            err(format!(
+                "xlsx 파일 경로 확인 실패: {source_path} ({e})",
+                source_path = source_xlsx.display()
+            ))
+        })?;
+        if !source_exists {
+            return Err(err(format!(
+                "xlsx 파일이 없습니다: {source_path}",
+                source_path = source_xlsx.display()
+            )));
         }
         ensure_extract_tools_available()?;
         let cleanup = WorkDirCleanup::new(create_unique_work_dir()?);
@@ -65,15 +64,15 @@ impl XlsxContainer {
         let archive_path = cleanup.path().join("workbook.zip");
         fs::create_dir_all(&unpack_dir).map_err(|e| {
             err(format!(
-                "임시 폴더 생성 실패: {} ({e})",
-                unpack_dir.display()
+                "임시 폴더 생성 실패: {unpack_dir_path} ({e})",
+                unpack_dir_path = unpack_dir.display()
             ))
         })?;
         fs::copy(source_xlsx, &archive_path).map_err(|e| {
             err(format!(
-                "xlsx 임시 복사 실패: {} -> {} ({e})",
-                source_xlsx.display(),
-                archive_path.display()
+                "xlsx 임시 복사 실패: {source_path} -> {archive_path} ({e})",
+                source_path = source_xlsx.display(),
+                archive_path = archive_path.display()
             ))
         })?;
         extract_archive(&archive_path, &unpack_dir)?;
@@ -86,32 +85,59 @@ impl XlsxContainer {
     }
     pub fn read_text(&self, relative_path: &str) -> Result<String> {
         let path = self.resolve_relative_path(relative_path)?;
-        fs::read_to_string(&path)
-            .map_err(|e| err(format!("파일 읽기 실패: {} ({e})", path.display())))
+        fs::read_to_string(&path).map_err(|e| {
+            err(format!(
+                "파일 읽기 실패: {path_display} ({e})",
+                path_display = path.display()
+            ))
+        })
     }
     pub fn write_text(&self, relative_path: &str, content: &str) -> Result<()> {
         let path = self.resolve_relative_path(relative_path)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| err(format!("폴더 생성 실패: {} ({e})", parent.display())))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                err(format!(
+                    "폴더 생성 실패: {parent_path} ({e})",
+                    parent_path = parent.display()
+                ))
+            })?;
         }
-        fs::write(&path, content)
-            .map_err(|e| err(format!("파일 쓰기 실패: {} ({e})", path.display())))
+        fs::write(&path, content).map_err(|e| {
+            err(format!(
+                "파일 쓰기 실패: {path_display} ({e})",
+                path_display = path.display()
+            ))
+        })
+    }
+    pub fn remove_file_if_exists(&self, relative_path: &str) -> Result<()> {
+        let path = self.resolve_relative_path(relative_path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(err(format!(
+                "파일 삭제 실패: {path_display} ({e})",
+                path_display = path.display()
+            ))),
+        }
     }
     pub fn save_as(&self, output_xlsx: &Path, verify_saved_file: bool) -> Result<()> {
         ensure_create_tools_available()?;
         create_archive(&self.unpack_dir, &self.archive_path)?;
         if let Some(parent) = output_xlsx.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| err(format!("출력 폴더 생성 실패: {} ({e})", parent.display())))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                err(format!(
+                    "출력 폴더 생성 실패: {parent_path} ({e})",
+                    parent_path = parent.display()
+                ))
+            })?;
         }
         let tmp_output = create_unique_temp_output_path(output_xlsx)?;
         let result = (|| -> Result<()> {
             fs::copy(&self.archive_path, &tmp_output).map_err(|e| {
                 err(format!(
-                    "xlsx 임시 저장 실패: {} -> {} ({e})",
-                    self.archive_path.display(),
-                    tmp_output.display()
+                    "xlsx 임시 저장 실패: {archive_path} -> {tmp_output_path} ({e})",
+                    archive_path = self.archive_path.display(),
+                    tmp_output_path = tmp_output.display()
                 ))
             })?;
             if verify_saved_file {
@@ -158,7 +184,7 @@ impl Drop for XlsxContainer {
     }
 }
 fn create_unique_work_dir() -> Result<PathBuf> {
-    let base = std::env::temp_dir();
+    let base = env::temp_dir();
     let pid = process::id();
     for seq in 0..1024_u32 {
         let nanos = SystemTime::now()
@@ -173,8 +199,8 @@ fn create_unique_work_dir() -> Result<PathBuf> {
             }
             Err(e) => {
                 return Err(err(format!(
-                    "임시 작업 폴더 생성 실패: {} ({e})",
-                    path.display()
+                    "임시 작업 폴더 생성 실패: {path_display} ({e})",
+                    path_display = path.display()
                 )));
             }
         }
@@ -207,15 +233,15 @@ fn create_unique_temp_output_path(output_xlsx: &Path) -> Result<PathBuf> {
             }
             Err(e) => {
                 return Err(err(format!(
-                    "임시 출력 파일 생성 실패: {} ({e})",
-                    candidate.display()
+                    "임시 출력 파일 생성 실패: {candidate_path} ({e})",
+                    candidate_path = candidate.display()
                 )));
             }
         }
     }
     Err(err(format!(
-        "임시 출력 파일 경로 생성 실패: {}",
-        output_xlsx.display()
+        "임시 출력 파일 경로 생성 실패: {output_path}",
+        output_path = output_xlsx.display()
     )))
 }
 fn promote_temp_output(temp_output: &Path, output_xlsx: &Path) -> Result<()> {
@@ -227,9 +253,9 @@ fn promote_temp_output(temp_output: &Path, output_xlsx: &Path) -> Result<()> {
     {
         fs::rename(temp_output, output_xlsx).map_err(|e| {
             err(format!(
-                "xlsx 저장 실패: {} -> {} ({e})",
-                temp_output.display(),
-                output_xlsx.display()
+                "xlsx 저장 실패: {temp_output_path} -> {output_path} ({e})",
+                temp_output_path = temp_output.display(),
+                output_path = output_xlsx.display()
             ))
         })?;
         if let Err(e) = fs::OpenOptions::new()
@@ -239,13 +265,13 @@ fn promote_temp_output(temp_output: &Path, output_xlsx: &Path) -> Result<()> {
         {
             if durability_strict_mode() {
                 return Err(err(format!(
-                    "xlsx 저장 내구성 동기화 실패(파일): {} ({e})",
-                    output_xlsx.display()
+                    "xlsx 저장 내구성 동기화 실패(파일): {output_path} ({e})",
+                    output_path = output_xlsx.display()
                 )));
             }
             eprintln!(
-                "경고: 저장 내구성 동기화 실패(파일): {} ({e})",
-                output_xlsx.display()
+                "경고: 저장 내구성 동기화 실패(파일): {output_path} ({e})",
+                output_path = output_xlsx.display()
             );
         }
         if let Some(parent) = output_xlsx.parent()
@@ -253,13 +279,13 @@ fn promote_temp_output(temp_output: &Path, output_xlsx: &Path) -> Result<()> {
         {
             if durability_strict_mode() {
                 return Err(err(format!(
-                    "xlsx 저장 내구성 동기화 실패(폴더): {} ({e})",
-                    parent.display()
+                    "xlsx 저장 내구성 동기화 실패(폴더): {parent_path} ({e})",
+                    parent_path = parent.display()
                 )));
             }
             eprintln!(
-                "경고: 저장 내구성 동기화 실패(폴더): {} ({e})",
-                parent.display()
+                "경고: 저장 내구성 동기화 실패(폴더): {parent_path} ({e})",
+                parent_path = parent.display()
             );
         }
         Ok(())
@@ -334,8 +360,8 @@ fn verify_saved_xlsx(output_xlsx: &Path) -> Result<()> {
     let verify_unpacked = verify_work.join("verify_unpacked");
     fs::create_dir_all(&verify_unpacked).map_err(|e| {
         err(format!(
-            "저장 검증용 임시 폴더 생성 실패: {} ({e})",
-            verify_unpacked.display()
+            "저장 검증용 임시 폴더 생성 실패: {verify_path} ({e})",
+            verify_path = verify_unpacked.display()
         ))
     })?;
     let result = (|| -> Result<()> {
@@ -348,8 +374,8 @@ fn verify_saved_xlsx(output_xlsx: &Path) -> Result<()> {
             let path = verify_unpacked.join(path_from_slashes(rel));
             if !path.is_file() {
                 return Err(err(format!(
-                    "저장 검증 실패: 필수 OOXML 파트가 없습니다: {}",
-                    path.display()
+                    "저장 검증 실패: 필수 OOXML 파트가 없습니다: {path_display}",
+                    path_display = path.display()
                 )));
             }
         }
@@ -362,8 +388,8 @@ fn verify_saved_xlsx(output_xlsx: &Path) -> Result<()> {
 fn verify_saved_workbook_reopen(output_xlsx: &Path) -> Result<()> {
     super::writer::Workbook::open(output_xlsx).map_err(|e| {
         err(format!(
-            "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다: {} ({e})",
-            output_xlsx.display()
+            "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다: {output_path} ({e})",
+            output_path = output_xlsx.display()
         ))
     })?;
     Ok(())
@@ -373,9 +399,9 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
     {
         let mut attempts = Vec::new();
         let script = format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            ps_quote(archive_path),
-            ps_quote(unpack_dir),
+            "Expand-Archive -LiteralPath '{archive_path_quoted}' -DestinationPath '{unpack_dir_quoted}' -Force",
+            archive_path_quoted = ps_quote(archive_path),
+            unpack_dir_quoted = ps_quote(unpack_dir),
         );
         if let Some(shell_program) = detect_powershell_program() {
             match run_powershell(shell_program, &script) {
@@ -397,10 +423,10 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
             Err(e) => attempts.push(format!("tar: {e}")),
         }
         Err(err(format!(
-            "xlsx 압축 해제 실패: {} -> {} ({})",
-            archive_path.display(),
-            unpack_dir.display(),
-            attempts.join(" / ")
+            "xlsx 압축 해제 실패: {archive_path_display} -> {unpack_dir_path} ({attempts})",
+            archive_path_display = archive_path.display(),
+            unpack_dir_path = unpack_dir.display(),
+            attempts = attempts.join(" / ")
         )))
     }
     #[cfg(not(windows))]
@@ -448,24 +474,24 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
             Err(e) => attempts.push(format!("python -m zipfile: {e}")),
         }
         Err(err(format!(
-            "xlsx 압축 해제 실패: {} -> {} ({})",
-            archive_path.display(),
-            unpack_dir.display(),
-            attempts.join(" / ")
+            "xlsx 압축 해제 실패: {archive_path_display} -> {unpack_dir_path} ({attempts})",
+            archive_path_display = archive_path.display(),
+            unpack_dir_path = unpack_dir.display(),
+            attempts = attempts.join(" / ")
         )))
     }
 }
 fn create_archive(unpack_dir: &Path, archive_path: &Path) -> Result<()> {
     if archive_path.try_exists().map_err(|e| {
         err(format!(
-            "archive 경로 확인 실패: {} ({e})",
-            archive_path.display()
+            "archive 경로 확인 실패: {archive_path_display} ({e})",
+            archive_path_display = archive_path.display()
         ))
     })? {
         fs::remove_file(archive_path).map_err(|e| {
             err(format!(
-                "기존 archive 삭제 실패: {} ({e})",
-                archive_path.display()
+                "기존 archive 삭제 실패: {archive_path_display} ({e})",
+                archive_path_display = archive_path.display()
             ))
         })?;
     }
@@ -475,9 +501,9 @@ fn create_archive(unpack_dir: &Path, archive_path: &Path) -> Result<()> {
 fn create_archive_impl(unpack_dir: &Path, archive_path: &Path) -> Result<()> {
     let mut attempts = Vec::new();
     let script = format!(
-        "Compress-Archive -Path (Join-Path '{}' '*') -DestinationPath '{}' -Force",
-        ps_quote(unpack_dir),
-        ps_quote(archive_path),
+        "Compress-Archive -Path (Join-Path '{unpack_dir_quoted}' '*') -DestinationPath '{archive_path_quoted}' -Force",
+        unpack_dir_quoted = ps_quote(unpack_dir),
+        archive_path_quoted = ps_quote(archive_path),
     );
     if let Some(shell_program) = detect_powershell_program() {
         match run_powershell(shell_program, &script) {
@@ -502,10 +528,10 @@ fn create_archive_impl(unpack_dir: &Path, archive_path: &Path) -> Result<()> {
         Err(e) => attempts.push(format!("tar: {e}")),
     }
     Err(err(format!(
-        "xlsx 압축 생성 실패: {} -> {} ({})",
-        unpack_dir.display(),
-        archive_path.display(),
-        attempts.join(" / ")
+        "xlsx 압축 생성 실패: {unpack_dir_path} -> {archive_path_display} ({attempts})",
+        unpack_dir_path = unpack_dir.display(),
+        archive_path_display = archive_path.display(),
+        attempts = attempts.join(" / ")
     )))
 }
 #[cfg(not(windows))]
@@ -561,10 +587,10 @@ with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         Err(e) => attempts.push(format!("python -c zipfile: {e}")),
     }
     Err(err(format!(
-        "xlsx 압축 생성 실패: {} -> {} ({})",
-        unpack_dir.display(),
-        archive_path.display(),
-        attempts.join(" / ")
+        "xlsx 압축 생성 실패: {unpack_dir_path} -> {archive_path_display} ({attempts})",
+        unpack_dir_path = unpack_dir.display(),
+        archive_path_display = archive_path.display(),
+        attempts = attempts.join(" / ")
     )))
 }
 fn format_process_failure(program: &str, output: &process::Output) -> String {
@@ -582,7 +608,7 @@ fn format_process_failure(program: &str, output: &process::Output) -> String {
     }
 }
 fn command_timeout() -> Option<Duration> {
-    std::env::var("FCUPDATER_COMMAND_TIMEOUT_SECS")
+    env::var("FCUPDATER_COMMAND_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
@@ -611,8 +637,8 @@ fn wait_with_optional_timeout(
                     let _kill_result = child.kill();
                     let _wait_result = child.wait();
                     return Err(err(format!(
-                        "{program} 실행 제한시간 초과: {}초",
-                        limit.as_secs()
+                        "{program} 실행 제한시간 초과: {timeout_secs}초",
+                        timeout_secs = limit.as_secs()
                     )));
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -685,7 +711,7 @@ fn ps_quote(path: &Path) -> String {
 }
 #[cfg(not(windows))]
 fn durability_strict_mode() -> bool {
-    std::env::var("FCUPDATER_DURABILITY_STRICT")
+    env::var("FCUPDATER_DURABILITY_STRICT")
         .ok()
         .is_some_and(|v| {
             matches!(

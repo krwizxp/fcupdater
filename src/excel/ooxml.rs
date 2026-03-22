@@ -60,8 +60,8 @@ pub fn load_shared_strings(container: &XlsxContainer) -> Result<Vec<String>> {
         .join(path_from_slashes("xl/sharedStrings.xml"));
     if !path.try_exists().map_err(|e| {
         err(format!(
-            "sharedStrings.xml 경로 확인 실패: {} ({e})",
-            path.display()
+            "sharedStrings.xml 경로 확인 실패: {path_display} ({e})",
+            path_display = path.display()
         ))
     })? {
         return Ok(vec![]);
@@ -93,7 +93,9 @@ fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
         let Some(si_end) = find_end_tag(xml, "si", body_start) else {
             break;
         };
-        let si_body = &xml[body_start..si_end];
+        let Some(si_body) = xml.get(body_start..si_end) else {
+            break;
+        };
         let text = extract_all_tag_text(si_body, "t")
             .map(|v| decode_xml_entities(&v))
             .unwrap_or_default();
@@ -109,7 +111,10 @@ fn iter_start_tags<'xml>(xml: &'xml str, tag_name: &str) -> Vec<&'xml str> {
         let Some(end) = find_tag_end(xml, start) else {
             break;
         };
-        out.push(&xml[start..=end]);
+        let Some(tag) = xml.get(start..=end) else {
+            break;
+        };
+        out.push(tag);
         cursor = end + 1;
     }
     out

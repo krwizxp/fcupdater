@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use crate::excel::windows_api::local_date_yyyy_mm_dd;
 use crate::{Result, err, err_with_source};
 #[cfg(not(windows))]
 use std::process;
@@ -91,11 +93,11 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
             let value = take_option_value(raw_args, &mut i, "--sources-dir")?;
             args.sources_dir = PathBuf::from(value);
         } else if token == OsStr::new("--sources-prefix") {
-            let value = take_option_value(raw_args, &mut i, "--sources-prefix")?;
-            let value: &str = value.try_into().map_err(|source| {
+            let raw_value = take_option_value(raw_args, &mut i, "--sources-prefix")?;
+            let value_str: &str = raw_value.try_into().map_err(|source| {
                 err_with_source("--sources-prefix 값은 UTF-8 문자열이어야 합니다.", source)
             })?;
-            args.sources_prefix = parse_sources_prefix(value)?;
+            args.sources_prefix = parse_sources_prefix(value_str)?;
         } else if token == OsStr::new("--output") {
             let value = take_option_value(raw_args, &mut i, "--output")?;
             set_output_target_explicit(&mut args.output_target, PathBuf::from(value))?;
@@ -110,15 +112,15 @@ fn parse_args(raw_args: &[OsString]) -> Result<ParseAction> {
                 set_output_target_explicit(&mut args.output_target, PathBuf::from(v))?;
             } else {
                 return Err(err(format!(
-                    "알 수 없는 옵션: {token_str}\n\n{}",
-                    usage_text()
+                    "알 수 없는 옵션: {token_str}\n\n{usage}",
+                    usage = usage_text()
                 )));
             }
         } else {
             return Err(err(format!(
-                "알 수 없는 옵션: {}\n\n{}",
-                token.to_string_lossy(),
-                usage_text()
+                "알 수 없는 옵션: {token}\n\n{usage}",
+                token = token.to_string_lossy(),
+                usage = usage_text()
             )));
         }
         i += 1;
@@ -162,8 +164,8 @@ fn take_option_value<'args>(
     };
     if is_long_option_token(value.as_os_str()) {
         return Err(err(format!(
-            "{opt_name} 옵션에 값이 필요합니다. (다음 토큰: {})",
-            value.to_string_lossy()
+            "{opt_name} 옵션에 값이 필요합니다. (다음 토큰: {next_token})",
+            next_token = value.to_string_lossy()
         )));
     }
     Ok(value.as_os_str())
@@ -244,7 +246,7 @@ fn is_yyyy_mm_dd(s: &str) -> bool {
 }
 #[cfg(windows)]
 fn local_today_windows() -> Result<String> {
-    let today = crate::excel::windows_api::local_date_yyyy_mm_dd()?;
+    let today = local_date_yyyy_mm_dd()?;
     if !is_yyyy_mm_dd(&today) {
         return Err(err(format!("오늘 날짜 형식이 올바르지 않습니다: {today}")));
     }
@@ -271,8 +273,8 @@ fn local_today_from_date_command() -> Result<String> {
         .map_err(|e| err(format!("date 명령 실행 실패: {e}")))?;
     if !output.status.success() {
         return Err(err(format!(
-            "date 명령 실행 실패: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "date 명령 실행 실패: {stderr}",
+            stderr = String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
     let today = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -292,8 +294,8 @@ fn local_today_from_python_command(program: &str) -> Result<String> {
         .map_err(|e| err(format!("{program} 실행 실패: {e}")))?;
     if !output.status.success() {
         return Err(err(format!(
-            "{program} 비정상 종료: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{program} 비정상 종료: {stderr}",
+            stderr = String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
     let today = String::from_utf8_lossy(&output.stdout).trim().to_string();
