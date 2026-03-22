@@ -2,7 +2,7 @@ pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<Strin
     let pattern = format!("{attr_name}=");
     let bytes = tag.as_bytes();
     let mut cursor = 0_usize;
-    while let Some(rel) = tag[cursor..].find(&pattern) {
+    while let Some(rel) = tag.get(cursor..)?.find(&pattern) {
         let idx = cursor + rel;
         if idx > 0 {
             let prev = *bytes.get(idx - 1)?;
@@ -18,16 +18,16 @@ pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<Strin
             continue;
         }
         let value_start = quote_idx + 1;
-        let value_end_rel = tag[value_start..].find(char::from(quote))?;
+        let value_end_rel = tag.get(value_start..)?.find(char::from(quote))?;
         let value_end = value_start + value_end_rel;
-        return Some(decode_xml_entities(&tag[value_start..value_end]));
+        return Some(decode_xml_entities(tag.get(value_start..value_end)?));
     }
     None
 }
 pub(in crate::excel) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     let mut cursor = from.min(xml.len());
     let wanted = local_tag_name(tag_name);
-    while let Some(rel) = xml[cursor..].find('<') {
+    while let Some(rel) = xml.get(cursor..)?.find('<') {
         let start = cursor + rel;
         let rest = xml.get(start + 1..)?;
         if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
@@ -48,7 +48,7 @@ pub(in crate::excel) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -
 pub(in crate::excel) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     let mut cursor = from.min(xml.len());
     let wanted = local_tag_name(tag_name);
-    while let Some(rel) = xml[cursor..].find("</") {
+    while let Some(rel) = xml.get(cursor..)?.find("</") {
         let start = cursor + rel;
         let rest = xml.get(start + 2..)?;
         let name_end_rel = rest
@@ -68,28 +68,21 @@ pub(in crate::excel) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usiz
         .map(|rel| tag_start + rel)
 }
 pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Option<String> {
-    let open_pattern = format!("<{tag_name}");
-    let open_start = xml.find(&open_pattern)?;
-    let open_end = open_start + xml[open_start..].find('>')?;
+    let open_start = find_start_tag(xml, tag_name, 0)?;
+    let open_end = find_tag_end(xml, open_start)?;
     let body_start = open_end + 1;
-    let close_pattern = format!("</{tag_name}>");
-    let close_rel = xml[body_start..].find(&close_pattern)?;
-    let body_end = body_start + close_rel;
-    Some(xml[body_start..body_end].to_string())
+    let body_end = find_end_tag(xml, tag_name, body_start)?;
+    Some(xml.get(body_start..body_end)?.to_owned())
 }
 pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Option<String> {
-    let open_pattern = format!("<{tag_name}");
-    let close_pattern = format!("</{tag_name}>");
     let mut cursor = 0_usize;
     let mut out = String::new();
-    while let Some(open_rel) = xml[cursor..].find(&open_pattern) {
-        let open_start = cursor + open_rel;
-        let open_end = open_start + xml[open_start..].find('>')?;
+    while let Some(open_start) = find_start_tag(xml, tag_name, cursor) {
+        let open_end = find_tag_end(xml, open_start)?;
         let body_start = open_end + 1;
-        let close_rel = xml[body_start..].find(&close_pattern)?;
-        let body_end = body_start + close_rel;
-        out.push_str(&xml[body_start..body_end]);
-        cursor = body_end + close_pattern.len();
+        let body_end = find_end_tag(xml, tag_name, body_start)?;
+        out.push_str(xml.get(body_start..body_end)?);
+        cursor = body_end + tag_name.len() + 3;
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -100,13 +93,16 @@ pub(in crate::excel) fn decode_xml_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0_usize;
     while i < s.len() {
-        let rest = &s[i..];
+        let Some(rest) = s.get(i..) else {
+            break;
+        };
         if rest.starts_with('&')
             && let Some(end_rel) = rest.find(';')
         {
             let end = i + end_rel;
             if end > i + 1
-                && let Some(decoded) = decode_single_entity(&s[i + 1..end])
+                && let Some(entity) = s.get(i + 1..end)
+                && let Some(decoded) = decode_single_entity(entity)
             {
                 out.push(decoded);
                 i = end + 1;

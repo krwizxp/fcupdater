@@ -1,13 +1,15 @@
 use crate::{Result, err};
+use std::env;
 #[cfg(not(windows))]
 use std::{
     collections::{HashMap, VecDeque},
     io::Write,
-    process::{Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    thread::sleep,
     time::{Duration, Instant},
 };
 #[cfg(not(windows))]
@@ -96,14 +98,12 @@ fn decode_cp949_non_windows(bytes: &[u8]) -> Option<String> {
         .inspect(|text| cp949_cache_put(bytes, text))
 }
 fn cp949_strict_mode() -> bool {
-    std::env::var("FCUPDATER_CP949_STRICT")
-        .ok()
-        .is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    env::var("FCUPDATER_CP949_STRICT").ok().is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 #[cfg(not(windows))]
 fn cp949_cache_get(bytes: &[u8]) -> Option<String> {
@@ -191,7 +191,7 @@ fn run_decoder_command(program: &str, args: &[&str], input: &[u8]) -> Option<Str
 }
 #[cfg(not(windows))]
 fn decoder_timeout() -> Option<Duration> {
-    std::env::var("FCUPDATER_DECODER_TIMEOUT_SECS")
+    env::var("FCUPDATER_DECODER_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
@@ -199,9 +199,9 @@ fn decoder_timeout() -> Option<Duration> {
 }
 #[cfg(not(windows))]
 fn wait_decoder_with_optional_timeout(
-    mut child: std::process::Child,
+    mut child: Child,
     timeout: Option<Duration>,
-) -> Option<std::process::Output> {
+) -> Option<Output> {
     let Some(limit) = timeout else {
         return child.wait_with_output().ok();
     };
@@ -215,7 +215,7 @@ fn wait_decoder_with_optional_timeout(
                     let _ = child.wait();
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                sleep(Duration::from_millis(25));
             }
             Err(_) => {
                 let _ = child.kill();

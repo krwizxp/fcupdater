@@ -2,7 +2,7 @@ use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, canon_header, err,
     excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, env};
 struct ChangeLogLayout {
     data_start_row: u32,
     col_region: u32,
@@ -344,21 +344,21 @@ fn pick_change_log_style_template_row(ws: &Worksheet, max_col: u32, data_start_r
     data_start_row
 }
 fn change_log_header_scan_rows() -> u32 {
-    std::env::var("FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS")
+    env::var("FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)
         .map_or(30, |v| v.min(1_000))
 }
 fn change_log_header_scan_cols() -> u32 {
-    std::env::var("FCUPDATER_CHANGELOG_HEADER_SCAN_COLS")
+    env::var("FCUPDATER_CHANGELOG_HEADER_SCAN_COLS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)
         .map_or(60, |v| v.min(500))
 }
 fn change_log_style_template_row() -> u32 {
-    std::env::var("FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW")
+    env::var("FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)

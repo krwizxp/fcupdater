@@ -1,4 +1,9 @@
-use crate::{Result, err};
+use crate::{
+    Result, err,
+    excel::source_reader,
+    normalize_address_key,
+    source_download::{filter_target_region_records, is_auto_source_file_name_folded},
+};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -41,11 +46,14 @@ pub fn find_source_files(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
     let mut auto_candidates = Vec::new();
     let mut manual_candidates = Vec::new();
     let prefix_fold = prefix.to_lowercase();
-    for entry in
-        fs::read_dir(dir).map_err(|e| err(format!("폴더 읽기 실패: {} ({e})", dir.display())))?
-    {
-        let entry = entry?;
-        let path = entry.path();
+    for entry in fs::read_dir(dir).map_err(|e| {
+        err(format!(
+            "폴더 읽기 실패: {dir_path} ({e})",
+            dir_path = dir.display()
+        ))
+    })? {
+        let dir_entry = entry?;
+        let path = dir_entry.path();
         if !path.is_file() {
             continue;
         }
@@ -63,8 +71,7 @@ pub fn find_source_files(dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
         if !file_name_fold.starts_with(&prefix_fold) {
             continue;
         }
-        let is_auto =
-            crate::source_download::is_auto_source_file_name_folded(file_name, &prefix_fold);
+        let is_auto = is_auto_source_file_name_folded(file_name, &prefix_fold);
         let natural_key = split_natural_parts(&file_name_fold);
         let candidate = SourceFileCandidate { path, natural_key };
         if is_auto {
@@ -88,12 +95,14 @@ pub fn build_source_index_with_report(paths: &[PathBuf]) -> Result<SourceIndexBu
     let mut report = SourceIndexBuildReport::default();
     let mut sampled_keys: HashSet<String> = HashSet::new();
     for (file_order, path) in paths.iter().enumerate() {
-        let recs = crate::source_download::filter_target_region_records(
-            read_source_file(path)
-                .map_err(|e| err(format!("소스 파일 읽기 실패: {} ({e})", path.display())))?,
-        );
+        let recs = filter_target_region_records(read_source_file(path).map_err(|e| {
+            err(format!(
+                "소스 파일 읽기 실패: {path_display} ({e})",
+                path_display = path.display()
+            ))
+        })?);
         for rec in recs {
-            let key = crate::normalize_address_key(&rec.address);
+            let key = normalize_address_key(&rec.address);
             let score = source_priority(&rec);
             match map.entry(key) {
                 Entry::Vacant(vacant) => {
@@ -157,31 +166,6 @@ enum NaturalPart {
     Number { normalized: String, raw_len: usize },
     Text(String),
 }
-impl NaturalPart {
-    #[expect(
-        clippy::ref_patterns,
-        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
-    )]
-    fn as_number(&self) -> Option<(&str, usize)> {
-        match *self {
-            Self::Number {
-                ref normalized,
-                raw_len,
-            } => Some((normalized, raw_len)),
-            Self::Text(_) => None,
-        }
-    }
-    #[expect(
-        clippy::ref_patterns,
-        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
-    )]
-    fn as_text(&self) -> Option<&str> {
-        match *self {
-            Self::Text(ref text) => Some(text),
-            Self::Number { .. } => None,
-        }
-    }
-}
 fn split_natural_parts(s: &str) -> Vec<NaturalPart> {
     let mut out = Vec::new();
     let mut buf = String::new();
@@ -224,18 +208,24 @@ fn push_natural_part(out: &mut Vec<NaturalPart>, raw: &str, digit_mode: bool) {
     }
 }
 fn compare_natural_part(a: &NaturalPart, b: &NaturalPart) -> Ordering {
-    if let (Some((a_num, a_raw)), Some((b_num, b_raw))) = (a.as_number(), b.as_number()) {
-        a_num
+    match (a.clone(), b.clone()) {
+        (
+            NaturalPart::Number {
+                normalized: a_num,
+                raw_len: a_raw,
+            },
+            NaturalPart::Number {
+                normalized: b_num,
+                raw_len: b_raw,
+            },
+        ) => a_num
             .len()
             .cmp(&b_num.len())
-            .then_with(|| a_num.cmp(b_num))
-            .then_with(|| a_raw.cmp(&b_raw))
-    } else if let (Some(a_text), Some(b_text)) = (a.as_text(), b.as_text()) {
-        a_text.cmp(b_text)
-    } else if a.as_number().is_some() {
-        Ordering::Less
-    } else {
-        Ordering::Greater
+            .then_with(|| a_num.cmp(&b_num))
+            .then_with(|| a_raw.cmp(&b_raw)),
+        (NaturalPart::Text(a_text), NaturalPart::Text(b_text)) => a_text.cmp(&b_text),
+        (NaturalPart::Number { .. }, NaturalPart::Text(_)) => Ordering::Less,
+        (NaturalPart::Text(_), NaturalPart::Number { .. }) => Ordering::Greater,
     }
 }
 fn source_priority(rec: &SourceRecord) -> SourcePriority {
@@ -258,10 +248,10 @@ fn source_priority(rec: &SourceRecord) -> SourcePriority {
     (price_count, text_field_count, text_len)
 }
 fn read_source_file(path: &Path) -> Result<Vec<SourceRecord>> {
-    crate::excel::source_reader::read_source_file(path)
+    source_reader::read_source_file(path)
 }
 fn source_label(path: &Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
-        .map_or_else(|| path.display().to_string(), ToString::to_string)
+        .map_or_else(|| path.display().to_string(), str::to_owned)
 }

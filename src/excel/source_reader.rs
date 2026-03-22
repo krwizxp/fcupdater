@@ -1,3 +1,5 @@
+#[path = "source_reader_biff.rs"]
+mod source_reader_biff;
 use super::{
     ooxml::{load_shared_strings, load_sheet_catalog, load_sheet_xml},
     xlsx_container::XlsxContainer,
@@ -6,11 +8,11 @@ use super::{
         find_end_tag, find_start_tag, find_tag_end,
     },
 };
-use crate::source_sync::SourceRecord;
-use crate::{Result, canon_header, err, err_with_source, numeric::round_f64_to_i32, parse_i32_str};
-use std::{collections::BTreeMap, path::Path};
-#[path = "source_reader_biff.rs"]
-mod source_reader_biff;
+use crate::{
+    Result, canon_header, err, err_with_source, numeric::round_f64_to_i32, parse_i32_str,
+    source_sync::SourceRecord,
+};
+use std::{collections::BTreeMap, env, error::Error, path::Path};
 #[derive(Debug, Clone, PartialEq)]
 enum CellValue {
     Empty,
@@ -31,30 +33,7 @@ struct SourceHeaderIndices {
 const MAX_XLSX_ROW: u32 = 200_000;
 const MAX_XLSX_COL: usize = 1_024;
 const DEFAULT_SOURCE_HEADER_SCAN_ROWS: usize = 200;
-impl CellValue {
-    #[expect(
-        clippy::ref_patterns,
-        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
-    )]
-    fn as_string(&self) -> String {
-        match *self {
-            Self::Empty => String::new(),
-            Self::Text(ref v) => v.trim().to_owned(),
-            Self::Number(v) => format_number(v),
-        }
-    }
-    #[expect(
-        clippy::ref_patterns,
-        reason = "borrowed enum fields need explicit reference patterns to satisfy pattern_type_mismatch"
-    )]
-    fn as_i32(&self) -> Option<i32> {
-        match *self {
-            Self::Empty => None,
-            Self::Number(v) => round_f64_to_i32(v),
-            Self::Text(ref v) => parse_i32_str(v),
-        }
-    }
-}
+impl CellValue {}
 fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
     value.filter(|v| *v > 0_i32)
 }
@@ -68,8 +47,8 @@ pub fn read_source_file(path: &Path) -> Result<Vec<SourceRecord>> {
         "xlsx" => read_xlsx_source(path),
         "xls" => read_xls_source(path),
         _ => Err(err(format!(
-            "지원하지 않는 소스 확장자입니다: {}",
-            path.display()
+            "지원하지 않는 소스 확장자입니다: {path_display}",
+            path_display = path.display()
         ))),
     }
 }
@@ -81,7 +60,7 @@ fn read_xlsx_source(path: &Path) -> Result<Vec<SourceRecord>> {
         return Err(err("xlsx에 시트가 없습니다."));
     }
     let mut all = Vec::new();
-    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    let mut last_err: Option<Box<dyn Error + Send + Sync>> = None;
     for sheet_name in &catalog.sheet_order {
         let sheet_xml = load_sheet_xml(&container, &catalog, sheet_name)?;
         match parse_sheet_source_records(&sheet_xml, &shared_strings) {
@@ -131,15 +110,20 @@ fn build_source_records_from_sheet_xml_streaming(
     let mut scanned_rows = 0_usize;
     let header_scan_rows = source_header_scan_rows();
     let mut header_indices: Option<SourceHeaderIndices> = None;
-    while let Some(row_open_rel) = sheet_data[cursor..].find("<row") {
+    while let Some(row_open_rel) = sheet_data.get(cursor..).and_then(|tail| tail.find("<row")) {
         let row_open = cursor + row_open_rel;
-        let Some(row_tag_end_rel) = sheet_data[row_open..].find('>') else {
+        let Some(row_tag_end_rel) = sheet_data.get(row_open..).and_then(|tail| tail.find('>'))
+        else {
             return Err(err(format!(
                 "xlsx row 시작 태그가 손상되었습니다. (offset={row_open})"
             )));
         };
         let row_tag_end = row_open + row_tag_end_rel;
-        let row_tag = &sheet_data[row_open..=row_tag_end];
+        let row_tag = sheet_data.get(row_open..=row_tag_end).ok_or_else(|| {
+            err(format!(
+                "xlsx row 태그 범위가 손상되었습니다. (offset={row_open})"
+            ))
+        })?;
         let row_num_u32 = parse_row_number(row_tag)
             .unwrap_or_else(|| u32::try_from(next_row_num).unwrap_or(MAX_XLSX_ROW + 1));
         if row_num_u32 > MAX_XLSX_ROW {
@@ -158,13 +142,22 @@ fn build_source_records_from_sheet_xml_streaming(
             Vec::new()
         } else {
             let row_body_start = row_tag_end + 1;
-            let Some(row_close_rel) = sheet_data[row_body_start..].find("</row>") else {
+            let Some(row_close_rel) = sheet_data
+                .get(row_body_start..)
+                .and_then(|tail| tail.find("</row>"))
+            else {
                 return Err(err(format!(
                     "xlsx row 종료 태그를 찾지 못했습니다. (row={row_num_u32})"
                 )));
             };
             let row_body_end = row_body_start + row_close_rel;
-            let row_body = &sheet_data[row_body_start..row_body_end];
+            let row_body = sheet_data
+                .get(row_body_start..row_body_end)
+                .ok_or_else(|| {
+                    err(format!(
+                        "xlsx row 본문 범위가 손상되었습니다. (row={row_num_u32})"
+                    ))
+                })?;
             cursor = row_body_end + "</row>".len();
             parse_xlsx_row_cells(row_body, row_num, shared_strings)?
         };
@@ -205,7 +198,9 @@ fn sheet_data_body(sheet_xml: &str) -> Result<&str> {
     let Some(sheet_data_close) = find_end_tag(sheet_xml, "sheetData", sheet_data_body_start) else {
         return Err(err("xlsx worksheet XML에 </sheetData>가 없습니다."));
     };
-    Ok(&sheet_xml[sheet_data_body_start..sheet_data_close])
+    sheet_xml
+        .get(sheet_data_body_start..sheet_data_close)
+        .ok_or_else(|| err("xlsx worksheet XML의 sheetData 본문 범위가 손상되었습니다."))
 }
 fn parse_xlsx_rows(
     sheet_xml: &str,
@@ -215,15 +210,20 @@ fn parse_xlsx_rows(
     let mut rows_map: BTreeMap<usize, Vec<CellValue>> = BTreeMap::new();
     let mut cursor = 0_usize;
     let mut next_row_num = 1_usize;
-    while let Some(row_open_rel) = sheet_data[cursor..].find("<row") {
+    while let Some(row_open_rel) = sheet_data.get(cursor..).and_then(|tail| tail.find("<row")) {
         let row_open = cursor + row_open_rel;
-        let Some(row_tag_end_rel) = sheet_data[row_open..].find('>') else {
+        let Some(row_tag_end_rel) = sheet_data.get(row_open..).and_then(|tail| tail.find('>'))
+        else {
             return Err(err(format!(
                 "xlsx row 시작 태그가 손상되었습니다. (offset={row_open})"
             )));
         };
         let row_tag_end = row_open + row_tag_end_rel;
-        let row_tag = &sheet_data[row_open..=row_tag_end];
+        let row_tag = sheet_data.get(row_open..=row_tag_end).ok_or_else(|| {
+            err(format!(
+                "xlsx row 태그 범위가 손상되었습니다. (offset={row_open})"
+            ))
+        })?;
         let row_num_u32 = parse_row_number(row_tag)
             .unwrap_or_else(|| u32::try_from(next_row_num).unwrap_or(MAX_XLSX_ROW + 1));
         if row_num_u32 > MAX_XLSX_ROW {
@@ -245,13 +245,22 @@ fn parse_xlsx_rows(
             continue;
         }
         let row_body_start = row_tag_end + 1;
-        let Some(row_close_rel) = sheet_data[row_body_start..].find("</row>") else {
+        let Some(row_close_rel) = sheet_data
+            .get(row_body_start..)
+            .and_then(|tail| tail.find("</row>"))
+        else {
             return Err(err(format!(
                 "xlsx row 종료 태그를 찾지 못했습니다. (row={row_num_u32})"
             )));
         };
         let row_body_end = row_body_start + row_close_rel;
-        let row_body = &sheet_data[row_body_start..row_body_end];
+        let row_body = sheet_data
+            .get(row_body_start..row_body_end)
+            .ok_or_else(|| {
+                err(format!(
+                    "xlsx row 본문 범위가 손상되었습니다. (row={row_num_u32})"
+                ))
+            })?;
         let row_cells = parse_xlsx_row_cells(row_body, row_num, shared_strings)?;
         rows_map.insert(row_num, row_cells);
         next_row_num = row_num.saturating_add(1);
@@ -271,23 +280,28 @@ fn parse_xlsx_row_cells(
     let mut row_cells: Vec<CellValue> = Vec::new();
     let mut cursor = 0_usize;
     let mut next_col = 0_usize;
-    while let Some(cell_open_rel) = row_xml[cursor..].find("<c") {
+    while let Some(cell_open_rel) = row_xml.get(cursor..).and_then(|tail| tail.find("<c")) {
         let cell_open = cursor + cell_open_rel;
-        let Some(cell_tag_end_rel) = row_xml[cell_open..].find('>') else {
+        let Some(cell_tag_end_rel) = row_xml.get(cell_open..).and_then(|tail| tail.find('>'))
+        else {
             return Err(err(format!(
                 "xlsx 셀 시작 태그가 손상되었습니다. (row={row_num}, offset={cell_open})"
             )));
         };
         let cell_tag_end = cell_open + cell_tag_end_rel;
-        let cell_tag = &row_xml[cell_open..=cell_tag_end];
+        let cell_tag = row_xml.get(cell_open..=cell_tag_end).ok_or_else(|| {
+            err(format!(
+                "xlsx 셀 태그 범위가 손상되었습니다. (row={row_num}, offset={cell_open})"
+            ))
+        })?;
         let col_index = extract_attr(cell_tag, "r")
             .as_deref()
             .and_then(cell_ref_to_col_index)
             .unwrap_or(next_col);
         if col_index >= MAX_XLSX_COL {
             return Err(err(format!(
-                "xlsx 열 인덱스가 비정상적으로 큽니다: {}",
-                col_index + 1
+                "xlsx 열 인덱스가 비정상적으로 큽니다: {col_num}",
+                col_num = col_index + 1
             )));
         }
         if row_cells.len() <= col_index {
@@ -302,14 +316,22 @@ fn parse_xlsx_row_cells(
             continue;
         }
         let cell_body_start = cell_tag_end + 1;
-        let Some(cell_close_rel) = row_xml[cell_body_start..].find("</c>") else {
+        let Some(cell_close_rel) = row_xml
+            .get(cell_body_start..)
+            .and_then(|tail| tail.find("</c>"))
+        else {
             return Err(err(format!(
-                "xlsx 셀 종료 태그를 찾지 못했습니다. (row={row_num}, col={})",
-                col_index + 1
+                "xlsx 셀 종료 태그를 찾지 못했습니다. (row={row_num}, col={col_num})",
+                col_num = col_index + 1
             )));
         };
         let cell_body_end = cell_body_start + cell_close_rel;
-        let cell_body = &row_xml[cell_body_start..cell_body_end];
+        let cell_body = row_xml.get(cell_body_start..cell_body_end).ok_or_else(|| {
+            err(format!(
+                "xlsx 셀 본문 범위가 손상되었습니다. (row={row_num}, col={col_num})",
+                col_num = col_index + 1
+            ))
+        })?;
         if let Some(cell) = row_cells.get_mut(col_index) {
             *cell = parse_xlsx_cell_value(cell_tag, cell_body, shared_strings);
         }
@@ -359,13 +381,14 @@ fn cell_ref_to_col_index(cell_ref: &str) -> Option<usize> {
     for ch in cell_ref.chars() {
         if ch.is_ascii_alphabetic() {
             has_alpha = true;
-            let upper = ch.to_ascii_uppercase() as u8;
+            let upper = ch.to_ascii_uppercase();
             if !upper.is_ascii_uppercase() {
                 return None;
             }
+            let upper_byte = u8::try_from(u32::from(upper)).ok()?;
             col = col
                 .checked_mul(26)?
-                .checked_add(usize::from(upper - b'A' + 1))?;
+                .checked_add(usize::from(upper_byte - b'A' + 1))?;
         } else {
             break;
         }
@@ -406,15 +429,15 @@ fn build_source_records_from_rows(rows: &[(usize, Vec<CellValue>)]) -> Result<Ve
             break;
         }
     }
-    let header_row_idx = header_row_idx.ok_or_else(|| err("헤더 행을 찾지 못했습니다"))?;
+    let found_header_row_idx = header_row_idx.ok_or_else(|| err("헤더 행을 찾지 못했습니다"))?;
     let header = rows
-        .get(header_row_idx)
+        .get(found_header_row_idx)
         .map(|row_entry| &row_entry.1)
         .ok_or_else(|| err("헤더 행 접근 실패"))?;
     let header_indices =
         parse_source_header_indices(header).ok_or_else(|| err("헤더 행 접근 실패"))?;
     let mut out = Vec::new();
-    for row_entry in rows.iter().skip(header_row_idx + 1) {
+    for row_entry in rows.iter().skip(found_header_row_idx + 1) {
         let row = &row_entry.1;
         if let Some(record) = build_source_record_from_row(row, header_indices) {
             out.push(record);
@@ -432,7 +455,12 @@ fn parse_source_header_indices(header: &[CellValue]) -> Option<SourceHeaderIndic
     let mut idx_gas: Option<usize> = None;
     let mut idx_diesel: Option<usize> = None;
     for (i, cell) in header.iter().enumerate() {
-        let h = canon_header(&cell.as_string());
+        let header_text = match cell.clone() {
+            CellValue::Empty => String::new(),
+            CellValue::Text(v) => v.trim().to_owned(),
+            CellValue::Number(v) => format_number(v),
+        };
+        let h = canon_header(&header_text);
         match h.as_str() {
             "지역" => idx_region = Some(i),
             "상호" => idx_name = Some(i),
@@ -445,13 +473,13 @@ fn parse_source_header_indices(header: &[CellValue]) -> Option<SourceHeaderIndic
             _ => {}
         }
     }
-    let idx_name = idx_name?;
-    let idx_addr = idx_addr?;
-    let idx_region = idx_region?;
+    let name_idx = idx_name?;
+    let addr_idx = idx_addr?;
+    let region_idx = idx_region?;
     Some(SourceHeaderIndices {
-        region: Some(idx_region),
-        name: idx_name,
-        address: idx_addr,
+        region: Some(region_idx),
+        name: name_idx,
+        address: addr_idx,
         brand: idx_brand,
         self_yn: idx_self,
         premium: idx_premium,
@@ -498,13 +526,24 @@ fn build_source_record_from_row(
     })
 }
 fn get_row_string(row: &[CellValue], idx: usize) -> String {
-    row.get(idx).map(CellValue::as_string).unwrap_or_default()
+    row.get(idx)
+        .map(|cell| match cell.clone() {
+            CellValue::Empty => String::new(),
+            CellValue::Text(v) => v.trim().to_owned(),
+            CellValue::Number(v) => format_number(v),
+        })
+        .unwrap_or_default()
 }
 fn get_row_i32(row: &[CellValue], idx: usize) -> Option<i32> {
-    row.get(idx).and_then(CellValue::as_i32)
+    let cell = row.get(idx)?;
+    match cell.clone() {
+        CellValue::Empty => None,
+        CellValue::Text(v) => parse_i32_str(&v),
+        CellValue::Number(v) => round_f64_to_i32(v),
+    }
 }
 fn source_header_scan_rows() -> usize {
-    std::env::var("FCUPDATER_SOURCE_HEADER_SCAN_ROWS")
+    env::var("FCUPDATER_SOURCE_HEADER_SCAN_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)

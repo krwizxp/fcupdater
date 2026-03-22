@@ -24,23 +24,27 @@ fn find_filter_database_defined_name_content_range(
     let sheet_ref_plain = format!("{sheet_name}!");
     let sheet_ref_quoted = format!("'{sheet_name}'!");
     let mut cursor = 0_usize;
-    while let Some(open_rel) = workbook_xml[cursor..].find("<definedName") {
+    while let Some(open_rel) = workbook_xml.get(cursor..)?.find("<definedName") {
         let open_pos = cursor + open_rel;
-        let Some(open_end_rel) = workbook_xml[open_pos..].find('>') else {
+        let Some(open_end_rel) = workbook_xml.get(open_pos..)?.find('>') else {
             break;
         };
         let open_end = open_pos + open_end_rel;
-        let open_tag = &workbook_xml[open_pos..=open_end];
+        let Some(open_tag) = workbook_xml.get(open_pos..=open_end) else {
+            break;
+        };
         if !open_tag.contains(&marker_attr_double) && !open_tag.contains(&marker_attr_single) {
             cursor = open_end + 1;
             continue;
         }
         let content_start = open_end + 1;
-        let Some(close_rel) = workbook_xml[content_start..].find("</definedName>") else {
+        let Some(close_rel) = workbook_xml.get(content_start..)?.find("</definedName>") else {
             break;
         };
         let content_end = content_start + close_rel;
-        let content = &workbook_xml[content_start..content_end];
+        let Some(content) = workbook_xml.get(content_start..content_end) else {
+            break;
+        };
         if content.contains(&sheet_ref_plain) || content.contains(&sheet_ref_quoted) {
             return Some((content_start, content_end));
         }
