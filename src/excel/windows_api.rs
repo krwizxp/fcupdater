@@ -1,26 +1,23 @@
-use crate::{Result, err};
 use core::ffi::c_void;
-use std::{
-    iter::once,
-    os::windows::ffi::OsStrExt as _,
-    path::Path,
-    ptr::{null, null_mut},
-};
+pub const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
+pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+pub const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+pub const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
 #[repr(C)]
-struct SystemTime {
-    year: u16,
-    month: u16,
-    day_of_week: u16,
-    day: u16,
-    hour: u16,
-    minute: u16,
-    second: u16,
-    milliseconds: u16,
+pub struct SystemTime {
+    pub year: u16,
+    pub month: u16,
+    pub day_of_week: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub milliseconds: u16,
 }
 unsafe extern "system" {
-    fn GetLocalTime(system_time: *mut SystemTime);
-    fn GetLastError() -> u32;
-    fn MultiByteToWideChar(
+    pub fn GetLocalTime(system_time: *mut SystemTime);
+    pub fn GetLastError() -> u32;
+    pub fn MultiByteToWideChar(
         code_page: u32,
         flags: u32,
         src: *const u8,
@@ -28,7 +25,7 @@ unsafe extern "system" {
         dst: *mut u16,
         dst_len: i32,
     ) -> i32;
-    fn ReplaceFileW(
+    pub fn ReplaceFileW(
         replaced_file_name: *const u16,
         replacement_file_name: *const u16,
         backup_file_name: *const u16,
@@ -36,127 +33,9 @@ unsafe extern "system" {
         exclude: *mut c_void,
         reserved: *mut c_void,
     ) -> i32;
-    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
-}
-const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
-const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
-pub fn local_date_yyyy_mm_dd() -> Result<String> {
-    let mut st = SystemTime {
-        year: 0,
-        month: 0,
-        day_of_week: 0,
-        day: 0,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        milliseconds: 0,
-    };
-    // SAFETY: `st` points to a valid writable `SystemTime` value for the duration of the call.
-    unsafe {
-        GetLocalTime(&raw mut st);
-    }
-    if st.month == 0 || st.month > 12 || st.day == 0 || st.day > 31 {
-        return Err(err(format!(
-            "OS 날짜 조회 결과가 비정상적입니다: {:04}-{:02}-{:02}",
-            st.year, st.month, st.day
-        )));
-    }
-    Ok(format!("{:04}-{:02}-{:02}", st.year, st.month, st.day))
-}
-pub fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
-    if bytes.is_empty() {
-        return Some(String::new());
-    }
-    let src_len = i32::try_from(bytes.len()).ok()?;
-    // SAFETY: `bytes.as_ptr()` is valid for `src_len` bytes and a null destination requests
-    // only the required UTF-16 output length.
-    let required = unsafe {
-        MultiByteToWideChar(
-            code_page,
-            MB_ERR_INVALID_CHARS,
-            bytes.as_ptr(),
-            src_len,
-            null_mut(),
-            0,
-        )
-    };
-    if required <= 0_i32 {
-        return None;
-    }
-    let required_usize = usize::try_from(required).ok()?;
-    let mut wide = vec![0_u16; required_usize];
-    // SAFETY: `wide` is allocated for `required` UTF-16 code units and both buffers remain
-    // valid for the duration of the conversion call.
-    let written = unsafe {
-        MultiByteToWideChar(
-            code_page,
-            0,
-            bytes.as_ptr(),
-            src_len,
-            wide.as_mut_ptr(),
-            required,
-        )
-    };
-    if written <= 0_i32 {
-        return None;
-    }
-    let written_usize = usize::try_from(written).ok()?;
-    let view = wide.get(..written_usize.min(required_usize))?;
-    Some(String::from_utf16_lossy(view))
-}
-pub fn replace_file_atomic(replacement: &Path, destination: &Path) -> Result<()> {
-    let replacement_w = encode_path_wide(replacement);
-    let destination_w = encode_path_wide(destination);
-    if destination.try_exists().map_err(|e| {
-        err(format!(
-            "대상 파일 경로 확인 실패: {destination_path} ({e})",
-            destination_path = destination.display()
-        ))
-    })? {
-        // SAFETY: Both UTF-16 path buffers are NUL-terminated and live across the call; the
-        // optional backup, exclude, and reserved pointers are intentionally null.
-        let replaced = unsafe {
-            ReplaceFileW(
-                destination_w.as_ptr(),
-                replacement_w.as_ptr(),
-                null(),
-                REPLACEFILE_WRITE_THROUGH,
-                null_mut(),
-                null_mut(),
-            )
-        };
-        if replaced != 0_i32 {
-            return Ok(());
-        }
-        // SAFETY: Called immediately after the failing Windows API call on the same thread.
-        let code = unsafe { GetLastError() };
-        return Err(err(format!(
-            "파일 교체 실패(ReplaceFileW): {destination_path} <- {replacement_path} (GetLastError={code})",
-            destination_path = destination.display(),
-            replacement_path = replacement.display()
-        )));
-    }
-    // SAFETY: Both UTF-16 path buffers are NUL-terminated and valid for the duration of the call.
-    let moved = unsafe {
-        MoveFileExW(
-            replacement_w.as_ptr(),
-            destination_w.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved != 0_i32 {
-        return Ok(());
-    }
-    // SAFETY: Called immediately after the failing Windows API call on the same thread.
-    let code = unsafe { GetLastError() };
-    Err(err(format!(
-        "파일 이동 실패(MoveFileExW): {replacement_path} -> {destination_path} (GetLastError={code})",
-        replacement_path = replacement.display(),
-        destination_path = destination.display()
-    )))
-}
-fn encode_path_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(once(0)).collect()
+    pub fn MoveFileExW(
+        existing_file_name: *const u16,
+        new_file_name: *const u16,
+        flags: u32,
+    ) -> i32;
 }
