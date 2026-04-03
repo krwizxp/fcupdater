@@ -13,7 +13,7 @@ use core::{
     time::Duration,
 };
 #[cfg(not(windows))]
-use std::io::stderr;
+use std::io::{Write as _, stderr};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt as _;
 use std::{
@@ -766,6 +766,7 @@ fn attempt_source_message(program: &str, source: impl Display) -> String {
     push_display(&mut out, source);
     out
 }
+#[cfg(windows)]
 fn push_attempt(attempts: &mut Vec<String>, program: &str, source: impl Display) {
     attempts.push(attempt_source_message(program, source));
 }
