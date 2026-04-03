@@ -1,9 +1,14 @@
 use crate::{Result, err};
+#[cfg(not(windows))]
+use core::fmt::Arguments;
+use core::fmt::Write as _;
+#[cfg(windows)]
+use core::ptr::null_mut;
 use std::env;
 #[cfg(not(windows))]
 use std::{
     collections::{HashMap, VecDeque},
-    io::Write,
+    io::{ErrorKind, Write},
     process::{Child, Command, Output, Stdio},
     sync::{
         LazyLock, Mutex,
@@ -35,12 +40,61 @@ struct Cp949DecodeCache {
     order: VecDeque<Vec<u8>>,
     total_bytes: usize,
 }
+const WINDOWS_1252_EXTENDED_CHARS: [char; 32] = [
+    '€', '�', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '�', 'Ž', '�', '�', '‘', '’',
+    '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '�', 'ž', 'Ÿ',
+];
+fn decode_bytes_to_string(bytes: &[u8], mut map_byte: impl FnMut(u8) -> char) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for byte in bytes {
+        out.push(map_byte(*byte));
+    }
+    out
+}
 pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<String> {
     #[cfg(windows)]
     {
-        if let Some(decoded) =
-            super::windows_api::decode_code_page(bytes, u32::from(code_page.unwrap_or(949)))
-        {
+        let code_page_u32 = u32::from(code_page.unwrap_or(949));
+        let decoded_text = if bytes.is_empty() {
+            Some(String::new())
+        } else {
+            let src_len = i32::try_from(bytes.len()).ok();
+            src_len.and_then(|src_len_i32| {
+                // SAFETY: `bytes.as_ptr()` is valid for `src_len_i32` bytes and a null destination requests only the required UTF-16 output length.
+                let required = unsafe {
+                    super::windows_api::MultiByteToWideChar(
+                        code_page_u32,
+                        super::windows_api::MB_ERR_INVALID_CHARS,
+                        bytes.as_ptr(),
+                        src_len_i32,
+                        null_mut(),
+                        0,
+                    )
+                };
+                if required <= 0_i32 {
+                    return None;
+                }
+                let required_usize = usize::try_from(required).ok()?;
+                let mut wide = vec![0_u16; required_usize];
+                // SAFETY: `wide` is allocated for `required` UTF-16 code units and both buffers remain valid for the duration of the conversion call.
+                let written = unsafe {
+                    super::windows_api::MultiByteToWideChar(
+                        code_page_u32,
+                        0,
+                        bytes.as_ptr(),
+                        src_len_i32,
+                        wide.as_mut_ptr(),
+                        required,
+                    )
+                };
+                if written <= 0_i32 {
+                    return None;
+                }
+                let written_usize = usize::try_from(written).ok()?;
+                Some(String::from_utf16_lossy(wide.get(..written_usize)?))
+            })
+        };
+        if let Some(decoded) = decoded_text {
             return Ok(decoded);
         }
     }
@@ -51,36 +105,50 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
             if let Some(decoded) = decode_cp949_non_windows(bytes) {
                 return Ok(decoded);
             }
-            if cp949_strict_mode() {
+            if env::var("FCUPDATER_CP949_STRICT")
+                .ok()
+                .is_some_and(|value| {
+                    let trimmed = value.trim();
+                    trimmed == "1"
+                        || trimmed.eq_ignore_ascii_case("true")
+                        || trimmed.eq_ignore_ascii_case("yes")
+                        || trimmed.eq_ignore_ascii_case("on")
+                })
+            {
                 let cp = code_page.unwrap_or(949);
-                return Err(err(format!(
-                    "code page {cp} 디코딩에 실패했습니다. (FCUPDATER_CP949_STRICT=1)"
-                )));
+                let capacity = 64;
+                let mut out = String::with_capacity(capacity);
+                out.push_str("code page ");
+                match write!(&mut out, "{cp}") {
+                    Ok(()) | Err(_) => {}
+                }
+                out.push_str(" 디코딩에 실패했습니다. (FCUPDATER_CP949_STRICT=1)");
+                return Err(err(out));
             }
-            Ok(decode_ascii_with_replacement(bytes, code_page))
+            #[cfg(windows)]
+            let _: Option<u16> = code_page;
+            #[cfg(not(windows))]
+            warn_non_windows_cp949_once(code_page.unwrap_or(0));
+            Ok(decode_bytes_to_string(bytes, |byte| {
+                if byte.is_ascii() {
+                    char::from(byte)
+                } else {
+                    '�'
+                }
+            }))
         }
-        Some(1252 | 28591) => Ok(decode_windows_1252(bytes)),
-        _ => Ok(decode_latin1(bytes)),
-    }
-}
-fn decode_ascii_with_replacement(bytes: &[u8], code_page: Option<u16>) -> String {
-    #[cfg(windows)]
-    let _: Option<u16> = code_page;
-    #[cfg(not(windows))]
-    warn_non_windows_cp949_once(code_page.unwrap_or(0));
-    bytes
-        .iter()
-        .map(|b| {
-            if b.is_ascii() {
-                char::from(*b)
+        Some(1252 | 28591) => Ok(decode_bytes_to_string(bytes, |byte| {
+            if (0x80..=0x9F).contains(&byte) {
+                WINDOWS_1252_EXTENDED_CHARS
+                    .get(usize::from(byte).saturating_sub(0x80))
+                    .copied()
+                    .unwrap_or('�')
             } else {
-                '\u{FFFD}'
+                char::from(byte)
             }
-        })
-        .collect()
-}
-fn decode_latin1(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| char::from(*b)).collect()
+        })),
+        _ => Ok(decode_bytes_to_string(bytes, char::from)),
+    }
 }
 #[cfg(not(windows))]
 fn decode_cp949_non_windows(bytes: &[u8]) -> Option<String> {
@@ -96,14 +164,6 @@ fn decode_cp949_non_windows(bytes: &[u8]) -> Option<String> {
     decode_cp949_with_iconv(bytes)
         .or_else(|| decode_cp949_with_python(bytes))
         .inspect(|text| cp949_cache_put(bytes, text))
-}
-fn cp949_strict_mode() -> bool {
-    env::var("FCUPDATER_CP949_STRICT").ok().is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
 #[cfg(not(windows))]
 fn cp949_cache_get(bytes: &[u8]) -> Option<String> {
@@ -144,7 +204,7 @@ fn cp949_cache_put(bytes: &[u8], decoded: &str) {
         }
         guard.total_bytes = guard.total_bytes.saturating_add(entry_size);
         guard.order.push_back(key.clone());
-        guard.map.insert(key, decoded.to_string());
+        guard.map.insert(key, decoded.to_owned());
     }
 }
 #[cfg(not(windows))]
@@ -179,11 +239,10 @@ fn run_decoder_command(program: &str, args: &[&str], input: &[u8]) -> Option<Str
     if let Some(mut stdin) = child.stdin.take()
         && stdin.write_all(input).is_err()
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
         return None;
     }
-    let output = wait_decoder_with_optional_timeout(child, decoder_timeout())?;
+    let output = wait_decoder_with_optional_timeout(program, child, decoder_timeout())?;
     if !output.status.success() {
         return None;
     }
@@ -199,6 +258,7 @@ fn decoder_timeout() -> Option<Duration> {
 }
 #[cfg(not(windows))]
 fn wait_decoder_with_optional_timeout(
+    program: &str,
     mut child: Child,
     timeout: Option<Duration>,
 ) -> Option<Output> {
@@ -211,15 +271,13 @@ fn wait_decoder_with_optional_timeout(
             Ok(Some(_)) => return child.wait_with_output().ok(),
             Ok(None) => {
                 if start.elapsed() >= limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
                     return None;
                 }
                 sleep(Duration::from_millis(25));
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
                 return None;
             }
         }
@@ -241,44 +299,68 @@ fn warn_non_windows_cp949_once(code_page: u16) {
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
-        eprintln!(
+        write_nonfatal_stderr_line(format_args!(
             "주의: 비Windows 환경에서 code page {code_page}는 완전 디코딩이 불가하여 비ASCII 문자를 대체문자(�)로 처리합니다."
-        );
+        ));
     }
 }
-fn decode_windows_1252(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| decode_windows_1252_byte(*b)).collect()
+#[cfg(not(windows))]
+fn report_decoder_cleanup_issue(program: &str, cleanup_diagnostic: Option<String>) {
+    let Some(cleanup) = cleanup_diagnostic else {
+        return;
+    };
+    write_nonfatal_stderr_line(format_args!(
+        "주의: {program} 디코더 프로세스 정리 중 문제가 발생했습니다: {cleanup}"
+    ));
 }
-fn decode_windows_1252_byte(byte: u8) -> char {
-    match byte {
-        0x80 => '\u{20AC}',
-        0x81 | 0x8D | 0x8F | 0x90 | 0x9D => '\u{FFFD}',
-        0x82 => '\u{201A}',
-        0x83 => '\u{0192}',
-        0x84 => '\u{201E}',
-        0x85 => '\u{2026}',
-        0x86 => '\u{2020}',
-        0x87 => '\u{2021}',
-        0x88 => '\u{02C6}',
-        0x89 => '\u{2030}',
-        0x8A => '\u{0160}',
-        0x8B => '\u{2039}',
-        0x8C => '\u{0152}',
-        0x8E => '\u{017D}',
-        0x91 => '\u{2018}',
-        0x92 => '\u{2019}',
-        0x93 => '\u{201C}',
-        0x94 => '\u{201D}',
-        0x95 => '\u{2022}',
-        0x96 => '\u{2013}',
-        0x97 => '\u{2014}',
-        0x98 => '\u{02DC}',
-        0x99 => '\u{2122}',
-        0x9A => '\u{0161}',
-        0x9B => '\u{203A}',
-        0x9C => '\u{0153}',
-        0x9E => '\u{017E}',
-        0x9F => '\u{0178}',
-        _ => char::from(byte),
+#[cfg(not(windows))]
+fn stop_decoder_child(child: &mut Child) -> Option<String> {
+    let mut diagnostic = String::with_capacity(96);
+    match child.try_wait() {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(source_err) => {
+            diagnostic.push_str("상태 확인 실패: ");
+            match write!(&mut diagnostic, "{source_err}") {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+    match child.kill() {
+        Ok(()) => {}
+        Err(source_err) if source_err.kind() == ErrorKind::InvalidInput => {}
+        Err(source_err) => {
+            if !diagnostic.is_empty() {
+                diagnostic.push_str(" / ");
+            }
+            diagnostic.push_str("종료 실패: ");
+            match write!(&mut diagnostic, "{source_err}") {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+    match child.wait() {
+        Ok(_) => {}
+        Err(source_err) => {
+            if !diagnostic.is_empty() {
+                diagnostic.push_str(" / ");
+            }
+            diagnostic.push_str("대기 실패: ");
+            match write!(&mut diagnostic, "{source_err}") {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+    if diagnostic.is_empty() {
+        None
+    } else {
+        Some(diagnostic)
+    }
+}
+#[cfg(not(windows))]
+fn write_nonfatal_stderr_line(args: Arguments<'_>) {
+    let mut err = std::io::stderr().lock();
+    match writeln!(err, "{args}") {
+        Ok(()) | Err(_) => {}
     }
 }
