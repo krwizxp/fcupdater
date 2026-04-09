@@ -279,6 +279,14 @@ impl ArchiveOpsExt for ArchiveOps {
         let verify_unpacked = verify_work.join("verify_unpacked");
         create_dir_all_checked(&verify_unpacked, "저장 검증용 임시 폴더 생성 실패")?;
         let verify_result = (|| -> Result<()> {
+            for entry_name in Self::list_archive_entries(saved_archive)? {
+                if !Self::is_safe_archive_entry_path(&entry_name) {
+                    return Err(err(prefixed_message(
+                        "허용되지 않은 압축 경로가 포함되어 있습니다: ",
+                        entry_name,
+                    )));
+                }
+            }
             extract_archive(saved_archive, &verify_unpacked)?;
             for rel in [
                 "[Content_Types].xml",
@@ -306,6 +314,165 @@ impl ArchiveOpsExt for ArchiveOps {
             Ok(()) | Err(_) => {}
         }
         verify_result
+    }
+}
+impl ArchiveOps {
+    fn is_safe_archive_entry_path(entry_name: &str) -> bool {
+        if entry_name.is_empty() || entry_name.starts_with(['/', '\\']) {
+            return false;
+        }
+        let bytes = entry_name.as_bytes();
+        if let Some((&first, &colon)) = bytes.first().zip(bytes.get(1))
+            && colon == b':'
+            && first.is_ascii_alphabetic()
+        {
+            return false;
+        }
+        let mut has_name = false;
+        for part in entry_name.split(['/', '\\']) {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            if part == ".." {
+                return false;
+            }
+            has_name = true;
+        }
+        has_name
+    }
+    #[cfg(not(windows))]
+    fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>> {
+        let parse_archive_listing = |stdout: &str| {
+            stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let mut attempts = Vec::with_capacity(3);
+        match run_command_capture(
+            "unzip",
+            &[
+                "-Z".into(),
+                "-1".into(),
+                archive_path.as_os_str().to_os_string(),
+            ],
+            None,
+        ) {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Ok(parse_archive_listing(stdout.as_ref()))
+            }
+            Err(unzip_err) => {
+                attempts.push(attempt_source_message("unzip -Z -1", unzip_err));
+                let py_code = "import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as zf:\n    for name in zf.namelist():\n        print(name)";
+                for program in ["python3", "python"] {
+                    match run_command_capture(
+                        program,
+                        &[
+                            "-c".into(),
+                            py_code.into(),
+                            archive_path.as_os_str().to_os_string(),
+                        ],
+                        None,
+                    ) {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            return Ok(parse_archive_listing(stdout.as_ref()));
+                        }
+                        Err(python_err) => attempts.push(attempt_source_message(
+                            match program {
+                                "python3" => "python3 -c zipfile",
+                                _ => "python -c zipfile",
+                            },
+                            python_err,
+                        )),
+                    }
+                }
+                Err(err(archive_attempts_message(
+                    "xlsx 압축 엔트리 목록 확인 실패",
+                    archive_path,
+                    archive_path,
+                    &attempts,
+                )))
+            }
+        }
+    }
+    #[cfg(windows)]
+    fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>> {
+        let parse_archive_listing = |stdout: &str| {
+            stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let mut attempts = Vec::with_capacity(2);
+        detect_powershell_program().map_or_else(
+            || match run_command_capture(
+                "tar",
+                &["-tf".into(), archive_path.as_os_str().to_os_string()],
+                None,
+            ) {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    Ok(parse_archive_listing(stdout.as_ref()))
+                }
+                Err(tar_err) => Err(err(archive_attempts_message(
+                    "xlsx 압축 엔트리 목록 확인 실패",
+                    archive_path,
+                    archive_path,
+                    &[attempt_source_message("tar", tar_err)],
+                ))),
+            },
+            |shell_program| {
+                let archive_quoted = ps_quote(archive_path);
+                let prefix = "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::OpenRead('";
+                let suffix = "').Entries | ForEach-Object {$_.FullName}";
+                let capacity = prefix
+                    .len()
+                    .saturating_add(archive_quoted.len())
+                    .saturating_add(suffix.len());
+                let mut script = String::with_capacity(capacity);
+                script.push_str(prefix);
+                script.push_str(&archive_quoted);
+                script.push_str(suffix);
+                match run_command_capture(
+                    shell_program,
+                    &["-NoProfile".into(), "-Command".into(), script.into()],
+                    None,
+                ) {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        Ok(parse_archive_listing(stdout.as_ref()))
+                    }
+                    Err(shell_err) => {
+                        push_attempt(&mut attempts, shell_program, shell_err);
+                        match run_command_capture(
+                            "tar",
+                            &["-tf".into(), archive_path.as_os_str().to_os_string()],
+                            None,
+                        ) {
+                            Ok(output) => {
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                Ok(parse_archive_listing(stdout.as_ref()))
+                            }
+                            Err(tar_err) => {
+                                attempts.push(attempt_source_message("tar", tar_err));
+                                Err(err(archive_attempts_message(
+                                    "xlsx 압축 엔트리 목록 확인 실패",
+                                    archive_path,
+                                    archive_path,
+                                    &attempts,
+                                )))
+                            }
+                        }
+                    }
+                }
+            },
+        )
     }
 }
 impl XlsxContainer {
@@ -349,6 +516,14 @@ impl XlsxContainer {
                 source_err,
             ))
         })?;
+        for entry_name in ArchiveOps::list_archive_entries(&archive_path)? {
+            if !ArchiveOps::is_safe_archive_entry_path(&entry_name) {
+                return Err(err(prefixed_message(
+                    "허용되지 않은 압축 경로가 포함되어 있습니다: ",
+                    entry_name,
+                )));
+            }
+        }
         extract_archive(&archive_path, &unpack_dir)?;
         cleanup.keep = true;
         let work_dir = mem::take(&mut cleanup.path);
@@ -906,7 +1081,11 @@ fn stop_process_with_diagnostics(child: &mut process::Child) -> Option<String> {
         Some(diagnostic)
     }
 }
-fn run_command(program: &str, args: &[OsString], current_dir: Option<&Path>) -> Result<()> {
+fn run_command_capture(
+    program: &str,
+    args: &[OsString],
+    current_dir: Option<&Path>,
+) -> Result<process::Output> {
     let mut cmd = process::Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -920,9 +1099,12 @@ fn run_command(program: &str, args: &[OsString], current_dir: Option<&Path>) -> 
         .map_err(|source_err| err(program_source_message(program, "실행 실패", source_err))))?;
     let output = (wait_with_optional_timeout(child, program, command_timeout()))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(output);
     }
     Err(err(format_process_failure(program, &output)))
+}
+fn run_command(program: &str, args: &[OsString], current_dir: Option<&Path>) -> Result<()> {
+    run_command_capture(program, args, current_dir).map(|_| ())
 }
 fn command_exists(program: &str, args: &[&str], current_dir: Option<&Path>) -> bool {
     let mut cmd = process::Command::new(program);
