@@ -39,11 +39,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
       - name: Use GitHub runner WebDrivers
         if: ${{ !inputs.skip_download }}
         shell: pwsh
@@ -92,7 +94,7 @@ jobs:
           FCUPDATER_ARTIFACT_NAME: ${{ inputs.artifact_name }}
         run: .\.github\scripts\run-update-master.ps1
       - name: Upload result artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           path: ${{ steps.run_updater.outputs.artifact_path }}
           archive: false
