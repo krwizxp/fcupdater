@@ -12,7 +12,7 @@
 - 출력 파일명 충돌 시 자동으로 새 파일명 선택(`_1`, `_2` suffix)
 - 저장 후 OOXML 필수 파트 무결성 검증(기본)
 ## 요구사항
-- MSRV: Rust 1.94
+- MSRV: Rust 1.95
 - 최신 Rust stable 사용 가능
 - Chrome 또는 Edge 설치
 - `chromedriver` 또는 `msedgedriver`가 PATH에 있거나 프로젝트 내 `chromedriver/chromedriver(.exe)` 또는 `edgedriver/msedgedriver(.exe)` 위치에 있어야 함
