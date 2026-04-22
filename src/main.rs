@@ -693,93 +693,93 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                     .enumerate()
                     .all(|(index, ch)| index == 4 || index == 7 || ch.is_ascii_digit())
         };
-        #[cfg(windows)]
-        {
-            let mut system_time = excel::windows_api::SystemTime {
-                year: 0,
-                month: 0,
-                day_of_week: 0,
-                day: 0,
-                hour: 0,
-                minute: 0,
-                second: 0,
-                milliseconds: 0,
-            };
-            // SAFETY: `system_time` points to a valid writable `SystemTime` value for the duration of the call.
-            unsafe { excel::windows_api::GetLocalTime(&raw mut system_time) };
-            if system_time.month == 0
-                || system_time.month > 12
-                || system_time.day == 0
-                || system_time.day > 31
-            {
-                return Err(err(format_ymd(
-                    "OS 날짜 조회 결과가 비정상적입니다: ",
-                    system_time.year,
-                    system_time.month,
-                    system_time.day,
-                )));
+        cfg_select! {
+            windows => {
+                let mut system_time = excel::windows_api::SystemTime {
+                    year: 0,
+                    month: 0,
+                    day_of_week: 0,
+                    day: 0,
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                    milliseconds: 0,
+                };
+                // SAFETY: `system_time` points to a valid writable `SystemTime` value for the duration of the call.
+                unsafe { excel::windows_api::GetLocalTime(&raw mut system_time) };
+                if system_time.month == 0
+                    || system_time.month > 12
+                    || system_time.day == 0
+                    || system_time.day > 31
+                {
+                    return Err(err(format_ymd(
+                        "OS 날짜 조회 결과가 비정상적입니다: ",
+                        system_time.year,
+                        system_time.month,
+                        system_time.day,
+                    )));
+                }
+                let today = format_ymd("", system_time.year, system_time.month, system_time.day);
+                if !is_yyyy_mm_dd(&today) {
+                    return Err(err(prefixed_message(
+                        "오늘 날짜 형식이 올바르지 않습니다: ",
+                        &today,
+                    )));
+                }
+                Ok(today)
             }
-            let today = format_ymd("", system_time.year, system_time.month, system_time.day);
-            if !is_yyyy_mm_dd(&today) {
-                return Err(err(prefixed_message(
-                    "오늘 날짜 형식이 올바르지 않습니다: ",
-                    &today,
-                )));
-            }
-            Ok(today)
-        }
-        #[cfg(not(windows))]
-        {
-            let mut detected_today = None;
-            if let Ok(output) = Command::new("date").args(["+%Y-%m-%d"]).output()
-                && output.status.success()
-            {
-                detected_today = valid_today_from_output(&output, is_yyyy_mm_dd);
-            }
-            if detected_today.is_none() {
-                let script =
-                    "from datetime import datetime;print(datetime.now().strftime('%Y-%m-%d'))";
-                for program in ["python3", "python"] {
-                    if let Ok(output) = Command::new(program).args(["-c", script]).output()
-                        && output.status.success()
-                    {
-                        detected_today = valid_today_from_output(&output, is_yyyy_mm_dd);
-                        if detected_today.is_some() {
-                            break;
+            _ => {
+                let mut detected_today = None;
+                if let Ok(output) = Command::new("date").args(["+%Y-%m-%d"]).output()
+                    && output.status.success()
+                {
+                    detected_today = valid_today_from_output(&output, is_yyyy_mm_dd);
+                }
+                if detected_today.is_none() {
+                    let script =
+                        "from datetime import datetime;print(datetime.now().strftime('%Y-%m-%d'))";
+                    for program in ["python3", "python"] {
+                        if let Ok(output) = Command::new(program).args(["-c", script]).output()
+                            && output.status.success()
+                        {
+                            detected_today = valid_today_from_output(&output, is_yyyy_mm_dd);
+                            if detected_today.is_some() {
+                                break;
+                            }
                         }
                     }
                 }
+                if let Some(today) = detected_today {
+                    return Ok(today);
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|source| err(prefixed_message("현재 시간 조회 실패: ", source)))?;
+                let days = i64::try_from(now.as_secs() / 86_400)
+                    .map_err(|_| err("UTC 날짜 계산 중 일수 변환에 실패했습니다."))?;
+                let shifted_days = days + 719_468;
+                let era = if shifted_days >= 0 {
+                    shifted_days
+                } else {
+                    shifted_days - 146_096
+                } / 146_097;
+                let doe = shifted_days - era * 146_097;
+                let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+                let year_of_era = yoe + era * 400;
+                let day_of_year = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let month_phase = (5 * day_of_year + 2) / 153;
+                let day = day_of_year - (153 * month_phase + 2) / 5 + 1;
+                let month = month_phase + if month_phase < 10 { 3 } else { -9 };
+                let year = (year_of_era + if month <= 2 { 1 } else { 0 }) as i32;
+                let today = format_ymd("", year, month, day);
+                if !is_yyyy_mm_dd(&today) {
+                    return Err(err(prefixed_message(
+                        "오늘 날짜 형식이 올바르지 않습니다: ",
+                        &today,
+                    )));
+                }
+                Ok(today)
             }
-            if let Some(today) = detected_today {
-                return Ok(today);
-            }
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|source| err(prefixed_message("현재 시간 조회 실패: ", source)))?;
-            let days = i64::try_from(now.as_secs() / 86_400)
-                .map_err(|_| err("UTC 날짜 계산 중 일수 변환에 실패했습니다."))?;
-            let shifted_days = days + 719_468;
-            let era = if shifted_days >= 0 {
-                shifted_days
-            } else {
-                shifted_days - 146_096
-            } / 146_097;
-            let doe = shifted_days - era * 146_097;
-            let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-            let year_of_era = yoe + era * 400;
-            let day_of_year = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let month_phase = (5 * day_of_year + 2) / 153;
-            let day = day_of_year - (153 * month_phase + 2) / 5 + 1;
-            let month = month_phase + if month_phase < 10 { 3 } else { -9 };
-            let year = (year_of_era + if month <= 2 { 1 } else { 0 }) as i32;
-            let today = format_ymd("", year, month, day);
-            if !is_yyyy_mm_dd(&today) {
-                return Err(err(prefixed_message(
-                    "오늘 날짜 형식이 올바르지 않습니다: ",
-                    &today,
-                )));
-            }
-            Ok(today)
         }
     }
     fn run_update(&mut self) -> Result<()> {

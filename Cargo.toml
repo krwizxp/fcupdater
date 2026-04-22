@@ -2,7 +2,7 @@
 name = "fcupdater"
 version = "1.0.1"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "CLI tool to update fuel_cost_chungcheong.xlsx from regional .xls/.xlsx source files."
 license = "UNLICENSED"
 repository = "https://github.com/krwizxp/fcupdater"
