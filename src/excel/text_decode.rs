@@ -1,7 +1,6 @@
 use crate::{Result, err};
 #[cfg(not(windows))]
 use core::fmt::Arguments;
-use core::fmt::Write as _;
 #[cfg(windows)]
 use core::ptr::null_mut;
 use std::env;
@@ -52,58 +51,61 @@ fn decode_bytes_to_string(bytes: &[u8], mut map_byte: impl FnMut(u8) -> char) ->
     out
 }
 pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<String> {
-    #[cfg(windows)]
-    {
-        let code_page_u32 = u32::from(code_page.unwrap_or(949));
-        let decoded_text = if bytes.is_empty() {
-            Some(String::new())
-        } else {
-            let src_len = i32::try_from(bytes.len()).ok();
-            src_len.and_then(|src_len_i32| {
-                // SAFETY: `bytes.as_ptr()` is valid for `src_len_i32` bytes and a null destination requests only the required UTF-16 output length.
-                let required = unsafe {
-                    super::windows_api::MultiByteToWideChar(
-                        code_page_u32,
-                        super::windows_api::MB_ERR_INVALID_CHARS,
-                        bytes.as_ptr(),
-                        src_len_i32,
-                        null_mut(),
-                        0,
-                    )
-                };
-                if required <= 0_i32 {
-                    return None;
-                }
-                let required_usize = usize::try_from(required).ok()?;
-                let mut wide = vec![0_u16; required_usize];
-                // SAFETY: `wide` is allocated for `required` UTF-16 code units and both buffers remain valid for the duration of the conversion call.
-                let written = unsafe {
-                    super::windows_api::MultiByteToWideChar(
-                        code_page_u32,
-                        0,
-                        bytes.as_ptr(),
-                        src_len_i32,
-                        wide.as_mut_ptr(),
-                        required,
-                    )
-                };
-                if written <= 0_i32 {
-                    return None;
-                }
-                let written_usize = usize::try_from(written).ok()?;
-                Some(String::from_utf16_lossy(wide.get(..written_usize)?))
-            })
-        };
-        if let Some(decoded) = decoded_text {
-            return Ok(decoded);
-        }
+    let decoded_text = cfg_select! {
+        windows => {{
+            let code_page_u32 = u32::from(code_page.unwrap_or(949));
+            if bytes.is_empty() {
+                Some(String::new())
+            } else {
+                let src_len = i32::try_from(bytes.len()).ok();
+                src_len.and_then(|src_len_i32| {
+                    // SAFETY: `bytes.as_ptr()` is valid for `src_len_i32` bytes and a null destination requests only the required UTF-16 output length.
+                    let required = unsafe {
+                        super::windows_api::MultiByteToWideChar(
+                            code_page_u32,
+                            super::windows_api::MB_ERR_INVALID_CHARS,
+                            bytes.as_ptr(),
+                            src_len_i32,
+                            null_mut(),
+                            0,
+                        )
+                    };
+                    if required <= 0_i32 {
+                        return None;
+                    }
+                    let required_usize = usize::try_from(required).ok()?;
+                    let mut wide = vec![0_u16; required_usize];
+                    // SAFETY: `wide` is allocated for `required` UTF-16 code units and both buffers remain valid for the duration of the conversion call.
+                    let written = unsafe {
+                        super::windows_api::MultiByteToWideChar(
+                            code_page_u32,
+                            0,
+                            bytes.as_ptr(),
+                            src_len_i32,
+                            wide.as_mut_ptr(),
+                            required,
+                        )
+                    };
+                    if written <= 0_i32 {
+                        return None;
+                    }
+                    let written_usize = usize::try_from(written).ok()?;
+                    Some(String::from_utf16_lossy(wide.get(..written_usize)?))
+                })
+            }
+        }}
+        _ => None
+    };
+    if let Some(decoded) = decoded_text {
+        return Ok(decoded);
     }
     match code_page {
         Some(65001) => Ok(String::from_utf8_lossy(bytes).into_owned()),
         Some(949 | 1361 | 51949) => {
-            #[cfg(not(windows))]
-            if let Some(decoded) = decode_cp949_non_windows(bytes) {
-                return Ok(decoded);
+            let cp949_decoded =
+                cfg_select! { windows => { None } _ => { decode_cp949_non_windows(bytes) } };
+            if let Some(decoded_cp949_text) = cp949_decoded {
+                return Ok(decoded_cp949_text);
             }
             if env::var("FCUPDATER_CP949_STRICT")
                 .ok()
@@ -115,20 +117,12 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
                         || trimmed.eq_ignore_ascii_case("on")
                 })
             {
-                let cp = code_page.unwrap_or(949);
-                let capacity = 64;
-                let mut out = String::with_capacity(capacity);
-                out.push_str("code page ");
-                match write!(&mut out, "{cp}") {
-                    Ok(()) | Err(_) => {}
-                }
-                out.push_str(" 디코딩에 실패했습니다. (FCUPDATER_CP949_STRICT=1)");
-                return Err(err(out));
+                return Err(err(format!(
+                    "code page {} 디코딩에 실패했습니다. (FCUPDATER_CP949_STRICT=1)",
+                    code_page.unwrap_or(949)
+                )));
             }
-            #[cfg(windows)]
-            let _: Option<u16> = code_page;
-            #[cfg(not(windows))]
-            warn_non_windows_cp949_once(code_page.unwrap_or(0));
+            cfg_select! { windows => {} _ => { warn_non_windows_cp949_once(code_page.unwrap_or(0)); } };
             Ok(decode_bytes_to_string(bytes, |byte| {
                 if byte.is_ascii() {
                     char::from(byte)
