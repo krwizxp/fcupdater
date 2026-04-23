@@ -81,197 +81,197 @@ impl Drop for WorkDirCleanup {
 }
 impl ArchiveOpsExt for ArchiveOps {
     fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()> {
-        #[cfg(windows)]
-        {
-            let mut attempts = Vec::with_capacity(2);
-            let script = build_powershell_archive_script(
-                "Compress-Archive -Path (Join-Path '",
-                unpack_dir,
-                "' '*') -DestinationPath '",
-                archive_path,
-                "' -Force",
-            );
-            if let Some(shell_program) = detect_powershell_program() {
-                match run_powershell(shell_program, &script) {
+        cfg_select! {
+            windows => {
+                let mut attempts = Vec::with_capacity(2);
+                let script = build_powershell_archive_script(
+                    "Compress-Archive -Path (Join-Path '",
+                    unpack_dir,
+                    "' '*') -DestinationPath '",
+                    archive_path,
+                    "' -Force",
+                );
+                if let Some(shell_program) = detect_powershell_program() {
+                    match run_powershell(shell_program, &script) {
+                        Ok(()) => return Ok(()),
+                        Err(command_err) => push_attempt(&mut attempts, shell_program, command_err),
+                    }
+                }
+                match run_command(
+                    "tar",
+                    &[
+                        "-a".into(),
+                        "-c".into(),
+                        "-f".into(),
+                        archive_path.as_os_str().to_os_string(),
+                        "-C".into(),
+                        unpack_dir.as_os_str().to_os_string(),
+                        ".".into(),
+                    ],
+                    None,
+                ) {
                     Ok(()) => return Ok(()),
-                    Err(command_err) => push_attempt(&mut attempts, shell_program, command_err),
+                    Err(command_err) => attempts.push(attempt_source_message("tar", command_err)),
                 }
+                Err(err(archive_attempts_message(
+                    "xlsx 압축 생성 실패",
+                    unpack_dir,
+                    archive_path,
+                    &attempts,
+                )))
             }
-            match run_command(
-                "tar",
-                &[
-                    "-a".into(),
-                    "-c".into(),
-                    "-f".into(),
-                    archive_path.as_os_str().to_os_string(),
-                    "-C".into(),
-                    unpack_dir.as_os_str().to_os_string(),
-                    ".".into(),
-                ],
-                None,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(command_err) => attempts.push(attempt_source_message("tar", command_err)),
-            }
-            Err(err(archive_attempts_message(
-                "xlsx 압축 생성 실패",
-                unpack_dir,
-                archive_path,
-                &attempts,
-            )))
-        }
-        #[cfg(not(windows))]
-        {
-            let mut attempts = Vec::with_capacity(3);
-            match run_command(
-                "zip",
-                &[
-                    "-qr".into(),
-                    archive_path.as_os_str().to_os_string(),
-                    ".".into(),
-                ],
-                Some(unpack_dir),
-            ) {
-                Ok(()) => return Ok(()),
-                Err(source_err) => attempts.push(attempt_source_message("zip", source_err)),
-            }
-            match run_command(
-                "python3",
-                &[
-                    "-c".into(),
-                    PYTHON_CREATE_ZIP_SCRIPT.into(),
-                    unpack_dir.as_os_str().to_os_string(),
-                    archive_path.as_os_str().to_os_string(),
-                ],
-                None,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(source_err) => {
-                    attempts.push(attempt_source_message("python3 -c zipfile", source_err))
+            _ => {
+                let mut attempts = Vec::with_capacity(3);
+                match run_command(
+                    "zip",
+                    &[
+                        "-qr".into(),
+                        archive_path.as_os_str().to_os_string(),
+                        ".".into(),
+                    ],
+                    Some(unpack_dir),
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(source_err) => attempts.push(attempt_source_message("zip", source_err)),
                 }
-            }
-            match run_command(
-                "python",
-                &[
-                    "-c".into(),
-                    PYTHON_CREATE_ZIP_SCRIPT.into(),
-                    unpack_dir.as_os_str().to_os_string(),
-                    archive_path.as_os_str().to_os_string(),
-                ],
-                None,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(source_err) => {
-                    attempts.push(attempt_source_message("python -c zipfile", source_err))
+                match run_command(
+                    "python3",
+                    &[
+                        "-c".into(),
+                        PYTHON_CREATE_ZIP_SCRIPT.into(),
+                        unpack_dir.as_os_str().to_os_string(),
+                        archive_path.as_os_str().to_os_string(),
+                    ],
+                    None,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(source_err) => {
+                        attempts.push(attempt_source_message("python3 -c zipfile", source_err))
+                    }
                 }
+                match run_command(
+                    "python",
+                    &[
+                        "-c".into(),
+                        PYTHON_CREATE_ZIP_SCRIPT.into(),
+                        unpack_dir.as_os_str().to_os_string(),
+                        archive_path.as_os_str().to_os_string(),
+                    ],
+                    None,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(source_err) => {
+                        attempts.push(attempt_source_message("python -c zipfile", source_err))
+                    }
+                }
+                Err(err(archive_attempts_message(
+                    "xlsx 압축 생성 실패",
+                    unpack_dir,
+                    archive_path,
+                    &attempts,
+                )))
             }
-            Err(err(archive_attempts_message(
-                "xlsx 압축 생성 실패",
-                unpack_dir,
-                archive_path,
-                &attempts,
-            )))
         }
     }
     fn promote_temp_output(&self, temp_output: &Path, output_xlsx: &Path) -> Result<()> {
-        #[cfg(windows)]
-        {
-            let replacement_w = encode_path_wide(temp_output);
-            let destination_w = encode_path_wide(output_xlsx);
-            if output_xlsx.try_exists().map_err(|source_err| {
-                err(path_source_message(
-                    "대상 파일 경로 확인 실패",
-                    output_xlsx,
-                    source_err,
-                ))
-            })? {
-                // SAFETY: Both UTF-16 path buffers are NUL-terminated and live across the call; optional pointers are intentionally null.
-                let replaced = unsafe {
-                    super::windows_api::ReplaceFileW(
-                        destination_w.as_ptr(),
+        cfg_select! {
+            windows => {
+                let replacement_w = encode_path_wide(temp_output);
+                let destination_w = encode_path_wide(output_xlsx);
+                if output_xlsx.try_exists().map_err(|source_err| {
+                    err(path_source_message(
+                        "대상 파일 경로 확인 실패",
+                        output_xlsx,
+                        source_err,
+                    ))
+                })? {
+                    // SAFETY: Both UTF-16 path buffers are NUL-terminated and live across the call; optional pointers are intentionally null.
+                    let replaced = unsafe {
+                        super::windows_api::ReplaceFileW(
+                            destination_w.as_ptr(),
+                            replacement_w.as_ptr(),
+                            null(),
+                            super::windows_api::REPLACEFILE_WRITE_THROUGH,
+                            null_mut(),
+                            null_mut(),
+                        )
+                    };
+                    if replaced != 0_i32 {
+                        return Ok(());
+                    }
+                    // SAFETY: Called immediately after the failing Windows API call on the same thread.
+                    let code = unsafe { super::windows_api::GetLastError() };
+                    return Err(err(windows_file_op_error_message(
+                        "파일 교체 실패(ReplaceFileW): ",
+                        output_xlsx,
+                        Some(temp_output),
+                        " <- ",
+                        code,
+                    )));
+                }
+                // SAFETY: Both UTF-16 path buffers are NUL-terminated and valid for the duration of the call.
+                let moved = unsafe {
+                    super::windows_api::MoveFileExW(
                         replacement_w.as_ptr(),
-                        null(),
-                        super::windows_api::REPLACEFILE_WRITE_THROUGH,
-                        null_mut(),
-                        null_mut(),
+                        destination_w.as_ptr(),
+                        super::windows_api::MOVEFILE_REPLACE_EXISTING
+                            | super::windows_api::MOVEFILE_WRITE_THROUGH,
                     )
                 };
-                if replaced != 0_i32 {
+                if moved != 0_i32 {
                     return Ok(());
                 }
                 // SAFETY: Called immediately after the failing Windows API call on the same thread.
                 let code = unsafe { super::windows_api::GetLastError() };
-                return Err(err(windows_file_op_error_message(
-                    "파일 교체 실패(ReplaceFileW): ",
-                    output_xlsx,
-                    Some(temp_output),
-                    " <- ",
-                    code,
-                )));
-            }
-            // SAFETY: Both UTF-16 path buffers are NUL-terminated and valid for the duration of the call.
-            let moved = unsafe {
-                super::windows_api::MoveFileExW(
-                    replacement_w.as_ptr(),
-                    destination_w.as_ptr(),
-                    super::windows_api::MOVEFILE_REPLACE_EXISTING
-                        | super::windows_api::MOVEFILE_WRITE_THROUGH,
-                )
-            };
-            if moved != 0_i32 {
-                return Ok(());
-            }
-            // SAFETY: Called immediately after the failing Windows API call on the same thread.
-            let code = unsafe { super::windows_api::GetLastError() };
-            Err(err(windows_file_op_error_message(
-                "파일 이동 실패(MoveFileExW): ",
-                temp_output,
-                Some(output_xlsx),
-                " -> ",
-                code,
-            )))
-        }
-        #[cfg(not(windows))]
-        {
-            fs::rename(temp_output, output_xlsx).map_err(|source_err| {
-                err(path_pair_source_message(
-                    "xlsx 저장 실패",
+                Err(err(windows_file_op_error_message(
+                    "파일 이동 실패(MoveFileExW): ",
                     temp_output,
-                    output_xlsx,
-                    source_err,
-                ))
-            })?;
-            if let Err(source_err) = fs::OpenOptions::new()
-                .read(true)
-                .open(output_xlsx)
-                .and_then(|file| file.sync_all())
-            {
-                if durability_strict_mode() {
-                    return Err(err(path_source_message(
-                        "xlsx 저장 내구성 동기화 실패(파일)",
+                    Some(output_xlsx),
+                    " -> ",
+                    code,
+                )))
+            }
+            _ => {
+                fs::rename(temp_output, output_xlsx).map_err(|source_err| {
+                    err(path_pair_source_message(
+                        "xlsx 저장 실패",
+                        temp_output,
                         output_xlsx,
                         source_err,
-                    )));
+                    ))
+                })?;
+                if let Err(source_err) = fs::OpenOptions::new()
+                    .read(true)
+                    .open(output_xlsx)
+                    .and_then(|file| file.sync_all())
+                {
+                    if durability_strict_mode() {
+                        return Err(err(path_source_message(
+                            "xlsx 저장 내구성 동기화 실패(파일)",
+                            output_xlsx,
+                            source_err,
+                        )));
+                    }
+                    let mut output_path = String::with_capacity(64);
+                    push_display(&mut output_path, output_xlsx.display());
+                    write_durability_warning("파일", &output_path, &source_err);
                 }
-                let mut output_path = String::with_capacity(64);
-                push_display(&mut output_path, output_xlsx.display());
-                write_durability_warning("파일", &output_path, &source_err);
-            }
-            if let Some(parent) = output_xlsx.parent()
-                && let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all())
-            {
-                if durability_strict_mode() {
-                    return Err(err(path_source_message(
-                        "xlsx 저장 내구성 동기화 실패(폴더)",
-                        parent,
-                        source_err,
-                    )));
+                if let Some(parent) = output_xlsx.parent()
+                    && let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all())
+                {
+                    if durability_strict_mode() {
+                        return Err(err(path_source_message(
+                            "xlsx 저장 내구성 동기화 실패(폴더)",
+                            parent,
+                            source_err,
+                        )));
+                    }
+                    let mut parent_path = String::with_capacity(64);
+                    push_display(&mut parent_path, parent.display());
+                    write_durability_warning("폴더", &parent_path, &source_err);
                 }
-                let mut parent_path = String::with_capacity(64);
-                push_display(&mut parent_path, parent.display());
-                write_durability_warning("폴더", &parent_path, &source_err);
+                Ok(())
             }
-            Ok(())
         }
     }
     fn verify_saved_archive(&self, saved_archive: &Path) -> Result<()> {
@@ -340,35 +340,69 @@ impl ArchiveOps {
         }
         has_name
     }
-    #[cfg(not(windows))]
     fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>> {
-        let parse_archive_listing = |stdout: &str| {
-            stdout
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        let mut attempts = Vec::with_capacity(3);
-        match run_command_capture(
-            "unzip",
-            &[
-                "-Z".into(),
-                "-1".into(),
-                archive_path.as_os_str().to_os_string(),
-            ],
-            None,
-        ) {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok(parse_archive_listing(stdout.as_ref()))
+        cfg_select! {
+            windows => {
+                let mut attempts = Vec::with_capacity(2);
+                if let Some(shell_program) = detect_powershell_program() {
+                    let archive_quoted = ps_quote(archive_path);
+                    let prefix = "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::OpenRead('";
+                    let suffix = "').Entries | ForEach-Object {$_.FullName}";
+                    let mut script = String::with_capacity(
+                        prefix
+                            .len()
+                            .saturating_add(archive_quoted.len())
+                            .saturating_add(suffix.len()),
+                    );
+                    script.push_str(prefix);
+                    script.push_str(&archive_quoted);
+                    script.push_str(suffix);
+                    match Self::run_archive_listing_capture(
+                        shell_program,
+                        &["-NoProfile".into(), "-Command".into(), script.into()],
+                        None,
+                    ) {
+                        Ok(entries) => return Ok(entries),
+                        Err(shell_err) => push_attempt(&mut attempts, shell_program, shell_err),
+                    }
+                }
+                match Self::run_archive_listing_capture(
+                    "tar",
+                    &["-tf".into(), archive_path.as_os_str().to_os_string()],
+                    None,
+                ) {
+                    Ok(entries) => Ok(entries),
+                    Err(tar_err) => {
+                        attempts.push(attempt_source_message("tar", tar_err));
+                        Err(err(archive_attempts_message(
+                            "xlsx 압축 엔트리 목록 확인 실패",
+                            archive_path,
+                            archive_path,
+                            &attempts,
+                        )))
+                    }
+                }
             }
-            Err(unzip_err) => {
-                attempts.push(attempt_source_message("unzip -Z -1", unzip_err));
+            _ => {
+                let mut attempts = Vec::with_capacity(3);
+                match Self::run_archive_listing_capture(
+                    "unzip",
+                    &[
+                        "-Z".into(),
+                        "-1".into(),
+                        archive_path.as_os_str().to_os_string(),
+                    ],
+                    None,
+                ) {
+                    Ok(entries) => return Ok(entries),
+                    Err(unzip_err) => attempts.push(attempt_source_message("unzip -Z -1", unzip_err)),
+                }
                 let py_code = "import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as zf:\n    for name in zf.namelist():\n        print(name)";
-                for program in ["python3", "python"] {
-                    match run_command_capture(
+                for (program, label) in [
+                    ("python3", "python3 -c zipfile"),
+                    ("python", "python -c zipfile"),
+                ] {
+                    match Self::run_archive_listing_capture(
                         program,
                         &[
                             "-c".into(),
@@ -377,17 +411,8 @@ impl ArchiveOps {
                         ],
                         None,
                     ) {
-                        Ok(output) => {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            return Ok(parse_archive_listing(stdout.as_ref()));
-                        }
-                        Err(python_err) => attempts.push(attempt_source_message(
-                            match program {
-                                "python3" => "python3 -c zipfile",
-                                _ => "python -c zipfile",
-                            },
-                            python_err,
-                        )),
+                        Ok(entries) => return Ok(entries),
+                        Err(python_err) => attempts.push(attempt_source_message(label, python_err)),
                     }
                 }
                 Err(err(archive_attempts_message(
@@ -399,80 +424,19 @@ impl ArchiveOps {
             }
         }
     }
-    #[cfg(windows)]
-    fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>> {
-        let parse_archive_listing = |stdout: &str| {
-            stdout
+    fn run_archive_listing_capture(
+        program: &str,
+        args: &[OsString],
+        current_dir: Option<&Path>,
+    ) -> Result<Vec<String>> {
+        run_command_capture(program, args, current_dir).map(|output| {
+            String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        let mut attempts = Vec::with_capacity(2);
-        detect_powershell_program().map_or_else(
-            || match run_command_capture(
-                "tar",
-                &["-tf".into(), archive_path.as_os_str().to_os_string()],
-                None,
-            ) {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    Ok(parse_archive_listing(stdout.as_ref()))
-                }
-                Err(tar_err) => Err(err(archive_attempts_message(
-                    "xlsx 압축 엔트리 목록 확인 실패",
-                    archive_path,
-                    archive_path,
-                    &[attempt_source_message("tar", tar_err)],
-                ))),
-            },
-            |shell_program| {
-                let archive_quoted = ps_quote(archive_path);
-                let prefix = "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::OpenRead('";
-                let suffix = "').Entries | ForEach-Object {$_.FullName}";
-                let capacity = prefix
-                    .len()
-                    .saturating_add(archive_quoted.len())
-                    .saturating_add(suffix.len());
-                let mut script = String::with_capacity(capacity);
-                script.push_str(prefix);
-                script.push_str(&archive_quoted);
-                script.push_str(suffix);
-                match run_command_capture(
-                    shell_program,
-                    &["-NoProfile".into(), "-Command".into(), script.into()],
-                    None,
-                ) {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        Ok(parse_archive_listing(stdout.as_ref()))
-                    }
-                    Err(shell_err) => {
-                        push_attempt(&mut attempts, shell_program, shell_err);
-                        match run_command_capture(
-                            "tar",
-                            &["-tf".into(), archive_path.as_os_str().to_os_string()],
-                            None,
-                        ) {
-                            Ok(output) => {
-                                let stdout = String::from_utf8_lossy(&output.stdout);
-                                Ok(parse_archive_listing(stdout.as_ref()))
-                            }
-                            Err(tar_err) => {
-                                attempts.push(attempt_source_message("tar", tar_err));
-                                Err(err(archive_attempts_message(
-                                    "xlsx 압축 엔트리 목록 확인 실패",
-                                    archive_path,
-                                    archive_path,
-                                    &attempts,
-                                )))
-                            }
-                        }
-                    }
-                }
-            },
-        )
+                .collect()
+        })
     }
 }
 impl XlsxContainer {
@@ -489,13 +453,16 @@ impl XlsxContainer {
                 source_xlsx.display(),
             )));
         }
-        #[cfg(windows)]
-        let extract_tools_ready =
-            detect_powershell_program().is_some() || command_exists("tar", &["--version"], None);
-        #[cfg(not(windows))]
-        let extract_tools_ready = command_exists("unzip", &["-v"], None)
-            || command_exists("python3", &["-c", "import zipfile,sys;sys.exit(0)"], None)
-            || command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None);
+        let extract_tools_ready = cfg_select! {
+            windows => {
+                detect_powershell_program().is_some() || command_exists("tar", &["--version"], None)
+            }
+            _ => {
+                command_exists("unzip", &["-v"], None)
+                    || command_exists("python3", &["-c", "import zipfile,sys;sys.exit(0)"], None)
+                    || command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None)
+            }
+        };
         ensure_tools_ready(
             &EXTRACT_TOOLS_READY,
             extract_tools_ready,
@@ -576,13 +543,16 @@ impl XlsxContainer {
     }
     pub fn save_as(&self, output_xlsx: &Path, verify_saved_file: bool) -> Result<()> {
         let archive_ops = ArchiveOps;
-        #[cfg(windows)]
-        let create_tools_ready =
-            detect_powershell_program().is_some() || command_exists("tar", &["--version"], None);
-        #[cfg(not(windows))]
-        let create_tools_ready = command_exists("zip", &["-v"], None)
-            || command_exists("python3", &["-c", "import zipfile,sys;sys.exit(0)"], None)
-            || command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None);
+        let create_tools_ready = cfg_select! {
+            windows => {
+                detect_powershell_program().is_some() || command_exists("tar", &["--version"], None)
+            }
+            _ => {
+                command_exists("zip", &["-v"], None)
+                    || command_exists("python3", &["-c", "import zipfile,sys;sys.exit(0)"], None)
+                    || command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None)
+            }
+        };
         ensure_tools_ready(
             &CREATE_TOOLS_READY,
             create_tools_ready,
@@ -764,96 +734,96 @@ where
     Err(err(exhausted_message))
 }
 fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let mut attempts = Vec::with_capacity(2);
-        let script = build_powershell_archive_script(
-            "Expand-Archive -LiteralPath '",
-            archive_path,
-            "' -DestinationPath '",
-            unpack_dir,
-            "' -Force",
-        );
-        if let Some(shell_program) = detect_powershell_program() {
-            match run_powershell(shell_program, &script) {
+    cfg_select! {
+        windows => {
+            let mut attempts = Vec::with_capacity(2);
+            let script = build_powershell_archive_script(
+                "Expand-Archive -LiteralPath '",
+                archive_path,
+                "' -DestinationPath '",
+                unpack_dir,
+                "' -Force",
+            );
+            if let Some(shell_program) = detect_powershell_program() {
+                match run_powershell(shell_program, &script) {
+                    Ok(()) => return Ok(()),
+                    Err(command_err) => push_attempt(&mut attempts, shell_program, command_err),
+                }
+            }
+            match run_command(
+                "tar",
+                &[
+                    "-xf".into(),
+                    archive_path.as_os_str().to_os_string(),
+                    "-C".into(),
+                    unpack_dir.as_os_str().to_os_string(),
+                ],
+                None,
+            ) {
                 Ok(()) => return Ok(()),
-                Err(command_err) => push_attempt(&mut attempts, shell_program, command_err),
+                Err(command_err) => attempts.push(attempt_source_message("tar", command_err)),
             }
+            Err(err(archive_attempts_message(
+                "xlsx 압축 해제 실패",
+                archive_path,
+                unpack_dir,
+                &attempts,
+            )))
         }
-        match run_command(
-            "tar",
-            &[
-                "-xf".into(),
-                archive_path.as_os_str().to_os_string(),
-                "-C".into(),
-                unpack_dir.as_os_str().to_os_string(),
-            ],
-            None,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(command_err) => attempts.push(attempt_source_message("tar", command_err)),
-        }
-        Err(err(archive_attempts_message(
-            "xlsx 압축 해제 실패",
-            archive_path,
-            unpack_dir,
-            &attempts,
-        )))
-    }
-    #[cfg(not(windows))]
-    {
-        let mut attempts = Vec::with_capacity(3);
-        match run_command(
-            "unzip",
-            &[
-                "-o".into(),
-                archive_path.as_os_str().to_os_string(),
-                "-d".into(),
-                unpack_dir.as_os_str().to_os_string(),
-            ],
-            None,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(source_err) => attempts.push(attempt_source_message("unzip", source_err)),
-        }
-        match run_command(
-            "python3",
-            &[
-                "-m".into(),
-                "zipfile".into(),
-                "-e".into(),
-                archive_path.as_os_str().to_os_string(),
-                unpack_dir.as_os_str().to_os_string(),
-            ],
-            None,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(source_err) => {
-                attempts.push(attempt_source_message("python3 -m zipfile", source_err))
+        _ => {
+            let mut attempts = Vec::with_capacity(3);
+            match run_command(
+                "unzip",
+                &[
+                    "-o".into(),
+                    archive_path.as_os_str().to_os_string(),
+                    "-d".into(),
+                    unpack_dir.as_os_str().to_os_string(),
+                ],
+                None,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(source_err) => attempts.push(attempt_source_message("unzip", source_err)),
             }
-        }
-        match run_command(
-            "python",
-            &[
-                "-m".into(),
-                "zipfile".into(),
-                "-e".into(),
-                archive_path.as_os_str().to_os_string(),
-                unpack_dir.as_os_str().to_os_string(),
-            ],
-            None,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(source_err) => {
-                attempts.push(attempt_source_message("python -m zipfile", source_err))
+            match run_command(
+                "python3",
+                &[
+                    "-m".into(),
+                    "zipfile".into(),
+                    "-e".into(),
+                    archive_path.as_os_str().to_os_string(),
+                    unpack_dir.as_os_str().to_os_string(),
+                ],
+                None,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(source_err) => {
+                    attempts.push(attempt_source_message("python3 -m zipfile", source_err))
+                }
             }
+            match run_command(
+                "python",
+                &[
+                    "-m".into(),
+                    "zipfile".into(),
+                    "-e".into(),
+                    archive_path.as_os_str().to_os_string(),
+                    unpack_dir.as_os_str().to_os_string(),
+                ],
+                None,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(source_err) => {
+                    attempts.push(attempt_source_message("python -m zipfile", source_err))
+                }
+            }
+            Err(err(archive_attempts_message(
+                "xlsx 압축 해제 실패",
+                archive_path,
+                unpack_dir,
+                &attempts,
+            )))
         }
-        Err(err(archive_attempts_message(
-            "xlsx 압축 해제 실패",
-            archive_path,
-            unpack_dir,
-            &attempts,
-        )))
     }
 }
 fn archive_attempts_message(label: &str, from: &Path, to: &Path, attempts: &[String]) -> String {

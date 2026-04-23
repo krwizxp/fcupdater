@@ -38,16 +38,17 @@ pub const AUTO_SOURCE_MARKER: &str = "__fcupdater_auto__";
 const DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_mins(3);
 const TASK_SESSION_RETRY_LIMIT: usize = 2;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-#[cfg(windows)]
-const CHROMEDRIVER_BIN_NAME: &str = "chromedriver.exe";
-#[cfg(not(windows))]
-const CHROMEDRIVER_BIN_NAME: &str = "chromedriver";
-#[cfg(windows)]
-const EDGEDRIVER_BIN_NAME: &str = "msedgedriver.exe";
-#[cfg(not(windows))]
-const EDGEDRIVER_BIN_NAME: &str = "msedgedriver";
+cfg_select! {
+    windows => {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CHROMEDRIVER_BIN_NAME: &str = "chromedriver.exe";
+        const EDGEDRIVER_BIN_NAME: &str = "msedgedriver.exe";
+    }
+    _ => {
+        const CHROMEDRIVER_BIN_NAME: &str = "chromedriver";
+        const EDGEDRIVER_BIN_NAME: &str = "msedgedriver";
+    }
+}
 const TASKS: [Task; 11] = [
     Task {
         sido: "대전광역시",
@@ -604,19 +605,18 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
     }
 }
 impl SourceDownloadWebDriverExt for SourceDownloadOps {
-    #[cfg(windows)]
     fn apply_webdriver_spawn_options<'command>(
         &self,
         command: &'command mut Command,
     ) -> &'command mut Command {
-        command.creation_flags(CREATE_NO_WINDOW)
-    }
-    #[cfg(not(windows))]
-    fn apply_webdriver_spawn_options<'command>(
-        &self,
-        command: &'command mut Command,
-    ) -> &'command mut Command {
-        command
+        cfg_select! {
+            windows => {
+                command.creation_flags(CREATE_NO_WINDOW)
+            }
+            _ => {
+                command
+            }
+        }
     }
     fn download_nationwide_source_in_session(
         &self,
@@ -1008,13 +1008,15 @@ impl SourceDownloadWebDriverExt for SourceDownloadOps {
         }
         out
     }
-    #[cfg(windows)]
     fn os_dev_null(&self) -> &'static str {
-        "NUL"
-    }
-    #[cfg(not(windows))]
-    fn os_dev_null(&self) -> &'static str {
-        "/dev/null"
+        cfg_select! {
+            windows => {
+                "NUL"
+            }
+            _ => {
+                "/dev/null"
+            }
+        }
     }
     fn parse_content_length(&self, header: &str) -> StdResult<Option<usize>, String> {
         for line in header.lines() {
@@ -1345,14 +1347,16 @@ impl SourceDownloadWebDriverExt for SourceDownloadOps {
         self.http_request(webdriver_addr, "DELETE", &path, None)?;
         Ok(())
     }
-    #[cfg(windows)]
     fn webdriver_download_dir_string(&self, path: &Path) -> String {
-        let raw = path.to_string_lossy();
-        raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
-    }
-    #[cfg(not(windows))]
-    fn webdriver_download_dir_string(&self, path: &Path) -> String {
-        path.to_string_lossy().into_owned()
+        cfg_select! {
+            windows => {
+                let raw = path.to_string_lossy();
+                raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
+            }
+            _ => {
+                path.to_string_lossy().into_owned()
+            }
+        }
     }
     fn webdriver_execute_optional_string(
         &self,
