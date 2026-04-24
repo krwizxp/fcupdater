@@ -6,13 +6,9 @@ use super::{
         find_start_tag, find_tag_end,
     },
 };
-use crate::{Result, err, parse_i32_str};
+use crate::{Result, err, parse_i32_str, push_display};
 use alloc::collections::BTreeMap;
-use core::{
-    fmt::{Display, Write as _},
-    iter::Peekable,
-    str::Chars,
-};
+use core::{fmt::Display, iter::Peekable, str::Chars};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 const MAX_A1_COL: u32 = 0x4000;
@@ -1745,11 +1741,6 @@ fn display_string(value: impl Display) -> String {
     let mut out = String::with_capacity(capacity);
     push_display(&mut out, value);
     out
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }
 fn offset_only_error(prefix: &str, offset: usize) -> String {
     let capacity = prefix.len().saturating_add(24);

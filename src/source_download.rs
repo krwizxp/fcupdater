@@ -1,6 +1,6 @@
 use crate::{
     Result, err, is_metropolitan_token, is_province_token, normalize_address_key,
-    path_source_message, prefixed_message,
+    path_source_message, prefixed_message, push_display,
     source_download_opdownload::{
         OPDOWNLOAD_DIAGNOSTIC_SCRIPT, OPDOWNLOAD_DISCOVERY_SCRIPT, OPDOWNLOAD_PAGE_READY_SCRIPT,
         OPDOWNLOAD_TRIGGER_SCRIPT,
@@ -9,11 +9,7 @@ use crate::{
     strip_basic_region_suffix,
 };
 use alloc::{string::String, vec::Vec};
-use core::{
-    fmt::{Display, Write as _},
-    result::Result as StdResult,
-    time::Duration,
-};
+use core::{fmt::Display, result::Result as StdResult, time::Duration};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 use std::{
@@ -1531,11 +1527,6 @@ fn build_webdriver_session_path(session_id: &str, suffix: &str) -> String {
     path.push_str(session_id);
     path.push_str(suffix);
     path
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }
 fn browser_source_message(browser_name: &str, label: &str, source: impl Display) -> String {
     let capacity = browser_name

@@ -2,17 +2,12 @@ use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, canon_header, display_region_label_from_source,
     err, excel,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
-    normalize_address_key, same_trimmed, shift_row,
+    normalize_address_key, push_display, same_trimmed, shift_row,
     source_sync::SourceRecord,
     usize_to_u32,
 };
 use alloc::collections::BTreeMap;
-use core::{
-    cmp::Ordering,
-    error::Error,
-    fmt::{Display, Write as _},
-    mem,
-};
+use core::{cmp::Ordering, error::Error, mem};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -1857,9 +1852,4 @@ fn missing_sort_target_row_error(row_num: u32) -> Box<dyn Error + Send + Sync> {
     out.push_str("정렬 대상 행을 찾지 못했습니다: ");
     push_display(&mut out, row_num);
     err(out)
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }

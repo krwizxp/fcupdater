@@ -1,17 +1,13 @@
 use super::path_util::path_from_slashes;
 use crate::{
     Result, err, path_pair_source_message, path_source_message, prefixed_message,
-    program_source_message,
+    program_source_message, push_display,
 };
 #[cfg(windows)]
 use core::iter::once;
 #[cfg(windows)]
 use core::ptr::{null, null_mut};
-use core::{
-    fmt::{Display, Write as _},
-    mem,
-    time::Duration,
-};
+use core::{fmt::Display, mem, time::Duration};
 #[cfg(not(windows))]
 use std::io::{Write as _, stderr};
 #[cfg(windows)]
@@ -29,8 +25,15 @@ use std::{
 };
 static EXTRACT_TOOLS_READY: OnceLock<()> = OnceLock::new();
 static CREATE_TOOLS_READY: OnceLock<()> = OnceLock::new();
-#[cfg(not(windows))]
-const PYTHON_CREATE_ZIP_SCRIPT: &str = r#"import os
+cfg_select! {
+    windows => {
+        const EXTRACT_TOOLS_MISSING_MESSAGE: &str =
+            "xlsx 압축 해제를 위한 도구가 없습니다. (PowerShell 또는 tar 필요)";
+        const CREATE_TOOLS_MISSING_MESSAGE: &str =
+            "xlsx 압축 생성을 위한 도구가 없습니다. (PowerShell 또는 tar 필요)";
+    }
+    _ => {
+        const PYTHON_CREATE_ZIP_SCRIPT: &str = r#"import os
 import sys
 import zipfile
 root, out = sys.argv[1], sys.argv[2]
@@ -41,18 +44,12 @@ with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             arc = os.path.relpath(p, root).replace(os.sep, "/")
             zf.write(p, arc)
 "#;
-#[cfg(windows)]
-const EXTRACT_TOOLS_MISSING_MESSAGE: &str =
-    "xlsx 압축 해제를 위한 도구가 없습니다. (PowerShell 또는 tar 필요)";
-#[cfg(not(windows))]
-const EXTRACT_TOOLS_MISSING_MESSAGE: &str =
-    "xlsx 압축 해제를 위한 도구가 없습니다. (unzip 또는 python3/python 필요)";
-#[cfg(windows)]
-const CREATE_TOOLS_MISSING_MESSAGE: &str =
-    "xlsx 압축 생성을 위한 도구가 없습니다. (PowerShell 또는 tar 필요)";
-#[cfg(not(windows))]
-const CREATE_TOOLS_MISSING_MESSAGE: &str =
-    "xlsx 압축 생성을 위한 도구가 없습니다. (zip 또는 python3/python 필요)";
+        const EXTRACT_TOOLS_MISSING_MESSAGE: &str =
+            "xlsx 압축 해제를 위한 도구가 없습니다. (unzip 또는 python3/python 필요)";
+        const CREATE_TOOLS_MISSING_MESSAGE: &str =
+            "xlsx 압축 생성을 위한 도구가 없습니다. (zip 또는 python3/python 필요)";
+    }
+}
 #[derive(Debug)]
 pub struct XlsxContainer {
     archive_path: PathBuf,
@@ -872,11 +869,6 @@ fn build_powershell_archive_script(
     script.push_str(&second_quoted);
     script.push_str(suffix);
     script
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }
 fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
     let mut out = String::with_capacity(prefix.len().saturating_add(relative_path.len()));

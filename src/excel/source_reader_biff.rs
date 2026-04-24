@@ -3,7 +3,8 @@ use super::{
     build_source_records_from_rows,
 };
 use crate::{
-    Result, err, err_with_source, path_source_message, prefixed_message, source_sync::SourceRecord,
+    Result, err, err_with_source, path_source_message, prefixed_message, push_display,
+    source_sync::SourceRecord,
 };
 use alloc::collections::BTreeMap;
 use core::{
@@ -1567,11 +1568,6 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
         | (u64::from(arr[5]) << 40_u32)
         | (u64::from(arr[6]) << 48_u32)
         | (u64::from(arr[7]) << 56_u32))
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }
 fn prefixed_display_message(prefix: &str, value: impl Display) -> String {
     let mut out = String::with_capacity(prefix.len().saturating_add(32));

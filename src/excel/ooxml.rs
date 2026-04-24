@@ -6,8 +6,7 @@ use super::{
         find_tag_end,
     },
 };
-use crate::{Result, err};
-use core::fmt::{Display, Write as _};
+use crate::{Result, err, push_display};
 use std::{
     collections::HashMap,
     path::{Component, PathBuf},
@@ -157,9 +156,4 @@ fn iter_start_tags<'xml>(xml: &'xml str, tag_name: &str) -> Vec<&'xml str> {
         cursor = next_cursor;
     }
     out
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }
