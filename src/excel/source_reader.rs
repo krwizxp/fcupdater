@@ -4,7 +4,8 @@ use super::xml::{
     find_start_tag, find_tag_end,
 };
 use crate::{
-    Result, canon_header, err, numeric::round_f64_to_i32, parse_i32_str, source_sync::SourceRecord,
+    Result, canon_header, err, numeric::round_f64_to_i32, parse_i32_str, push_display,
+    source_sync::SourceRecord,
 };
 use core::{
     error::Error as CoreError,
@@ -418,9 +419,4 @@ pub fn source_header_scan_rows() -> usize {
         .map_or(DEFAULT_SOURCE_HEADER_SCAN_ROWS, |parsed_value| {
             parsed_value.min(10_000)
         })
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }

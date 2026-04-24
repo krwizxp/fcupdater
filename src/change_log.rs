@@ -1,8 +1,8 @@
 use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, canon_header, err,
     excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
+    push_display,
 };
-use core::fmt::{Display, Write as _};
 use std::{collections::HashMap, env};
 const HEADER_KEYS_REGION: [&str; 1] = ["지역"];
 const HEADER_KEYS_NAME: [&str; 1] = ["상호"];
@@ -470,9 +470,4 @@ fn delta_formula(old_col: &str, new_col: &str, row: u32) -> String {
     push_display(&mut out, row);
     out.push(')');
     out
-}
-fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
 }

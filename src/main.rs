@@ -951,7 +951,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         out
     }
 }
-fn push_display(out: &mut String, value: impl Display) {
+pub(crate) fn push_display(out: &mut String, value: impl Display) {
     match write!(out, "{value}") {
         Ok(()) | Err(_) => {}
     }
