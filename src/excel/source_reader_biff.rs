@@ -232,9 +232,8 @@ impl CfbFileExt for CfbFile {
         })?;
         for sid in fat_sector_ids {
             let sector = get_sector_slice(data, sector_size, *sid)?;
-            for i in 0..entries_per_sector {
-                let entry_offset = checked_index_offset(0, i, 4, "CFB FAT sector")?;
-                fat.push(read_u32_le(sector, entry_offset)?);
+            for chunk in sector.chunks_exact(4).take(entries_per_sector) {
+                fat.push(u32_from_le_chunk(chunk)?);
             }
         }
         Ok(fat)
@@ -274,14 +273,10 @@ impl CfbFileExt for CfbFile {
             Some(mini_fat_limit),
             "CFB mini FAT",
         )?;
-        let mut out = Vec::with_capacity(mini_fat_bytes.len().checked_div(4).unwrap_or(0));
-        let mut idx = 0_usize;
-        while let Some(next_idx) = idx.checked_add(4) {
-            if next_idx > mini_fat_bytes.len() {
-                break;
-            }
-            out.push(read_u32_le(&mini_fat_bytes, idx)?);
-            idx = next_idx;
+        let chunks = mini_fat_bytes.chunks_exact(4);
+        let mut out = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            out.push(u32_from_le_chunk(chunk)?);
         }
         Ok(out)
     }
@@ -328,9 +323,8 @@ impl CfbFileExt for CfbFile {
                 .checked_div(4)
                 .and_then(|word_count| word_count.checked_sub(1))
                 .ok_or_else(|| err("CFB DIFAT sector 크기가 비정상적입니다."))?;
-            for idx in 0..entries_per_sector {
-                let entry_offset = checked_index_offset(0, idx, 4, "CFB DIFAT sector")?;
-                let entry = read_u32_le(sector, entry_offset)?;
+            for chunk in sector.chunks_exact(4).take(entries_per_sector) {
+                let entry = u32_from_le_chunk(chunk)?;
                 if is_regular_sector_id(entry) {
                     difat_entries.push(entry);
                 }
@@ -493,18 +487,9 @@ impl CfbFileExt for CfbFile {
         dir_stream: &[u8],
         major_version: u16,
     ) -> Result<Vec<CfbDirectoryEntry>> {
-        let mut entries = Vec::with_capacity(dir_stream.len().checked_div(128).unwrap_or(0));
-        let mut cursor = 0_usize;
-        while cursor
-            .checked_add(128)
-            .is_some_and(|next_cursor| next_cursor <= dir_stream.len())
-        {
-            let entry_end = cursor
-                .checked_add(128)
-                .ok_or_else(|| err("CFB 디렉터리 엔트리 끝 offset 계산에 실패했습니다."))?;
-            let entry = dir_stream
-                .get(cursor..entry_end)
-                .ok_or_else(|| err("CFB 디렉터리 엔트리 범위 오류"))?;
+        let chunks = dir_stream.chunks_exact(128);
+        let mut entries = Vec::with_capacity(chunks.len());
+        for entry in chunks {
             let name_len = usize::from(read_u16_le(entry, 0x40)?);
             let object_type = *entry
                 .get(0x42)
@@ -530,7 +515,6 @@ impl CfbFileExt for CfbFile {
                 start_sector,
                 stream_size,
             });
-            cursor = cursor.saturating_add(128);
         }
         Ok(entries)
     }
@@ -756,16 +740,15 @@ impl<'chunk> SstChunkReaderExt<'chunk> for SstChunkReader<'chunk> {
         Ok(out)
     }
     fn read_u16(&mut self) -> Result<u16> {
-        let b0 = u16::from(self.read_u8()?);
-        let b1 = u16::from(self.read_u8()?);
-        Ok(b0 | (b1 << 8))
+        Ok(u16::from_le_bytes([self.read_u8()?, self.read_u8()?]))
     }
     fn read_u32(&mut self) -> Result<u32> {
-        let b0 = u32::from(self.read_u8()?);
-        let b1 = u32::from(self.read_u8()?);
-        let b2 = u32::from(self.read_u8()?);
-        let b3 = u32::from(self.read_u8()?);
-        Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+        Ok(u32::from_le_bytes([
+            self.read_u8()?,
+            self.read_u8()?,
+            self.read_u8()?,
+            self.read_u8()?,
+        ]))
     }
     fn read_u8(&mut self) -> Result<u8> {
         self.ensure_available()?;
@@ -890,7 +873,7 @@ impl SourceReaderBiffParseExt for SourceReader {
         }
         let mut rows = Vec::with_capacity(rows_map.len());
         for (row_num, cells) in rows_map {
-            let Some(max_col) = cells.keys().copied().max() else {
+            let Some(max_col) = cells.last_key_value().map(|(&col, _)| col) else {
                 rows.push((row_num, Vec::default()));
                 continue;
             };
@@ -1504,21 +1487,21 @@ fn decode_rk_number(rk: u32) -> f64 {
     value
 }
 fn decode_utf16_le(bytes: &[u8]) -> String {
-    let mut data = Vec::with_capacity(bytes.len().checked_div(2).unwrap_or(0));
-    let mut i = 0_usize;
-    while i
-        .checked_add(1)
-        .is_some_and(|next_idx| next_idx < bytes.len())
-    {
-        let b0 = bytes.get(i).copied().unwrap_or_default();
-        let b1 = bytes
-            .get(i.checked_add(1).unwrap_or(i))
-            .copied()
-            .unwrap_or_default();
-        data.push(u16::from(b0) | (u16::from(b1) << 8_u32));
-        i = i.saturating_add(2);
+    let chunks = bytes.chunks_exact(2);
+    let mut data = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if let Some(arr) = chunk.as_array::<2>().copied() {
+            data.push(u16::from_le_bytes(arr));
+        }
     }
     String::from_utf16_lossy(&data)
+}
+fn u32_from_le_chunk(chunk: &[u8]) -> Result<u32> {
+    let arr = chunk
+        .as_array::<4>()
+        .copied()
+        .ok_or_else(|| err("little-endian u32 chunk 길이가 잘못되었습니다."))?;
+    Ok(u32::from_le_bytes(arr))
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
     let end = checked_offset_add(offset, 2, "u16 read")?;
@@ -1531,7 +1514,7 @@ fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
                 offset,
             ))
         })?;
-    Ok(u16::from(arr[0]) | (u16::from(arr[1]) << 8_u32))
+    Ok(u16::from_le_bytes(*arr))
 }
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
     let end = checked_offset_add(offset, 4, "u32 read")?;
@@ -1544,10 +1527,7 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
                 offset,
             ))
         })?;
-    Ok(u32::from(arr[0])
-        | (u32::from(arr[1]) << 8_u32)
-        | (u32::from(arr[2]) << 16_u32)
-        | (u32::from(arr[3]) << 24_u32))
+    Ok(u32::from_le_bytes(*arr))
 }
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
     let end = checked_offset_add(offset, 8, "u64 read")?;
@@ -1560,14 +1540,7 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
                 offset,
             ))
         })?;
-    Ok(u64::from(arr[0])
-        | (u64::from(arr[1]) << 8_u32)
-        | (u64::from(arr[2]) << 16_u32)
-        | (u64::from(arr[3]) << 24_u32)
-        | (u64::from(arr[4]) << 32_u32)
-        | (u64::from(arr[5]) << 40_u32)
-        | (u64::from(arr[6]) << 48_u32)
-        | (u64::from(arr[7]) << 56_u32))
+    Ok(u64::from_le_bytes(*arr))
 }
 fn prefixed_display_message(prefix: &str, value: impl Display) -> String {
     let mut out = String::with_capacity(prefix.len().saturating_add(32));
