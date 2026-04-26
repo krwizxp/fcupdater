@@ -1253,7 +1253,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         let filter_end_col = ws
             .rows
             .get(&header_row)
-            .and_then(|row| row.cells.keys().copied().max())
+            .and_then(|row| row.cells.last_key_value().map(|(&col, _)| col))
             .unwrap_or(1)
             .max(ws.max_cell_col());
         if let Err(error) = ws.update_dimension() {

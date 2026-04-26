@@ -9,7 +9,7 @@ use super::{
 use crate::{Result, err, parse_i32_str, push_display};
 use alloc::collections::BTreeMap;
 use core::{fmt::Display, iter::Peekable, str::Chars};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 const MAX_A1_COL: u32 = 0x4000;
 const MAX_A1_ROW: u32 = 0x0010_0000;
@@ -146,14 +146,16 @@ impl Workbook {
                     }) else {
                         continue;
                     };
-                    let shared_idx = if let Some(idx) = index_map.get(&text).copied() {
-                        idx
-                    } else {
-                        let idx = self.shared_strings.len();
-                        self.shared_strings.push(text.clone());
-                        index_map.insert(text.clone(), idx);
-                        newly_appended_shared_strings.push(text);
-                        idx
+                    let shared_idx = match index_map.entry(text) {
+                        Entry::Occupied(entry) => *entry.get(),
+                        Entry::Vacant(entry) => {
+                            let idx = self.shared_strings.len();
+                            let value = entry.key().clone();
+                            self.shared_strings.push(value.clone());
+                            entry.insert(idx);
+                            newly_appended_shared_strings.push(value);
+                            idx
+                        }
                     };
                     set_attr(&mut cell.attrs, "t", "s");
                     cell.inner_xml = Some(build_display_text_tag("v", shared_idx));
@@ -566,17 +568,20 @@ impl Worksheet {
         if !row_obj.attrs.is_empty() {
             return true;
         }
-        (1..=max_col).any(|col| row_obj.cells.contains_key(&col))
+        if max_col == 0 {
+            return false;
+        }
+        row_obj.cells.range(1..=max_col).next().is_some()
     }
     pub fn max_cell_col(&self) -> u32 {
         self.rows
             .values()
-            .flat_map(|row| row.cells.keys().copied())
+            .filter_map(|row| row.cells.last_key_value().map(|(&col, _)| col))
             .max()
             .unwrap_or(1)
     }
     pub fn max_row_num(&self) -> u32 {
-        self.rows.keys().copied().max().unwrap_or(1)
+        self.rows.last_key_value().map_or(1, |(&row, _)| row)
     }
     fn normalize_shared_formulas(&mut self) -> Result<()> {
         let mut heads: HashMap<String, SharedFormulaHead> = HashMap::with_capacity(self.rows.len());
@@ -985,10 +990,8 @@ impl WorksheetXmlParseExt for Worksheet {
             let row_num = get_attr(&row_attrs, "r")
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or_else(|| {
-                    rows.keys()
-                        .last()
-                        .copied()
-                        .unwrap_or(0_u32)
+                    rows.last_key_value()
+                        .map_or(0_u32, |(&last_row, _)| last_row)
                         .saturating_add(1)
                 });
             set_attr(&mut row_attrs, "r", display_string(row_num));
