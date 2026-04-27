@@ -1,5 +1,5 @@
 use crate::{
-    Result, err, is_metropolitan_token, is_province_token, normalize_address_key,
+    Result, err, err_with_source, is_metropolitan_token, is_province_token, normalize_address_key,
     path_source_message, prefixed_message, push_display,
     source_download_opdownload::{
         OPDOWNLOAD_DIAGNOSTIC_SCRIPT, OPDOWNLOAD_DISCOVERY_SCRIPT, OPDOWNLOAD_PAGE_READY_SCRIPT,
@@ -105,7 +105,8 @@ struct ChildGuard {
 }
 pub struct SourceDownloadOps;
 pub trait SourceDownloadApi {
-    fn filter_target_region_records(&self, records: Vec<SourceRecord>) -> Vec<SourceRecord>;
+    fn filter_target_region_records(&self, records: Vec<SourceRecord>)
+    -> Result<Vec<SourceRecord>>;
     fn refresh_sources(
         &self,
         dir: &Path,
@@ -114,7 +115,10 @@ pub trait SourceDownloadApi {
     ) -> Result<Vec<PathBuf>>;
 }
 impl SourceDownloadApi for SourceDownloadOps {
-    fn filter_target_region_records(&self, records: Vec<SourceRecord>) -> Vec<SourceRecord> {
+    fn filter_target_region_records(
+        &self,
+        records: Vec<SourceRecord>,
+    ) -> Result<Vec<SourceRecord>> {
         self.filter_target_region_records_impl(records)
     }
     fn refresh_sources(
@@ -127,7 +131,10 @@ impl SourceDownloadApi for SourceDownloadOps {
     }
 }
 trait SourceDownloadOpsExt {
-    fn filter_target_region_records_impl(&self, records: Vec<SourceRecord>) -> Vec<SourceRecord>;
+    fn filter_target_region_records_impl(
+        &self,
+        records: Vec<SourceRecord>,
+    ) -> Result<Vec<SourceRecord>>;
     fn refresh_sources_impl(
         &self,
         dir: &Path,
@@ -278,12 +285,27 @@ struct WaitUntilParams<'text> {
     timeout: Duration,
 }
 impl SourceDownloadOpsExt for SourceDownloadOps {
-    fn filter_target_region_records_impl(&self, records: Vec<SourceRecord>) -> Vec<SourceRecord> {
+    fn filter_target_region_records_impl(
+        &self,
+        records: Vec<SourceRecord>,
+    ) -> Result<Vec<SourceRecord>> {
         let matchers = self.task_matchers();
-        records
-            .into_iter()
-            .filter(|record| self.record_matches_any_task(record, matchers))
-            .collect()
+        let mut filtered = Vec::new();
+        filtered
+            .try_reserve_exact(records.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("필터링 소스 레코드 목록 메모리 확보 실패: ");
+                push_display(&mut message, records.len());
+                message.push_str(" records");
+                err_with_source(message, source)
+            })?;
+        for record in records {
+            if self.record_matches_any_task(&record, matchers) {
+                filtered.push(record);
+            }
+        }
+        Ok(filtered)
     }
     fn refresh_sources_impl(
         &self,
@@ -1040,7 +1062,13 @@ impl SourceDownloadWebDriverExt for SourceDownloadOps {
         Ok(None)
     }
     fn read_http_response(&self, stream: &mut TcpStream) -> StdResult<String, String> {
-        let mut raw = Vec::with_capacity(8192);
+        let mut raw: Vec<u8> = Vec::new();
+        raw.try_reserve_exact(8192).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("HTTP 응답 버퍼 메모리 확보 실패: ");
+            push_display(&mut message, source);
+            message
+        })?;
         let mut expected_total_len = None;
         loop {
             let mut chunk = [0_u8; 4096];
@@ -1050,6 +1078,12 @@ impl SourceDownloadWebDriverExt for SourceDownloadOps {
                     let chunk_bytes = chunk
                         .get(..read)
                         .ok_or_else(|| "HTTP 응답 chunk 범위 오류".to_owned())?;
+                    raw.try_reserve(chunk_bytes.len()).map_err(|source| {
+                        let mut message = String::with_capacity(64);
+                        message.push_str("HTTP 응답 버퍼 추가 메모리 확보 실패: ");
+                        push_display(&mut message, source);
+                        message
+                    })?;
                     raw.extend_from_slice(chunk_bytes);
                     if expected_total_len.is_none()
                         && let Some((header_end, separator_len)) = self.find_http_header_end(&raw)
@@ -1068,7 +1102,16 @@ impl SourceDownloadWebDriverExt for SourceDownloadOps {
                             if let Some(expected) = expected_total_len
                                 && expected > raw.len()
                             {
-                                raw.reserve(expected.saturating_sub(raw.len()));
+                                let additional = expected.saturating_sub(raw.len());
+                                raw.try_reserve(additional).map_err(|source| {
+                                    let mut message = String::with_capacity(64);
+                                    message.push_str("HTTP 응답 Content-Length 메모리 확보 실패: ");
+                                    push_display(&mut message, additional);
+                                    message.push_str(" bytes (");
+                                    push_display(&mut message, source);
+                                    message.push(')');
+                                    message
+                                })?;
                             }
                         }
                     }
@@ -1166,7 +1209,13 @@ impl SourceDownloadWebDriverExt for SourceDownloadOps {
         Ok(PathBuf::from(browser.driver_cmd()))
     }
     fn snapshot_files(&self, dir: &Path) -> StdResult<HashSet<PathBuf>, String> {
-        let mut set = HashSet::with_capacity(32);
+        let mut set: HashSet<PathBuf> = HashSet::new();
+        set.try_reserve(32).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("다운로드 snapshot 집합 메모리 확보 실패: ");
+            push_display(&mut message, source);
+            message
+        })?;
         if !dir
             .try_exists()
             .map_err(|error| path_source_message("다운로드 폴더 경로 확인 실패", dir, error))?
@@ -1180,6 +1229,12 @@ impl SourceDownloadWebDriverExt for SourceDownloadOps {
                 .map_err(|error| prefixed_message("디렉터리 항목 읽기 실패: ", error))?;
             let path = dir_entry.path();
             if path.is_file() {
+                set.try_reserve(1).map_err(|source| {
+                    let mut message = String::with_capacity(64);
+                    message.push_str("다운로드 snapshot 항목 추가 메모리 확보 실패: ");
+                    push_display(&mut message, source);
+                    message
+                })?;
                 set.insert(path);
             }
         }

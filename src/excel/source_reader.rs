@@ -4,8 +4,8 @@ use super::xml::{
     find_start_tag, find_tag_end,
 };
 use crate::{
-    Result, canon_header, err, numeric::round_f64_to_i32, parse_i32_str, push_display,
-    source_sync::SourceRecord,
+    Result, canon_header, err, err_with_source, numeric::round_f64_to_i32, parse_i32_str,
+    push_display, source_sync::SourceRecord,
 };
 use core::{
     error::Error as CoreError,
@@ -239,10 +239,19 @@ pub fn parse_xlsx_row_cells(
     row_num: usize,
     shared_strings: &[String],
 ) -> Result<Vec<CellValue>> {
+    let cell_count = row_xml.matches("<c").count();
+    let mut row_cells: Vec<CellValue> = Vec::new();
+    row_cells.try_reserve_exact(cell_count).map_err(|source| {
+        let mut message = String::with_capacity(64);
+        message.push_str("xlsx row 셀 메모리 확보 실패: ");
+        push_display(&mut message, cell_count);
+        message.push_str(" cells");
+        err_with_source(message, source)
+    })?;
     XlsxRowCellParser {
         cursor: 0,
         next_col: 0,
-        row_cells: Vec::with_capacity(row_xml.matches("<c").count()),
+        row_cells,
         row_num,
         row_xml,
         shared_strings,
@@ -261,7 +270,15 @@ pub fn build_source_records_from_rows(
         })
         .ok_or_else(|| err("헤더 행을 찾지 못했습니다"))?;
     let data_row_start = found_header_row_idx.checked_add(1).unwrap_or(rows.len());
-    let mut out = Vec::with_capacity(rows.len().saturating_sub(data_row_start));
+    let data_row_capacity = rows.len().saturating_sub(data_row_start);
+    let mut out: Vec<SourceRecord> = Vec::new();
+    out.try_reserve_exact(data_row_capacity).map_err(|source| {
+        let mut message = String::with_capacity(64);
+        message.push_str("소스 레코드 목록 메모리 확보 실패: ");
+        push_display(&mut message, data_row_capacity);
+        message.push_str(" rows");
+        err_with_source(message, source)
+    })?;
     for row_entry in rows.iter().skip(data_row_start) {
         let row = &row_entry.1;
         if let Some(record) = build_source_record_from_row(row, header_indices) {
