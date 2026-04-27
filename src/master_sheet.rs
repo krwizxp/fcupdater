@@ -424,16 +424,12 @@ impl MasterSheetOpsExt for MasterSheetOps {
         old_rows: &[u32],
         kept_source_rows: &[(u32, Option<SourceRecord>)],
     ) -> Vec<u32> {
-        let mut kept_old_rows: HashSet<u32> = HashSet::with_capacity(kept_source_rows.len());
-        for entry in kept_source_rows {
-            kept_old_rows.insert(entry.0);
-        }
-        let mut deleted_rows: Vec<u32> = Vec::with_capacity(old_rows.len());
-        for row_num in old_rows.iter().copied() {
-            if !kept_old_rows.contains(&row_num) {
-                deleted_rows.push(row_num);
-            }
-        }
+        let kept_old_rows: HashSet<u32> = kept_source_rows.iter().map(|entry| entry.0).collect();
+        let mut deleted_rows: Vec<u32> = old_rows
+            .iter()
+            .copied()
+            .filter(|row_num| !kept_old_rows.contains(row_num))
+            .collect();
         deleted_rows.sort_unstable();
         deleted_rows
     }
@@ -647,11 +643,10 @@ impl MasterSheetOpsExt for MasterSheetOps {
                 .then_with(|| left.1.name.cmp(&right.1.name))
                 .then_with(|| left.1.address.cmp(&right.1.address))
         });
-        let mut out = Vec::with_capacity(new_sources.len());
-        for (_, rec) in new_sources {
-            out.push(rec.clone());
-        }
-        out
+        new_sources
+            .into_iter()
+            .map(|(_, rec)| rec.clone())
+            .collect()
     }
     fn compare_out_of_rank_fuels(&self, left: &RankSortKey, right: &RankSortKey) -> Ordering {
         left.gasoline
@@ -1068,25 +1063,29 @@ impl MasterSheetOpsExt for MasterSheetOps {
         if trimmed.is_empty() || trimmed == "-" {
             return None;
         }
-        let normalized = trimmed.replace(',', "");
+        let normalized_storage;
+        let normalized = if trimmed.contains(',') {
+            normalized_storage = trimmed.replace(',', "");
+            normalized_storage.as_str()
+        } else {
+            trimmed
+        };
         let (sign, digits) = normalized
             .strip_prefix('-')
-            .map_or((1_i64, normalized.as_str()), |rest| (-1_i64, rest));
+            .map_or((1_i64, normalized), |rest| (-1_i64, rest));
         let (whole_text, fraction_text) = digits.split_once('.').unwrap_or((digits, ""));
         let whole = whole_text.parse::<i64>().ok()?;
-        let mut fraction_digits = fraction_text
-            .chars()
-            .filter(char::is_ascii_digit)
-            .take(6)
-            .collect::<String>();
-        while fraction_digits.len() < 6 {
-            fraction_digits.push('0');
+        let mut fraction = 0_i64;
+        let mut fraction_digit_count = 0_u8;
+        for ch in fraction_text.chars().filter(char::is_ascii_digit).take(6) {
+            let digit = ch.to_digit(10)?;
+            fraction = fraction.checked_mul(10)?.checked_add(i64::from(digit))?;
+            fraction_digit_count = fraction_digit_count.checked_add(1)?;
         }
-        let fraction = if fraction_digits.is_empty() {
-            0_i64
-        } else {
-            fraction_digits.parse::<i64>().ok()?
-        };
+        while fraction_digit_count < 6 {
+            fraction = fraction.checked_mul(10)?;
+            fraction_digit_count = fraction_digit_count.checked_add(1)?;
+        }
         let whole_scaled = whole.checked_mul(DECIMAL_SCALE)?;
         let combined = whole_scaled.checked_add(fraction)?;
         combined.checked_mul(sign)
@@ -1294,14 +1293,13 @@ impl MasterSheetOpsExt for MasterSheetOps {
             self.write_rank_formula_cache(ws, row, layout, &cache);
             rank_totals.push((row, cache.rank_total));
         }
-        let visible_rank_totals: Vec<ScaledSortKey> =
+        let mut visible_rank_totals: Vec<ScaledSortKey> =
             rank_totals.iter().filter_map(|entry| entry.1).collect();
+        visible_rank_totals.sort_unstable();
         for (row, rank_total) in rank_totals {
             let rank_text = rank_total.map(|current| {
                 let rank = visible_rank_totals
-                    .iter()
-                    .filter(|value| **value < current)
-                    .count()
+                    .partition_point(|value| *value < current)
                     .saturating_add(1);
                 rank.to_string()
             });
@@ -1418,18 +1416,17 @@ impl MasterSheetOpsExt for MasterSheetOps {
         out
     }
     fn rows_from_sources(&self, new_sources: &[SourceRecord]) -> Vec<StoreRow> {
-        let mut rows = Vec::with_capacity(new_sources.len());
-        for src in new_sources {
-            rows.push(StoreRow {
+        new_sources
+            .iter()
+            .map(|src| StoreRow {
                 region: display_region_label_from_source(&src.region, &src.address),
                 name: src.name.clone(),
                 address: src.address.clone(),
                 gasoline: src.gasoline,
                 premium: src.premium,
                 diesel: src.diesel,
-            });
-        }
-        rows
+            })
+            .collect()
     }
     fn sort_master_rows_by_rank(
         &self,
@@ -1699,11 +1696,11 @@ impl MasterSheetOpsExt for MasterSheetOps {
             ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
         }
         if let Some(col) = layout.sort_key {
-            let text = cache
-                .rank_total
-                .map(|value| format_scaled_value(value, DECIMAL_SCALE_SQUARED))
-                .or_else(|| Some("1000000000000000".to_owned()));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
+            let text = cache.rank_total.map_or_else(
+                || "1000000000000000".to_owned(),
+                |value| format_scaled_value(value, DECIMAL_SCALE_SQUARED),
+            );
+            ws.set_formula_cached_value_at(col, row, Some(&text), None);
         }
         if let Some(col) = layout.unit_price_with_currency {
             ws.set_formula_cached_value_at(

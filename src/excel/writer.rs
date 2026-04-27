@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{Result, err, parse_i32_str, push_display};
 use alloc::collections::BTreeMap;
-use core::{fmt::Display, iter::Peekable, str::Chars};
+use core::fmt::Display;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 const MAX_A1_COL: u32 = 0x4000;
@@ -58,7 +58,6 @@ trait WorkbookSharedStringsExt {
         &mut self,
         existing_total: usize,
         existing_unique: usize,
-        new_values: &[String],
     ) -> Result<()>;
 }
 trait WorksheetXmlParseExt {
@@ -120,8 +119,6 @@ impl Workbook {
         for (idx, value) in self.shared_strings.iter().enumerate() {
             index_map.entry(value.clone()).or_insert(idx);
         }
-        let mut newly_appended_shared_strings =
-            Vec::with_capacity(self.shared_strings.len().min(64));
         for sheet in self.sheets.values_mut() {
             for row in sheet.rows.values_mut() {
                 for cell in row.cells.values_mut() {
@@ -151,9 +148,8 @@ impl Workbook {
                         Entry::Vacant(entry) => {
                             let idx = self.shared_strings.len();
                             let value = entry.key().clone();
-                            self.shared_strings.push(value.clone());
+                            self.shared_strings.push(value);
                             entry.insert(idx);
-                            newly_appended_shared_strings.push(value);
                             idx
                         }
                     };
@@ -162,14 +158,13 @@ impl Workbook {
                 }
             }
         }
-        if newly_appended_shared_strings.is_empty() {
+        if self.shared_strings.len() == existing_total {
             return Ok(());
         }
         <Self as WorkbookSharedStringsExt>::update_shared_strings_xml_text(
             self,
             existing_total,
             existing_unique,
-            &newly_appended_shared_strings,
         )
     }
     fn remove_excel_recovery_artifacts(&mut self) -> Result<()> {
@@ -286,8 +281,11 @@ impl WorkbookSharedStringsExt for Workbook {
         &mut self,
         existing_total: usize,
         existing_unique: usize,
-        new_values: &[String],
     ) -> Result<()> {
+        let new_values = self
+            .shared_strings
+            .get(existing_total..)
+            .ok_or_else(|| err("sharedStrings 신규 값 범위가 손상되었습니다."))?;
         let original_xml = self
             .shared_strings_xml_text
             .take()
@@ -441,13 +439,13 @@ impl Worksheet {
                         for token in sqref.split_whitespace() {
                             let (start_ref, end_ref) = parse_range_token(token);
                             let Some((start_col, start_row, start_col_lock, start_row_lock)) =
-                                parse_ref_with_locks(&start_ref)
+                                parse_ref_with_locks(start_ref)
                             else {
                                 ranges_out.push(token.to_owned());
                                 continue;
                             };
                             let Some((end_col, end_row, end_col_lock, end_row_lock)) =
-                                parse_ref_with_locks(&end_ref)
+                                parse_ref_with_locks(end_ref)
                             else {
                                 ranges_out.push(token.to_owned());
                                 continue;
@@ -816,7 +814,7 @@ impl Worksheet {
                 let mut end_col = 1_u32;
                 if let Some(existing_ref) = get_attr(&attrs, "ref") {
                     let (_, end_ref) = parse_range_token(existing_ref);
-                    if let Some((parsed_end_col, _, _, _)) = parse_ref_with_locks(&end_ref) {
+                    if let Some((parsed_end_col, _, _, _)) = parse_ref_with_locks(end_ref) {
                         end_col = parsed_end_col;
                     }
                 }
@@ -1131,10 +1129,7 @@ fn attr_sort_key(name: &str) -> (u8, &str) {
     }
 }
 fn push_sorted_attrs_xml(out: &mut String, attrs: &[(String, String)]) {
-    let mut sorted_attrs: Vec<&(String, String)> = Vec::with_capacity(attrs.len());
-    for attr in attrs {
-        sorted_attrs.push(attr);
-    }
+    let mut sorted_attrs: Vec<_> = attrs.iter().collect();
     sorted_attrs.sort_by(|left, right| attr_sort_key(&left.0).cmp(&attr_sort_key(&right.0)));
     for attr in sorted_attrs {
         out.push(' ');
@@ -1437,18 +1432,35 @@ where
     if index == col_start {
         return Ok(None);
     }
-    let mut col_text = String::with_capacity(index.saturating_sub(col_start));
-    for ch in chars
-        .iter()
-        .skip(col_start)
-        .take(index.saturating_sub(col_start))
-        .copied()
-    {
-        col_text.push(ch);
-    }
-    let Some(base_col) = parse_a1_col_index(&col_text) else {
+    let col_chars = chars
+        .get(col_start..index)
+        .ok_or_else(|| err("formula column reference 범위가 손상되었습니다."))?;
+    if col_chars.len() > 3 {
         return Ok(None);
-    };
+    }
+    let mut base_col = 0_u32;
+    for ch in col_chars {
+        let upper = ch.to_ascii_uppercase();
+        if !upper.is_ascii_alphabetic() {
+            return Ok(None);
+        }
+        let letter_value = u32::from(upper)
+            .checked_sub(u32::from('A'))
+            .and_then(|value| value.checked_add(1));
+        let Some(letter) = letter_value else {
+            return Ok(None);
+        };
+        let Some(next_col) = base_col
+            .checked_mul(26)
+            .and_then(|value| value.checked_add(letter))
+        else {
+            return Ok(None);
+        };
+        base_col = next_col;
+    }
+    if !(1..=MAX_A1_COL).contains(&base_col) {
+        return Ok(None);
+    }
     let mut row_lock = false;
     if chars.get(index) == Some(&'$') {
         row_lock = true;
@@ -1473,18 +1485,25 @@ where
     {
         return Ok(None);
     }
-    let mut row_text = String::with_capacity(index.saturating_sub(row_start));
-    for ch in chars
-        .iter()
-        .skip(row_start)
-        .take(index.saturating_sub(row_start))
-        .copied()
-    {
-        row_text.push(ch);
+    let row_chars = chars
+        .get(row_start..index)
+        .ok_or_else(|| err("formula row reference 범위가 손상되었습니다."))?;
+    let mut base_row = 0_u32;
+    for ch in row_chars {
+        let Some(digit) = u32::from(*ch).checked_sub(u32::from('0')) else {
+            return Ok(None);
+        };
+        if digit > 9 {
+            return Ok(None);
+        }
+        let Some(next_row) = base_row
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+        else {
+            return Ok(None);
+        };
+        base_row = next_row;
     }
-    let Ok(base_row) = row_text.parse::<u32>() else {
-        return Ok(None);
-    };
     if !(1..=MAX_A1_ROW).contains(&base_row) {
         return Ok(None);
     }
@@ -1585,37 +1604,35 @@ fn xml_escape_text(text: &str) -> String {
 fn needs_xml_space_preserve(text: &str) -> bool {
     text.starts_with(' ') || text.ends_with(' ') || text.contains("  ")
 }
-fn parse_range_token(token: &str) -> (String, String) {
-    if let Some((start_ref, end_ref)) = token.split_once(':') {
-        (start_ref.to_owned(), end_ref.to_owned())
-    } else {
-        (token.to_owned(), token.to_owned())
-    }
-}
-fn take_while_next_if_map(
-    chars: &mut Peekable<Chars<'_>>,
-    predicate: impl Fn(char) -> bool,
-) -> String {
-    let mut out = String::new();
-    while let Some(ch) = chars.next_if(|ch| predicate(*ch)) {
-        out.push(ch);
-    }
-    out
+fn parse_range_token(token: &str) -> (&str, &str) {
+    token.split_once(':').unwrap_or((token, token))
 }
 fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, bool)> {
-    let mut chars = reference.chars().peekable();
-    let col_lock = chars.next_if_eq(&'$').is_some();
-    let col_s = take_while_next_if_map(&mut chars, |ch| ch.is_ascii_alphabetic());
-    if col_s.is_empty() {
+    let (col_lock, after_col_lock) = reference
+        .strip_prefix('$')
+        .map_or((false, reference), |tail| (true, tail));
+    let col_end = after_col_lock
+        .find(|ch: char| !ch.is_ascii_alphabetic())
+        .unwrap_or(after_col_lock.len());
+    if col_end == 0 {
         return None;
     }
-    let row_lock = chars.next_if_eq(&'$').is_some();
-    let row_s = take_while_next_if_map(&mut chars, |ch| ch.is_ascii_digit());
-    if row_s.is_empty() || chars.next().is_some() {
+    let col_s = after_col_lock.get(..col_end)?;
+    let after_col = after_col_lock.get(col_end..)?;
+    let (row_lock, row_part) = after_col
+        .strip_prefix('$')
+        .map_or((false, after_col), |tail| (true, tail));
+    let row_end = row_part
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(row_part.len());
+    if row_end == 0 || row_end != row_part.len() {
         return None;
     }
-    let col = parse_a1_col_index(&col_s)?;
-    let row = row_s.parse::<u32>().ok()?;
+    let col = name_to_col(col_s)?;
+    if !(1..=MAX_A1_COL).contains(&col) {
+        return None;
+    }
+    let row = row_part.parse::<u32>().ok()?;
     Some((col, row, col_lock, row_lock))
 }
 fn ref_with_locks(col: u32, row: u32, col_lock: bool, row_lock: bool) -> String {
@@ -1631,13 +1648,6 @@ fn ref_with_locks(col: u32, row: u32, col_lock: bool, row_lock: bool) -> String 
     }
     push_display(&mut out, row);
     out
-}
-fn parse_a1_col_index(col_text: &str) -> Option<u32> {
-    if col_text.is_empty() || col_text.len() > 3 {
-        return None;
-    }
-    let col = name_to_col(col_text)?;
-    (1..=MAX_A1_COL).contains(&col).then_some(col)
 }
 const fn is_ref_neighbor_identifier(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'

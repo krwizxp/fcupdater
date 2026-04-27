@@ -827,17 +827,7 @@ fn archive_attempts_message(label: &str, from: &Path, to: &Path, attempts: &[Str
     if attempts.is_empty() {
         path_pair_source_message(label, from, to, "원인 정보 없음")
     } else {
-        let mut attempts_len = attempts.len().saturating_sub(1).saturating_mul(3);
-        for attempt_text in attempts {
-            attempts_len = attempts_len.saturating_add(attempt_text.len());
-        }
-        let mut attempts_text = String::with_capacity(attempts_len);
-        for (index, attempt) in attempts.iter().enumerate() {
-            if index > 0 {
-                attempts_text.push_str(" / ");
-            }
-            attempts_text.push_str(attempt);
-        }
+        let attempts_text = attempts.join(" / ");
         path_pair_source_message(label, from, to, attempts_text)
     }
 }

@@ -97,15 +97,10 @@ impl XlsxRowCellParserExt for XlsxRowCellParser<'_, '_> {
     }
     fn parse_col_index(&self, cell_tag: &str) -> Option<usize> {
         extract_attr(cell_tag, "r").as_deref().and_then(|cell_ref| {
-            let capacity = cell_ref.len().min(8);
-            let mut col_name = String::with_capacity(capacity);
-            for ch in cell_ref.chars() {
-                if !ch.is_ascii_alphabetic() {
-                    break;
-                }
-                col_name.push(ch);
-            }
-            let one_based_col = name_to_col(&col_name)?;
+            let col_end = cell_ref
+                .find(|ch: char| !ch.is_ascii_alphabetic())
+                .unwrap_or(cell_ref.len());
+            let one_based_col = name_to_col(cell_ref.get(..col_end)?)?;
             let zero_based_col = one_based_col.checked_sub(1)?;
             usize::try_from(zero_based_col).ok()
         })
@@ -254,53 +249,17 @@ pub fn parse_xlsx_row_cells(
     }
     .parse()
 }
-fn format_number(value: f64) -> String {
-    const I64_MIN_F64: f64 = -9_223_372_036_854_776_000.0;
-    const I64_MAX_F64: f64 = 9_223_372_036_854_776_000.0;
-    if value.fract().abs() < f64::EPSILON && (I64_MIN_F64..=I64_MAX_F64).contains(&value) {
-        if value == 0.0 {
-            "0".into()
-        } else {
-            let mut out = String::with_capacity(32);
-            match write!(&mut out, "{value:.0}") {
-                Ok(()) | Err(_) => {}
-            }
-            out
-        }
-    } else {
-        let mut text = String::with_capacity(32);
-        match write!(&mut text, "{value}") {
-            Ok(()) | Err(_) => {}
-        }
-        if text.contains('.') {
-            while text.ends_with('0') {
-                text.pop();
-            }
-            if text.ends_with('.') {
-                text.pop();
-            }
-        }
-        text
-    }
-}
 pub fn build_source_records_from_rows(
     rows: &[(usize, Vec<CellValue>)],
 ) -> Result<Vec<SourceRecord>> {
-    let mut header_row_idx: Option<usize> = None;
-    for (idx, row_entry) in rows.iter().take(source_header_scan_rows()).enumerate() {
-        let row = &row_entry.1;
-        if parse_source_header_indices(row).is_some() {
-            header_row_idx = Some(idx);
-            break;
-        }
-    }
-    let found_header_row_idx = (header_row_idx.ok_or_else(|| err("헤더 행을 찾지 못했습니다")))?;
-    let header = (rows
-        .get(found_header_row_idx)
-        .map(|row_entry| &row_entry.1)
-        .ok_or_else(|| err("헤더 행 접근 실패")))?;
-    let header_indices =
-        (parse_source_header_indices(header).ok_or_else(|| err("헤더 행 접근 실패")))?;
+    let (found_header_row_idx, header_indices) = rows
+        .iter()
+        .take(source_header_scan_rows())
+        .enumerate()
+        .find_map(|(idx, row_entry)| {
+            parse_source_header_indices(&row_entry.1).map(|indices| (idx, indices))
+        })
+        .ok_or_else(|| err("헤더 행을 찾지 못했습니다"))?;
     let data_row_start = found_header_row_idx.checked_add(1).unwrap_or(rows.len());
     let mut out = Vec::with_capacity(rows.len().saturating_sub(data_row_start));
     for row_entry in rows.iter().skip(data_row_start) {
@@ -321,11 +280,7 @@ pub fn parse_source_header_indices(header: &[CellValue]) -> Option<SourceHeaderI
     let mut idx_gas: Option<usize> = None;
     let mut idx_diesel: Option<usize> = None;
     for (i, cell) in header.iter().enumerate() {
-        let header_text = match cell.clone() {
-            CellValue::Text(text_value) => text_value.trim().to_owned(),
-            CellValue::Number(number_value) => format_number(number_value),
-            CellValue::Empty => String::new(),
-        };
+        let header_text = cell_to_string(cell.clone());
         let canonical_header = canon_header(&header_text);
         match canonical_header.as_str() {
             "지역" => idx_region = Some(i),
@@ -363,9 +318,6 @@ pub fn build_source_record_from_row(
 ) -> Option<SourceRecord> {
     let name = get_row_string(row, header_indices.name);
     let address = get_row_string(row, header_indices.address);
-    if name.trim().is_empty() && address.trim().is_empty() {
-        return None;
-    }
     if address.trim().is_empty() {
         return None;
     }
@@ -397,18 +349,51 @@ pub fn build_source_record_from_row(
 }
 fn get_row_string(row: &[CellValue], idx: usize) -> String {
     row.get(idx)
-        .map(|cell| match cell.clone() {
-            CellValue::Text(text_value) => text_value.trim().to_owned(),
-            CellValue::Number(number_value) => format_number(number_value),
-            CellValue::Empty => String::new(),
-        })
-        .unwrap_or_default()
+        .cloned()
+        .map_or_else(String::new, cell_to_string)
 }
 fn get_row_i32(row: &[CellValue], idx: usize) -> Option<i32> {
     match row.get(idx)?.clone() {
         CellValue::Text(text_value) => parse_i32_str(&text_value),
         CellValue::Number(number_value) => round_f64_to_i32(number_value),
         CellValue::Empty => None,
+    }
+}
+fn cell_to_string(cell: CellValue) -> String {
+    match cell {
+        CellValue::Text(text_value) => text_value.trim().to_owned(),
+        CellValue::Number(number_value) => {
+            const I64_MIN_F64: f64 = -9_223_372_036_854_776_000.0;
+            const I64_MAX_F64: f64 = 9_223_372_036_854_776_000.0;
+            if number_value.fract().abs() < f64::EPSILON
+                && (I64_MIN_F64..=I64_MAX_F64).contains(&number_value)
+            {
+                if number_value == 0.0 {
+                    "0".into()
+                } else {
+                    let mut out = String::with_capacity(32);
+                    match write!(&mut out, "{number_value:.0}") {
+                        Ok(()) | Err(_) => {}
+                    }
+                    out
+                }
+            } else {
+                let mut text = String::with_capacity(32);
+                match write!(&mut text, "{number_value}") {
+                    Ok(()) | Err(_) => {}
+                }
+                if text.contains('.') {
+                    while text.ends_with('0') {
+                        text.pop();
+                    }
+                    if text.ends_with('.') {
+                        text.pop();
+                    }
+                }
+                text
+            }
+        }
+        CellValue::Empty => String::new(),
     }
 }
 pub fn source_header_scan_rows() -> usize {

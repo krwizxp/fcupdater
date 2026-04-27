@@ -107,16 +107,13 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
             if let Some(decoded_cp949_text) = cp949_decoded {
                 return Ok(decoded_cp949_text);
             }
-            if env::var("FCUPDATER_CP949_STRICT")
-                .ok()
-                .is_some_and(|value| {
-                    let trimmed = value.trim();
-                    trimmed == "1"
-                        || trimmed.eq_ignore_ascii_case("true")
-                        || trimmed.eq_ignore_ascii_case("yes")
-                        || trimmed.eq_ignore_ascii_case("on")
-                })
-            {
+            if env::var("FCUPDATER_CP949_STRICT").is_ok_and(|value| {
+                let trimmed = value.trim();
+                trimmed == "1"
+                    || trimmed.eq_ignore_ascii_case("true")
+                    || trimmed.eq_ignore_ascii_case("yes")
+                    || trimmed.eq_ignore_ascii_case("on")
+            }) {
                 return Err(err(format!(
                     "code page {} 디코딩에 실패했습니다. (FCUPDATER_CP949_STRICT=1)",
                     code_page.unwrap_or(949)
@@ -149,7 +146,7 @@ fn decode_cp949_non_windows(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return Some(String::new());
     }
-    if bytes.iter().all(|b| b.is_ascii()) {
+    if bytes.is_ascii() {
         return Some(String::from_utf8_lossy(bytes).into_owned());
     }
     if let Some(cached) = cp949_cache_get(bytes) {
