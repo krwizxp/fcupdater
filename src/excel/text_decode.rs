@@ -1,23 +1,30 @@
 use crate::{Result, err};
 #[cfg(not(windows))]
-use core::fmt::{Arguments, Write as _};
+use alloc::collections::VecDeque;
 #[cfg(windows)]
 use core::ptr::null_mut;
+#[cfg(not(windows))]
+use core::{
+    fmt::{Arguments, Write as _},
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use std::env;
 #[cfg(not(windows))]
 use std::{
-    collections::{HashMap, VecDeque},
-    io::{ErrorKind, Write},
+    collections::HashMap,
+    io::{ErrorKind, Write as _, stderr},
     process::{Child, Command, Output, Stdio},
-    sync::{
-        LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{LazyLock, Mutex},
     thread::sleep,
-    time::{Duration, Instant},
+    time::Instant,
 };
 #[cfg(not(windows))]
 const CP949_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const WINDOWS_1252_EXTENDED_CHARS: [char; 32] = [
+    '€', '�', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '�', 'Ž', '�', '�', '‘', '’',
+    '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '�', 'ž', 'Ÿ',
+];
 #[cfg(not(windows))]
 static WARNED_NON_WINDOWS_CP949_FALLBACK: AtomicBool = AtomicBool::new(false);
 #[cfg(not(windows))]
@@ -39,10 +46,167 @@ struct Cp949DecodeCache {
     order: VecDeque<Vec<u8>>,
     total_bytes: usize,
 }
-const WINDOWS_1252_EXTENDED_CHARS: [char; 32] = [
-    '€', '�', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '�', 'Ž', '�', '�', '‘', '’',
-    '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '�', 'ž', 'Ÿ',
-];
+#[cfg(not(windows))]
+struct NonWindowsCp949;
+#[cfg(not(windows))]
+trait NonWindowsCp949Ext {
+    fn cache_get(&self, bytes: &[u8]) -> Option<String>;
+    fn cache_put(&self, bytes: &[u8], decoded: &str);
+    fn decode(&self, bytes: &[u8]) -> Option<String>;
+    fn decode_with_iconv(&self, bytes: &[u8]) -> Option<String>;
+    fn decode_with_python(&self, bytes: &[u8]) -> Option<String>;
+    fn decoder_timeout(&self) -> Option<Duration>;
+    fn run_decoder_command(&self, program: &str, args: &[&str], input: &[u8]) -> Option<String>;
+    fn wait_decoder_with_optional_timeout(
+        &self,
+        program: &str,
+        child: Child,
+        timeout: Option<Duration>,
+    ) -> Option<Output>;
+    fn warn_once(&self, code_page: u16);
+}
+#[cfg(not(windows))]
+impl NonWindowsCp949Ext for NonWindowsCp949 {
+    fn cache_get(&self, bytes: &[u8]) -> Option<String> {
+        let guard = CP949_DECODE_CACHE.lock().ok()?;
+        guard.map.get(bytes).cloned()
+    }
+    fn cache_put(&self, bytes: &[u8], decoded: &str) {
+        if let Ok(mut guard) = CP949_DECODE_CACHE.lock() {
+            let key = bytes.to_vec();
+            let entry_size = bytes.len().saturating_add(decoded.len());
+            if entry_size > CP949_CACHE_MAX_BYTES {
+                guard.map.clear();
+                guard.order.clear();
+                guard.total_bytes = 0;
+                return;
+            }
+            if let Some(prev) = guard.map.remove(&key) {
+                guard.total_bytes = guard
+                    .total_bytes
+                    .saturating_sub(bytes.len().saturating_add(prev.len()));
+                guard
+                    .order
+                    .retain(|cache_key| cache_key.as_slice() != bytes);
+            }
+            while guard.total_bytes.saturating_add(entry_size) > CP949_CACHE_MAX_BYTES {
+                let Some(evict_key) = guard.order.pop_front() else {
+                    break;
+                };
+                if let Some(evicted) = guard.map.remove(&evict_key) {
+                    guard.total_bytes = guard
+                        .total_bytes
+                        .saturating_sub(evict_key.len().saturating_add(evicted.len()));
+                }
+            }
+            if guard.total_bytes.saturating_add(entry_size) > CP949_CACHE_MAX_BYTES {
+                guard.map.clear();
+                guard.order.clear();
+                guard.total_bytes = 0;
+            }
+            guard.total_bytes = guard.total_bytes.saturating_add(entry_size);
+            guard.order.push_back(key.clone());
+            guard.map.insert(key, decoded.to_owned());
+        }
+    }
+    fn decode(&self, bytes: &[u8]) -> Option<String> {
+        if bytes.is_empty() {
+            return Some(String::new());
+        }
+        if bytes.is_ascii() {
+            return Some(String::from_utf8_lossy(bytes).into_owned());
+        }
+        if let Some(cached) = self.cache_get(bytes) {
+            return Some(cached);
+        }
+        self.decode_with_iconv(bytes)
+            .or_else(|| self.decode_with_python(bytes))
+            .inspect(|text| self.cache_put(bytes, text))
+    }
+    fn decode_with_iconv(&self, bytes: &[u8]) -> Option<String> {
+        if !*CP949_ICONV_AVAILABLE {
+            return None;
+        }
+        self.run_decoder_command("iconv", &["-f", "CP949", "-t", "UTF-8"], bytes)
+    }
+    fn decode_with_python(&self, bytes: &[u8]) -> Option<String> {
+        let script = "import sys;data=sys.stdin.buffer.read();sys.stdout.buffer.write(data.decode('cp949','strict').encode('utf-8'))";
+        if *CP949_PYTHON3_AVAILABLE
+            && let Some(decoded) = self.run_decoder_command("python3", &["-c", script], bytes)
+        {
+            return Some(decoded);
+        }
+        if !*CP949_PYTHON_AVAILABLE {
+            return None;
+        }
+        self.run_decoder_command("python", &["-c", script], bytes)
+    }
+    fn decoder_timeout(&self) -> Option<Duration> {
+        env::var("FCUPDATER_DECODER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+    }
+    fn run_decoder_command(&self, program: &str, args: &[&str], input: &[u8]) -> Option<String> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        if let Some(mut stdin) = child.stdin.take()
+            && stdin.write_all(input).is_err()
+        {
+            report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
+            return None;
+        }
+        let output =
+            self.wait_decoder_with_optional_timeout(program, child, self.decoder_timeout())?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout).ok()
+    }
+    fn wait_decoder_with_optional_timeout(
+        &self,
+        program: &str,
+        mut child: Child,
+        timeout: Option<Duration>,
+    ) -> Option<Output> {
+        let Some(limit) = timeout else {
+            return child.wait_with_output().ok();
+        };
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output().ok(),
+                Ok(None) => {
+                    if start.elapsed() >= limit {
+                        report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
+                        return None;
+                    }
+                    sleep(Duration::from_millis(25));
+                }
+                Err(_) => {
+                    report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
+                    return None;
+                }
+            }
+        }
+    }
+    fn warn_once(&self, code_page: u16) {
+        if WARNED_NON_WINDOWS_CP949_FALLBACK
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            write_nonfatal_stderr_line(format_args!(
+                "주의: 비Windows 환경에서 code page {code_page}는 완전 디코딩이 불가하여 비ASCII 문자를 대체문자(�)로 처리합니다."
+            ));
+        }
+    }
+}
 fn decode_bytes_to_string(bytes: &[u8], mut map_byte: impl FnMut(u8) -> char) -> String {
     let mut out = String::with_capacity(bytes.len());
     for byte in bytes {
@@ -103,7 +267,7 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
         Some(65001) => Ok(String::from_utf8_lossy(bytes).into_owned()),
         Some(949 | 1361 | 51949) => {
             let cp949_decoded =
-                cfg_select! { windows => { None } _ => { decode_cp949_non_windows(bytes) } };
+                cfg_select! { windows => { None } _ => { NonWindowsCp949.decode(bytes) } };
             if let Some(decoded_cp949_text) = cp949_decoded {
                 return Ok(decoded_cp949_text);
             }
@@ -119,7 +283,7 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
                     code_page.unwrap_or(949)
                 )));
             }
-            cfg_select! { windows => {} _ => { warn_non_windows_cp949_once(code_page.unwrap_or(0)); } };
+            cfg_select! { windows => {} _ => { NonWindowsCp949.warn_once(code_page.unwrap_or(0)); } };
             Ok(decode_bytes_to_string(bytes, |byte| {
                 if byte.is_ascii() {
                     char::from(byte)
@@ -142,139 +306,6 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
     }
 }
 #[cfg(not(windows))]
-fn decode_cp949_non_windows(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() {
-        return Some(String::new());
-    }
-    if bytes.is_ascii() {
-        return Some(String::from_utf8_lossy(bytes).into_owned());
-    }
-    if let Some(cached) = cp949_cache_get(bytes) {
-        return Some(cached);
-    }
-    decode_cp949_with_iconv(bytes)
-        .or_else(|| decode_cp949_with_python(bytes))
-        .inspect(|text| cp949_cache_put(bytes, text))
-}
-#[cfg(not(windows))]
-fn cp949_cache_get(bytes: &[u8]) -> Option<String> {
-    let guard = CP949_DECODE_CACHE.lock().ok()?;
-    guard.map.get(bytes).cloned()
-}
-#[cfg(not(windows))]
-fn cp949_cache_put(bytes: &[u8], decoded: &str) {
-    if let Ok(mut guard) = CP949_DECODE_CACHE.lock() {
-        let key = bytes.to_vec();
-        let entry_size = bytes.len().saturating_add(decoded.len());
-        if entry_size > CP949_CACHE_MAX_BYTES {
-            guard.map.clear();
-            guard.order.clear();
-            guard.total_bytes = 0;
-            return;
-        }
-        if let Some(prev) = guard.map.remove(&key) {
-            guard.total_bytes = guard
-                .total_bytes
-                .saturating_sub(bytes.len().saturating_add(prev.len()));
-            guard.order.retain(|k| k.as_slice() != bytes);
-        }
-        while guard.total_bytes.saturating_add(entry_size) > CP949_CACHE_MAX_BYTES {
-            let Some(evict_key) = guard.order.pop_front() else {
-                break;
-            };
-            if let Some(evicted) = guard.map.remove(&evict_key) {
-                guard.total_bytes = guard
-                    .total_bytes
-                    .saturating_sub(evict_key.len().saturating_add(evicted.len()));
-            }
-        }
-        if guard.total_bytes.saturating_add(entry_size) > CP949_CACHE_MAX_BYTES {
-            guard.map.clear();
-            guard.order.clear();
-            guard.total_bytes = 0;
-        }
-        guard.total_bytes = guard.total_bytes.saturating_add(entry_size);
-        guard.order.push_back(key.clone());
-        guard.map.insert(key, decoded.to_owned());
-    }
-}
-#[cfg(not(windows))]
-fn decode_cp949_with_iconv(bytes: &[u8]) -> Option<String> {
-    if !*CP949_ICONV_AVAILABLE {
-        return None;
-    }
-    run_decoder_command("iconv", &["-f", "CP949", "-t", "UTF-8"], bytes)
-}
-#[cfg(not(windows))]
-fn decode_cp949_with_python(bytes: &[u8]) -> Option<String> {
-    let script = "import sys;data=sys.stdin.buffer.read();sys.stdout.buffer.write(data.decode('cp949','strict').encode('utf-8'))";
-    if *CP949_PYTHON3_AVAILABLE
-        && let Some(decoded) = run_decoder_command("python3", &["-c", script], bytes)
-    {
-        return Some(decoded);
-    }
-    if !*CP949_PYTHON_AVAILABLE {
-        return None;
-    }
-    run_decoder_command("python", &["-c", script], bytes)
-}
-#[cfg(not(windows))]
-fn run_decoder_command(program: &str, args: &[&str], input: &[u8]) -> Option<String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut stdin) = child.stdin.take()
-        && stdin.write_all(input).is_err()
-    {
-        report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
-        return None;
-    }
-    let output = wait_decoder_with_optional_timeout(program, child, decoder_timeout())?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-#[cfg(not(windows))]
-fn decoder_timeout() -> Option<Duration> {
-    env::var("FCUPDATER_DECODER_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-}
-#[cfg(not(windows))]
-fn wait_decoder_with_optional_timeout(
-    program: &str,
-    mut child: Child,
-    timeout: Option<Duration>,
-) -> Option<Output> {
-    let Some(limit) = timeout else {
-        return child.wait_with_output().ok();
-    };
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) => {
-                if start.elapsed() >= limit {
-                    report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
-                    return None;
-                }
-                sleep(Duration::from_millis(25));
-            }
-            Err(_) => {
-                report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
-                return None;
-            }
-        }
-    }
-}
-#[cfg(not(windows))]
 fn command_available(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
@@ -283,17 +314,6 @@ fn command_available(program: &str, args: &[&str]) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-#[cfg(not(windows))]
-fn warn_non_windows_cp949_once(code_page: u16) {
-    if WARNED_NON_WINDOWS_CP949_FALLBACK
-        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-    {
-        write_nonfatal_stderr_line(format_args!(
-            "주의: 비Windows 환경에서 code page {code_page}는 완전 디코딩이 불가하여 비ASCII 문자를 대체문자(�)로 처리합니다."
-        ));
-    }
 }
 #[cfg(not(windows))]
 fn report_decoder_cleanup_issue(program: &str, cleanup_diagnostic: Option<String>) {
@@ -350,7 +370,7 @@ fn stop_decoder_child(child: &mut Child) -> Option<String> {
 }
 #[cfg(not(windows))]
 fn write_nonfatal_stderr_line(args: Arguments<'_>) {
-    let mut err = std::io::stderr().lock();
+    let mut err = stderr().lock();
     match writeln!(err, "{args}") {
         Ok(()) | Err(_) => {}
     }

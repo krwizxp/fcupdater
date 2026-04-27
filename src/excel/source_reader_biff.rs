@@ -117,6 +117,7 @@ trait SstChunkReaderExt<'chunks, 'chunk> {
     fn new(chunks: &'chunks [&'chunk [u8]], code_page: Option<u16>) -> Self
     where
         Self: Sized;
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]>;
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>>;
     fn read_u16(&mut self) -> Result<u16>;
     fn read_u32(&mut self) -> Result<u32>;
@@ -285,9 +286,13 @@ impl CfbFileExt for CfbFile {
     ) -> Result<Vec<u32>> {
         let mut difat_entries: Vec<u32> =
             Vec::with_capacity(109_usize.saturating_add(max_sector_count.min(32)));
-        for i in 0..109_usize {
-            let sid_offset = checked_index_offset(0x4C, i, 4, "CFB DIFAT 헤더")?;
-            let sid = read_u32_le(data, sid_offset)?;
+        let header_difat_end = checked_index_offset(0x4C, 109_usize, 4, "CFB DIFAT 헤더")?;
+        let header_difat = data
+            .get(0x4C..header_difat_end)
+            .ok_or_else(|| err("CFB DIFAT 헤더 범위가 손상되었습니다."))?;
+        let (header_difat_chunks, _) = header_difat.as_chunks::<4>();
+        for chunk in header_difat_chunks {
+            let sid = u32::from_le_bytes(*chunk);
             if is_regular_sector_id(sid) {
                 difat_entries.push(sid);
             }
@@ -695,6 +700,13 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
             offset_in_chunk: 0,
         }
     }
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let mut out = [0_u8; N];
+        for byte in &mut out {
+            *byte = self.read_u8()?;
+        }
+        Ok(out)
+    }
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
         if len > self.remaining_bytes() {
             return Err(err(parenthesized_message(
@@ -739,15 +751,10 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
         Ok(out)
     }
     fn read_u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes([self.read_u8()?, self.read_u8()?]))
+        Ok(u16::from_le_bytes(self.read_array::<2>()?))
     }
     fn read_u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes([
-            self.read_u8()?,
-            self.read_u8()?,
-            self.read_u8()?,
-            self.read_u8()?,
-        ]))
+        Ok(u32::from_le_bytes(self.read_array::<4>()?))
     }
     fn read_u8(&mut self) -> Result<u8> {
         self.ensure_available()?;
