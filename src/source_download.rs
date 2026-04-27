@@ -143,7 +143,7 @@ trait SourceDownloadWorkflowExt {
         prefix: &str,
         out: &mut dyn Write,
     ) -> Result<Vec<PathBuf>>;
-    fn record_matches_task(&self, record: &SourceRecord, matcher: &TaskMatcher) -> bool;
+    fn record_matches_any_task(&self, record: &SourceRecord, matchers: &[TaskMatcher]) -> bool;
     fn region_has_explicit_sigungu(&self, region: &str) -> bool;
     fn task_match_keys(&self, task: &Task) -> Vec<String>;
     fn task_matchers(&self) -> &'static [TaskMatcher];
@@ -279,17 +279,11 @@ struct WaitUntilParams<'text> {
 }
 impl SourceDownloadOpsExt for SourceDownloadOps {
     fn filter_target_region_records_impl(&self, records: Vec<SourceRecord>) -> Vec<SourceRecord> {
-        let mut filtered = Vec::with_capacity(records.len());
-        for record in records {
-            if self
-                .task_matchers()
-                .iter()
-                .any(|matcher| self.record_matches_task(&record, matcher))
-            {
-                filtered.push(record);
-            }
-        }
-        filtered
+        let matchers = self.task_matchers();
+        records
+            .into_iter()
+            .filter(|record| self.record_matches_any_task(record, matchers))
+            .collect()
     }
     fn refresh_sources_impl(
         &self,
@@ -517,36 +511,46 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
         message.push_str("를 확인하세요.");
         Err(err(message))
     }
-    fn record_matches_task(&self, record: &SourceRecord, matcher: &TaskMatcher) -> bool {
+    fn record_matches_any_task(&self, record: &SourceRecord, matchers: &[TaskMatcher]) -> bool {
         let region_key = normalize_address_key(&record.region);
-        let matches_task = |value: &str| {
-            matcher
-                .task_keys
-                .iter()
-                .any(|task_key| value.contains(task_key))
-        };
-        if !region_key.is_empty() {
-            if !region_key.contains(&matcher.sido_key) {
-                return false;
+        let region_has_explicit_sigungu =
+            !region_key.is_empty() && self.region_has_explicit_sigungu(&record.region);
+        let mut combined_key: Option<String> = None;
+
+        matchers.iter().any(|matcher| {
+            let matches_task = |value: &str| {
+                matcher
+                    .task_keys
+                    .iter()
+                    .any(|task_key| value.contains(task_key))
+            };
+
+            if !region_key.is_empty() {
+                if !region_key.contains(&matcher.sido_key) {
+                    return false;
+                }
+                if matches_task(&region_key) {
+                    return true;
+                }
+                if region_has_explicit_sigungu {
+                    return false;
+                }
             }
-            if matches_task(&region_key) {
-                return true;
-            }
-            if self.region_has_explicit_sigungu(&record.region) {
-                return false;
-            }
-        }
-        let capacity = record
-            .region
-            .len()
-            .saturating_add(record.address.len())
-            .saturating_add(1);
-        let mut combined_source = String::with_capacity(capacity);
-        combined_source.push_str(&record.region);
-        combined_source.push(' ');
-        combined_source.push_str(&record.address);
-        let combined = normalize_address_key(&combined_source);
-        combined.contains(&matcher.sido_key) && matches_task(&combined)
+
+            let combined = combined_key.get_or_insert_with(|| {
+                let capacity = record
+                    .region
+                    .len()
+                    .saturating_add(record.address.len())
+                    .saturating_add(1);
+                let mut combined_source = String::with_capacity(capacity);
+                combined_source.push_str(&record.region);
+                combined_source.push(' ');
+                combined_source.push_str(&record.address);
+                normalize_address_key(&combined_source)
+            });
+            combined.contains(&matcher.sido_key) && matches_task(combined)
+        })
     }
     fn region_has_explicit_sigungu(&self, region: &str) -> bool {
         let mut tokens = region.split_whitespace().filter(|token| !token.is_empty());
@@ -588,14 +592,13 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
     fn task_matchers(&self) -> &'static [TaskMatcher] {
         static TASK_MATCHERS: LazyLock<Vec<TaskMatcher>> = LazyLock::new(|| {
             let ops = SourceDownloadOps;
-            let mut matchers = Vec::with_capacity(TASKS.len());
-            for task in &TASKS {
-                matchers.push(TaskMatcher {
+            TASKS
+                .iter()
+                .map(|task| TaskMatcher {
                     sido_key: normalize_address_key(task.sido),
                     task_keys: ops.task_match_keys(task),
-                });
-            }
-            matchers
+                })
+                .collect()
         });
         TASK_MATCHERS.as_slice()
     }

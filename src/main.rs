@@ -378,10 +378,10 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             auto_candidates
         };
         candidates.sort_unstable();
-        let mut source_paths = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            source_paths.push(candidate.path);
-        }
+        let source_paths: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.path)
+            .collect();
         if source_paths.is_empty() {
             let capacity = self.args.sources_prefix.len().saturating_add(96);
             let mut out = String::with_capacity(capacity);
@@ -684,14 +684,12 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
     }
     fn resolve_today(&self) -> Result<String> {
         let is_yyyy_mm_dd = |text: &str| {
-            let bytes = text.as_bytes();
-            bytes.len() == 10
-                && bytes.get(4) == Some(&b'-')
-                && bytes.get(7) == Some(&b'-')
-                && bytes
-                    .iter()
-                    .enumerate()
-                    .all(|(index, ch)| index == 4 || index == 7 || ch.is_ascii_digit())
+            let &[y0, y1, y2, y3, b'-', m0, m1, b'-', d0, d1] = text.as_bytes() else {
+                return false;
+            };
+            [y0, y1, y2, y3, m0, m1, d0, d1]
+                .iter()
+                .all(u8::is_ascii_digit)
         };
         cfg_select! {
             windows => {
@@ -770,7 +768,9 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 let month_phase = (5 * day_of_year + 2) / 153;
                 let day = day_of_year - (153 * month_phase + 2) / 5 + 1;
                 let month = month_phase + if month_phase < 10 { 3 } else { -9 };
-                let year = (year_of_era + if month <= 2 { 1 } else { 0 }) as i32;
+                let year_i64 = year_of_era + if month <= 2 { 1 } else { 0 };
+                let year = i32::try_from(year_i64)
+                    .map_err(|_| err("UTC 날짜 계산 중 연도 변환에 실패했습니다."))?;
                 let today = format_ymd("", year, month, day);
                 if !is_yyyy_mm_dd(&today) {
                     return Err(err(prefixed_message(
@@ -885,19 +885,16 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 .flatten()
                 .count(),
             {
-                let mut non_empty_fields = 0_usize;
-                for field_value in [
+                [
                     record.region.trim(),
                     record.name.trim(),
                     record.brand.trim(),
                     record.self_yn.trim(),
                     record.address.trim(),
-                ] {
-                    if !field_value.is_empty() {
-                        non_empty_fields = non_empty_fields.saturating_add(1);
-                    }
-                }
-                non_empty_fields
+                ]
+                .into_iter()
+                .filter(|field_value| !field_value.is_empty())
+                .count()
             },
             record
                 .region
@@ -1266,7 +1263,13 @@ fn parse_i32_str(text: &str) -> Option<i32> {
     if trimmed.is_empty() || trimmed == "-" {
         return None;
     }
-    let normalized = trimmed.replace(',', "");
+    let normalized_storage;
+    let normalized = if trimmed.contains(',') {
+        normalized_storage = trimmed.replace(',', "");
+        normalized_storage.as_str()
+    } else {
+        trimmed
+    };
     normalized.parse::<f64>().ok().and_then(round_f64_to_i32)
 }
 fn usize_to_u32(value: usize, context: &str) -> Result<u32> {

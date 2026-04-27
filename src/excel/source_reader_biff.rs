@@ -61,9 +61,9 @@ struct BiffGlobals {
     code_page: Option<u16>,
     shared_strings: Vec<String>,
 }
-struct SstChunkReader<'chunk> {
+struct SstChunkReader<'chunks, 'chunk> {
     chunk_index: usize,
-    chunks: Vec<&'chunk [u8]>,
+    chunks: &'chunks [&'chunk [u8]],
     code_page: Option<u16>,
     offset_in_chunk: usize,
 }
@@ -112,9 +112,9 @@ trait CfbFileExt {
         name: &str,
     ) -> Result<Vec<u8>>;
 }
-trait SstChunkReaderExt<'chunk> {
+trait SstChunkReaderExt<'chunks, 'chunk> {
     fn ensure_available(&mut self) -> Result<()>;
-    fn new(chunks: Vec<&'chunk [u8]>, code_page: Option<u16>) -> Self
+    fn new(chunks: &'chunks [&'chunk [u8]], code_page: Option<u16>) -> Self
     where
         Self: Sized;
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>>;
@@ -232,8 +232,9 @@ impl CfbFileExt for CfbFile {
         })?;
         for sid in fat_sector_ids {
             let sector = get_sector_slice(data, sector_size, *sid)?;
-            for chunk in sector.chunks_exact(4).take(entries_per_sector) {
-                fat.push(u32_from_le_chunk(chunk)?);
+            let (chunks, _) = sector.as_chunks::<4>();
+            for chunk in chunks.iter().take(entries_per_sector) {
+                fat.push(u32::from_le_bytes(*chunk));
             }
         }
         Ok(fat)
@@ -273,10 +274,10 @@ impl CfbFileExt for CfbFile {
             Some(mini_fat_limit),
             "CFB mini FAT",
         )?;
-        let chunks = mini_fat_bytes.chunks_exact(4);
+        let (chunks, _) = mini_fat_bytes.as_chunks::<4>();
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            out.push(u32_from_le_chunk(chunk)?);
+            out.push(u32::from_le_bytes(*chunk));
         }
         Ok(out)
     }
@@ -323,8 +324,9 @@ impl CfbFileExt for CfbFile {
                 .checked_div(4)
                 .and_then(|word_count| word_count.checked_sub(1))
                 .ok_or_else(|| err("CFB DIFAT sector 크기가 비정상적입니다."))?;
-            for chunk in sector.chunks_exact(4).take(entries_per_sector) {
-                let entry = u32_from_le_chunk(chunk)?;
+            let (chunks, _) = sector.as_chunks::<4>();
+            for chunk in chunks.iter().take(entries_per_sector) {
+                let entry = u32::from_le_bytes(*chunk);
                 if is_regular_sector_id(entry) {
                     difat_entries.push(entry);
                 }
@@ -487,7 +489,7 @@ impl CfbFileExt for CfbFile {
         dir_stream: &[u8],
         major_version: u16,
     ) -> Result<Vec<CfbDirectoryEntry>> {
-        let chunks = dir_stream.chunks_exact(128);
+        let (chunks, _) = dir_stream.as_chunks::<128>();
         let mut entries = Vec::with_capacity(chunks.len());
         for entry in chunks {
             let name_len = usize::from(read_u16_le(entry, 0x40)?);
@@ -671,7 +673,7 @@ impl SourceReaderBiffExt for SourceReader {
         Err(err("xls 시트에서 유효한 소스 데이터를 찾지 못했습니다."))
     }
 }
-impl<'chunk> SstChunkReaderExt<'chunk> for SstChunkReader<'chunk> {
+impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chunks, 'chunk> {
     fn ensure_available(&mut self) -> Result<()> {
         while let Some(chunk) = self.chunks.get(self.chunk_index) {
             if self.offset_in_chunk < chunk.len() {
@@ -688,7 +690,7 @@ impl<'chunk> SstChunkReaderExt<'chunk> for SstChunkReader<'chunk> {
         }
         Ok(())
     }
-    fn new(chunks: Vec<&'chunk [u8]>, code_page: Option<u16>) -> Self {
+    fn new(chunks: &'chunks [&'chunk [u8]], code_page: Option<u16>) -> Self {
         Self {
             chunk_index: 0,
             chunks,
@@ -1199,7 +1201,7 @@ impl SourceReaderBiffParseExt for SourceReader {
             return Err(err("SST 데이터가 비정상적으로 짧습니다."));
         }
         let mut reader =
-            <SstChunkReader<'_> as SstChunkReaderExt<'_>>::new(chunks.to_vec(), code_page);
+            <SstChunkReader<'_, '_> as SstChunkReaderExt<'_, '_>>::new(chunks, code_page);
         let _total_count = reader.read_u32()?;
         let unique_count = usize::try_from(reader.read_u32()?)
             .map_err(|source| err_with_source("SST unique count 변환에 실패했습니다.", source))?;
@@ -1487,60 +1489,38 @@ fn decode_rk_number(rk: u32) -> f64 {
     value
 }
 fn decode_utf16_le(bytes: &[u8]) -> String {
-    let chunks = bytes.chunks_exact(2);
+    let (chunks, _) = bytes.as_chunks::<2>();
     let mut data = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        if let Some(arr) = chunk.as_array::<2>().copied() {
-            data.push(u16::from_le_bytes(arr));
-        }
+        data.push(u16::from_le_bytes(*chunk));
     }
     String::from_utf16_lossy(&data)
 }
-fn u32_from_le_chunk(chunk: &[u8]) -> Result<u32> {
-    let arr = chunk
-        .as_array::<4>()
-        .copied()
-        .ok_or_else(|| err("little-endian u32 chunk 길이가 잘못되었습니다."))?;
-    Ok(u32::from_le_bytes(arr))
-}
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
-    let end = checked_offset_add(offset, 2, "u16 read")?;
-    let arr = bytes
-        .get(offset..end)
-        .and_then(|slice| slice.as_array::<2>())
-        .ok_or_else(|| {
-            err(prefixed_display_message(
-                "u16 read out of range at ",
-                offset,
-            ))
-        })?;
-    Ok(u16::from_le_bytes(*arr))
+    let arr = read_le_array::<2>(bytes, offset, "u16 read", "u16 read out of range at ")?;
+    Ok(u16::from_le_bytes(arr))
 }
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
-    let end = checked_offset_add(offset, 4, "u32 read")?;
-    let arr = bytes
-        .get(offset..end)
-        .and_then(|slice| slice.as_array::<4>())
-        .ok_or_else(|| {
-            err(prefixed_display_message(
-                "u32 read out of range at ",
-                offset,
-            ))
-        })?;
-    Ok(u32::from_le_bytes(*arr))
+    let arr = read_le_array::<4>(bytes, offset, "u32 read", "u32 read out of range at ")?;
+    Ok(u32::from_le_bytes(arr))
 }
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
-    let end = checked_offset_add(offset, 8, "u64 read")?;
+    let arr = read_le_array::<8>(bytes, offset, "u64 read", "u64 read out of range at ")?;
+    Ok(u64::from_le_bytes(arr))
+}
+fn read_le_array<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+    label: &str,
+    out_of_range_prefix: &str,
+) -> Result<[u8; N]> {
+    let end = checked_offset_add(offset, N, label)?;
     let arr = bytes
         .get(offset..end)
-        .and_then(|slice| slice.as_array::<8>())
-        .ok_or_else(|| {
-            err(prefixed_display_message(
-                "u64 read out of range at ",
-                offset,
-            ))
-        })?;
-    Ok(u64::from_le_bytes(*arr))
+        .and_then(|slice| slice.first_chunk::<N>())
+        .copied()
+        .ok_or_else(|| err(prefixed_display_message(out_of_range_prefix, offset)))?;
+    Ok(arr)
 }
 fn prefixed_display_message(prefix: &str, value: impl Display) -> String {
     let mut out = String::with_capacity(prefix.len().saturating_add(32));

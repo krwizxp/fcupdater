@@ -163,5 +163,5 @@ pub(in crate::excel) fn decode_xml_entities(text: &str) -> String {
     out
 }
 fn local_tag_name(name: &str) -> &str {
-    name.rsplit(':').next().unwrap_or(name)
+    name.rsplit_once(':').map_or(name, |(_, local)| local)
 }

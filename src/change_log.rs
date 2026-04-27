@@ -203,10 +203,8 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 .rows
                 .range(layout.data_start_row..=last_data_row)
             {
-                for col in row_obj.cells.keys().copied() {
-                    if col <= layout.max_col {
-                        cells_to_clear.push((col, *row));
-                    }
+                for entry in row_obj.cells.range(..=layout.max_col) {
+                    cells_to_clear.push((*entry.0, *row));
                 }
             }
             for (col, row) in cells_to_clear {
