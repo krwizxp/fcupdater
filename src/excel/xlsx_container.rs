@@ -62,10 +62,21 @@ struct WorkDirCleanup {
     path: PathBuf,
 }
 struct ArchiveOps;
+struct ProcessCommandOps;
 trait ArchiveOpsExt {
     fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()>;
     fn promote_temp_output(&self, temp_output: &Path, output_xlsx: &Path) -> Result<()>;
     fn verify_saved_archive(&self, saved_archive: &Path) -> Result<()>;
+}
+trait ProcessCommandOpsExt {
+    fn command_timeout(&self) -> Option<Duration>;
+    fn format_process_failure(&self, program: &str, output: &process::Output) -> String;
+    fn wait_with_optional_timeout(
+        &self,
+        child: process::Child,
+        program: &str,
+        timeout: Option<Duration>,
+    ) -> Result<process::Output>;
 }
 impl Drop for WorkDirCleanup {
     fn drop(&mut self) {
@@ -143,7 +154,7 @@ impl ArchiveOpsExt for ArchiveOps {
                 ) {
                     Ok(()) => return Ok(()),
                     Err(source_err) => {
-                        attempts.push(attempt_source_message("python3 -c zipfile", source_err))
+                        attempts.push(attempt_source_message("python3 -c zipfile", source_err));
                     }
                 }
                 match run_command(
@@ -158,7 +169,7 @@ impl ArchiveOpsExt for ArchiveOps {
                 ) {
                     Ok(()) => return Ok(()),
                     Err(source_err) => {
-                        attempts.push(attempt_source_message("python -c zipfile", source_err))
+                        attempts.push(attempt_source_message("python -c zipfile", source_err));
                     }
                 }
                 Err(err(archive_attempts_message(
@@ -643,6 +654,105 @@ impl XlsxContainer {
             .map_err(|source_err| err(path_source_message("파일 쓰기 실패", &path, source_err)))
     }
 }
+impl Drop for XlsxContainer {
+    fn drop(&mut self) {
+        match fs::remove_dir_all(&self.work_dir) {
+            Ok(()) | Err(_) => {}
+        }
+    }
+}
+impl ProcessCommandOpsExt for ProcessCommandOps {
+    fn command_timeout(&self) -> Option<Duration> {
+        env::var("FCUPDATER_COMMAND_TIMEOUT_SECS")
+            .ok()
+            .and_then(|timeout_text| timeout_text.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+    }
+    fn format_process_failure(&self, program: &str, output: &process::Output) -> String {
+        let stderr = trimmed_lossy_owned(&output.stderr);
+        let stdout = trimmed_lossy_owned(&output.stdout);
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        if detail.is_empty() {
+            let mut out = String::with_capacity(
+                program
+                    .len()
+                    .saturating_add(12)
+                    .saturating_add(" 비정상 종료(code=)".len()),
+            );
+            out.push_str(program);
+            out.push_str(" 비정상 종료(code=");
+            match output.status.code() {
+                Some(status_code) => push_display(&mut out, status_code),
+                None => out.push_str("None"),
+            }
+            out.push(')');
+            out
+        } else {
+            let mut out = String::with_capacity(
+                program
+                    .len()
+                    .saturating_add(12)
+                    .saturating_add(detail.len())
+                    .saturating_add(" 비정상 종료(code=): ".len()),
+            );
+            out.push_str(program);
+            out.push_str(" 비정상 종료(code=");
+            match output.status.code() {
+                Some(status_code) => push_display(&mut out, status_code),
+                None => out.push_str("None"),
+            }
+            out.push_str("): ");
+            out.push_str(&detail);
+            out
+        }
+    }
+    fn wait_with_optional_timeout(
+        &self,
+        mut child: process::Child,
+        program: &str,
+        timeout: Option<Duration>,
+    ) -> Result<process::Output> {
+        let Some(limit) = timeout else {
+            return child.wait_with_output().map_err(|source_err| {
+                err(program_source_message(program, "실행 실패", source_err))
+            });
+        };
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child.wait_with_output().map_err(|source_err| {
+                        err(program_source_message(
+                            program,
+                            "실행 결과 수집 실패",
+                            source_err,
+                        ))
+                    });
+                }
+                Ok(None) => {
+                    if start.elapsed() >= limit {
+                        let cleanup_diagnostic = stop_process_with_diagnostics(&mut child);
+                        let mut message = String::with_capacity(program.len().saturating_add(32));
+                        message.push_str(program);
+                        message.push_str(" 실행 제한시간 초과: ");
+                        push_display(&mut message, limit.as_secs());
+                        message.push('초');
+                        append_cleanup_diagnostic(&mut message, cleanup_diagnostic.as_deref());
+                        return Err(err(message));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(source_err) => {
+                    let cleanup_diagnostic = stop_process_with_diagnostics(&mut child);
+                    let mut message = program_source_message(program, "상태 확인 실패", source_err);
+                    append_cleanup_diagnostic(&mut message, cleanup_diagnostic.as_deref());
+                    return Err(err(message));
+                }
+            }
+        }
+    }
+}
 #[cfg(not(windows))]
 fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::Error) {
     let mut err = stderr().lock();
@@ -651,13 +761,6 @@ fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::E
         "경고: 저장 내구성 동기화 실패({path_kind}): {path_text} ({source_err})",
     ) {
         Ok(()) | Err(_) => {}
-    }
-}
-impl Drop for XlsxContainer {
-    fn drop(&mut self) {
-        match fs::remove_dir_all(&self.work_dir) {
-            Ok(()) | Err(_) => {}
-        }
     }
 }
 fn create_unique_work_dir() -> Result<PathBuf> {
@@ -795,7 +898,7 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
             ) {
                 Ok(()) => return Ok(()),
                 Err(source_err) => {
-                    attempts.push(attempt_source_message("python3 -m zipfile", source_err))
+                    attempts.push(attempt_source_message("python3 -m zipfile", source_err));
                 }
             }
             match run_command(
@@ -811,7 +914,7 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
             ) {
                 Ok(()) => return Ok(()),
                 Err(source_err) => {
-                    attempts.push(attempt_source_message("python -m zipfile", source_err))
+                    attempts.push(attempt_source_message("python -m zipfile", source_err));
                 }
             }
             Err(err(archive_attempts_message(
@@ -900,95 +1003,6 @@ fn push_attempt(attempts: &mut Vec<String>, program: &str, source: impl Display)
 fn trimmed_lossy_owned(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_owned()
 }
-fn format_process_failure(program: &str, output: &process::Output) -> String {
-    let stderr = trimmed_lossy_owned(&output.stderr);
-    let stdout = trimmed_lossy_owned(&output.stdout);
-    let detail = if stderr.is_empty() { stdout } else { stderr };
-    if detail.is_empty() {
-        let mut out = String::with_capacity(
-            program
-                .len()
-                .saturating_add(12)
-                .saturating_add(" 비정상 종료(code=)".len()),
-        );
-        out.push_str(program);
-        out.push_str(" 비정상 종료(code=");
-        match output.status.code() {
-            Some(status_code) => push_display(&mut out, status_code),
-            None => out.push_str("None"),
-        }
-        out.push(')');
-        out
-    } else {
-        let mut out = String::with_capacity(
-            program
-                .len()
-                .saturating_add(12)
-                .saturating_add(detail.len())
-                .saturating_add(" 비정상 종료(code=): ".len()),
-        );
-        out.push_str(program);
-        out.push_str(" 비정상 종료(code=");
-        match output.status.code() {
-            Some(status_code) => push_display(&mut out, status_code),
-            None => out.push_str("None"),
-        }
-        out.push_str("): ");
-        out.push_str(&detail);
-        out
-    }
-}
-fn command_timeout() -> Option<Duration> {
-    env::var("FCUPDATER_COMMAND_TIMEOUT_SECS")
-        .ok()
-        .and_then(|timeout_text| timeout_text.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-}
-fn wait_with_optional_timeout(
-    mut child: process::Child,
-    program: &str,
-    timeout: Option<Duration>,
-) -> Result<process::Output> {
-    let Some(limit) = timeout else {
-        return child
-            .wait_with_output()
-            .map_err(|source_err| err(program_source_message(program, "실행 실패", source_err)));
-    };
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child.wait_with_output().map_err(|source_err| {
-                    err(program_source_message(
-                        program,
-                        "실행 결과 수집 실패",
-                        source_err,
-                    ))
-                });
-            }
-            Ok(None) => {
-                if start.elapsed() >= limit {
-                    let cleanup_diagnostic = stop_process_with_diagnostics(&mut child);
-                    let mut message = String::with_capacity(program.len().saturating_add(32));
-                    message.push_str(program);
-                    message.push_str(" 실행 제한시간 초과: ");
-                    push_display(&mut message, limit.as_secs());
-                    message.push('초');
-                    append_cleanup_diagnostic(&mut message, cleanup_diagnostic.as_deref());
-                    return Err(err(message));
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(source_err) => {
-                let cleanup_diagnostic = stop_process_with_diagnostics(&mut child);
-                let mut message = program_source_message(program, "상태 확인 실패", source_err);
-                append_cleanup_diagnostic(&mut message, cleanup_diagnostic.as_deref());
-                return Err(err(message));
-            }
-        }
-    }
-}
 fn append_cleanup_diagnostic(message: &mut String, cleanup_diagnostic: Option<&str>) {
     if let Some(cleanup) = cleanup_diagnostic {
         message.push_str(" (정리 경고: ");
@@ -1049,11 +1063,13 @@ fn run_command_capture(
     let child = (cmd
         .spawn()
         .map_err(|source_err| err(program_source_message(program, "실행 실패", source_err))))?;
-    let output = (wait_with_optional_timeout(child, program, command_timeout()))?;
+    let command_ops = ProcessCommandOps;
+    let output =
+        command_ops.wait_with_optional_timeout(child, program, command_ops.command_timeout())?;
     if output.status.success() {
         return Ok(output);
     }
-    Err(err(format_process_failure(program, &output)))
+    Err(err(command_ops.format_process_failure(program, &output)))
 }
 fn run_command(program: &str, args: &[OsString], current_dir: Option<&Path>) -> Result<()> {
     run_command_capture(program, args, current_dir).map(|_| ())
@@ -1088,11 +1104,13 @@ fn run_powershell(program: &str, script: &str) -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source_err| err(program_source_message(program, "실행 실패", source_err))))?;
-    let output = (wait_with_optional_timeout(child, program, command_timeout()))?;
+    let command_ops = ProcessCommandOps;
+    let output =
+        command_ops.wait_with_optional_timeout(child, program, command_ops.command_timeout())?;
     if output.status.success() {
         return Ok(());
     }
-    Err(err(format_process_failure(program, &output)))
+    Err(err(command_ops.format_process_failure(program, &output)))
 }
 #[cfg(windows)]
 fn ps_quote(path: &Path) -> String {
@@ -1102,13 +1120,11 @@ fn ps_quote(path: &Path) -> String {
 fn durability_strict_mode() -> bool {
     env::var("FCUPDATER_DURABILITY_STRICT")
         .ok()
-        .is_some_and(|value| is_truthy_flag(&value))
-}
-#[cfg(not(windows))]
-fn is_truthy_flag(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed == "1"
-        || trimmed.eq_ignore_ascii_case("true")
-        || trimmed.eq_ignore_ascii_case("yes")
-        || trimmed.eq_ignore_ascii_case("on")
+        .is_some_and(|value| {
+            let trimmed = value.trim();
+            trimmed == "1"
+                || trimmed.eq_ignore_ascii_case("true")
+                || trimmed.eq_ignore_ascii_case("yes")
+                || trimmed.eq_ignore_ascii_case("on")
+        })
 }

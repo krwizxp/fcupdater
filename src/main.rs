@@ -158,9 +158,17 @@ struct UpdateSummary<'data> {
     source_paths: &'data [PathBuf],
     source_report: &'data source_sync::SourceIndexBuildReport,
 }
+#[cfg(not(windows))]
+struct SystemDateFallback;
 struct UpdateRunContext<'args, 'out> {
     args: &'args Args,
     out: &'out mut dyn Write,
+}
+#[cfg(not(windows))]
+trait SystemDateFallbackExt {
+    fn resolve_today_from_system_time<F>(&self, is_yyyy_mm_dd: F) -> Result<String>
+    where
+        F: Fn(&str) -> bool;
 }
 trait UpdateRunContextExt {
     fn build_source_index_and_report(
@@ -201,6 +209,91 @@ trait UpdateRunContextExt {
     ) -> Result<()>;
     fn score_source_record(&self, record: &source_sync::SourceRecord) -> SourceScore;
     fn split_natural_parts(&self, text: &str) -> Vec<NaturalPart>;
+}
+#[cfg(not(windows))]
+impl SystemDateFallbackExt for SystemDateFallback {
+    fn resolve_today_from_system_time<F>(&self, is_yyyy_mm_dd: F) -> Result<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|source| err(prefixed_message("현재 시간 조회 실패: ", source)))?;
+        let checked_date_calc = |value: Option<i64>| {
+            value.ok_or_else(|| err("UTC 날짜 계산 중 범위 오류가 발생했습니다."))
+        };
+        let days_u64 = now
+            .as_secs()
+            .checked_div(86_400)
+            .ok_or_else(|| err("UTC 날짜 계산 중 일수 나눗셈에 실패했습니다."))?;
+        let days = i64::try_from(days_u64).map_err(|source| {
+            err_with_source("UTC 날짜 계산 중 일수 변환에 실패했습니다.", source)
+        })?;
+        let shifted_days = checked_date_calc(days.checked_add(719_468))?;
+        let era = shifted_days.div_euclid(146_097);
+        let doe = shifted_days.rem_euclid(146_097);
+        let yoe_after_first =
+            checked_date_calc(doe.checked_sub(checked_date_calc(doe.checked_div(1_460))?))?;
+        let yoe_after_second = checked_date_calc(
+            yoe_after_first.checked_add(checked_date_calc(doe.checked_div(36_524))?),
+        )?;
+        let yoe_numerator = checked_date_calc(
+            yoe_after_second.checked_sub(checked_date_calc(doe.checked_div(146_096))?),
+        )?;
+        let yoe = checked_date_calc(yoe_numerator.checked_div(365))?;
+        let year_of_era =
+            checked_date_calc(yoe.checked_add(checked_date_calc(era.checked_mul(400))?))?;
+        let year_days = checked_date_calc(365_i64.checked_mul(yoe))?;
+        let leap_days = checked_date_calc(yoe.checked_div(4))?;
+        let skipped_centuries = checked_date_calc(yoe.checked_div(100))?;
+        let day_of_year = checked_date_calc(doe.checked_sub(checked_date_calc(
+            checked_date_calc(year_days.checked_add(leap_days))?.checked_sub(skipped_centuries),
+        )?))?;
+        let month_phase = checked_date_calc(
+            checked_date_calc(
+                5_i64
+                    .checked_mul(day_of_year)
+                    .and_then(|value| value.checked_add(2)),
+            )?
+            .checked_div(153),
+        )?;
+        let month_term = checked_date_calc(
+            checked_date_calc(
+                153_i64
+                    .checked_mul(month_phase)
+                    .and_then(|value| value.checked_add(2)),
+            )?
+            .checked_div(5),
+        )?;
+        let day_i64 = checked_date_calc(
+            checked_date_calc(day_of_year.checked_sub(month_term))?.checked_add(1),
+        )?;
+        let day = u32::try_from(day_i64).map_err(|source| {
+            err_with_source("UTC 날짜 계산 중 일 변환에 실패했습니다.", source)
+        })?;
+        let month_i64 = if month_phase < 10 {
+            checked_date_calc(month_phase.checked_add(3))?
+        } else {
+            checked_date_calc(month_phase.checked_sub(9))?
+        };
+        let month = u32::try_from(month_i64).map_err(|source| {
+            err_with_source("UTC 날짜 계산 중 월 변환에 실패했습니다.", source)
+        })?;
+        let year_i64 = checked_date_calc(year_of_era.checked_add(i64::from(month <= 2)))?;
+        let year = i32::try_from(year_i64).map_err(|source| {
+            err_with_source("UTC 날짜 계산 중 연도 변환에 실패했습니다.", source)
+        })?;
+        let today = format_ymd("", year, month, day);
+        if !is_yyyy_mm_dd(&today) {
+            return Err(err(format_ymd(
+                "오늘 날짜 형식이 올바르지 않습니다: ",
+                year,
+                month,
+                day,
+            )));
+        }
+        Ok(today)
+    }
 }
 impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
     fn build_source_index_and_report(
@@ -727,12 +820,14 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 Ok(today)
             }
             _ => {
-                let mut detected_today = None;
-                if let Ok(output) = Command::new("date").args(["+%Y-%m-%d"]).output()
+                let mut detected_today =
+                    if let Ok(output) = Command::new("date").args(["+%Y-%m-%d"]).output()
                     && output.status.success()
-                {
-                    detected_today = valid_today_from_output(&output, is_yyyy_mm_dd);
-                }
+                    {
+                        valid_today_from_output(&output, is_yyyy_mm_dd)
+                    } else {
+                        None
+                    };
                 if detected_today.is_none() {
                     let script =
                         "from datetime import datetime;print(datetime.now().strftime('%Y-%m-%d'))";
@@ -750,35 +845,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 if let Some(today) = detected_today {
                     return Ok(today);
                 }
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|source| err(prefixed_message("현재 시간 조회 실패: ", source)))?;
-                let days = i64::try_from(now.as_secs() / 86_400)
-                    .map_err(|_| err("UTC 날짜 계산 중 일수 변환에 실패했습니다."))?;
-                let shifted_days = days + 719_468;
-                let era = if shifted_days >= 0 {
-                    shifted_days
-                } else {
-                    shifted_days - 146_096
-                } / 146_097;
-                let doe = shifted_days - era * 146_097;
-                let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-                let year_of_era = yoe + era * 400;
-                let day_of_year = doe - (365 * yoe + yoe / 4 - yoe / 100);
-                let month_phase = (5 * day_of_year + 2) / 153;
-                let day = day_of_year - (153 * month_phase + 2) / 5 + 1;
-                let month = month_phase + if month_phase < 10 { 3 } else { -9 };
-                let year_i64 = year_of_era + if month <= 2 { 1 } else { 0 };
-                let year = i32::try_from(year_i64)
-                    .map_err(|_| err("UTC 날짜 계산 중 연도 변환에 실패했습니다."))?;
-                let today = format_ymd("", year, month, day);
-                if !is_yyyy_mm_dd(&today) {
-                    return Err(err(prefixed_message(
-                        "오늘 날짜 형식이 올바르지 않습니다: ",
-                        &today,
-                    )));
-                }
-                Ok(today)
+                SystemDateFallback.resolve_today_from_system_time(is_yyyy_mm_dd)
             }
         }
     }
