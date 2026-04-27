@@ -1,6 +1,6 @@
 use crate::{Result, err};
 #[cfg(not(windows))]
-use core::fmt::Arguments;
+use core::fmt::{Arguments, Write as _};
 #[cfg(windows)]
 use core::ptr::null_mut;
 use std::env;
