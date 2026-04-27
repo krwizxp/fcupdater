@@ -1,6 +1,6 @@
 use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, canon_header, display_region_label_from_source,
-    err, excel,
+    err, err_with_source, excel,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
     normalize_address_key, push_display, same_trimmed, shift_row,
     source_sync::SourceRecord,
@@ -169,7 +169,7 @@ trait MasterSheetOpsExt {
         shared_strings: &[String],
         data_start_row: u32,
         layout: MasterSheetLayout,
-    ) -> Vec<u32>;
+    ) -> Result<Vec<u32>>;
     fn collect_new_sources(
         &self,
         source_index: &HashMap<String, SourceRecord>,
@@ -210,7 +210,7 @@ trait MasterSheetOpsExt {
         old_rows: &[u32],
         source_index: &HashMap<String, SourceRecord>,
         layout: MasterSheetLayout,
-    ) -> MasterRowEvaluation;
+    ) -> Result<MasterRowEvaluation>;
     fn find_master_sheet_layout(
         &self,
         ws: &excel::writer::Worksheet,
@@ -268,7 +268,7 @@ trait MasterSheetOpsExt {
         data_start_row: u32,
         data_end_row: u32,
         layout: MasterSheetLayout,
-    );
+    ) -> Result<()>;
     fn repair_rank_formulas(
         &self,
         ws: &mut excel::writer::Worksheet,
@@ -283,7 +283,7 @@ trait MasterSheetOpsExt {
         data_start_row: u32,
         data_end_row: u32,
     ) -> String;
-    fn rows_from_sources(&self, new_sources: &[SourceRecord]) -> Vec<StoreRow>;
+    fn rows_from_sources(&self, new_sources: &[SourceRecord]) -> Result<Vec<StoreRow>>;
     fn sort_master_rows_by_rank(
         &self,
         ws: &mut excel::writer::Worksheet,
@@ -608,8 +608,15 @@ impl MasterSheetOpsExt for MasterSheetOps {
         shared_strings: &[String],
         data_start_row: u32,
         layout: MasterSheetLayout,
-    ) -> Vec<u32> {
-        let mut rows = Vec::with_capacity(ws.rows.len());
+    ) -> Result<Vec<u32>> {
+        let mut rows: Vec<u32> = Vec::new();
+        rows.try_reserve_exact(ws.rows.len()).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("마스터 데이터 행 목록 메모리 확보 실패: ");
+            push_display(&mut message, ws.rows.len());
+            message.push_str(" rows");
+            err_with_source(message, source)
+        })?;
         for row in ws.rows.range(data_start_row..).map(|(row, _)| *row) {
             let region = ws.get_display_at(layout.region, row, shared_strings);
             let name = ws.get_display_at(layout.name, row, shared_strings);
@@ -619,7 +626,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
             }
             rows.push(row);
         }
-        rows
+        Ok(rows)
     }
     fn collect_new_sources(
         &self,
@@ -885,11 +892,47 @@ impl MasterSheetOpsExt for MasterSheetOps {
         old_rows: &[u32],
         source_index: &HashMap<String, SourceRecord>,
         layout: MasterSheetLayout,
-    ) -> MasterRowEvaluation {
-        let mut matched_source_keys = HashSet::with_capacity(old_rows.len());
-        let mut kept_source_rows = Vec::with_capacity(old_rows.len());
-        let mut changes = Vec::with_capacity(old_rows.len());
-        let mut deleted = Vec::with_capacity(old_rows.len());
+    ) -> Result<MasterRowEvaluation> {
+        let mut matched_source_keys: HashSet<String> = HashSet::new();
+        matched_source_keys
+            .try_reserve(old_rows.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("매칭 소스 키 집합 메모리 확보 실패: ");
+                push_display(&mut message, old_rows.len());
+                message.push_str(" entries");
+                err_with_source(message, source)
+            })?;
+        let mut kept_source_rows: Vec<(u32, Option<SourceRecord>)> = Vec::new();
+        kept_source_rows
+            .try_reserve_exact(old_rows.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("유지 행 목록 메모리 확보 실패: ");
+                push_display(&mut message, old_rows.len());
+                message.push_str(" rows");
+                err_with_source(message, source)
+            })?;
+        let mut changes: Vec<ChangeRow> = Vec::new();
+        changes
+            .try_reserve_exact(old_rows.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("변경 행 목록 메모리 확보 실패: ");
+                push_display(&mut message, old_rows.len());
+                message.push_str(" rows");
+                err_with_source(message, source)
+            })?;
+        let mut deleted: Vec<StoreRow> = Vec::new();
+        deleted
+            .try_reserve_exact(old_rows.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("삭제 행 목록 메모리 확보 실패: ");
+                push_display(&mut message, old_rows.len());
+                message.push_str(" rows");
+                err_with_source(message, source)
+            })?;
         for old_row in old_rows.iter().copied() {
             let MasterRowDecision {
                 src,
@@ -909,12 +952,12 @@ impl MasterSheetOpsExt for MasterSheetOps {
             }
             kept_source_rows.push((old_row, src));
         }
-        MasterRowEvaluation {
+        Ok(MasterRowEvaluation {
             changes,
             deleted,
             kept_source_rows,
             matched_source_keys,
-        }
+        })
     }
     fn find_master_sheet_layout(
         &self,
@@ -923,8 +966,15 @@ impl MasterSheetOpsExt for MasterSheetOps {
     ) -> Result<(u32, MasterSheetLayout)> {
         let max_cols = self.master_header_scan_cols(ws);
         for row in 1..=self.master_header_scan_rows() {
-            let mut headers: HashMap<String, u32> =
-                HashMap::with_capacity(usize::try_from(max_cols).unwrap_or(0));
+            let header_capacity = usize::try_from(max_cols).unwrap_or(0);
+            let mut headers: HashMap<String, u32> = HashMap::new();
+            headers.try_reserve(header_capacity).map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("마스터 헤더 맵 메모리 확보 실패: ");
+                push_display(&mut message, header_capacity);
+                message.push_str(" entries");
+                err_with_source(message, source)
+            })?;
             for col in 1..=max_cols {
                 let key = canon_header(ws.get_display_at(col, row, shared_strings).trim());
                 if key.is_empty() {
@@ -1098,7 +1148,16 @@ impl MasterSheetOpsExt for MasterSheetOps {
         data_start_row: u32,
         row_mapper: &RowMapper,
     ) -> Result<Vec<KeptMasterRow>> {
-        let mut kept_rows: Vec<KeptMasterRow> = Vec::with_capacity(kept_source_rows.len());
+        let mut kept_rows: Vec<KeptMasterRow> = Vec::new();
+        kept_rows
+            .try_reserve_exact(kept_source_rows.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("유지 마스터 행 메모리 확보 실패: ");
+                push_display(&mut message, kept_source_rows.len());
+                message.push_str(" rows");
+                err_with_source(message, source)
+            })?;
         for (i, kept_source_row) in kept_source_rows.iter().enumerate() {
             let old_row = kept_source_row.0;
             let src = &kept_source_row.1;
@@ -1137,7 +1196,16 @@ impl MasterSheetOpsExt for MasterSheetOps {
             template_row,
             template_row_num,
         } = plan;
-        let mut new_rows_from_sources = Vec::with_capacity(new_sources.len());
+        let mut new_rows_from_sources: Vec<(u32, SourceRecord)> = Vec::new();
+        new_rows_from_sources
+            .try_reserve_exact(new_sources.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("신규 소스 행 메모리 확보 실패: ");
+                push_display(&mut message, new_sources.len());
+                message.push_str(" rows");
+                err_with_source(message, source)
+            })?;
         for (i, src) in new_sources.iter().cloned().enumerate() {
             let offset = kept_count
                 .checked_add(i)
@@ -1268,7 +1336,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         data_start_row: u32,
         data_end_row: u32,
         layout: MasterSheetLayout,
-    ) {
+    ) -> Result<()> {
         let display_total_qty = self
             .get_f64_at(ws, 2, 10, shared_strings)
             .filter(|value| !self.is_zero(*value));
@@ -1280,7 +1348,16 @@ impl MasterSheetOpsExt for MasterSheetOps {
                 .saturating_add(1),
         )
         .unwrap_or(0);
-        let mut rank_totals = Vec::with_capacity(capacity_for_rank_totals_init);
+        let mut rank_totals: Vec<(u32, Option<ScaledSortKey>)> = Vec::new();
+        rank_totals
+            .try_reserve_exact(capacity_for_rank_totals_init)
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("랭크 캐시 목록 메모리 확보 실패: ");
+                push_display(&mut message, capacity_for_rank_totals_init);
+                message.push_str(" rows");
+                err_with_source(message, source)
+            })?;
         for row in data_start_row..=data_end_row {
             let cache = self.build_rank_formula_cache(
                 ws,
@@ -1305,6 +1382,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
             });
             ws.set_formula_cached_value_at(layout.rank, row, rank_text.as_deref(), None);
         }
+        Ok(())
     }
     fn repair_rank_formulas(
         &self,
@@ -1415,18 +1493,27 @@ impl MasterSheetOpsExt for MasterSheetOps {
         out.push_str(suffix);
         out
     }
-    fn rows_from_sources(&self, new_sources: &[SourceRecord]) -> Vec<StoreRow> {
-        new_sources
-            .iter()
-            .map(|src| StoreRow {
+    fn rows_from_sources(&self, new_sources: &[SourceRecord]) -> Result<Vec<StoreRow>> {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(new_sources.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("신규 StoreRow 목록 메모리 확보 실패: ");
+                push_display(&mut message, new_sources.len());
+                message.push_str(" rows");
+                err_with_source(message, source)
+            })?;
+        for src in new_sources {
+            rows.push(StoreRow {
                 region: display_region_label_from_source(&src.region, &src.address),
                 name: src.name.clone(),
                 address: src.address.clone(),
                 gasoline: src.gasoline,
                 premium: src.premium,
                 diesel: src.diesel,
-            })
-            .collect()
+            });
+        }
+        Ok(rows)
     }
     fn sort_master_rows_by_rank(
         &self,
@@ -1446,7 +1533,14 @@ impl MasterSheetOpsExt for MasterSheetOps {
                 .saturating_add(1),
         )
         .unwrap_or(0);
-        let mut data_rows = Vec::with_capacity(row_count);
+        let mut data_rows: Vec<(u32, RankSortKey)> = Vec::new();
+        data_rows.try_reserve_exact(row_count).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("정렬 대상 행 메모리 확보 실패: ");
+            push_display(&mut message, row_count);
+            message.push_str(" rows");
+            err_with_source(message, source)
+        })?;
         for row_num in data_start_row..=data_end_row {
             if !ws.rows.contains_key(&row_num) {
                 return Err(missing_sort_target_row_error(row_num));
@@ -1456,13 +1550,29 @@ impl MasterSheetOpsExt for MasterSheetOps {
             data_rows.push((row_num, sort_key));
         }
         data_rows.sort_by(|left, right| self.compare_rank_sort_key(&left.1, &right.1));
-        let mut row_mapping = HashMap::with_capacity(data_rows.len());
+        let mut row_mapping: HashMap<u32, u32> = HashMap::new();
+        row_mapping.try_reserve(data_rows.len()).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("정렬 행 매핑 메모리 확보 실패: ");
+            push_display(&mut message, data_rows.len());
+            message.push_str(" entries");
+            err_with_source(message, source)
+        })?;
         for (index, data_row) in data_rows.iter().enumerate() {
             let old_row = data_row.0;
             let new_row = add_row_offset(data_start_row, index, "유류비 정렬 재배치")?;
             row_mapping.insert(old_row, new_row);
         }
-        let mut detached_rows = HashMap::with_capacity(data_rows.len());
+        let mut detached_rows: HashMap<u32, StdRow> = HashMap::new();
+        detached_rows
+            .try_reserve(data_rows.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("정렬 분리 행 메모리 확보 실패: ");
+                push_display(&mut message, data_rows.len());
+                message.push_str(" entries");
+                err_with_source(message, source)
+            })?;
         for old_row in data_start_row..=data_end_row {
             let row = ws
                 .rows
@@ -1501,7 +1611,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
     ) -> Result<()> {
         self.sort_master_rows_by_rank(ws, shared_strings, data_start_row, data_end_row, layout)?;
         self.repair_rank_formulas(ws, data_start_row, data_end_row, layout);
-        self.refresh_rank_formula_caches(ws, shared_strings, data_start_row, data_end_row, layout);
+        self.refresh_rank_formula_caches(ws, shared_strings, data_start_row, data_end_row, layout)?;
         Ok(())
     }
     fn update_filter_database_defined_name(
@@ -1588,12 +1698,12 @@ impl MasterSheetOpsExt for MasterSheetOps {
                     layout,
                 };
                 let old_rows =
-                    self.collect_master_data_rows(ws, shared_strings, data_start_row, layout);
+                    self.collect_master_data_rows(ws, shared_strings, data_start_row, layout)?;
                 let evaluation =
-                    self.evaluate_master_rows(ws, shared_strings, &old_rows, source_index, layout);
+                    self.evaluate_master_rows(ws, shared_strings, &old_rows, source_index, layout)?;
                 let new_sources =
                     self.collect_new_sources(source_index, &evaluation.matched_source_keys);
-                let added = self.rows_from_sources(&new_sources);
+                let added = self.rows_from_sources(&new_sources)?;
                 let (filter_end_row, filter_end_col) = self.rebuild_master_rows(
                     ws,
                     shared_strings,

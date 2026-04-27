@@ -1,5 +1,5 @@
 use crate::{
-    ChangeRow, Result, StoreRow, add_row_offset, canon_header, err,
+    ChangeRow, Result, StoreRow, add_row_offset, canon_header, err, err_with_source,
     excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
     push_display,
 };
@@ -68,9 +68,9 @@ trait ChangeLogUpdaterExt {
         changes: &[ChangeRow],
         added: &[StoreRow],
         deleted: &[StoreRow],
-    ) -> Vec<ChangeLogEntry>;
-    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout);
-    fn collect_header_columns(&self, row: u32, max_cols: u32) -> HashMap<String, u32>;
+    ) -> Result<Vec<ChangeLogEntry>>;
+    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<()>;
+    fn collect_header_columns(&self, row: u32, max_cols: u32) -> Result<HashMap<String, u32>>;
     fn find_layout(&self) -> Result<ChangeLogLayout>;
     fn select_style_template_row(&self, layout: &ChangeLogLayout) -> u32;
     fn update(
@@ -112,13 +112,21 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         changes: &[ChangeRow],
         added: &[StoreRow],
         deleted: &[StoreRow],
-    ) -> Vec<ChangeLogEntry> {
-        let mut entries = Vec::with_capacity(
-            changes
-                .len()
-                .saturating_add(added.len())
-                .saturating_add(deleted.len()),
-        );
+    ) -> Result<Vec<ChangeLogEntry>> {
+        let entry_capacity = changes
+            .len()
+            .saturating_add(added.len())
+            .saturating_add(deleted.len());
+        let mut entries: Vec<ChangeLogEntry> = Vec::new();
+        entries
+            .try_reserve_exact(entry_capacity)
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("변경내역 entry 메모리 확보 실패: ");
+                push_display(&mut message, entry_capacity);
+                message.push_str(" entries");
+                err_with_source(message, source)
+            })?;
         for change in changes {
             entries.push(ChangeLogEntry {
                 reason: change.reason.clone(),
@@ -161,9 +169,9 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 new_diesel: None,
             });
         }
-        entries
+        Ok(entries)
     }
-    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) {
+    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<()> {
         let cols = [
             layout.col_region,
             layout.col_name,
@@ -194,11 +202,19 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             let estimated_rows = last_data_row
                 .saturating_sub(layout.data_start_row)
                 .saturating_add(1);
-            let mut cells_to_clear = Vec::with_capacity(
-                usize::try_from(estimated_rows)
-                    .unwrap_or(0)
-                    .saturating_mul(8),
-            );
+            let cell_capacity = usize::try_from(estimated_rows)
+                .unwrap_or(0)
+                .saturating_mul(8);
+            let mut cells_to_clear: Vec<(u32, u32)> = Vec::new();
+            cells_to_clear
+                .try_reserve_exact(cell_capacity)
+                .map_err(|source| {
+                    let mut message = String::with_capacity(64);
+                    message.push_str("변경내역 clear 대상 메모리 확보 실패: ");
+                    push_display(&mut message, cell_capacity);
+                    message.push_str(" cells");
+                    err_with_source(message, source)
+                })?;
             for (row, row_obj) in self
                 .worksheet
                 .rows
@@ -212,17 +228,24 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 self.worksheet.clear_cell_if_exists(col, row);
             }
         }
+        Ok(())
     }
-    fn collect_header_columns(&self, row: u32, max_cols: u32) -> HashMap<String, u32> {
+    fn collect_header_columns(&self, row: u32, max_cols: u32) -> Result<HashMap<String, u32>> {
         let Some(row_obj) = self.worksheet.rows.get(&row) else {
-            return HashMap::new();
+            return Ok(HashMap::new());
         };
-        let mut headers = HashMap::with_capacity(
-            row_obj
-                .cells
-                .len()
-                .min(usize::try_from(max_cols).unwrap_or(0)),
-        );
+        let header_capacity = row_obj
+            .cells
+            .len()
+            .min(usize::try_from(max_cols).unwrap_or(0));
+        let mut headers: HashMap<String, u32> = HashMap::new();
+        headers.try_reserve(header_capacity).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("변경내역 헤더 맵 메모리 확보 실패: ");
+            push_display(&mut message, header_capacity);
+            message.push_str(" entries");
+            err_with_source(message, source)
+        })?;
         for (&col, _) in row_obj.cells.range(1..=max_cols) {
             let key = canon_header(
                 self.worksheet
@@ -233,13 +256,13 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 headers.entry(key).or_insert(col);
             }
         }
-        headers
+        Ok(headers)
     }
     fn find_layout(&self) -> Result<ChangeLogLayout> {
         let max_rows = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS", 30, Some(1_000));
         let max_cols = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_COLS", 60, Some(500));
         for (&row, _) in self.worksheet.rows.range(1..=max_rows) {
-            let headers = self.collect_header_columns(row, max_cols);
+            let headers = self.collect_header_columns(row, max_cols)?;
             if headers.is_empty() {
                 continue;
             }
@@ -359,8 +382,8 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         self.worksheet.set_string_at(1, 2, &date_text);
         let layout = self.find_layout()?;
         let style_template_row = self.select_style_template_row(&layout);
-        self.clear_existing_rows(&layout);
-        let entries = self.build_entries(changes, added, deleted);
+        self.clear_existing_rows(&layout)?;
+        let entries = self.build_entries(changes, added, deleted)?;
         self.write_entries(&layout, style_template_row, &entries)?;
         self.worksheet.update_dimension()?;
         Ok(())

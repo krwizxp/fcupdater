@@ -303,14 +303,36 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         HashMap<String, source_sync::SourceRecord>,
         source_sync::SourceIndexBuildReport,
     )> {
-        let mut map: HashMap<String, SourceIndexEntry> =
-            HashMap::with_capacity(source_paths.len().saturating_mul(32));
+        let source_index_capacity = source_paths.len().saturating_mul(32);
+        let mut map: HashMap<String, SourceIndexEntry> = HashMap::new();
+        map.try_reserve(source_index_capacity).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("소스 index 맵 메모리 확보 실패: ");
+            push_display(&mut message, source_index_capacity);
+            message.push_str(" entries");
+            err_with_source(message, source)
+        })?;
         let mut report = source_sync::SourceIndexBuildReport::default();
-        let mut sampled_keys: HashSet<String> =
-            HashSet::with_capacity(source_sync::MAX_CONFLICT_SAMPLES);
+        let mut sampled_keys: HashSet<String> = HashSet::new();
+        sampled_keys
+            .try_reserve(source_sync::MAX_CONFLICT_SAMPLES)
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("소스 충돌 sample key 집합 메모리 확보 실패: ");
+                push_display(&mut message, source_sync::MAX_CONFLICT_SAMPLES);
+                message.push_str(" entries");
+                err_with_source(message, source)
+            })?;
         for (file_order, path) in source_paths.iter().enumerate() {
             let records = source_download::SourceDownloadOps
-                .filter_target_region_records(self.read_source_records(path)?);
+                .filter_target_region_records(self.read_source_records(path)?)?;
+            map.try_reserve(records.len()).map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("소스 index 맵 추가 메모리 확보 실패: ");
+                push_display(&mut message, records.len());
+                message.push_str(" entries");
+                err_with_source(message, source)
+            })?;
             for record in records {
                 let key = normalize_address_key(&record.address);
                 let score = self.score_source_record(&record);
@@ -359,10 +381,19 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 }
             }
         }
-        let index = map
-            .into_iter()
-            .map(|(key, (entry, _score, _order))| (key, entry))
-            .collect();
+        let map_len = map.len();
+        let mut index: HashMap<String, source_sync::SourceRecord> = HashMap::new();
+        index.try_reserve(map_len).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("최종 소스 index 메모리 확보 실패: ");
+            push_display(&mut message, map_len);
+            message.push_str(" entries");
+            err_with_source(message, source)
+        })?;
+        index.extend(
+            map.into_iter()
+                .map(|(key, (entry, _score, _order))| (key, entry)),
+        );
         Ok((index, report))
     }
     fn build_source_records_from_sheet_xml_streaming(
@@ -371,7 +402,8 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         shared_strings: &[String],
     ) -> Result<Vec<source_sync::SourceRecord>> {
         let sheet_data = excel::source_reader::sheet_data_body(sheet_xml)?;
-        let mut out = Vec::with_capacity(64);
+        let mut out: Vec<source_sync::SourceRecord> = Vec::new();
+        try_reserve_vec_exact(&mut out, 64, "스트리밍 소스 레코드 메모리 확보 실패")?;
         let mut cursor = 0_usize;
         let mut next_row_num = 1_usize;
         let mut scanned_rows = 0_usize;
@@ -414,6 +446,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 && let Some(record) =
                     excel::source_reader::build_source_record_from_row(&row_cells, indices)
             {
+                try_reserve_vec(&mut out, 1, "스트리밍 소스 레코드 추가 메모리 확보 실패")?;
                 out.push(record);
             }
             scanned_rows = scanned_rows.saturating_add(1);
@@ -424,8 +457,18 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         Ok(out)
     }
     fn collect_source_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut auto_candidates = Vec::with_capacity(16);
-        let mut manual_candidates = Vec::with_capacity(16);
+        let mut auto_candidates: Vec<SourceFileCandidate> = Vec::new();
+        let mut manual_candidates: Vec<SourceFileCandidate> = Vec::new();
+        try_reserve_vec_exact(
+            &mut auto_candidates,
+            16,
+            "자동 소스 후보 목록 메모리 확보 실패",
+        )?;
+        try_reserve_vec_exact(
+            &mut manual_candidates,
+            16,
+            "수동 소스 후보 목록 메모리 확보 실패",
+        )?;
         let prefix_fold = self.args.sources_prefix.to_lowercase();
         for entry in fs::read_dir(&self.args.sources_dir).map_err(|source_err| {
             err(path_source_message(
@@ -460,8 +503,18 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             let natural_key = self.split_natural_parts(&file_name_fold);
             let candidate = SourceFileCandidate { natural_key, path };
             if is_auto {
+                try_reserve_vec(
+                    &mut auto_candidates,
+                    1,
+                    "자동 소스 후보 추가 메모리 확보 실패",
+                )?;
                 auto_candidates.push(candidate);
             } else {
+                try_reserve_vec(
+                    &mut manual_candidates,
+                    1,
+                    "수동 소스 후보 추가 메모리 확보 실패",
+                )?;
                 manual_candidates.push(candidate);
             }
         }
@@ -471,10 +524,13 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             auto_candidates
         };
         candidates.sort_unstable();
-        let source_paths: Vec<_> = candidates
-            .into_iter()
-            .map(|candidate| candidate.path)
-            .collect();
+        let mut source_paths: Vec<PathBuf> = Vec::new();
+        try_reserve_vec_exact(
+            &mut source_paths,
+            candidates.len(),
+            "소스 경로 목록 메모리 확보 실패",
+        )?;
+        source_paths.extend(candidates.into_iter().map(|candidate| candidate.path));
         if source_paths.is_empty() {
             let capacity = self.args.sources_prefix.len().saturating_add(96);
             let mut out = String::with_capacity(capacity);
@@ -703,15 +759,19 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         if catalog.sheet_order.is_empty() {
             return Err(err("xlsx에 시트가 없습니다."));
         }
-        let mut all = Vec::with_capacity(catalog.sheet_order.len().saturating_mul(32));
+        let all_capacity = catalog.sheet_order.len().saturating_mul(32);
+        let mut all: Vec<source_sync::SourceRecord> = Vec::new();
+        try_reserve_vec_exact(
+            &mut all,
+            all_capacity,
+            "xlsx 전체 소스 레코드 메모리 확보 실패",
+        )?;
         let mut last_err: Option<BoxError> = None;
         for sheet_name in &catalog.sheet_order {
             let sheet_xml = excel::ooxml::load_sheet_xml(&container, &catalog, sheet_name)?;
             match self.build_source_records_from_sheet_xml_streaming(&sheet_xml, &shared_strings) {
                 Ok(records) => {
-                    if !records.is_empty() {
-                        all.extend(records);
-                    }
+                    extend_source_records(&mut all, records)?;
                 }
                 Err(stream_err) => {
                     let rows = {
@@ -741,13 +801,19 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                             next_row_num = row_num.saturating_add(1);
                             cursor = next_cursor;
                         }
-                        rows_map.into_iter().collect::<Vec<_>>()
+                        let row_count = rows_map.len();
+                        let mut rows = Vec::new();
+                        try_reserve_vec_exact(
+                            &mut rows,
+                            row_count,
+                            "xlsx 구형 행 목록 메모리 확보 실패",
+                        )?;
+                        rows.extend(rows_map);
+                        rows
                     };
                     match excel::source_reader::build_source_records_from_rows(&rows) {
                         Ok(records) => {
-                            if !records.is_empty() {
-                                all.extend(records);
-                            }
+                            extend_source_records(&mut all, records)?;
                         }
                         Err(legacy_err) => {
                             let capacity = 128;
@@ -1019,6 +1085,40 @@ pub(crate) fn push_display(out: &mut String, value: impl Display) {
     match write!(out, "{value}") {
         Ok(()) | Err(_) => {}
     }
+}
+fn try_reserve_vec<T>(values: &mut Vec<T>, additional: usize, context: &str) -> Result<()> {
+    values.try_reserve(additional).map_err(|source| {
+        let mut message = String::with_capacity(64);
+        message.push_str(context);
+        message.push_str(": ");
+        push_display(&mut message, additional);
+        message.push_str(" entries");
+        err_with_source(message, source)
+    })
+}
+fn try_reserve_vec_exact<T>(values: &mut Vec<T>, additional: usize, context: &str) -> Result<()> {
+    values.try_reserve_exact(additional).map_err(|source| {
+        let mut message = String::with_capacity(64);
+        message.push_str(context);
+        message.push_str(": ");
+        push_display(&mut message, additional);
+        message.push_str(" entries");
+        err_with_source(message, source)
+    })
+}
+fn extend_source_records(
+    out: &mut Vec<source_sync::SourceRecord>,
+    records: Vec<source_sync::SourceRecord>,
+) -> Result<()> {
+    if !records.is_empty() {
+        try_reserve_vec(
+            out,
+            records.len(),
+            "xlsx 전체 소스 레코드 추가 메모리 확보 실패",
+        )?;
+        out.extend(records);
+    }
+    Ok(())
 }
 #[cfg(not(windows))]
 fn valid_today_from_output(

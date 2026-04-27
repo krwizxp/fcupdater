@@ -6,7 +6,7 @@ use super::{
         find_start_tag, find_tag_end,
     },
 };
-use crate::{Result, err, parse_i32_str, push_display};
+use crate::{Result, err, err_with_source, parse_i32_str, push_display};
 use alloc::collections::BTreeMap;
 use core::fmt::Display;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
@@ -108,14 +108,30 @@ impl Workbook {
         }
         let existing_total = self.shared_strings.len();
         let existing_unique = {
-            let mut seen: HashSet<&str> = HashSet::with_capacity(self.shared_strings.len());
+            let mut seen: HashSet<&str> = HashSet::new();
+            seen.try_reserve(self.shared_strings.len())
+                .map_err(|source| {
+                    let mut message = String::with_capacity(64);
+                    message.push_str("shared string 중복 집합 메모리 확보 실패: ");
+                    push_display(&mut message, self.shared_strings.len());
+                    message.push_str(" entries");
+                    err_with_source(message, source)
+                })?;
             for value in &self.shared_strings {
                 seen.insert(value);
             }
             seen.len()
         };
-        let mut index_map: HashMap<String, usize> =
-            HashMap::with_capacity(self.shared_strings.len());
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        index_map
+            .try_reserve(self.shared_strings.len())
+            .map_err(|source| {
+                let mut message = String::with_capacity(64);
+                message.push_str("shared string index map 메모리 확보 실패: ");
+                push_display(&mut message, self.shared_strings.len());
+                message.push_str(" entries");
+                err_with_source(message, source)
+            })?;
         for (idx, value) in self.shared_strings.iter().enumerate() {
             index_map.entry(value.clone()).or_insert(idx);
         }
@@ -435,7 +451,19 @@ impl Worksheet {
                 if let Some(sqref) = get_attr(&attrs, "sqref").map(ToOwned::to_owned) {
                     let updated_sqref = {
                         let mut changed = false;
-                        let mut ranges_out = Vec::with_capacity(sqref.split_whitespace().count());
+                        let range_count = sqref.split_whitespace().count();
+                        let mut ranges_out: Vec<String> = Vec::new();
+                        ranges_out
+                            .try_reserve_exact(range_count)
+                            .map_err(|source| {
+                                let mut message = String::with_capacity(64);
+                                message.push_str(
+                                    "conditionalFormatting range 목록 메모리 확보 실패: ",
+                                );
+                                push_display(&mut message, range_count);
+                                message.push_str(" ranges");
+                                err_with_source(message, source)
+                            })?;
                         for token in sqref.split_whitespace() {
                             let (start_ref, end_ref) = parse_range_token(token);
                             let Some((start_col, start_row, start_col_lock, start_row_lock)) =
@@ -582,7 +610,14 @@ impl Worksheet {
         self.rows.last_key_value().map_or(1, |(&row, _)| row)
     }
     fn normalize_shared_formulas(&mut self) -> Result<()> {
-        let mut heads: HashMap<String, SharedFormulaHead> = HashMap::with_capacity(self.rows.len());
+        let mut heads: HashMap<String, SharedFormulaHead> = HashMap::new();
+        heads.try_reserve(self.rows.len()).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("shared formula head 맵 메모리 확보 실패: ");
+            push_display(&mut message, self.rows.len());
+            message.push_str(" entries");
+            err_with_source(message, source)
+        })?;
         for (row_num, row) in &self.rows {
             for (col_num, cell) in &row.cells {
                 let Some(inner_xml) = cell.inner_xml.as_deref() else {
@@ -1156,7 +1191,8 @@ fn attrs_to_xml(attrs: &[(String, String)]) -> String {
     out
 }
 fn parse_tag_attrs(tag: &str) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::with_capacity(4);
+    let mut out: Vec<(String, String)> = Vec::new();
+    reserve_xml_attrs(&mut out, 4, "XML 속성 목록 메모리 확보 실패", true)?;
     let parse_error = |prefix: &str| {
         let capacity = prefix.len().saturating_add(tag.len());
         let mut message = String::with_capacity(capacity);
@@ -1241,12 +1277,33 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<(String, String)>> {
             .get(value_start..i)
             .ok_or_else(|| parse_error("XML 속성 파싱 실패: 값 범위를 계산할 수 없습니다. tag="))?;
         let value = decode_xml_entities(raw_value);
+        reserve_xml_attrs(&mut out, 1, "XML 속성 목록 추가 메모리 확보 실패", false)?;
         out.push((key.to_owned(), value));
         if i < bytes.len() {
             i = i.saturating_add(1);
         }
     }
     Ok(out)
+}
+fn reserve_xml_attrs(
+    attrs: &mut Vec<(String, String)>,
+    additional: usize,
+    context: &str,
+    exact: bool,
+) -> Result<()> {
+    let reserve_result = if exact {
+        attrs.try_reserve_exact(additional)
+    } else {
+        attrs.try_reserve(additional)
+    };
+    reserve_result.map_err(|source| {
+        let mut message = String::with_capacity(64);
+        message.push_str(context);
+        message.push_str(": ");
+        push_display(&mut message, additional);
+        message.push_str(" entries");
+        err_with_source(message, source)
+    })
 }
 fn get_attr<'attrs>(attrs: &'attrs [(String, String)], name: &str) -> Option<&'attrs str> {
     attrs
@@ -1295,7 +1352,14 @@ fn rewrite_formula_cell_refs<F>(formula: &str, mut try_rewrite_cell_ref: F) -> R
 where
     F: FnMut(&[char], usize) -> Result<Option<(usize, String)>>,
 {
-    let mut chars = Vec::with_capacity(formula.len());
+    let mut chars: Vec<char> = Vec::new();
+    chars.try_reserve_exact(formula.len()).map_err(|source| {
+        let mut message = String::with_capacity(64);
+        message.push_str("formula 문자 목록 메모리 확보 실패: ");
+        push_display(&mut message, formula.len());
+        message.push_str(" chars");
+        err_with_source(message, source)
+    })?;
     for ch in formula.chars() {
         chars.push(ch);
     }
