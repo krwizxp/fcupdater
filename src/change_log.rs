@@ -70,6 +70,7 @@ trait ChangeLogUpdaterExt {
         deleted: &[StoreRow],
     ) -> Vec<ChangeLogEntry>;
     fn clear_existing_rows(&mut self, layout: &ChangeLogLayout);
+    fn collect_header_columns(&self, row: u32, max_cols: u32) -> HashMap<String, u32>;
     fn find_layout(&self) -> Result<ChangeLogLayout>;
     fn select_style_template_row(&self, layout: &ChangeLogLayout) -> u32;
     fn update(
@@ -212,21 +213,35 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             }
         }
     }
+    fn collect_header_columns(&self, row: u32, max_cols: u32) -> HashMap<String, u32> {
+        let Some(row_obj) = self.worksheet.rows.get(&row) else {
+            return HashMap::new();
+        };
+        let mut headers = HashMap::with_capacity(
+            row_obj
+                .cells
+                .len()
+                .min(usize::try_from(max_cols).unwrap_or(0)),
+        );
+        for cell_entry in row_obj.cells.range(1..=max_cols) {
+            let col = *cell_entry.0;
+            let key = canon_header(
+                self.worksheet
+                    .get_display_at(col, row, self.shared_string_table)
+                    .trim(),
+            );
+            if !key.is_empty() {
+                headers.entry(key).or_insert(col);
+            }
+        }
+        headers
+    }
     fn find_layout(&self) -> Result<ChangeLogLayout> {
         let max_rows = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS", 30, Some(1_000));
         let max_cols = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_COLS", 60, Some(500));
-        for row in 1..=max_rows {
-            let mut headers = HashMap::with_capacity(usize::try_from(max_cols).unwrap_or(0));
-            for col in 1..=max_cols {
-                let key = canon_header(
-                    self.worksheet
-                        .get_display_at(col, row, self.shared_string_table)
-                        .trim(),
-                );
-                if !key.is_empty() {
-                    headers.entry(key).or_insert(col);
-                }
-            }
+        for entry in self.worksheet.rows.range(1..=max_rows) {
+            let row = *entry.0;
+            let headers = self.collect_header_columns(row, max_cols);
             if headers.is_empty() {
                 continue;
             }
