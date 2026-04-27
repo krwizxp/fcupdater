@@ -426,22 +426,21 @@ impl CfbFileExt for CfbFile {
             return Err(err(message));
         }
         let difat_entries = Self::collect_difat_entries(&data, &header, max_sector_count)?;
-        let fat_sector_ids: Vec<u32> = difat_entries
-            .into_iter()
-            .take(declared_fat_sectors)
-            .collect();
-        if fat_sector_ids.is_empty() {
+        if declared_fat_sectors == 0 || difat_entries.is_empty() {
             return Err(err("CFB FAT 정보를 찾지 못했습니다."));
         }
-        if fat_sector_ids.len() < declared_fat_sectors {
+        if difat_entries.len() < declared_fat_sectors {
             let mut message = String::with_capacity(96);
             message.push_str("CFB FAT 엔트리가 부족합니다: 필요 ");
             push_display(&mut message, declared_fat_sectors);
             message.push_str(", 실제 ");
-            push_display(&mut message, fat_sector_ids.len());
+            push_display(&mut message, difat_entries.len());
             return Err(err(message));
         }
-        let fat = Self::build_fat_table(&data, header.sector_size, &fat_sector_ids)?;
+        let fat_sector_ids = difat_entries
+            .get(..declared_fat_sectors)
+            .ok_or_else(|| err("CFB FAT entry 범위가 손상되었습니다."))?;
+        let fat = Self::build_fat_table(&data, header.sector_size, fat_sector_ids)?;
         let dir_stream = read_stream_from_fat_chain(
             &data,
             header.sector_size,
@@ -725,7 +724,14 @@ impl SourceReaderBiffExt for SourceReader {
                 globals.code_page,
             )?;
             match build_source_records_from_rows(&rows) {
-                Ok(records) if !records.is_empty() => all.extend(records),
+                Ok(records) if !records.is_empty() => {
+                    reserve_vec_entries_exact(
+                        &mut all,
+                        records.len(),
+                        "BIFF 소스 레코드 추가 메모리 확보 실패",
+                    )?;
+                    all.extend(records);
+                }
                 Ok(_) => {}
                 Err(error) => last_err = Some(error),
             }
@@ -884,8 +890,7 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
                 .get(self.offset_in_chunk..self.offset_in_chunk.saturating_add(byte_len))
                 .ok_or_else(|| err("SST 문자열 slice 범위 오류"))?;
             if high_byte {
-                let decoded = decode_utf16_le(bytes);
-                out.push_str(&decoded);
+                push_utf16_le_lossy(&mut out, bytes);
             } else {
                 let decoded = decode_single_byte_text(bytes, self.code_page)?;
                 out.push_str(&decoded);
@@ -1664,12 +1669,15 @@ fn decode_rk_number(rk: u32) -> f64 {
     value
 }
 fn decode_utf16_le(bytes: &[u8]) -> String {
-    let (chunks, _) = bytes.as_chunks::<2>();
     let mut out = String::new();
+    push_utf16_le_lossy(&mut out, bytes);
+    out
+}
+fn push_utf16_le_lossy(out: &mut String, bytes: &[u8]) {
+    let (chunks, _) = bytes.as_chunks::<2>();
     for decoded in decode_utf16(chunks.iter().map(|chunk| u16::from_le_bytes(*chunk))) {
         out.push(decoded.unwrap_or(REPLACEMENT_CHARACTER));
     }
-    out
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
     let arr = read_le_array::<2>(bytes, offset, "u16 read", "u16 read out of range at ")?;

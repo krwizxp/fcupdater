@@ -139,6 +139,16 @@ impl XlsxRowCellParserExt for XlsxRowCellParser<'_, '_> {
         }
         if self.row_cells.len() <= col_index {
             let next_len = checked_one_based_index(col_index, "xlsx row 셀 개수")?;
+            let additional = next_len.saturating_sub(self.row_cells.len());
+            self.row_cells
+                .try_reserve_exact(additional)
+                .map_err(|source| {
+                    let mut message = String::with_capacity(64);
+                    message.push_str("xlsx row 셀 확장 메모리 확보 실패: ");
+                    push_display(&mut message, additional);
+                    message.push_str(" cells");
+                    err_with_source(message, source)
+                })?;
             self.row_cells.resize(next_len, CellValue::Empty);
         }
         if cell_tag.ends_with("/>") {
