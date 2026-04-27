@@ -217,8 +217,8 @@ impl CfbFileExt for CfbFile {
             .len()
             .checked_mul(entries_per_sector)
             .ok_or_else(|| err("CFB FAT 엔트리 개수 계산 중 overflow가 발생했습니다."))?;
-        let mut fat: Vec<u32> = Vec::with_capacity(total_entries);
-        fat.try_reserve(total_entries).map_err(|source| {
+        let mut fat: Vec<u32> = Vec::new();
+        fat.try_reserve_exact(total_entries).map_err(|source| {
             err_with_source(
                 {
                     let mut out = String::with_capacity(48);
@@ -275,10 +275,7 @@ impl CfbFileExt for CfbFile {
             "CFB mini FAT",
         )?;
         let (chunks, _) = mini_fat_bytes.as_chunks::<4>();
-        let mut out = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            out.push(u32::from_le_bytes(*chunk));
-        }
+        let out: Vec<u32> = chunks.iter().copied().map(u32::from_le_bytes).collect();
         Ok(out)
     }
     fn collect_difat_entries(
@@ -390,10 +387,10 @@ impl CfbFileExt for CfbFile {
             return Err(err(message));
         }
         let difat_entries = Self::collect_difat_entries(&data, &header, max_sector_count)?;
-        let mut fat_sector_ids: Vec<u32> = Vec::with_capacity(declared_fat_sectors);
-        for sector_id in difat_entries.into_iter().take(declared_fat_sectors) {
-            fat_sector_ids.push(sector_id);
-        }
+        let fat_sector_ids: Vec<u32> = difat_entries
+            .into_iter()
+            .take(declared_fat_sectors)
+            .collect();
         if fat_sector_ids.is_empty() {
             return Err(err("CFB FAT 정보를 찾지 못했습니다."));
         }
@@ -706,8 +703,8 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
                 " bytes)",
             )));
         }
-        let mut out = Vec::with_capacity(len);
-        out.try_reserve(len).map_err(|source| {
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|source| {
             let mut message = String::with_capacity(64);
             message.push_str("SST 버퍼 메모리 확보 실패: ");
             push_display(&mut message, len);
