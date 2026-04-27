@@ -553,11 +553,6 @@ impl CfbFileExt for CfbFile {
         size: u64,
         name: &str,
     ) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(
-            usize::try_from(size)
-                .unwrap_or(0)
-                .min(self.root_stream.len()),
-        );
         let mut remaining = usize::try_from(size).map_err(|source| {
             let mut message = String::with_capacity(name.len().saturating_add(64));
             message.push_str("mini stream 길이 변환 실패: ");
@@ -567,6 +562,17 @@ impl CfbFileExt for CfbFile {
             message.push(')');
             err_with_source(message, source)
         })?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(remaining.min(self.root_stream.len()))
+            .map_err(|source| {
+                let mut message = String::with_capacity(name.len().saturating_add(64));
+                message.push_str("mini stream 메모리 확보 실패: ");
+                push_display(&mut message, remaining);
+                message.push_str(" bytes (");
+                message.push_str(name);
+                message.push(')');
+                err_with_source(message, source)
+            })?;
         let mut sid = start_mini_sector;
         let mut seen: HashSet<u32> = HashSet::with_capacity(self.mini_fat.len().min(64));
         while sid != CFB_END_OF_CHAIN && remaining > 0 {
@@ -1404,11 +1410,6 @@ fn read_stream_from_fat_chain(
     if !is_regular_sector_id(start_sector) {
         return Ok(Vec::default());
     }
-    let mut out = Vec::with_capacity(
-        size_limit
-            .and_then(|limit| usize::try_from(limit).ok())
-            .unwrap_or(sector_size),
-    );
     let mut remaining = size_limit
         .map(|limit| {
             usize::try_from(limit).map_err(|source| {
@@ -1422,6 +1423,17 @@ fn read_stream_from_fat_chain(
             })
         })
         .transpose()?;
+    let reserve_size = remaining.unwrap_or(sector_size);
+    let mut out = Vec::new();
+    out.try_reserve_exact(reserve_size).map_err(|source| {
+        let mut message = String::with_capacity(stream_name.len().saturating_add(64));
+        message.push_str("FAT stream 메모리 확보 실패: ");
+        push_display(&mut message, reserve_size);
+        message.push_str(" bytes (");
+        message.push_str(stream_name);
+        message.push(')');
+        err_with_source(message, source)
+    })?;
     let mut sid = start_sector;
     let mut seen: HashSet<u32> = HashSet::with_capacity(fat.len().min(64));
     while sid != CFB_END_OF_CHAIN {
