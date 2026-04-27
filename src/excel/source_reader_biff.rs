@@ -492,7 +492,14 @@ impl CfbFileExt for CfbFile {
         major_version: u16,
     ) -> Result<Vec<CfbDirectoryEntry>> {
         let (chunks, _) = dir_stream.as_chunks::<128>();
-        let mut entries = Vec::with_capacity(chunks.len());
+        let mut entries: Vec<CfbDirectoryEntry> = Vec::new();
+        entries.try_reserve_exact(chunks.len()).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("CFB 디렉터리 메모리 확보 실패: ");
+            push_display(&mut message, chunks.len());
+            message.push_str(" entries");
+            err_with_source(message, source)
+        })?;
         for entry in chunks {
             let name_len = usize::from(read_u16_le(entry, 0x40)?);
             let object_type = *entry
@@ -776,7 +783,14 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
         Ok(value)
     }
     fn read_xl_unicode_chars(&mut self, char_count: usize, mut high_byte: bool) -> Result<String> {
-        let mut out = String::with_capacity(char_count);
+        let mut out = String::new();
+        out.try_reserve_exact(char_count).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("SST 문자열 메모리 확보 실패: ");
+            push_display(&mut message, char_count);
+            message.push_str(" chars");
+            err_with_source(message, source)
+        })?;
         let mut remaining = char_count;
         let mut continuation = false;
         while remaining > 0 {
@@ -1227,7 +1241,14 @@ impl SourceReaderBiffParseExt for SourceReader {
                 max_unique_count,
             )));
         }
-        let mut out = Vec::with_capacity(unique_count);
+        let mut out: Vec<String> = Vec::new();
+        out.try_reserve_exact(unique_count).map_err(|source| {
+            let mut message = String::with_capacity(64);
+            message.push_str("SST 문자열 테이블 메모리 확보 실패: ");
+            push_display(&mut message, unique_count);
+            message.push_str(" entries");
+            err_with_source(message, source)
+        })?;
         for _ in 0..unique_count {
             let char_count = usize::from(reader.read_u16()?);
             let flags = reader.read_u8()?;

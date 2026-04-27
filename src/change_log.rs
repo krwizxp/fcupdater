@@ -204,8 +204,8 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 .rows
                 .range(layout.data_start_row..=last_data_row)
             {
-                for entry in row_obj.cells.range(..=layout.max_col) {
-                    cells_to_clear.push((*entry.0, *row));
+                for (&col, _) in row_obj.cells.range(..=layout.max_col) {
+                    cells_to_clear.push((col, *row));
                 }
             }
             for (col, row) in cells_to_clear {
@@ -223,8 +223,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 .len()
                 .min(usize::try_from(max_cols).unwrap_or(0)),
         );
-        for cell_entry in row_obj.cells.range(1..=max_cols) {
-            let col = *cell_entry.0;
+        for (&col, _) in row_obj.cells.range(1..=max_cols) {
             let key = canon_header(
                 self.worksheet
                     .get_display_at(col, row, self.shared_string_table)
@@ -239,8 +238,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
     fn find_layout(&self) -> Result<ChangeLogLayout> {
         let max_rows = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS", 30, Some(1_000));
         let max_cols = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_COLS", 60, Some(500));
-        for entry in self.worksheet.rows.range(1..=max_rows) {
-            let row = *entry.0;
+        for (&row, _) in self.worksheet.rows.range(1..=max_rows) {
             let headers = self.collect_header_columns(row, max_cols);
             if headers.is_empty() {
                 continue;
