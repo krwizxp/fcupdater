@@ -39,7 +39,7 @@ pub(crate) mod source_download_opdownload;
 mod source_sync;
 const MAX_CONFLICT_ATTEMPTS: u32 = 100_000;
 const RESERVATION_MAGIC: &[u8] = b"FCUPDATER_RESERVED_v1\n";
-const STALE_RESERVATION_AGE_SECS: u64 = 60 * 60;
+const STALE_RESERVATION_AGE: Duration = Duration::from_hours(1);
 const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
     ("충청남도", "충남"),
     ("충청북도", "충북"),
@@ -1277,7 +1277,7 @@ fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
                     .filter(fs::Metadata::is_file)
                     .and_then(|meta| meta.modified().ok())
                     .and_then(|modified| modified.elapsed().ok())
-                    .filter(|elapsed| *elapsed >= Duration::from_secs(STALE_RESERVATION_AGE_SECS))
+                    .filter(|elapsed| *elapsed >= STALE_RESERVATION_AGE)
                     .and_then(|_| fs::read(&candidate).ok())
                     .is_some_and(|content| {
                         content == RESERVATION_MAGIC && fs::remove_file(&candidate).is_ok()
