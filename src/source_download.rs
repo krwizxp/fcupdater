@@ -11,7 +11,7 @@
     clippy::single_call_fn,
     clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_wraps,
-    reason = "WinHTTP FFI wrapper keeps raw platform calls small and local without external crates"
+    reason = "native HTTPS FFI wrappers keep platform calls local without external Rust crates"
 )]
 use crate::{
     Result, err, err_with_source, is_metropolitan_token, is_province_token, normalize_address_key,
@@ -752,7 +752,17 @@ fn unix_epoch_millis() -> StdResult<u128, String> {
         .map(|duration| duration.as_millis())
         .map_err(|source| prefixed_message("현재 시간 조회 실패: ", source))
 }
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_https_request(
+    method: &str,
+    host: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+) -> StdResult<HttpResponse, String> {
+    libcurl::request(method, host, path, body, headers)
+}
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn platform_https_request(
     _method: &str,
     _host: &str,
@@ -761,7 +771,7 @@ fn platform_https_request(
     _headers: &[(&str, &str)],
 ) -> StdResult<HttpResponse, String> {
     Err(String::from(
-        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 현재 구현에서는 Windows WinHTTP가 필요합니다.",
+        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.",
     ))
 }
 #[cfg(windows)]
@@ -773,6 +783,370 @@ fn platform_https_request(
     headers: &[(&str, &str)],
 ) -> StdResult<HttpResponse, String> {
     winhttp::request(method, host, path, body, headers)
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod libcurl {
+    use super::HttpResponse;
+    use alloc::{ffi::CString, string::String, vec::Vec};
+    use core::{
+        ffi::{CStr, c_char, c_int, c_long, c_void},
+        ptr::null_mut,
+        slice,
+    };
+    use std::sync::OnceLock;
+    const CURLE_OK: CurlCode = 0;
+    const CURL_ERROR_SIZE: usize = 256;
+    const CURL_GLOBAL_DEFAULT: c_long = 3;
+    const CURLINFO_RESPONSE_CODE: CurlInfo = 0x20_0002;
+    const CURLOPT_CONNECTTIMEOUT: CurlOption = 78;
+    const CURLOPT_CUSTOMREQUEST: CurlOption = 10_036;
+    const CURLOPT_ERRORBUFFER: CurlOption = 10_010;
+    const CURLOPT_HEADERDATA: CurlOption = 10_029;
+    const CURLOPT_HEADERFUNCTION: CurlOption = 20_079;
+    const CURLOPT_HTTPHEADER: CurlOption = 10_023;
+    const CURLOPT_NOSIGNAL: CurlOption = 99;
+    const CURLOPT_POST: CurlOption = 47;
+    const CURLOPT_POSTFIELDS: CurlOption = 10_015;
+    const CURLOPT_POSTFIELDSIZE: CurlOption = 60;
+    const CURLOPT_TIMEOUT: CurlOption = 13;
+    const CURLOPT_URL: CurlOption = 10_002;
+    const CURLOPT_WRITEDATA: CurlOption = 10_001;
+    const CURLOPT_WRITEFUNCTION: CurlOption = 20_011;
+    type Curl = c_void;
+    type CurlCode = c_int;
+    type CurlInfo = c_int;
+    type CurlOption = c_int;
+    type HeaderCallback = extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
+    type WriteCallback = extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
+    #[repr(C)]
+    struct CurlSlist {
+        data: *mut c_char,
+        next: *mut Self,
+    }
+    struct EasyHandle(*mut Curl);
+    struct HeaderList(*mut CurlSlist);
+    struct Transfer {
+        body: Vec<u8>,
+        error: Option<String>,
+        headers: Vec<u8>,
+    }
+    #[link(name = "curl")]
+    unsafe extern "C" {
+        fn curl_easy_cleanup(curl: *mut Curl);
+        fn curl_easy_getinfo(curl: *mut Curl, info: CurlInfo, ...) -> CurlCode;
+        fn curl_easy_init() -> *mut Curl;
+        fn curl_easy_perform(curl: *mut Curl) -> CurlCode;
+        fn curl_easy_setopt(curl: *mut Curl, option: CurlOption, ...) -> CurlCode;
+        fn curl_easy_strerror(code: CurlCode) -> *const c_char;
+        fn curl_global_init(flags: c_long) -> CurlCode;
+        fn curl_slist_append(list: *mut CurlSlist, string: *const c_char) -> *mut CurlSlist;
+        fn curl_slist_free_all(list: *mut CurlSlist);
+    }
+    impl Drop for EasyHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    curl_easy_cleanup(self.0);
+                }
+            }
+        }
+    }
+    impl Drop for HeaderList {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    curl_slist_free_all(self.0);
+                }
+            }
+        }
+    }
+    pub(super) fn request(
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, String> {
+        ensure_global_init()?;
+        let handle = easy_handle()?;
+        let url = request_url(host, path)?;
+        let header_list = header_list(headers)?;
+        let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
+        let mut transfer = Transfer {
+            body: Vec::new(),
+            error: None,
+            headers: Vec::new(),
+        };
+        setopt_str(handle.0, CURLOPT_URL, url.as_ptr())?;
+        setopt_ptr(handle.0, CURLOPT_HTTPHEADER, header_list.0)?;
+        setopt_ptr(handle.0, CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
+        setopt_long(handle.0, CURLOPT_CONNECTTIMEOUT, 30)?;
+        setopt_long(handle.0, CURLOPT_TIMEOUT, 60)?;
+        setopt_long(handle.0, CURLOPT_NOSIGNAL, 1)?;
+        setopt_write_callback(handle.0, CURLOPT_WRITEFUNCTION, write_body)?;
+        setopt_ptr(
+            handle.0,
+            CURLOPT_WRITEDATA,
+            (&raw mut transfer).cast::<c_void>(),
+        )?;
+        setopt_header_callback(handle.0, CURLOPT_HEADERFUNCTION, write_header)?;
+        setopt_ptr(
+            handle.0,
+            CURLOPT_HEADERDATA,
+            (&raw mut transfer).cast::<c_void>(),
+        )?;
+        configure_method(handle.0, method, body)?;
+        let perform_code = unsafe { curl_easy_perform(handle.0) };
+        if perform_code != CURLE_OK {
+            return Err(curl_error_with_buffer(
+                "curl_easy_perform",
+                perform_code,
+                &error_buffer,
+                transfer.error.as_deref(),
+            ));
+        }
+        if let Some(callback_error) = transfer.error {
+            return Err(callback_error);
+        }
+        let status = response_code(handle.0)?;
+        let headers = parse_headers(&transfer.headers);
+        Ok(HttpResponse {
+            status,
+            headers,
+            body: transfer.body,
+        })
+    }
+    fn configure_method(curl: *mut Curl, method: &str, body: Option<&[u8]>) -> Result<(), String> {
+        if let Some(body_bytes) = body {
+            setopt_long(curl, CURLOPT_POST, 1)?;
+            setopt_const_ptr(
+                curl,
+                CURLOPT_POSTFIELDS,
+                body_bytes.as_ptr().cast::<c_char>(),
+            )?;
+            setopt_long(
+                curl,
+                CURLOPT_POSTFIELDSIZE,
+                c_long::try_from(body_bytes.len())
+                    .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?,
+            )?;
+        }
+        if method != "GET" && method != "POST" {
+            let custom_method = cstring("HTTP method", method)?;
+            setopt_str(curl, CURLOPT_CUSTOMREQUEST, custom_method.as_ptr())?;
+        }
+        Ok(())
+    }
+    fn cstring(label: &str, value: &str) -> Result<CString, String> {
+        CString::new(value)
+            .map_err(|source| format!("{label}에 NUL 문자가 포함되어 있습니다: {source}"))
+    }
+    fn curl_error(context: &str, code: CurlCode) -> String {
+        let message = unsafe {
+            let ptr = curl_easy_strerror(code);
+            if ptr.is_null() {
+                String::from("unknown curl error")
+            } else {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        };
+        format!("{context} 실패: {message} ({code})")
+    }
+    fn curl_error_with_buffer(
+        context: &str,
+        code: CurlCode,
+        error_buffer: &[c_char; CURL_ERROR_SIZE],
+        callback_error: Option<&str>,
+    ) -> String {
+        if let Some(callback_error_text) = callback_error {
+            return callback_error_text.to_owned();
+        }
+        if error_buffer.first().copied().unwrap_or_default() != 0 {
+            let message = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return format!("{context} 실패: {message} ({code})");
+        }
+        curl_error(context, code)
+    }
+    fn easy_handle() -> Result<EasyHandle, String> {
+        let handle = unsafe { curl_easy_init() };
+        if handle.is_null() {
+            Err(String::from("curl_easy_init 실패"))
+        } else {
+            Ok(EasyHandle(handle))
+        }
+    }
+    fn ensure_global_init() -> Result<(), String> {
+        static INIT: OnceLock<CurlCode> = OnceLock::new();
+        let code = *INIT.get_or_init(|| unsafe { curl_global_init(CURL_GLOBAL_DEFAULT) });
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_global_init", code))
+        }
+    }
+    fn header_list(headers: &[(&str, &str)]) -> Result<HeaderList, String> {
+        let mut list = HeaderList(null_mut());
+        for (name, value) in headers {
+            let mut header =
+                String::with_capacity(name.len().saturating_add(value.len()).saturating_add(2));
+            header.push_str(name);
+            header.push_str(": ");
+            header.push_str(value);
+            let header_c = cstring("HTTP header", &header)?;
+            let updated = unsafe { curl_slist_append(list.0, header_c.as_ptr()) };
+            if updated.is_null() {
+                return Err(String::from("curl_slist_append 실패"));
+            }
+            list.0 = updated;
+        }
+        Ok(list)
+    }
+    fn parse_headers(raw: &[u8]) -> Vec<(String, String)> {
+        let text = String::from_utf8_lossy(raw);
+        let normalized = text.replace("\r\n", "\n");
+        let mut selected = "";
+        for block in normalized.split("\n\n") {
+            if !block.trim().is_empty() {
+                selected = block;
+            }
+        }
+        let mut headers = Vec::new();
+        for line in selected.lines() {
+            if line.starts_with("HTTP/") {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            headers.push((name.trim().to_owned(), value.trim().to_owned()));
+        }
+        headers
+    }
+    fn request_url(host: &str, path: &str) -> Result<CString, String> {
+        let mut url = String::with_capacity(
+            "https://"
+                .len()
+                .saturating_add(host.len())
+                .saturating_add(path.len()),
+        );
+        url.push_str("https://");
+        url.push_str(host);
+        url.push_str(path);
+        cstring("URL", &url)
+    }
+    fn response_code(curl: *mut Curl) -> Result<u32, String> {
+        let mut status = c_long::default();
+        let code = unsafe { curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &raw mut status) };
+        if code != CURLE_OK {
+            return Err(curl_error("curl_easy_getinfo response_code", code));
+        }
+        u32::try_from(status).map_err(|source| format!("HTTP 상태 코드 변환 실패: {source}"))
+    }
+    fn setopt_const_ptr<T>(
+        curl: *mut Curl,
+        option: CurlOption,
+        value: *const T,
+    ) -> Result<(), String> {
+        let code = unsafe { curl_easy_setopt(curl, option, value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code))
+        }
+    }
+    fn setopt_header_callback(
+        curl: *mut Curl,
+        option: CurlOption,
+        value: HeaderCallback,
+    ) -> Result<(), String> {
+        let code = unsafe { curl_easy_setopt(curl, option, value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code))
+        }
+    }
+    fn setopt_long(curl: *mut Curl, option: CurlOption, value: c_long) -> Result<(), String> {
+        let code = unsafe { curl_easy_setopt(curl, option, value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code))
+        }
+    }
+    fn setopt_ptr<T>(curl: *mut Curl, option: CurlOption, value: *mut T) -> Result<(), String> {
+        let code = unsafe { curl_easy_setopt(curl, option, value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code))
+        }
+    }
+    fn setopt_str(curl: *mut Curl, option: CurlOption, value: *const c_char) -> Result<(), String> {
+        let code = unsafe { curl_easy_setopt(curl, option, value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code))
+        }
+    }
+    fn setopt_write_callback(
+        curl: *mut Curl,
+        option: CurlOption,
+        value: WriteCallback,
+    ) -> Result<(), String> {
+        let code = unsafe { curl_easy_setopt(curl, option, value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code))
+        }
+    }
+    extern "C" fn write_body(
+        ptr: *mut c_char,
+        size: usize,
+        nmemb: usize,
+        userdata: *mut c_void,
+    ) -> usize {
+        write_bytes(ptr, size, nmemb, userdata, true)
+    }
+    fn write_bytes(
+        ptr: *mut c_char,
+        size: usize,
+        nmemb: usize,
+        userdata: *mut c_void,
+        body: bool,
+    ) -> usize {
+        let Some(byte_count) = size.checked_mul(nmemb) else {
+            return 0;
+        };
+        if byte_count == 0 {
+            return 0;
+        }
+        let transfer = unsafe { &mut *userdata.cast::<Transfer>() };
+        let target = if body {
+            &mut transfer.body
+        } else {
+            &mut transfer.headers
+        };
+        if let Err(source) = target.try_reserve(byte_count) {
+            transfer.error = Some(format!("HTTP 응답 메모리 확보 실패: {source}"));
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(ptr.cast::<u8>(), byte_count) };
+        target.extend_from_slice(bytes);
+        byte_count
+    }
+    extern "C" fn write_header(
+        ptr: *mut c_char,
+        size: usize,
+        nmemb: usize,
+        userdata: *mut c_void,
+    ) -> usize {
+        write_bytes(ptr, size, nmemb, userdata, false)
+    }
 }
 #[cfg(windows)]
 mod winhttp {
