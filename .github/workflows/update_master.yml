@@ -46,40 +46,6 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: stable
-      - name: Use GitHub runner WebDrivers
-        if: ${{ !inputs.skip_download }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          function Resolve-RunnerDriver([string] $envVarName, [string] $fileName, [string] $commandName) {
-            $envValue = [Environment]::GetEnvironmentVariable($envVarName)
-            if (-not [string]::IsNullOrWhiteSpace($envValue)) {
-              $candidate = Join-Path $envValue $fileName
-              if (Test-Path $candidate) {
-                return (Resolve-Path $candidate).Path
-              }
-            }
-            $cmd = Get-Command $commandName -ErrorAction SilentlyContinue
-            if ($cmd) {
-              return $cmd.Source
-            }
-            return $null
-          }
-          $chromeDriverSource = Resolve-RunnerDriver "CHROMEWEBDRIVER" "chromedriver.exe" "chromedriver"
-          $edgeDriverSource = Resolve-RunnerDriver "EDGEWEBDRIVER" "msedgedriver.exe" "msedgedriver"
-          Remove-Item chromedriver\chromedriver.exe -Force -ErrorAction SilentlyContinue
-          Remove-Item edgedriver\msedgedriver.exe -Force -ErrorAction SilentlyContinue
-          if ($chromeDriverSource) {
-            New-Item -ItemType Directory -Force chromedriver | Out-Null
-            Copy-Item $chromeDriverSource chromedriver\chromedriver.exe -Force
-          }
-          if ($edgeDriverSource) {
-            New-Item -ItemType Directory -Force edgedriver | Out-Null
-            Copy-Item $edgeDriverSource edgedriver\msedgedriver.exe -Force
-          }
-          if (-not $chromeDriverSource -and -not $edgeDriverSource) {
-            throw "GitHub runner WebDrivers not found."
-          }
       - name: Build release binary
         run: cargo build --release --locked
       - name: Run updater
