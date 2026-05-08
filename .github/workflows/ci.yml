@@ -19,8 +19,13 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_path: artifacts/fcupdater-linux-x64.tar.gz
+            binary_name: fcupdater-linux-x64
+          - os: macos-latest
+            artifact_path: artifacts/fcupdater-macos.tar.gz
+            binary_name: fcupdater-macos
           - os: windows-latest
             artifact_path: target/release/fcupdater-windows-x64.exe
+            binary_name: fcupdater-windows-x64
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
         with:
@@ -29,19 +34,23 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: stable
+      - name: Install Linux native dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Build Release Binary
         run: cargo build --release --locked
-      - name: Prepare Linux artifact
-        if: matrix.os == 'ubuntu-latest'
+      - name: Prepare Unix artifact
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
-          mkdir -p artifacts
-          tar -C target/release --transform='s|^fcupdater$|fcupdater-linux-x64|' -czf artifacts/fcupdater-linux-x64.tar.gz fcupdater
+          mkdir -p artifacts package
+          cp target/release/fcupdater "package/${{ matrix.binary_name }}"
+          tar -C package -czf "${{ matrix.artifact_path }}" "${{ matrix.binary_name }}"
       - name: Rename Windows artifact file
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          Move-Item target\release\fcupdater.exe target\release\fcupdater-windows-x64.exe -Force
+          Move-Item target\release\fcupdater.exe target\release\${{ matrix.binary_name }}.exe -Force
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
