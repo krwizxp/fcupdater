@@ -35,7 +35,6 @@ mod excel;
 pub(crate) mod master_sheet;
 mod numeric;
 pub(crate) mod source_download;
-pub(crate) mod source_download_opdownload;
 mod source_sync;
 const MAX_CONFLICT_ATTEMPTS: u32 = 100_000;
 const RESERVATION_MAGIC: &[u8] = b"FCUPDATER_RESERVED_v1\n";
@@ -935,6 +934,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         let mut downloaded_sources = DownloadedSourceGuard::default();
         let (source_paths, source_index, source_report) =
             self.load_sources(&mut downloaded_sources)?;
+        write_line_ignored(self.out, format_args!("마스터 파일 처리 중..."));
         let mut book = StdWorkbook::open(&self.args.master)?;
         let (changes, added, deleted) =
             master_sheet::MasterSheetOps.update_master_sheet(&mut book, &source_index)?;
@@ -944,6 +944,9 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 .update_change_log_sheet(&mut book, &today, &changes, &added, &deleted)?;
         }
         let (out_path, reserved_output) = self.determine_output_path(&today)?;
+        if !self.args.save_mode.is_dry_run() {
+            write_line_ignored(self.out, format_args!("마스터 파일 저장 중..."));
+        }
         self.save_book(&mut book, &out_path, reserved_output, &today)?;
         self.print_update_summary(&UpdateSummary {
             added: &added,

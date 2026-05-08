@@ -1,50 +1,51 @@
+#![allow(
+    clippy::arbitrary_source_item_ordering,
+    clippy::borrow_as_ptr,
+    clippy::default_numeric_fallback,
+    clippy::indexing_slicing,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::pattern_type_mismatch,
+    clippy::semicolon_outside_block,
+    clippy::shadow_reuse,
+    clippy::shadow_unrelated,
+    clippy::single_call_fn,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unnecessary_wraps,
+    reason = "WinHTTP FFI wrapper keeps raw platform calls small and local without external crates"
+)]
 use crate::{
     Result, err, err_with_source, is_metropolitan_token, is_province_token, normalize_address_key,
-    path_source_message, prefixed_message, push_display,
-    source_download_opdownload::{
-        OPDOWNLOAD_DIAGNOSTIC_SCRIPT, OPDOWNLOAD_DISCOVERY_SCRIPT, OPDOWNLOAD_PAGE_READY_SCRIPT,
-        OPDOWNLOAD_TRIGGER_SCRIPT,
-    },
-    source_sync::SourceRecord,
+    path_source_message, prefixed_message, push_display, source_sync::SourceRecord,
     strip_basic_region_suffix,
 };
 use alloc::{string::String, vec::Vec};
-use core::{fmt::Display, result::Result as StdResult, time::Duration};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt as _;
+use core::{result::Result as StdResult, time::Duration};
 use std::{
-    collections::HashSet,
-    env::{current_dir, current_exe},
     fs,
-    io::{Error, ErrorKind, Read as _, Write},
-    net::{TcpListener, TcpStream},
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::LazyLock,
     thread::sleep,
-    time::{Instant, SystemTime},
+    time::{SystemTime, UNIX_EPOCH},
 };
-const WEBDRIVER_HOST: &str = "127.0.0.1";
-const CHROMEDRIVER_CMD: &str = "chromedriver";
-const CHROMEDRIVER_DIR_NAME: &str = "chromedriver";
-const EDGEDRIVER_CMD: &str = "msedgedriver";
-const EDGEDRIVER_DIR_NAME: &str = "edgedriver";
+const OPINET_HOST: &str = "www.opinet.co.kr";
+const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
+const OPDOWNLOAD_PATH: &str = "/user/opdown/opDownload.do";
 const OPDOWNLOAD_URL: &str = "https://www.opinet.co.kr/user/opdown/opDownload.do";
+const OPDOWNLOAD_LAYOUT_PATH: &str = "/user/main/main_move_price.do";
+const OPDOWNLOAD_EXCEL_PATH: &str = "/user/main/main_download_excel.do";
+const OIL_PRICE_DOWNLOAD_TAR_URL: &str = "/user/opdown/oil_price_download";
+const OPINET_KEY: &str = "tNNJ/zjnjSUqxRLpgiO/at1/w4SoJGbzzDOFVmlgEO0=";
+const NETFUNNEL_SERVICE_ID: &str = "service_1";
+const NETFUNNEL_ENTRY_ACTION_ID: &str = "B1";
+const NETFUNNEL_DOWNLOAD_ACTION_ID: &str = "B7";
+const CURRENT_PRICE_PAGE_DIV: &str = "PAGE_DIV_2";
+const GAS_STATION_LPG_CODE: &str = "A";
+const GAS_STATION_API_GBN: &str = "A";
+const DEFAULT_REGION_LABEL: &str = "선택하세요.";
+const USER_AGENT: &str = concat!("fcupdater/", env!("CARGO_PKG_VERSION"));
+const NETFUNNEL_POLL_LIMIT: usize = 20;
 pub const AUTO_SOURCE_MARKER: &str = "__fcupdater_auto__";
-const DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_mins(3);
-const TASK_SESSION_RETRY_LIMIT: usize = 2;
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-cfg_select! {
-    windows => {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CHROMEDRIVER_BIN_NAME: &str = "chromedriver.exe";
-        const EDGEDRIVER_BIN_NAME: &str = "msedgedriver.exe";
-    }
-    _ => {
-        const CHROMEDRIVER_BIN_NAME: &str = "chromedriver";
-        const EDGEDRIVER_BIN_NAME: &str = "msedgedriver";
-    }
-}
 const TASKS: [Task; 11] = [
     Task {
         sido: "대전광역시",
@@ -100,8 +101,19 @@ struct TaskMatcher {
     sido_key: String,
     task_keys: Vec<String>,
 }
-struct ChildGuard {
-    child: Option<Child>,
+#[derive(Debug)]
+struct HttpResponse {
+    status: u32,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+struct HttpClient {
+    cookies: Vec<Cookie>,
+}
+#[derive(Clone)]
+struct Cookie {
+    name: String,
+    value: String,
 }
 pub struct SourceDownloadOps;
 pub trait SourceDownloadApi {
@@ -143,146 +155,52 @@ trait SourceDownloadOpsExt {
     ) -> Result<Vec<PathBuf>>;
 }
 trait SourceDownloadWorkflowExt {
+    fn auto_source_name(&self, prefix: &str, extension: &str) -> String;
     fn cleanup_auto_source_files(&self, dir: &Path, prefix: &str) -> StdResult<usize, String>;
-    fn download_nationwide_source(
+    fn download_nationwide_source(&self, dir: &Path, prefix: &str) -> Result<Vec<PathBuf>>;
+    fn download_nationwide_source_http(
         &self,
         dir: &Path,
         prefix: &str,
-        out: &mut dyn Write,
-    ) -> Result<Vec<PathBuf>>;
+    ) -> StdResult<PathBuf, String>;
     fn record_matches_any_task(&self, record: &SourceRecord, matchers: &[TaskMatcher]) -> bool;
     fn region_has_explicit_sigungu(&self, region: &str) -> bool;
     fn task_match_keys(&self, task: &Task) -> Vec<String>;
     fn task_matchers(&self) -> &'static [TaskMatcher];
 }
-trait SourceDownloadWebDriverExt {
-    fn apply_webdriver_spawn_options<'command>(
-        &self,
-        command: &'command mut Command,
-    ) -> &'command mut Command;
-    fn download_nationwide_source_in_session(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        download_dir: &Path,
-        prefix: &str,
-    ) -> StdResult<PathBuf, String>;
-    fn download_nationwide_source_once(
-        &self,
-        webdriver_addr: &str,
-        browser: BrowserKind,
-        download_dir: &Path,
-        prefix: &str,
-    ) -> StdResult<PathBuf, String>;
-    fn download_nationwide_source_with_retries(
-        &self,
-        webdriver_addr: &str,
-        browser: BrowserKind,
-        download_dir: &Path,
-        prefix: &str,
-        out: &mut dyn Write,
-    ) -> StdResult<PathBuf, String>;
-    fn ensure_webdriver_for_browser(
-        &self,
-        browser: BrowserKind,
-    ) -> StdResult<WebDriverContext, String>;
-    fn extract_json_optional_string_by_key(&self, json: &str, key: &str)
-    -> Option<JsonStringField>;
-    fn find_http_header_end(&self, raw: &[u8]) -> Option<(usize, usize)>;
-    fn find_relative_webdriver(&self, browser: BrowserKind) -> StdResult<Option<PathBuf>, String>;
-    fn http_request(
-        &self,
-        webdriver_addr: &str,
-        method: &str,
+trait HttpClientExt {
+    fn add_cookie(&mut self, name: &str, value: &str) -> StdResult<(), String>;
+    fn cookie_header(&self) -> Option<String>;
+    fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> StdResult<String, String>;
+    fn get_text(
+        &mut self,
+        host: &str,
         path: &str,
-        body: Option<&str>,
+        referer: Option<&str>,
     ) -> StdResult<String, String>;
-    fn is_recoverable_session_error(&self, error: &str) -> bool;
-    fn is_transient_rename_error(&self, error: &Error) -> bool;
-    fn json_escape(&self, input: &str) -> String;
-    fn os_dev_null(&self) -> &'static str;
-    fn parse_content_length(&self, header: &str) -> StdResult<Option<usize>, String>;
-    fn read_http_response(&self, stream: &mut TcpStream) -> StdResult<String, String>;
-    fn rename_with_retries(
-        &self,
-        source: &Path,
-        target: &Path,
-        timeout: Duration,
-    ) -> StdResult<(), String>;
-    fn reserve_webdriver_addr(&self) -> StdResult<String, String>;
-    fn resolve_webdriver_program(&self, browser: BrowserKind) -> StdResult<PathBuf, String>;
-    fn snapshot_files(&self, dir: &Path) -> StdResult<HashSet<PathBuf>, String>;
-    fn split_http_response<'text>(&self, raw: &'text str) -> StdResult<(u16, &'text str), String>;
-    fn wait_for_new_download(
-        &self,
-        dir: &Path,
-        before: &HashSet<PathBuf>,
-        timeout: Duration,
-    ) -> StdResult<PathBuf, String>;
-    fn wait_for_webdriver_ready(
-        &self,
-        webdriver_addr: &str,
-        timeout: Duration,
-    ) -> StdResult<(), String>;
-    fn wait_until(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        params: &WaitUntilParams<'_>,
-    ) -> StdResult<(), String>;
-    fn webdriver_accept_alert(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-    ) -> StdResult<(), String>;
-    fn webdriver_candidates_from_base(&self, browser: BrowserKind, base_dir: &Path)
-    -> [PathBuf; 2];
-    fn webdriver_delete_session(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-    ) -> StdResult<(), String>;
-    fn webdriver_download_dir_string(&self, path: &Path) -> String;
-    fn webdriver_execute_optional_string(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        script: &str,
-    ) -> StdResult<Option<String>, String>;
-    fn webdriver_execute_string(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        script: &str,
+    fn post_form(
+        &mut self,
+        host: &str,
+        path: &str,
+        form: &[(&str, &str)],
+        referer: Option<&str>,
+        ajax: bool,
+    ) -> StdResult<HttpResponse, String>;
+    fn request(
+        &mut self,
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+    ) -> StdResult<HttpResponse, String>;
+    fn request_netfunnel(
+        &mut self,
+        action_id: &str,
+        key: Option<&str>,
+        ttl: Option<u32>,
     ) -> StdResult<String, String>;
-    fn webdriver_get(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        url: &str,
-    ) -> StdResult<(), String>;
-    fn webdriver_new_session(
-        &self,
-        browser: BrowserKind,
-        webdriver_addr: &str,
-        download_dir: &Path,
-    ) -> StdResult<String, String>;
-    fn webdriver_port(&self, webdriver_addr: &str) -> u16;
-    fn webdriver_setup_hint(&self) -> String;
-    fn webdriver_try_accept_alert(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        timeout: Duration,
-    ) -> StdResult<bool, String>;
-    fn webdriver_version_mismatch_hint(&self, browser: BrowserKind, error: &str) -> &'static str;
-}
-struct WaitUntilParams<'text> {
-    expected: &'text str,
-    interval: Duration,
-    label: &'text str,
-    script: &'text str,
-    timeout: Duration,
+    fn store_response_cookies(&mut self, response: &HttpResponse) -> StdResult<(), String>;
 }
 impl SourceDownloadOpsExt for SourceDownloadOps {
     fn filter_target_region_records_impl(
@@ -331,111 +249,23 @@ impl SourceDownloadOpsExt for SourceDownloadOps {
         if removed > 0 {
             let _write_result = writeln!(out, "이전 임시 소스 파일 {removed}개 정리");
         }
-        self.download_nationwide_source(&canonical_dir, prefix, out)
-    }
-}
-#[derive(Debug, Clone, Copy)]
-enum BrowserKind {
-    Chrome,
-    Edge,
-}
-impl BrowserKind {
-    const fn browser_name(self) -> &'static str {
-        match self {
-            Self::Chrome => "chrome",
-            Self::Edge => "MicrosoftEdge",
-        }
-    }
-    const fn display_name(self) -> &'static str {
-        match self {
-            Self::Chrome => "Chrome",
-            Self::Edge => "Edge",
-        }
-    }
-    const fn driver_bin_name(self) -> &'static str {
-        match self {
-            Self::Chrome => CHROMEDRIVER_BIN_NAME,
-            Self::Edge => EDGEDRIVER_BIN_NAME,
-        }
-    }
-    const fn driver_cmd(self) -> &'static str {
-        match self {
-            Self::Chrome => CHROMEDRIVER_CMD,
-            Self::Edge => EDGEDRIVER_CMD,
-        }
-    }
-    const fn driver_dir_name(self) -> &'static str {
-        match self {
-            Self::Chrome => CHROMEDRIVER_DIR_NAME,
-            Self::Edge => EDGEDRIVER_DIR_NAME,
-        }
-    }
-    const fn options_key(self) -> &'static str {
-        match self {
-            Self::Chrome => "goog:chromeOptions",
-            Self::Edge => "ms:edgeOptions",
-        }
-    }
-}
-struct WebDriverContext {
-    addr: String,
-    driver: ChildGuard,
-}
-enum JsonStringField {
-    Null,
-    String(String),
-}
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _cleanup_diagnostic = self.shutdown();
-    }
-}
-impl ChildGuard {
-    fn shutdown(&mut self) -> Option<String> {
-        let mut child = self.child.take()?;
-        let mut diagnostic = String::with_capacity(96);
-        match child.try_wait() {
-            Ok(Some(_)) => return None,
-            Ok(None) => {}
-            Err(source_err) => {
-                diagnostic.push_str("상태 확인 실패: ");
-                push_display(&mut diagnostic, source_err);
-            }
-        }
-        match child.kill() {
-            Ok(()) => {}
-            Err(source_err) if source_err.kind() == ErrorKind::InvalidInput => {}
-            Err(source_err) => {
-                if !diagnostic.is_empty() {
-                    diagnostic.push_str(" / ");
-                }
-                diagnostic.push_str("종료 실패: ");
-                push_display(&mut diagnostic, source_err);
-            }
-        }
-        match child.wait() {
-            Ok(_) => {}
-            Err(source_err) => {
-                if !diagnostic.is_empty() {
-                    diagnostic.push_str(" / ");
-                }
-                diagnostic.push_str("대기 실패: ");
-                push_display(&mut diagnostic, source_err);
-            }
-        }
-        if diagnostic.is_empty() {
-            None
-        } else {
-            Some(diagnostic)
-        }
-    }
-}
-impl WebDriverContext {
-    fn shutdown(mut self) -> Option<String> {
-        self.driver.shutdown()
+        self.download_nationwide_source(&canonical_dir, prefix)
     }
 }
 impl SourceDownloadWorkflowExt for SourceDownloadOps {
+    fn auto_source_name(&self, prefix: &str, extension: &str) -> String {
+        let capacity = prefix
+            .len()
+            .saturating_add(AUTO_SOURCE_MARKER.len())
+            .saturating_add("_opdownload_current_price.".len())
+            .saturating_add(extension.len());
+        let mut auto_source_name = String::with_capacity(capacity);
+        auto_source_name.push_str(prefix);
+        auto_source_name.push_str(AUTO_SOURCE_MARKER);
+        auto_source_name.push_str("_opdownload_current_price.");
+        auto_source_name.push_str(extension);
+        auto_source_name
+    }
     fn cleanup_auto_source_files(&self, dir: &Path, prefix: &str) -> StdResult<usize, String> {
         let mut removed = 0_usize;
         let prefix_fold = prefix.to_lowercase();
@@ -461,84 +291,92 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
         }
         Ok(removed)
     }
-    fn download_nationwide_source(
+    fn download_nationwide_source(&self, dir: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+        let downloaded =
+            self.download_nationwide_source_http(dir, prefix)
+                .map_err(|error_text| {
+                    err(prefixed_message("Opinet 자동 다운로드 실패: ", error_text))
+                })?;
+        Ok(vec![downloaded])
+    }
+    fn download_nationwide_source_http(
         &self,
         dir: &Path,
         prefix: &str,
-        out: &mut dyn Write,
-    ) -> Result<Vec<PathBuf>> {
-        let mut errors = Vec::with_capacity(4);
-        for browser in [BrowserKind::Chrome, BrowserKind::Edge] {
-            let webdriver = match self.ensure_webdriver_for_browser(browser) {
-                Ok(context) => context,
-                Err(driver_error) => {
-                    errors.push(browser_source_message(
-                        browser.display_name(),
-                        " WebDriver 준비 실패: ",
-                        driver_error,
-                    ));
-                    continue;
-                }
-            };
-            match self.download_nationwide_source_with_retries(
-                &webdriver.addr,
-                browser,
-                dir,
-                prefix,
-                out,
-            ) {
-                Ok(downloaded) => {
-                    let _shutdown_diagnostic = webdriver.shutdown();
-                    let _write_result = writeln!(
-                        out,
-                        "다운로드 완료: {downloaded_path}",
-                        downloaded_path = downloaded.display()
-                    );
-                    return Ok(vec![downloaded]);
-                }
-                Err(download_error) => {
-                    let shutdown_diagnostic = webdriver.shutdown();
-                    let mut download_failure = download_error;
-                    if let Some(cleanup) = shutdown_diagnostic.as_deref() {
-                        download_failure.push_str(" (정리 경고: ");
-                        download_failure.push_str(cleanup);
-                        download_failure.push(')');
-                    }
-                    errors.push(browser_source_message(
-                        browser.display_name(),
-                        " 다운로드 실패: ",
-                        download_failure,
-                    ));
-                }
+    ) -> StdResult<PathBuf, String> {
+        let mut client = HttpClient {
+            cookies: Vec::new(),
+        };
+        let _gate_html = client.get_text(OPINET_HOST, OPDOWNLOAD_PATH, None)?;
+        let entry_key = client.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
+        let _entry_page = client.post_form(
+            OPINET_HOST,
+            OPDOWNLOAD_PATH,
+            &[
+                ("netfunnel_key", entry_key.as_str()),
+                ("opinet_key", OPINET_KEY),
+            ],
+            Some(OPDOWNLOAD_URL),
+            false,
+        )?;
+        let _layout = client.post_form(
+            OPINET_HOST,
+            OPDOWNLOAD_LAYOUT_PATH,
+            &[("tarUrl", OIL_PRICE_DOWNLOAD_TAR_URL)],
+            Some(OPDOWNLOAD_URL),
+            true,
+        )?;
+        let download_key = client.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
+        let response = client.post_form(
+            OPINET_HOST,
+            OPDOWNLOAD_EXCEL_PATH,
+            &[
+                ("LPG_CD", GAS_STATION_LPG_CODE),
+                ("DATE_DIV_CD", ""),
+                ("PAGE_DIV", CURRENT_PRICE_PAGE_DIV),
+                ("SIDO_NM", DEFAULT_REGION_LABEL),
+                ("SIGUN_NM", DEFAULT_REGION_LABEL),
+                ("API_GBN", GAS_STATION_API_GBN),
+                ("netfunnel_key", download_key.as_str()),
+            ],
+            Some(OPDOWNLOAD_URL),
+            false,
+        )?;
+        if !looks_like_excel(&response.body) {
+            let preview = String::from_utf8_lossy(
+                response
+                    .body
+                    .get(..response.body.len().min(512))
+                    .unwrap_or(&[]),
+            );
+            return Err(prefixed_message(
+                "다운로드 응답이 Excel 파일이 아닙니다: ",
+                preview,
+            ));
+        }
+        let extension = download_extension(&response.headers);
+        let target = dir.join(self.auto_source_name(prefix, extension));
+        let temp = dir.join(self.auto_source_name(prefix, "tmp"));
+        fs::write(&temp, &response.body)
+            .map_err(|error| path_source_message("다운로드 파일 쓰기 실패", &temp, error))?;
+        match fs::rename(&temp, &target) {
+            Ok(()) => {}
+            Err(error) => {
+                let _cleanup_result = fs::remove_file(&temp);
+                return Err(path_source_message(
+                    "다운로드 파일 이름 변경 실패",
+                    &target,
+                    error,
+                ));
             }
         }
-        let setup_hint = self.webdriver_setup_hint();
-        let mut joined_len = errors.len().saturating_sub(1);
-        for error_text in &errors {
-            joined_len = joined_len.saturating_add(error_text.len());
-        }
-        let capacity = joined_len
-            .saturating_add(setup_hint.len())
-            .saturating_add(64);
-        let mut message = String::with_capacity(capacity);
-        message.push_str("Opinet 자동 다운로드 실패: ");
-        for (index, error_message) in errors.iter().enumerate() {
-            if index > 0 {
-                message.push('\n');
-            }
-            message.push_str(error_message);
-        }
-        message.push_str("\nChrome 또는 Edge 설치와 ");
-        message.push_str(&setup_hint);
-        message.push_str("를 확인하세요.");
-        Err(err(message))
+        Ok(target)
     }
     fn record_matches_any_task(&self, record: &SourceRecord, matchers: &[TaskMatcher]) -> bool {
         let region_key = normalize_address_key(&record.region);
         let region_has_explicit_sigungu =
             !region_key.is_empty() && self.region_has_explicit_sigungu(&record.region);
         let mut combined_key: Option<String> = None;
-
         matchers.iter().any(|matcher| {
             let matches_task = |value: &str| {
                 matcher
@@ -546,7 +384,6 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
                     .iter()
                     .any(|task_key| value.contains(task_key))
             };
-
             if !region_key.is_empty() {
                 if !region_key.contains(&matcher.sido_key) {
                     return false;
@@ -558,7 +395,6 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
                     return false;
                 }
             }
-
             let combined = combined_key.get_or_insert_with(|| {
                 let capacity = record
                     .region
@@ -625,975 +461,624 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
         TASK_MATCHERS.as_slice()
     }
 }
-impl SourceDownloadWebDriverExt for SourceDownloadOps {
-    fn apply_webdriver_spawn_options<'command>(
-        &self,
-        command: &'command mut Command,
-    ) -> &'command mut Command {
-        cfg_select! {
-            windows => {
-                command.creation_flags(CREATE_NO_WINDOW)
-            }
-            _ => {
-                command
-            }
+impl HttpClientExt for HttpClient {
+    fn add_cookie(&mut self, name: &str, value: &str) -> StdResult<(), String> {
+        if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
+            cookie.value.clear();
+            cookie
+                .value
+                .try_reserve(value.len())
+                .map_err(|source| prefixed_message("Cookie 값 메모리 확보 실패: ", source))?;
+            cookie.value.push_str(value);
+            return Ok(());
         }
-    }
-    fn download_nationwide_source_in_session(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        download_dir: &Path,
-        prefix: &str,
-    ) -> StdResult<PathBuf, String> {
-        self.webdriver_get(webdriver_addr, session_id, OPDOWNLOAD_URL)?;
-        self.wait_until(
-            webdriver_addr,
-            session_id,
-            &WaitUntilParams {
-                expected: "READY",
-                interval: Duration::from_millis(500),
-                label: "opDownload 페이지 로딩",
-                script: OPDOWNLOAD_PAGE_READY_SCRIPT,
-                timeout: Duration::from_secs(30),
-            },
-        )?;
-        sleep(Duration::from_secs(2));
-        let before = self.snapshot_files(download_dir)?;
-        let trigger = match self.webdriver_execute_optional_string(
-            webdriver_addr,
-            session_id,
-            OPDOWNLOAD_TRIGGER_SCRIPT,
-        ) {
-            Ok(Some(value)) => value,
-            Ok(None) => String::from("OK|null"),
-            Err(error) => {
-                return Err(prefixed_message(
-                    "opDownload 다운로드 트리거 실행 실패: ",
-                    error,
-                ));
-            }
+        let mut cookie = Cookie {
+            name: String::new(),
+            value: String::new(),
         };
-        let _alert_result =
-            self.webdriver_try_accept_alert(webdriver_addr, session_id, Duration::from_secs(5));
-        if !trigger.starts_with("OK|") {
-            let discovery = self
-                .webdriver_execute_string(webdriver_addr, session_id, OPDOWNLOAD_DISCOVERY_SCRIPT)
-                .unwrap_or_else(|err| prefixed_message("후보 컨트롤 조회 실패: ", err));
-            let capacity = trigger
-                .len()
-                .saturating_add(discovery.len())
-                .saturating_add(48);
-            let mut out = String::with_capacity(capacity);
-            out.push_str("opDownload 다운로드 트리거를 찾지 못했습니다.\n트리거 결과: ");
-            out.push_str(&trigger);
-            out.push_str("\n후보 컨트롤:\n");
-            out.push_str(&discovery);
-            return Err(out);
-        }
-        let downloaded = self
-            .wait_for_new_download(download_dir, &before, DOWNLOAD_WAIT_TIMEOUT)
-            .map_err(|error| {
-                let diagnostic = self
-                    .webdriver_execute_string(
-                        webdriver_addr,
-                        session_id,
-                        OPDOWNLOAD_DIAGNOSTIC_SCRIPT,
-                    )
-                    .unwrap_or_else(|err| prefixed_message("후속 진단 실패: ", err));
-                let capacity = error
-                    .len()
-                    .saturating_add(trigger.len())
-                    .saturating_add(diagnostic.len())
-                    .saturating_add(40);
-                let mut out = String::with_capacity(capacity);
-                out.push_str("다운로드 대기 실패: ");
-                out.push_str(&error);
-                out.push_str("\n트리거 결과: ");
-                out.push_str(&trigger);
-                out.push_str("\n후속 진단:\n");
-                out.push_str(&diagnostic);
-                out
-            })?;
-        let ext = downloaded
-            .extension()
-            .and_then(|value| value.to_str())
-            .map_or_else(|| String::from("xls"), str::to_owned);
-        let capacity = prefix
-            .len()
-            .saturating_add(AUTO_SOURCE_MARKER.len())
-            .saturating_add("_opdownload_current_price.".len())
-            .saturating_add(ext.len());
-        let mut auto_source_name = String::with_capacity(capacity);
-        auto_source_name.push_str(prefix);
-        auto_source_name.push_str(AUTO_SOURCE_MARKER);
-        auto_source_name.push_str("_opdownload_current_price.");
-        auto_source_name.push_str(&ext);
-        let renamed = download_dir.join(auto_source_name);
-        self.rename_with_retries(&downloaded, &renamed, Duration::from_secs(10))?;
-        Ok(renamed)
+        cookie
+            .name
+            .try_reserve(name.len())
+            .map_err(|source| prefixed_message("Cookie 이름 메모리 확보 실패: ", source))?;
+        cookie
+            .value
+            .try_reserve(value.len())
+            .map_err(|source| prefixed_message("Cookie 값 메모리 확보 실패: ", source))?;
+        cookie.name.push_str(name);
+        cookie.value.push_str(value);
+        self.cookies.push(cookie);
+        Ok(())
     }
-    fn download_nationwide_source_once(
-        &self,
-        webdriver_addr: &str,
-        browser: BrowserKind,
-        download_dir: &Path,
-        prefix: &str,
-    ) -> StdResult<PathBuf, String> {
-        let session_id = self
-            .webdriver_new_session(browser, webdriver_addr, download_dir)
-            .map_err(|error| {
-                let version_hint = self.webdriver_version_mismatch_hint(browser, &error);
-                let capacity = error
-                    .len()
-                    .saturating_add(version_hint.len())
-                    .saturating_add(16);
-                let mut out = String::with_capacity(capacity);
-                out.push_str("브라우저 세션 생성 실패: ");
-                out.push_str(&error);
-                out.push_str(version_hint);
-                out
-            })?;
-        let result = self.download_nationwide_source_in_session(
-            webdriver_addr,
-            &session_id,
-            download_dir,
-            prefix,
-        );
-        let _delete_result = self.webdriver_delete_session(webdriver_addr, &session_id);
-        result
-    }
-    fn download_nationwide_source_with_retries(
-        &self,
-        webdriver_addr: &str,
-        browser: BrowserKind,
-        download_dir: &Path,
-        prefix: &str,
-        out: &mut dyn Write,
-    ) -> StdResult<PathBuf, String> {
-        let mut last_error = None;
-        for attempt in 1..=TASK_SESSION_RETRY_LIMIT {
-            match self.download_nationwide_source_once(
-                webdriver_addr,
-                browser,
-                download_dir,
-                prefix,
-            ) {
-                Ok(path) => return Ok(path),
-                Err(err) => {
-                    let should_retry = attempt < TASK_SESSION_RETRY_LIMIT
-                        && self.is_recoverable_session_error(&err);
-                    last_error = Some(err);
-                    if should_retry {
-                        let _write_result = writeln!(
-                            out,
-                            "다운로드 재시도 {attempt}/{TASK_SESSION_RETRY_LIMIT}: 브라우저 세션을 다시 시작합니다."
-                        );
-                        sleep(Duration::from_secs(2));
-                        continue;
-                    }
-                    break;
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| String::from("다운로드 실패")))
-    }
-    fn ensure_webdriver_for_browser(
-        &self,
-        browser: BrowserKind,
-    ) -> StdResult<WebDriverContext, String> {
-        let webdriver_addr = self.reserve_webdriver_addr()?;
-        let webdriver_port = self.webdriver_port(&webdriver_addr);
-        let program = self.resolve_webdriver_program(browser)?;
-        let mut command = Command::new(&program);
-        let child = self
-            .apply_webdriver_spawn_options(
-                command
-                    .env("CHROME_LOG_FILE", self.os_dev_null())
-                    .env("MSEDGEDRIVER_TELEMETRY_OPTOUT", "1")
-                    .arg({
-                        let capacity = "--port=".len().saturating_add(6);
-                        let mut arg = String::with_capacity(capacity);
-                        arg.push_str("--port=");
-                        push_display(&mut arg, webdriver_port);
-                        arg
-                    })
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null()),
-            )
-            .spawn()
-            .map_err(|error| {
-                let capacity = 96;
-                let mut out = String::with_capacity(capacity);
-                out.push('`');
-                push_display(&mut out, program.display());
-                out.push_str("` 실행 실패: ");
-                push_display(&mut out, error);
-                out
-            })?;
-        let guard = ChildGuard { child: Some(child) };
-        self.wait_for_webdriver_ready(&webdriver_addr, Duration::from_secs(15))?;
-        Ok(WebDriverContext {
-            addr: webdriver_addr,
-            driver: guard,
-        })
-    }
-    fn extract_json_optional_string_by_key(
-        &self,
-        json: &str,
-        key: &str,
-    ) -> Option<JsonStringField> {
-        let capacity = key.len().saturating_add(2);
-        let mut needle = String::with_capacity(capacity);
-        needle.push('"');
-        needle.push_str(key);
-        needle.push('"');
-        let start = json.find(&needle)?;
-        let bytes = json.as_bytes();
-        let mut index = start.checked_add(needle.len())?;
-        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-            index = index.checked_add(1)?;
-        }
-        if bytes.get(index).copied() != Some(b':') {
+    fn cookie_header(&self) -> Option<String> {
+        if self.cookies.is_empty() {
             return None;
         }
-        index = index.checked_add(1)?;
-        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-            index = index.checked_add(1)?;
+        let mut capacity = self.cookies.len().saturating_sub(1).saturating_mul(2);
+        for cookie in &self.cookies {
+            capacity = capacity
+                .saturating_add(cookie.name.len())
+                .saturating_add(cookie.value.len())
+                .saturating_add(1);
         }
-        match bytes.get(index).copied() {
-            Some(b'"') => {
-                index = index.checked_add(1)?;
-                let mut out = String::with_capacity(bytes.len().saturating_sub(index).min(128));
-                let mut escaped = false;
-                while let Some(byte) = bytes.get(index).copied() {
-                    index = index.checked_add(1)?;
-                    if escaped {
-                        let ch = match byte {
-                            b'"' => '"',
-                            b'\\' => '\\',
-                            b'/' => '/',
-                            b'b' => '\u{0008}',
-                            b'f' => '\u{000C}',
-                            b'n' => '\n',
-                            b'r' => '\r',
-                            b't' => '\t',
-                            _ => char::from(byte),
-                        };
-                        out.push(ch);
-                        escaped = false;
-                        continue;
-                    }
-                    match byte {
-                        b'\\' => escaped = true,
-                        b'"' => return Some(JsonStringField::String(out)),
-                        _ => out.push(char::from(byte)),
-                    }
-                }
-                None
+        let mut out = String::with_capacity(capacity);
+        for (index, cookie) in self.cookies.iter().enumerate() {
+            if index > 0 {
+                out.push_str("; ");
             }
-            Some(b'n') if json.get(index..)?.starts_with("null") => Some(JsonStringField::Null),
-            _ => None,
+            out.push_str(&cookie.name);
+            out.push('=');
+            out.push_str(&cookie.value);
         }
+        Some(out)
     }
-    fn find_http_header_end(&self, raw: &[u8]) -> Option<(usize, usize)> {
-        raw.array_windows::<4>()
-            .position(|window| window == b"\r\n\r\n")
-            .map(|pos| (pos, 4))
-            .or_else(|| {
-                raw.array_windows::<2>()
-                    .position(|window| window == b"\n\n")
-                    .map(|pos| (pos, 2))
-            })
+    fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> StdResult<String, String> {
+        let mut current_key: Option<String> = None;
+        for _ in 0..NETFUNNEL_POLL_LIMIT {
+            let result = self.request_netfunnel(action_id, current_key.as_deref(), None)?;
+            self.add_cookie("NetFunnel_ID", &result)?;
+            let code = netfunnel_code(&result)?;
+            if matches!(code, 200 | 300 | 303) {
+                return extract_netfunnel_key(&result);
+            }
+            if matches!(code, 201 | 202 | 302) {
+                current_key = Some(extract_netfunnel_key(&result)?);
+                let wait_secs = netfunnel_ttl(&result).unwrap_or(1).clamp(1, 30);
+                sleep(Duration::from_secs(u64::from(wait_secs)));
+                continue;
+            }
+            return Err(prefixed_message("NetFunnel 응답 오류: ", result));
+        }
+        Err(String::from("NetFunnel 대기 횟수를 초과했습니다."))
     }
-    fn find_relative_webdriver(&self, browser: BrowserKind) -> StdResult<Option<PathBuf>, String> {
-        let mut base_dirs = Vec::with_capacity(4);
-        let push_unique_path = |paths: &mut Vec<PathBuf>, candidate: PathBuf| {
-            if !paths.contains(&candidate) {
-                paths.push(candidate);
-            }
-        };
-        let path_is_file = |path: &Path| -> StdResult<bool, String> {
-            if !path
-                .try_exists()
-                .map_err(|error| path_source_message("경로 확인 실패", path, error))?
-            {
-                return Ok(false);
-            }
-            fs::metadata(path)
-                .map(|metadata| metadata.is_file())
-                .map_err(|error| path_source_message("메타데이터 확인 실패", path, error))
-        };
-        if let Ok(current_dir) = current_dir() {
-            push_unique_path(&mut base_dirs, current_dir);
-        }
-        if let Ok(current_exe) = current_exe()
-            && let Some(exe_dir) = current_exe.parent()
-        {
-            for ancestor in exe_dir.ancestors().take(3) {
-                push_unique_path(&mut base_dirs, ancestor.to_path_buf());
-            }
-        }
-        for base_dir in base_dirs {
-            for candidate in self.webdriver_candidates_from_base(browser, &base_dir) {
-                if path_is_file(&candidate)? {
-                    return Ok(Some(candidate));
-                }
-            }
-        }
-        Ok(None)
-    }
-    fn http_request(
-        &self,
-        webdriver_addr: &str,
-        method: &str,
+    fn get_text(
+        &mut self,
+        host: &str,
         path: &str,
-        body: Option<&str>,
+        referer: Option<&str>,
     ) -> StdResult<String, String> {
-        let mut stream = TcpStream::connect(webdriver_addr)
-            .map_err(|error| prefixed_message("WebDriver 연결 실패: ", error))?;
-        let _read_timeout_result = stream.set_read_timeout(Some(Duration::from_mins(1)));
-        let _write_timeout_result = stream.set_write_timeout(Some(Duration::from_mins(1)));
-        let request_body = body.unwrap_or_default();
-        let capacity = method
-            .len()
-            .saturating_add(path.len())
-            .saturating_add(webdriver_addr.len().saturating_mul(2))
-            .saturating_add(request_body.len())
-            .saturating_add(20)
-            .saturating_add(128);
-        let mut request = String::with_capacity(capacity);
-        request.push_str(method);
-        request.push(' ');
-        request.push_str(path);
-        request.push_str(" HTTP/1.1\r\nHost: ");
-        request.push_str(webdriver_addr);
-        request.push_str(
-            "\r\nConnection: close\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ",
-        );
-        push_display(&mut request, request_body.len());
-        request.push_str("\r\n\r\n");
-        request.push_str(request_body);
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| prefixed_message("요청 전송 실패: ", error))?;
-        let _flush_result = stream.flush();
-        let raw = self.read_http_response(&mut stream)?;
-        let (status, response_body) = self.split_http_response(&raw)?;
-        if !(200..300).contains(&status) {
-            let message_capacity = response_body.len().saturating_add(64);
-            let mut message = String::with_capacity(message_capacity);
-            message.push_str("HTTP ");
-            push_display(&mut message, status);
-            message.push_str(" 오류: ");
-            message.push_str(response_body);
-            return Err(message);
+        let mut headers = Vec::with_capacity(3);
+        headers.push((
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ));
+        if let Some(referer_value) = referer {
+            headers.push(("Referer", referer_value));
         }
-        Ok(response_body.to_owned())
+        let response = self.request("GET", host, path, None, &headers)?;
+        String::from_utf8(response.body)
+            .map_err(|source| prefixed_message("HTTP 응답 UTF-8 변환 실패: ", source))
     }
-    fn is_recoverable_session_error(&self, error: &str) -> bool {
-        error.contains("invalid session id")
-            || error.contains("session deleted as the browser has closed the connection")
-            || error.contains("disconnected: not connected to DevTools")
-            || error.contains("chrome not reachable")
+    fn post_form(
+        &mut self,
+        host: &str,
+        path: &str,
+        form: &[(&str, &str)],
+        referer: Option<&str>,
+        ajax: bool,
+    ) -> StdResult<HttpResponse, String> {
+        let body = form_urlencode(form)?;
+        let mut headers = Vec::with_capacity(6);
+        headers.push((
+            "Content-Type",
+            "application/x-www-form-urlencoded; charset=UTF-8",
+        ));
+        headers.push(("Accept", "text/html, */*; q=0.01"));
+        if ajax {
+            headers.push(("X-Requested-With", "XMLHttpRequest"));
+        }
+        if let Some(referer_value) = referer {
+            headers.push(("Referer", referer_value));
+        }
+        self.request("POST", host, path, Some(body.as_bytes()), &headers)
     }
-    fn is_transient_rename_error(&self, error: &Error) -> bool {
-        matches!(
-            error.kind(),
-            ErrorKind::PermissionDenied | ErrorKind::WouldBlock
-        ) || matches!(error.raw_os_error(), Some(32 | 33))
+    fn request(
+        &mut self,
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+    ) -> StdResult<HttpResponse, String> {
+        let mut merged_headers = Vec::with_capacity(headers.len().saturating_add(3));
+        merged_headers.push(("User-Agent", USER_AGENT));
+        merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
+        for header in headers {
+            merged_headers.push(*header);
+        }
+        let cookie_header = self.cookie_header();
+        if let Some(cookie_text) = cookie_header.as_deref() {
+            merged_headers.push(("Cookie", cookie_text));
+        }
+        let response = platform_https_request(method, host, path, body, &merged_headers)?;
+        self.store_response_cookies(&response)?;
+        if !(200..300).contains(&response.status) {
+            let body_preview = String::from_utf8_lossy(
+                response
+                    .body
+                    .get(..response.body.len().min(512))
+                    .unwrap_or(&[]),
+            );
+            let mut out = String::with_capacity(body_preview.len().saturating_add(64));
+            out.push_str("HTTP ");
+            push_display(&mut out, response.status);
+            out.push_str(": ");
+            out.push_str(&body_preview);
+            return Err(out);
+        }
+        Ok(response)
     }
-    fn json_escape(&self, input: &str) -> String {
-        let mut out = String::with_capacity(input.len().saturating_add(16));
-        for ch in input.chars() {
-            match ch {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                control_char if (u32::from(control_char)) < 0x20 => {
-                    let value = u32::from(control_char);
-                    out.push_str("\\u");
-                    for shift in [12_u32, 8, 4, 0] {
-                        let nibble = usize::try_from((value >> shift) & 0x0f).ok();
-                        if let Some(index) = nibble
-                            && let Some(&digit) = HEX_DIGITS.get(index)
-                        {
-                            out.push(char::from(digit));
-                        }
-                    }
+    fn request_netfunnel(
+        &mut self,
+        action_id: &str,
+        key: Option<&str>,
+        ttl: Option<u32>,
+    ) -> StdResult<String, String> {
+        let timestamp = unix_epoch_millis()?;
+        let opcode = if key.is_some() { "5002" } else { "5101" };
+        let mut path = String::with_capacity(256);
+        path.push_str("/ts.wseq?opcode=");
+        path.push_str(opcode);
+        if let Some(key_value) = key {
+            path.push_str("&key=");
+            push_percent_encoded(&mut path, key_value.as_bytes());
+        }
+        path.push_str("&nfid=0&prefix=NetFunnel.gRtype%3D");
+        path.push_str(opcode);
+        path.push_str("%3B");
+        if let Some(ttl_value) = ttl {
+            path.push_str("&ttl=");
+            push_display(&mut path, ttl_value);
+        }
+        path.push_str("&sid=");
+        path.push_str(NETFUNNEL_SERVICE_ID);
+        path.push_str("&aid=");
+        path.push_str(action_id);
+        path.push_str("&js=yes&");
+        push_display(&mut path, timestamp);
+        let response = self.request(
+            "GET",
+            NETFUNNEL_HOST,
+            &path,
+            None,
+            &[("Accept", "application/javascript,*/*;q=0.8")],
+        )?;
+        let text = String::from_utf8(response.body)
+            .map_err(|source| prefixed_message("NetFunnel 응답 UTF-8 변환 실패: ", source))?;
+        extract_quoted_value(&text, "result='", '\'')
+            .map(str::to_owned)
+            .ok_or_else(|| prefixed_message("NetFunnel result 파싱 실패: ", text))
+    }
+    fn store_response_cookies(&mut self, response: &HttpResponse) -> StdResult<(), String> {
+        for (name, value) in &response.headers {
+            if !name.eq_ignore_ascii_case("set-cookie") {
+                continue;
+            }
+            let cookie_pair = value
+                .split_once(';')
+                .map_or(value.as_str(), |(head, _)| head);
+            let Some((cookie_name, cookie_value)) = cookie_pair.split_once('=') else {
+                continue;
+            };
+            self.add_cookie(cookie_name.trim(), cookie_value.trim())?;
+        }
+        Ok(())
+    }
+}
+fn download_extension(headers: &[(String, String)]) -> &'static str {
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("content-disposition") {
+            continue;
+        }
+        let folded = value.to_ascii_lowercase();
+        if folded.contains(".xlsx") {
+            return "xlsx";
+        }
+        if folded.contains(".xls") {
+            return "xls";
+        }
+    }
+    "xls"
+}
+fn extract_netfunnel_key(result: &str) -> StdResult<String, String> {
+    let Some(start) = result.find("key=") else {
+        return Err(prefixed_message("NetFunnel key 없음: ", result));
+    };
+    let value_start = start.saturating_add("key=".len());
+    let tail = result
+        .get(value_start..)
+        .ok_or_else(|| prefixed_message("NetFunnel key 범위 오류: ", result))?;
+    let value = tail.split('&').next().unwrap_or(tail);
+    if value.is_empty() {
+        return Err(prefixed_message("NetFunnel key 비어 있음: ", result));
+    }
+    Ok(value.to_owned())
+}
+fn extract_quoted_value<'text>(text: &'text str, marker: &str, quote: char) -> Option<&'text str> {
+    let start = text.find(marker)?.checked_add(marker.len())?;
+    let rest = text.get(start..)?;
+    let end = rest.find(quote)?;
+    rest.get(..end)
+}
+fn form_urlencode(pairs: &[(&str, &str)]) -> StdResult<String, String> {
+    let mut out = String::new();
+    for (index, (key, value)) in pairs.iter().enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        push_percent_encoded(&mut out, key.as_bytes());
+        out.push('=');
+        push_percent_encoded(&mut out, value.as_bytes());
+    }
+    Ok(out)
+}
+fn looks_like_excel(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
+        || bytes.starts_with(b"PK\x03\x04")
+}
+fn netfunnel_code(result: &str) -> StdResult<u32, String> {
+    let mut parts = result.split(':');
+    let _opcode = parts.next();
+    let Some(code_text) = parts.next() else {
+        return Err(prefixed_message("NetFunnel 코드 없음: ", result));
+    };
+    code_text
+        .parse::<u32>()
+        .map_err(|source| prefixed_message("NetFunnel 코드 파싱 실패: ", source))
+}
+fn netfunnel_ttl(result: &str) -> Option<u32> {
+    let start = result.find("ttl=")?.checked_add("ttl=".len())?;
+    let tail = result.get(start..)?;
+    tail.split('&').next()?.parse::<u32>().ok()
+}
+fn push_percent_encoded(out: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in bytes {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(*byte));
+            }
+            b' ' => out.push('+'),
+            other => {
+                out.push('%');
+                out.push(char::from(HEX[usize::from(other >> 4)]));
+                out.push(char::from(HEX[usize::from(other & 0x0F)]));
+            }
+        }
+    }
+}
+fn unix_epoch_millis() -> StdResult<u128, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(|source| prefixed_message("현재 시간 조회 실패: ", source))
+}
+#[cfg(not(windows))]
+fn platform_https_request(
+    _method: &str,
+    _host: &str,
+    _path: &str,
+    _body: Option<&[u8]>,
+    _headers: &[(&str, &str)],
+) -> StdResult<HttpResponse, String> {
+    Err(String::from(
+        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 현재 구현에서는 Windows WinHTTP가 필요합니다.",
+    ))
+}
+#[cfg(windows)]
+fn platform_https_request(
+    method: &str,
+    host: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    headers: &[(&str, &str)],
+) -> StdResult<HttpResponse, String> {
+    winhttp::request(method, host, path, body, headers)
+}
+#[cfg(windows)]
+mod winhttp {
+    use super::HttpResponse;
+    use alloc::{string::String, vec::Vec};
+    use core::{
+        ffi::c_void,
+        ptr::{null, null_mut},
+    };
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt as _};
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
+    const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
+    const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+    const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+    const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
+    const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+    type HInternet = *mut c_void;
+    #[link(name = "winhttp")]
+    unsafe extern "system" {
+        fn WinHttpCloseHandle(h_internet: HInternet) -> i32;
+        fn WinHttpConnect(
+            h_session: HInternet,
+            server_name: *const u16,
+            server_port: u16,
+            reserved: u32,
+        ) -> HInternet;
+        fn WinHttpOpen(
+            user_agent: *const u16,
+            access_type: u32,
+            proxy_name: *const u16,
+            proxy_bypass: *const u16,
+            flags: u32,
+        ) -> HInternet;
+        fn WinHttpOpenRequest(
+            h_connect: HInternet,
+            verb: *const u16,
+            object_name: *const u16,
+            version: *const u16,
+            referrer: *const u16,
+            accept_types: *const *const u16,
+            flags: u32,
+        ) -> HInternet;
+        fn WinHttpQueryDataAvailable(h_request: HInternet, bytes_available: *mut u32) -> i32;
+        fn WinHttpQueryHeaders(
+            h_request: HInternet,
+            info_level: u32,
+            name: *const u16,
+            buffer: *mut c_void,
+            buffer_length: *mut u32,
+            index: *mut u32,
+        ) -> i32;
+        fn WinHttpReadData(
+            h_request: HInternet,
+            buffer: *mut c_void,
+            bytes_to_read: u32,
+            bytes_read: *mut u32,
+        ) -> i32;
+        fn WinHttpReceiveResponse(h_request: HInternet, reserved: *mut c_void) -> i32;
+        fn WinHttpSendRequest(
+            h_request: HInternet,
+            headers: *const u16,
+            headers_length: u32,
+            optional: *const c_void,
+            optional_length: u32,
+            total_length: u32,
+            context: usize,
+        ) -> i32;
+        fn WinHttpSetTimeouts(
+            h_internet: HInternet,
+            resolve_timeout: i32,
+            connect_timeout: i32,
+            send_timeout: i32,
+            receive_timeout: i32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLastError() -> u32;
+    }
+    struct Handle(HInternet);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    WinHttpCloseHandle(self.0);
                 }
-                regular_char => out.push(regular_char),
-            }
-        }
-        out
-    }
-    fn os_dev_null(&self) -> &'static str {
-        cfg_select! {
-            windows => {
-                "NUL"
-            }
-            _ => {
-                "/dev/null"
             }
         }
     }
-    fn parse_content_length(&self, header: &str) -> StdResult<Option<usize>, String> {
-        for line in header.lines() {
+    pub(super) fn request(
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, String> {
+        let user_agent = wide(super::USER_AGENT);
+        let host_wide = wide(host);
+        let method_wide = wide(method);
+        let path_wide = wide(path);
+        let session = unsafe {
+            WinHttpOpen(
+                user_agent.as_ptr(),
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                null(),
+                null(),
+                0,
+            )
+        };
+        let session = non_null_handle(session, "WinHttpOpen")?;
+        unsafe {
+            WinHttpSetTimeouts(session.0, 30_000, 30_000, 60_000, 60_000);
+        }
+        let connect = unsafe {
+            WinHttpConnect(
+                session.0,
+                host_wide.as_ptr(),
+                INTERNET_DEFAULT_HTTPS_PORT,
+                0,
+            )
+        };
+        let connect = non_null_handle(connect, "WinHttpConnect")?;
+        let request = unsafe {
+            WinHttpOpenRequest(
+                connect.0,
+                method_wide.as_ptr(),
+                path_wide.as_ptr(),
+                null(),
+                null(),
+                null(),
+                WINHTTP_FLAG_SECURE,
+            )
+        };
+        let request = non_null_handle(request, "WinHttpOpenRequest")?;
+        let headers_text = build_headers(headers)?;
+        let headers_wide = wide(&headers_text);
+        let body_slice = body.unwrap_or(&[]);
+        let body_len = u32::try_from(body_slice.len())
+            .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?;
+        let sent = unsafe {
+            WinHttpSendRequest(
+                request.0,
+                headers_wide.as_ptr(),
+                u32::try_from(headers_wide.len().saturating_sub(1))
+                    .map_err(|source| format!("요청 헤더 길이 변환 실패: {source}"))?,
+                if body_slice.is_empty() {
+                    null()
+                } else {
+                    body_slice.as_ptr().cast::<c_void>()
+                },
+                body_len,
+                body_len,
+                0,
+            )
+        };
+        if sent == 0 {
+            return Err(last_error_message("WinHttpSendRequest"));
+        }
+        let received = unsafe { WinHttpReceiveResponse(request.0, null_mut()) };
+        if received == 0 {
+            return Err(last_error_message("WinHttpReceiveResponse"));
+        }
+        let status = query_status(request.0)?;
+        let headers = query_headers(request.0)?;
+        let body = read_body(request.0)?;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+    fn build_headers(headers: &[(&str, &str)]) -> Result<String, String> {
+        let mut out = String::new();
+        for (name, value) in headers {
+            out.try_reserve(name.len().saturating_add(value.len()).saturating_add(4))
+                .map_err(|source| format!("요청 헤더 메모리 확보 실패: {source}"))?;
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push_str("\r\n");
+        }
+        Ok(out)
+    }
+    fn last_error_message(context: &str) -> String {
+        let code = unsafe { GetLastError() };
+        format!("{context} 실패: Windows error {code}")
+    }
+    fn non_null_handle(handle: HInternet, context: &str) -> Result<Handle, String> {
+        if handle.is_null() {
+            Err(last_error_message(context))
+        } else {
+            Ok(Handle(handle))
+        }
+    }
+    fn query_headers(request: HInternet) -> Result<Vec<(String, String)>, String> {
+        let mut bytes = 0_u32;
+        let mut index = 0_u32;
+        let ok = unsafe {
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                null(),
+                null_mut(),
+                &mut bytes,
+                &mut index,
+            )
+        };
+        if ok != 0 {
+            return Ok(Vec::new());
+        }
+        let last_error = unsafe { GetLastError() };
+        if last_error != ERROR_INSUFFICIENT_BUFFER {
+            return Err(last_error_message("WinHttpQueryHeaders"));
+        }
+        let units = usize::try_from(bytes)
+            .map_err(|source| format!("응답 헤더 길이 변환 실패: {source}"))?
+            .checked_div(2)
+            .ok_or_else(|| String::from("응답 헤더 길이 계산 실패"))?;
+        let mut buffer = vec![0_u16; units];
+        index = 0;
+        let ok = unsafe {
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                null(),
+                buffer.as_mut_ptr().cast::<c_void>(),
+                &mut bytes,
+                &mut index,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error_message("WinHttpQueryHeaders"));
+        }
+        while buffer.last().copied() == Some(0) {
+            buffer.pop();
+        }
+        let raw = String::from_utf16_lossy(&buffer);
+        let mut parsed = Vec::new();
+        for line in raw.lines().skip(1) {
             let Some((name, value)) = line.split_once(':') else {
                 continue;
             };
-            if name.eq_ignore_ascii_case("content-length") {
-                let value_text = value.trim();
-                let length = value_text.parse::<usize>().map_err(|err| {
-                    let capacity = value_text.len().saturating_add(40);
-                    let mut out = String::with_capacity(capacity);
-                    out.push_str("Content-Length 파싱 실패: ");
-                    out.push_str(value_text);
-                    out.push_str(" (");
-                    push_display(&mut out, err);
-                    out.push(')');
-                    out
-                })?;
-                return Ok(Some(length));
-            }
+            parsed.push((name.trim().to_owned(), value.trim().to_owned()));
         }
-        Ok(None)
+        Ok(parsed)
     }
-    fn read_http_response(&self, stream: &mut TcpStream) -> StdResult<String, String> {
-        let mut raw: Vec<u8> = Vec::new();
-        raw.try_reserve_exact(8192).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("HTTP 응답 버퍼 메모리 확보 실패: ");
-            push_display(&mut message, source);
-            message
-        })?;
-        let mut expected_total_len = None;
-        loop {
-            let mut chunk = [0_u8; 4096];
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => {
-                    let chunk_bytes = chunk
-                        .get(..read)
-                        .ok_or_else(|| "HTTP 응답 chunk 범위 오류".to_owned())?;
-                    raw.try_reserve(chunk_bytes.len()).map_err(|source| {
-                        let mut message = String::with_capacity(64);
-                        message.push_str("HTTP 응답 버퍼 추가 메모리 확보 실패: ");
-                        push_display(&mut message, source);
-                        message
-                    })?;
-                    raw.extend_from_slice(chunk_bytes);
-                    if expected_total_len.is_none()
-                        && let Some((header_end, separator_len)) = self.find_http_header_end(&raw)
-                    {
-                        let header_bytes = raw
-                            .get(..header_end)
-                            .ok_or_else(|| "HTTP 헤더 범위 오류".to_owned())?;
-                        let header = String::from_utf8_lossy(header_bytes);
-                        if let Some(content_length) = self.parse_content_length(&header)? {
-                            expected_total_len = Some(
-                                header_end
-                                    .checked_add(separator_len)
-                                    .and_then(|value| value.checked_add(content_length))
-                                    .ok_or_else(|| "HTTP 응답 길이 계산 overflow".to_owned())?,
-                            );
-                            if let Some(expected) = expected_total_len
-                                && expected > raw.len()
-                            {
-                                let additional = expected.saturating_sub(raw.len());
-                                raw.try_reserve(additional).map_err(|source| {
-                                    let mut message = String::with_capacity(64);
-                                    message.push_str("HTTP 응답 Content-Length 메모리 확보 실패: ");
-                                    push_display(&mut message, additional);
-                                    message.push_str(" bytes (");
-                                    push_display(&mut message, source);
-                                    message.push(')');
-                                    message
-                                })?;
-                            }
-                        }
-                    }
-                    if expected_total_len.is_some_and(|expected| raw.len() >= expected) {
-                        break;
-                    }
-                }
-                Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
-                    if raw.is_empty() {
-                        return Err("HTTP 응답이 비어 있습니다".into());
-                    }
-                    break;
-                }
-                Err(err) => return Err(prefixed_message("응답 수신 실패: ", err)),
-            }
-        }
-        if raw.is_empty() {
-            return Err("HTTP 응답이 비어 있습니다".into());
-        }
-        if let Some(expected) = expected_total_len
-            && raw.len() < expected
-        {
-            let capacity = 96;
-            let mut out = String::with_capacity(capacity);
-            out.push_str("HTTP 응답 본문이 끝나기 전에 연결이 종료되었습니다. (received=");
-            push_display(&mut out, raw.len());
-            out.push_str(", expected=");
-            push_display(&mut out, expected);
-            out.push(')');
-            return Err(out);
-        }
-        Ok(String::from_utf8_lossy(&raw).into_owned())
-    }
-    fn rename_with_retries(
-        &self,
-        source: &Path,
-        target: &Path,
-        timeout: Duration,
-    ) -> StdResult<(), String> {
-        let start = Instant::now();
-        let mut last_error = None;
-        loop {
-            match fs::rename(source, target) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    let error_text = format!("{error}");
-                    if !self.is_transient_rename_error(&error) || start.elapsed() > timeout {
-                        return Err(last_error.unwrap_or(error_text));
-                    }
-                    last_error = Some(error_text);
-                    sleep(Duration::from_millis(250));
-                }
-            }
-        }
-    }
-    fn reserve_webdriver_addr(&self) -> StdResult<String, String> {
-        for _ in 0_u32..32_u32 {
-            let listener_v4 = TcpListener::bind((WEBDRIVER_HOST, 0))
-                .map_err(|error| prefixed_message("빈 WebDriver 포트 확보 실패: ", error))?;
-            let port = listener_v4
-                .local_addr()
-                .map_err(|error| prefixed_message("할당 포트 확인 실패: ", error))?
-                .port();
-            match TcpListener::bind(("::1", port)) {
-                Ok(listener_v6) => {
-                    drop(listener_v6);
-                    drop(listener_v4);
-                    let capacity = WEBDRIVER_HOST.len().saturating_add(6).saturating_add(1);
-                    let mut addr = String::with_capacity(capacity);
-                    addr.push_str(WEBDRIVER_HOST);
-                    addr.push(':');
-                    push_display(&mut addr, port);
-                    return Ok(addr);
-                }
-                Err(err) if err.kind() == ErrorKind::AddrInUse => {}
-                Err(err) if err.kind() == ErrorKind::AddrNotAvailable => {
-                    return Err(
-                        "IPv6 loopback(::1)을 사용할 수 없습니다. 현재 ChromeDriver는 IPv6 바인딩이 가능한 환경이 필요합니다."
-                            .to_owned(),
-                    );
-                }
-                Err(err) => {
-                    return Err(prefixed_message("IPv6 포트 확인 실패: ", err));
-                }
-            }
-        }
-        Err(String::from(
-            "사용 가능한 WebDriver 포트를 찾지 못했습니다.",
-        ))
-    }
-    fn resolve_webdriver_program(&self, browser: BrowserKind) -> StdResult<PathBuf, String> {
-        if let Some(candidate) = self.find_relative_webdriver(browser)? {
-            return Ok(candidate);
-        }
-        Ok(PathBuf::from(browser.driver_cmd()))
-    }
-    fn snapshot_files(&self, dir: &Path) -> StdResult<HashSet<PathBuf>, String> {
-        let mut set: HashSet<PathBuf> = HashSet::new();
-        set.try_reserve(32).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("다운로드 snapshot 집합 메모리 확보 실패: ");
-            push_display(&mut message, source);
-            message
-        })?;
-        if !dir
-            .try_exists()
-            .map_err(|error| path_source_message("다운로드 폴더 경로 확인 실패", dir, error))?
-        {
-            return Ok(set);
-        }
-        let entries = fs::read_dir(dir)
-            .map_err(|error| path_source_message("다운로드 폴더 읽기 실패", dir, error))?;
-        for entry_result in entries {
-            let dir_entry = entry_result
-                .map_err(|error| prefixed_message("디렉터리 항목 읽기 실패: ", error))?;
-            let path = dir_entry.path();
-            if path.is_file() {
-                set.try_reserve(1).map_err(|source| {
-                    let mut message = String::with_capacity(64);
-                    message.push_str("다운로드 snapshot 항목 추가 메모리 확보 실패: ");
-                    push_display(&mut message, source);
-                    message
-                })?;
-                set.insert(path);
-            }
-        }
-        Ok(set)
-    }
-    fn split_http_response<'text>(&self, raw: &'text str) -> StdResult<(u16, &'text str), String> {
-        if raw.trim().is_empty() {
-            return Err("HTTP 응답이 비어 있습니다".into());
-        }
-        let status_line = raw
-            .lines()
-            .find(|line| !line.is_empty())
-            .ok_or_else(|| "HTTP 상태줄을 읽지 못했습니다".to_owned())?;
-        let mut parts = status_line.split_whitespace();
-        let _http = parts.next();
-        let code = parts
-            .next()
-            .ok_or_else(|| prefixed_message("HTTP 상태코드 없음: ", status_line))?
-            .parse::<u16>()
-            .map_err(|error| prefixed_message("HTTP 상태코드 파싱 실패: ", error))?;
-        let body = raw
-            .split_once("\r\n\r\n")
-            .or_else(|| raw.split_once("\n\n"))
-            .map(|(_, body)| body)
-            .ok_or_else(|| "HTTP 본문을 찾지 못했습니다".to_owned())?;
-        Ok((code, body))
-    }
-    fn wait_for_new_download(
-        &self,
-        dir: &Path,
-        before: &HashSet<PathBuf>,
-        timeout: Duration,
-    ) -> StdResult<PathBuf, String> {
-        let start = Instant::now();
-        loop {
-            let mut latest_complete: Option<(Option<SystemTime>, PathBuf)> = None;
-            let mut temp_exists = false;
-            if dir
-                .try_exists()
-                .map_err(|error| path_source_message("다운로드 폴더 경로 확인 실패", dir, error))?
-            {
-                let entries = fs::read_dir(dir)
-                    .map_err(|error| path_source_message("다운로드 폴더 읽기 실패", dir, error))?;
-                for entry_result in entries {
-                    let dir_entry = entry_result
-                        .map_err(|error| prefixed_message("디렉터리 항목 읽기 실패: ", error))?;
-                    let path = dir_entry.path();
-                    if !path.is_file() || before.contains(&path) {
-                        continue;
-                    }
-                    let ext = path
-                        .extension()
-                        .and_then(|suffix| suffix.to_str())
-                        .unwrap_or_default();
-                    if ext.eq_ignore_ascii_case("xls") || ext.eq_ignore_ascii_case("xlsx") {
-                        let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
-                        let should_replace = latest_complete.as_ref().is_none_or(|best| {
-                            modified > best.0 || (modified == best.0 && path > best.1)
-                        });
-                        if should_replace {
-                            latest_complete = Some((modified, path));
-                        }
-                    } else {
-                        let is_temp_download = ext.eq_ignore_ascii_case("crdownload")
-                            || ext.eq_ignore_ascii_case("part")
-                            || ext.eq_ignore_ascii_case("tmp");
-                        if is_temp_download {
-                            temp_exists = true;
-                        }
-                    }
-                }
-            }
-            if let Some((_, path)) = latest_complete
-                && !temp_exists
-            {
-                return Ok(path);
-            }
-            if start.elapsed() > timeout {
-                return Err("다운로드 완료 파일을 찾지 못했습니다".into());
-            }
-            sleep(Duration::from_millis(500));
-        }
-    }
-    fn wait_for_webdriver_ready(
-        &self,
-        webdriver_addr: &str,
-        timeout: Duration,
-    ) -> StdResult<(), String> {
-        let start = Instant::now();
-        let mut last_error = "아직 /status 응답이 없습니다.".into();
-        loop {
-            if start.elapsed() > timeout {
-                return Err(prefixed_message(
-                    "WebDriver 준비 대기 시간 초과: ",
-                    &last_error,
-                ));
-            }
-            match self.http_request(webdriver_addr, "GET", "/status", None) {
-                Ok(response)
-                    if response.contains(r#""ready":true"#)
-                        || response.contains(r#""ready": true"#)
-                        || response.contains("ChromeDriver ready for new sessions") =>
-                {
-                    return Ok(());
-                }
-                Ok(response) => {
-                    last_error = prefixed_message("WebDriver 준비 전 응답: ", response);
-                }
-                Err(err) => {
-                    last_error = err;
-                }
-            }
-            sleep(Duration::from_millis(200));
-        }
-    }
-    fn wait_until(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        params: &WaitUntilParams<'_>,
-    ) -> StdResult<(), String> {
-        let start = Instant::now();
-        loop {
-            let value = self.webdriver_execute_string(webdriver_addr, session_id, params.script)?;
-            if value == params.expected {
-                return Ok(());
-            }
-            if start.elapsed() > params.timeout {
-                let mut out = String::with_capacity(params.label.len().saturating_add(16));
-                out.push_str("대기 시간 초과: ");
-                out.push_str(params.label);
-                return Err(out);
-            }
-            sleep(params.interval);
-        }
-    }
-    fn webdriver_accept_alert(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-    ) -> StdResult<(), String> {
-        let path = build_webdriver_session_path(session_id, "/alert/accept");
-        self.http_request(webdriver_addr, "POST", &path, Some("{}"))?;
-        Ok(())
-    }
-    fn webdriver_candidates_from_base(
-        &self,
-        browser: BrowserKind,
-        base_dir: &Path,
-    ) -> [PathBuf; 2] {
-        [
-            base_dir.join(browser.driver_bin_name()),
-            base_dir
-                .join(browser.driver_dir_name())
-                .join(browser.driver_bin_name()),
-        ]
-    }
-    fn webdriver_delete_session(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-    ) -> StdResult<(), String> {
-        let path = build_webdriver_session_path(session_id, "");
-        self.http_request(webdriver_addr, "DELETE", &path, None)?;
-        Ok(())
-    }
-    fn webdriver_download_dir_string(&self, path: &Path) -> String {
-        cfg_select! {
-            windows => {
-                let raw = path.to_string_lossy();
-                raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
-            }
-            _ => {
-                path.to_string_lossy().into_owned()
-            }
-        }
-    }
-    fn webdriver_execute_optional_string(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        script: &str,
-    ) -> StdResult<Option<String>, String> {
-        let path = build_webdriver_session_path(session_id, "/execute/sync");
-        let escaped_script = self.json_escape(script);
-        let mut body = String::with_capacity(
-            escaped_script
-                .len()
-                .saturating_add(r#"{"script":"","args":[]}"#.len()),
-        );
-        body.push_str(r#"{"script":""#);
-        body.push_str(&escaped_script);
-        body.push_str(r#"","args":[]}"#);
-        let response = self.http_request(webdriver_addr, "POST", &path, Some(&body))?;
-        match self.extract_json_optional_string_by_key(&response, "value") {
-            Some(JsonStringField::String(value)) => Ok(Some(value)),
-            Some(JsonStringField::Null) => Ok(None),
-            None => Err(prefixed_message("execute/sync 응답 파싱 실패: ", response)),
-        }
-    }
-    fn webdriver_execute_string(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        script: &str,
-    ) -> StdResult<String, String> {
-        self.webdriver_execute_optional_string(webdriver_addr, session_id, script)?
-            .map_or_else(|| Err(String::from("execute/sync 응답이 null 입니다.")), Ok)
-    }
-    fn webdriver_get(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        url: &str,
-    ) -> StdResult<(), String> {
-        let path = build_webdriver_session_path(session_id, "/url");
-        let escaped_url = self.json_escape(url);
-        let mut body =
-            String::with_capacity(escaped_url.len().saturating_add(r#"{"url":""}"#.len()));
-        body.push_str(r#"{"url":""#);
-        body.push_str(&escaped_url);
-        body.push_str(r#""}"#);
-        self.http_request(webdriver_addr, "POST", &path, Some(&body))?;
-        Ok(())
-    }
-    fn webdriver_new_session(
-        &self,
-        browser: BrowserKind,
-        webdriver_addr: &str,
-        download_dir: &Path,
-    ) -> StdResult<String, String> {
-        let dir_str = self.webdriver_download_dir_string(download_dir);
-        let escaped_dir = self.json_escape(&dir_str);
-        let browser_name = browser.browser_name();
-        let options_key = browser.options_key();
-        let mut body = String::with_capacity(
-            escaped_dir
-                .len()
-                .saturating_add(browser_name.len())
-                .saturating_add(options_key.len())
-                .saturating_add(256),
-        );
-        body.push_str(r#"{"capabilities":{"alwaysMatch":{"browserName":""#);
-        body.push_str(browser_name);
-        body.push_str(r#"",""#);
-        body.push_str(options_key);
-        body.push_str(r#"":{"args":["--headless=new","--window-size=1920,1080","--disable-background-networking","--disable-default-apps","--disable-gpu","--disable-sync","--log-level=3","--no-first-run"],"excludeSwitches":["enable-logging"],"prefs":{"download.default_directory":""#);
-        body.push_str(&escaped_dir);
-        body.push_str(r#"","download.prompt_for_download":false,"download.directory_upgrade":true,"safebrowsing.enabled":true,"profile.default_content_setting_values.automatic_downloads":1}}}}}"#);
-        let response = self.http_request(webdriver_addr, "POST", "/session", Some(&body))?;
-        match self.extract_json_optional_string_by_key(&response, "sessionId") {
-            Some(JsonStringField::String(session_id)) => Ok(session_id),
-            _ => Err(prefixed_message("sessionId 파싱 실패: ", response)),
-        }
-    }
-    fn webdriver_port(&self, webdriver_addr: &str) -> u16 {
-        webdriver_addr
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .unwrap_or(9515)
-    }
-    fn webdriver_setup_hint(&self) -> String {
-        let capacity = BrowserKind::Chrome
-            .driver_dir_name()
-            .len()
-            .saturating_add(BrowserKind::Chrome.driver_bin_name().len())
-            .saturating_add(1);
-        let mut chrome_hint = String::with_capacity(capacity);
-        chrome_hint.push_str(BrowserKind::Chrome.driver_dir_name());
-        chrome_hint.push('/');
-        chrome_hint.push_str(BrowserKind::Chrome.driver_bin_name());
-        let edge_capacity = BrowserKind::Edge
-            .driver_dir_name()
-            .len()
-            .saturating_add(BrowserKind::Edge.driver_bin_name().len())
-            .saturating_add(1);
-        let mut edge_hint = String::with_capacity(edge_capacity);
-        edge_hint.push_str(BrowserKind::Edge.driver_dir_name());
-        edge_hint.push('/');
-        edge_hint.push_str(BrowserKind::Edge.driver_bin_name());
-        let output_capacity = BrowserKind::Chrome
-            .driver_cmd()
-            .len()
-            .saturating_add(BrowserKind::Edge.driver_cmd().len())
-            .saturating_add(chrome_hint.len())
-            .saturating_add(edge_hint.len())
-            .saturating_add(32);
-        let mut out = String::with_capacity(output_capacity);
-        out.push('`');
-        out.push_str(BrowserKind::Chrome.driver_cmd());
-        out.push_str("` 또는 `");
-        out.push_str(BrowserKind::Edge.driver_cmd());
-        out.push_str("` PATH 등록, 또는 프로젝트 내 `");
-        out.push_str(&chrome_hint);
-        out.push_str("` / `");
-        out.push_str(&edge_hint);
-        out.push_str("` 배치");
-        out
-    }
-    fn webdriver_try_accept_alert(
-        &self,
-        webdriver_addr: &str,
-        session_id: &str,
-        timeout: Duration,
-    ) -> StdResult<bool, String> {
-        let start = Instant::now();
-        loop {
-            match self.webdriver_accept_alert(webdriver_addr, session_id) {
-                Ok(()) => return Ok(true),
-                Err(err) if err.contains("no such alert") => {
-                    if start.elapsed() > timeout {
-                        return Ok(false);
-                    }
-                    sleep(Duration::from_millis(200));
-                }
-                Err(err) => {
-                    if start.elapsed() > timeout {
-                        return Err(err);
-                    }
-                    sleep(Duration::from_millis(200));
-                }
-            }
-        }
-    }
-    fn webdriver_version_mismatch_hint(&self, browser: BrowserKind, error: &str) -> &'static str {
-        if error.contains("only supports Chrome version")
-            || error.contains("Current browser version is")
-            || error.contains("only supports Microsoft Edge version")
-        {
-            match browser {
-                BrowserKind::Chrome => {
-                    "\n설치된 Chrome과 ChromeDriver의 메이저 버전을 맞춰 주세요."
-                }
-                BrowserKind::Edge => "\n설치된 Edge와 EdgeDriver의 메이저 버전을 맞춰 주세요.",
-            }
+    fn query_status(request: HInternet) -> Result<u32, String> {
+        let mut status = 0_u32;
+        let mut bytes = u32::try_from(size_of::<u32>())
+            .map_err(|source| format!("상태 코드 버퍼 길이 변환 실패: {source}"))?;
+        let ok = unsafe {
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                null(),
+                (&raw mut status).cast::<c_void>(),
+                &mut bytes,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            Err(last_error_message("WinHttpQueryHeaders status"))
         } else {
-            ""
+            Ok(status)
         }
     }
-}
-fn build_webdriver_session_path(session_id: &str, suffix: &str) -> String {
-    let capacity = "/session/"
-        .len()
-        .saturating_add(session_id.len())
-        .saturating_add(suffix.len());
-    let mut path = String::with_capacity(capacity);
-    path.push_str("/session/");
-    path.push_str(session_id);
-    path.push_str(suffix);
-    path
-}
-fn browser_source_message(browser_name: &str, label: &str, source: impl Display) -> String {
-    let capacity = browser_name
-        .len()
-        .saturating_add(label.len())
-        .saturating_add(64);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(browser_name);
-    out.push_str(label);
-    push_display(&mut out, source);
-    out
+    fn read_body(request: HInternet) -> Result<Vec<u8>, String> {
+        let mut body = Vec::new();
+        loop {
+            let mut available = 0_u32;
+            let ok = unsafe { WinHttpQueryDataAvailable(request, &mut available) };
+            if ok == 0 {
+                return Err(last_error_message("WinHttpQueryDataAvailable"));
+            }
+            if available == 0 {
+                break;
+            }
+            let chunk_len = usize::try_from(available)
+                .map_err(|source| format!("응답 chunk 길이 변환 실패: {source}"))?;
+            let old_len = body.len();
+            body.try_reserve(chunk_len)
+                .map_err(|source| format!("응답 본문 메모리 확보 실패: {source}"))?;
+            body.resize(old_len.saturating_add(chunk_len), 0);
+            let mut read = 0_u32;
+            let ok = unsafe {
+                WinHttpReadData(
+                    request,
+                    body.as_mut_ptr().add(old_len).cast::<c_void>(),
+                    available,
+                    &mut read,
+                )
+            };
+            if ok == 0 {
+                return Err(last_error_message("WinHttpReadData"));
+            }
+            let read_len = usize::try_from(read)
+                .map_err(|source| format!("응답 read 길이 변환 실패: {source}"))?;
+            body.truncate(old_len.saturating_add(read_len));
+            if read == 0 {
+                break;
+            }
+        }
+        Ok(body)
+    }
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain([0]).collect()
+    }
 }
