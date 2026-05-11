@@ -1161,6 +1161,7 @@ mod winhttp {
     const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
     const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
     const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+    const WINHTTP_OPTION_IGNORE_CERT_REVOCATION_OFFLINE: u32 = 155;
     const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
     const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
     const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
@@ -1214,6 +1215,12 @@ mod winhttp {
             optional_length: u32,
             total_length: u32,
             context: usize,
+        ) -> i32;
+        fn WinHttpSetOption(
+            h_internet: HInternet,
+            option: u32,
+            buffer: *mut c_void,
+            buffer_length: u32,
         ) -> i32;
         fn WinHttpSetTimeouts(
             h_internet: HInternet,
@@ -1282,6 +1289,7 @@ mod winhttp {
             )
         };
         let request = non_null_handle(request, "WinHttpOpenRequest")?;
+        set_ignore_revocation_offline(request.0)?;
         let headers_text = build_headers(headers)?;
         let headers_wide = wide(&headers_text);
         let body_slice = body.unwrap_or(&[]);
@@ -1340,6 +1348,26 @@ mod winhttp {
             Err(last_error_message(context))
         } else {
             Ok(Handle(handle))
+        }
+    }
+    fn set_ignore_revocation_offline(request: HInternet) -> Result<(), String> {
+        let mut enabled = 1_u32;
+        let buffer_length = u32::try_from(size_of::<u32>())
+            .map_err(|source| format!("WinHTTP 옵션 길이 변환 실패: {source}"))?;
+        let ok = unsafe {
+            WinHttpSetOption(
+                request,
+                WINHTTP_OPTION_IGNORE_CERT_REVOCATION_OFFLINE,
+                (&raw mut enabled).cast::<c_void>(),
+                buffer_length,
+            )
+        };
+        if ok == 0 {
+            Err(last_error_message(
+                "WinHttpSetOption IGNORE_CERT_REVOCATION_OFFLINE",
+            ))
+        } else {
+            Ok(())
         }
     }
     fn query_headers(request: HInternet) -> Result<Vec<(String, String)>, String> {
