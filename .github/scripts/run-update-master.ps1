@@ -26,8 +26,9 @@ Require-NonEmpty $sourcesPrefix "sources_prefix"
 $skipDownload = Parse-Bool $env:FCUPDATER_SKIP_DOWNLOAD "skip_download"
 $noChangeLog = Parse-Bool $env:FCUPDATER_NO_CHANGE_LOG "no_change_log"
 $fastSave = Parse-Bool $env:FCUPDATER_FAST_SAVE "fast_save"
-New-Item -ItemType Directory -Force artifacts | Out-Null
-$outputPath = Join-Path $PWD ("artifacts\{0}.xlsx" -f $artifactStem)
+$artifactDir = Join-Path $PWD "artifacts"
+New-Item -ItemType Directory -Force $artifactDir | Out-Null
+$outputPath = Join-Path $artifactDir ("{0}.xlsx" -f $artifactStem)
 $args = @(
   "--master", $masterPath,
   "--sources-dir", ".",
@@ -43,5 +44,13 @@ if ($noChangeLog) {
 if ($fastSave) {
   $args += "--fast-save"
 }
-& .\target\release\fcupdater.exe @args
+$runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+  [System.Runtime.InteropServices.OSPlatform]::Windows
+)
+if ($runningOnWindows) {
+  $binaryPath = Join-Path $PWD "target\release\fcupdater.exe"
+} else {
+  $binaryPath = Join-Path $PWD "target/release/fcupdater"
+}
+& $binaryPath @args
 "artifact_path=$outputPath" >> $env:GITHUB_OUTPUT
