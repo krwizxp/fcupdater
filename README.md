@@ -3,6 +3,7 @@
 - Excel 미설치 환경에서 동작
 - Opinet 전국 단일 소스 파일 자동 다운로드(기본)
 - `.xls` / `.xlsx` 소스 입력 지원
+- `.xlsx` 압축/해제는 내장 Rust ZIP/deflate 처리 사용
 - 주소 기반 매칭으로 기존 행 갱신
 - 소스 파일 prefix 대소문자 구분 없이 자동 탐색
 - 소스 기준 신규 업체 자동 추가
@@ -17,11 +18,8 @@
 - 자동 다운로드: Windows는 WinHTTP, Linux/macOS는 native libcurl 사용
 - Linux 빌드 환경: libcurl 개발 패키지 필요(예: Ubuntu/Debian `libcurl4-openssl-dev`)
 - Linux 실행 환경: libcurl 공유 라이브러리 필요(예: Ubuntu/Debian `libcurl4`)
-- 압축/해제 도구
-- Windows: `pwsh` 또는 `powershell` 또는 `tar`
-- macOS/Linux: 해제는 `unzip` 또는 `python3`/`python`(zipfile), 생성은 `zip` 또는 `python3`/`python`(zipfile)
-- macOS/Linux 현행화 일자: `date` 명령 우선 사용, 실패 시 `python3`/`python` 시도, 둘 다 불가하면 UTC 날짜로 대체
-- macOS/Linux CP949 디코딩: native `iconv` 사용
+- 현행화 일자: OS 시간대와 무관하게 KST 기준 날짜 사용
+- CP949 디코딩: 내장 Rust 매핑 테이블 사용
 ## 빌드
 ```bash
 cargo build --release
@@ -97,9 +95,7 @@ fcupdater.exe --skip-download
 - `FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS`: 변경내역 헤더 탐색 최대 행 수(기본 30, 최대 1000)
 - `FCUPDATER_CHANGELOG_HEADER_SCAN_COLS`: 변경내역 헤더 탐색 최대 열 수(기본 60, 최대 500)
 - `FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW`: 변경내역 서식 복제 기준 행(기본 243)
-- `FCUPDATER_CP949_STRICT`: `1/true/yes/on`일 때 CP949 디코딩 실패 시 대체문자 처리 대신 즉시 오류 반환
 - `FCUPDATER_DURABILITY_STRICT`: `1/true/yes/on`이면 비Windows 저장 후 `sync_all` 실패를 경고가 아닌 오류로 처리
-- `FCUPDATER_COMMAND_TIMEOUT_SECS`: 압축/해제 등 외부 명령 제한 시간(초). 미설정/0이면 제한 없음(기본)
 예시:
 ```bash
 fcupdater.exe --master "C:\path\fuel_cost_chungcheong.xlsx" --sources-dir "C:\path\sources" --output out.xlsx
@@ -108,6 +104,7 @@ fcupdater.exe --skip-download --sources-dir "C:\path\manual-sources" --output ou
 ## 동작 기준
 - 기본 실행은 Opinet에서 전국 현재 판매가격 파일 1건을 자동 다운로드한 뒤, 11개 대상 지역만 필터링해 현행화를 진행합니다.
 - 자동 다운로드는 Windows에서 WinHTTP, Linux/macOS에서 libcurl로 수행하며, 브라우저나 WebDriver를 실행하지 않습니다.
+- `.xlsx` 읽기/저장은 외부 압축 명령 없이 프로그램 내부 ZIP/deflate 처리로 수행합니다.
 - Linux/macOS에서도 `--skip-download`로 기존 소스 파일을 지정해 현행화할 수 있습니다.
 - `--sources-dir`는 자동 다운로드 결과 저장 위치이기도 합니다.
 - 자동 다운로드 파일명은 `{prefix}__fcupdater_auto__...` 형식이며, 해당 파일이 있으면 그 파일들만 우선 사용합니다.

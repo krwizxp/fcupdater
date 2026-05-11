@@ -1,55 +1,26 @@
-use super::path_util::path_from_slashes;
+use super::{
+    path_util::path_from_slashes,
+    zip_archive::{self, ZipArchiveOpsExt as _},
+};
 use crate::{
-    Result, err, path_pair_source_message, path_source_message, prefixed_message,
-    program_source_message, push_display,
+    Result, err, path_pair_source_message, path_source_message, prefixed_message, push_display,
 };
 #[cfg(windows)]
 use core::iter::once;
 #[cfg(windows)]
 use core::ptr::{null, null_mut};
-use core::{fmt::Display, mem, time::Duration};
+use core::{mem, time::Duration};
 #[cfg(not(windows))]
 use std::io::{Write as _, stderr};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt as _;
 use std::{
-    env,
-    ffi::OsString,
-    fs,
+    env, fs,
     io::{self, ErrorKind},
     path::{Component, Path, PathBuf},
-    process::{self, Stdio},
-    sync::OnceLock,
-    thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    process, thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
-static EXTRACT_TOOLS_READY: OnceLock<()> = OnceLock::new();
-static CREATE_TOOLS_READY: OnceLock<()> = OnceLock::new();
-cfg_select! {
-    windows => {
-        const EXTRACT_TOOLS_MISSING_MESSAGE: &str =
-            "xlsx 압축 해제를 위한 도구가 없습니다. (PowerShell 또는 tar 필요)";
-        const CREATE_TOOLS_MISSING_MESSAGE: &str =
-            "xlsx 압축 생성을 위한 도구가 없습니다. (PowerShell 또는 tar 필요)";
-    }
-    _ => {
-        const PYTHON_CREATE_ZIP_SCRIPT: &str = r#"import os
-import sys
-import zipfile
-root, out = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    for dp, _, files in os.walk(root):
-        for name in files:
-            p = os.path.join(dp, name)
-            arc = os.path.relpath(p, root).replace(os.sep, "/")
-            zf.write(p, arc)
-"#;
-        const EXTRACT_TOOLS_MISSING_MESSAGE: &str =
-            "xlsx 압축 해제를 위한 도구가 없습니다. (unzip 또는 python3/python 필요)";
-        const CREATE_TOOLS_MISSING_MESSAGE: &str =
-            "xlsx 압축 생성을 위한 도구가 없습니다. (zip 또는 python3/python 필요)";
-    }
-}
 #[derive(Debug)]
 pub struct XlsxContainer {
     archive_path: PathBuf,
@@ -62,21 +33,10 @@ struct WorkDirCleanup {
     path: PathBuf,
 }
 struct ArchiveOps;
-struct ProcessCommandOps;
 trait ArchiveOpsExt {
     fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()>;
     fn promote_temp_output(&self, temp_output: &Path, output_xlsx: &Path) -> Result<()>;
     fn verify_saved_archive(&self, saved_archive: &Path) -> Result<()>;
-}
-trait ProcessCommandOpsExt {
-    fn command_timeout(&self) -> Option<Duration>;
-    fn format_process_failure(&self, program: &str, output: &process::Output) -> String;
-    fn wait_with_optional_timeout(
-        &self,
-        child: process::Child,
-        program: &str,
-        timeout: Option<Duration>,
-    ) -> Result<process::Output>;
 }
 impl Drop for WorkDirCleanup {
     fn drop(&mut self) {
@@ -89,97 +49,7 @@ impl Drop for WorkDirCleanup {
 }
 impl ArchiveOpsExt for ArchiveOps {
     fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()> {
-        cfg_select! {
-            windows => {
-                let mut attempts = Vec::with_capacity(2);
-                let script = build_powershell_archive_script(
-                    "Compress-Archive -Path (Join-Path '",
-                    unpack_dir,
-                    "' '*') -DestinationPath '",
-                    archive_path,
-                    "' -Force",
-                );
-                if let Some(shell_program) = detect_powershell_program() {
-                    match run_powershell(shell_program, &script) {
-                        Ok(()) => return Ok(()),
-                        Err(command_err) => push_attempt(&mut attempts, shell_program, command_err),
-                    }
-                }
-                match run_command(
-                    "tar",
-                    &[
-                        "-a".into(),
-                        "-c".into(),
-                        "-f".into(),
-                        archive_path.as_os_str().to_os_string(),
-                        "-C".into(),
-                        unpack_dir.as_os_str().to_os_string(),
-                        ".".into(),
-                    ],
-                    None,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(command_err) => attempts.push(attempt_source_message("tar", command_err)),
-                }
-                Err(err(archive_attempts_message(
-                    "xlsx 압축 생성 실패",
-                    unpack_dir,
-                    archive_path,
-                    &attempts,
-                )))
-            }
-            _ => {
-                let mut attempts = Vec::with_capacity(3);
-                match run_command(
-                    "zip",
-                    &[
-                        "-qr".into(),
-                        archive_path.as_os_str().to_os_string(),
-                        ".".into(),
-                    ],
-                    Some(unpack_dir),
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(source_err) => attempts.push(attempt_source_message("zip", source_err)),
-                }
-                match run_command(
-                    "python3",
-                    &[
-                        "-c".into(),
-                        PYTHON_CREATE_ZIP_SCRIPT.into(),
-                        unpack_dir.as_os_str().to_os_string(),
-                        archive_path.as_os_str().to_os_string(),
-                    ],
-                    None,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(source_err) => {
-                        attempts.push(attempt_source_message("python3 -c zipfile", source_err));
-                    }
-                }
-                match run_command(
-                    "python",
-                    &[
-                        "-c".into(),
-                        PYTHON_CREATE_ZIP_SCRIPT.into(),
-                        unpack_dir.as_os_str().to_os_string(),
-                        archive_path.as_os_str().to_os_string(),
-                    ],
-                    None,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(source_err) => {
-                        attempts.push(attempt_source_message("python -c zipfile", source_err));
-                    }
-                }
-                Err(err(archive_attempts_message(
-                    "xlsx 압축 생성 실패",
-                    unpack_dir,
-                    archive_path,
-                    &attempts,
-                )))
-            }
-        }
+        zip_archive::ZipArchiveOps.create_from_directory(unpack_dir, archive_path)
     }
     fn promote_temp_output(&self, temp_output: &Path, output_xlsx: &Path) -> Result<()> {
         cfg_select! {
@@ -349,102 +219,7 @@ impl ArchiveOps {
         has_name
     }
     fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>> {
-        cfg_select! {
-            windows => {
-                let mut attempts = Vec::with_capacity(2);
-                if let Some(shell_program) = detect_powershell_program() {
-                    let archive_quoted = ps_quote(archive_path);
-                    let prefix = "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::OpenRead('";
-                    let suffix = "').Entries | ForEach-Object {$_.FullName}";
-                    let mut script = String::with_capacity(
-                        prefix
-                            .len()
-                            .saturating_add(archive_quoted.len())
-                            .saturating_add(suffix.len()),
-                    );
-                    script.push_str(prefix);
-                    script.push_str(&archive_quoted);
-                    script.push_str(suffix);
-                    match Self::run_archive_listing_capture(
-                        shell_program,
-                        &["-NoProfile".into(), "-Command".into(), script.into()],
-                        None,
-                    ) {
-                        Ok(entries) => return Ok(entries),
-                        Err(shell_err) => push_attempt(&mut attempts, shell_program, shell_err),
-                    }
-                }
-                match Self::run_archive_listing_capture(
-                    "tar",
-                    &["-tf".into(), archive_path.as_os_str().to_os_string()],
-                    None,
-                ) {
-                    Ok(entries) => Ok(entries),
-                    Err(tar_err) => {
-                        attempts.push(attempt_source_message("tar", tar_err));
-                        Err(err(archive_attempts_message(
-                            "xlsx 압축 엔트리 목록 확인 실패",
-                            archive_path,
-                            archive_path,
-                            &attempts,
-                        )))
-                    }
-                }
-            }
-            _ => {
-                let mut attempts = Vec::with_capacity(3);
-                match Self::run_archive_listing_capture(
-                    "unzip",
-                    &[
-                        "-Z".into(),
-                        "-1".into(),
-                        archive_path.as_os_str().to_os_string(),
-                    ],
-                    None,
-                ) {
-                    Ok(entries) => return Ok(entries),
-                    Err(unzip_err) => attempts.push(attempt_source_message("unzip -Z -1", unzip_err)),
-                }
-                let py_code = "import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as zf:\n    for name in zf.namelist():\n        print(name)";
-                for (program, label) in [
-                    ("python3", "python3 -c zipfile"),
-                    ("python", "python -c zipfile"),
-                ] {
-                    match Self::run_archive_listing_capture(
-                        program,
-                        &[
-                            "-c".into(),
-                            py_code.into(),
-                            archive_path.as_os_str().to_os_string(),
-                        ],
-                        None,
-                    ) {
-                        Ok(entries) => return Ok(entries),
-                        Err(python_err) => attempts.push(attempt_source_message(label, python_err)),
-                    }
-                }
-                Err(err(archive_attempts_message(
-                    "xlsx 압축 엔트리 목록 확인 실패",
-                    archive_path,
-                    archive_path,
-                    &attempts,
-                )))
-            }
-        }
-    }
-    fn run_archive_listing_capture(
-        program: &str,
-        args: &[OsString],
-        current_dir: Option<&Path>,
-    ) -> Result<Vec<String>> {
-        run_command_capture(program, args, current_dir).map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
+        zip_archive::ZipArchiveOps.list_entries(archive_path)
     }
 }
 impl XlsxContainer {
@@ -461,21 +236,6 @@ impl XlsxContainer {
                 source_xlsx.display(),
             )));
         }
-        let extract_tools_ready = cfg_select! {
-            windows => {
-                detect_powershell_program().is_some() || command_exists("tar", &["--version"], None)
-            }
-            _ => {
-                command_exists("unzip", &["-v"], None)
-                    || command_exists("python3", &["-c", "import zipfile,sys;sys.exit(0)"], None)
-                    || command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None)
-            }
-        };
-        ensure_tools_ready(
-            &EXTRACT_TOOLS_READY,
-            extract_tools_ready,
-            EXTRACT_TOOLS_MISSING_MESSAGE,
-        )?;
         let mut cleanup = WorkDirCleanup {
             path: (create_unique_work_dir())?,
             keep: false,
@@ -551,21 +311,6 @@ impl XlsxContainer {
     }
     pub fn save_as(&self, output_xlsx: &Path, verify_saved_file: bool) -> Result<()> {
         let archive_ops = ArchiveOps;
-        let create_tools_ready = cfg_select! {
-            windows => {
-                detect_powershell_program().is_some() || command_exists("tar", &["--version"], None)
-            }
-            _ => {
-                command_exists("zip", &["-v"], None)
-                    || command_exists("python3", &["-c", "import zipfile,sys;sys.exit(0)"], None)
-                    || command_exists("python", &["-c", "import zipfile,sys;sys.exit(0)"], None)
-            }
-        };
-        ensure_tools_ready(
-            &CREATE_TOOLS_READY,
-            create_tools_ready,
-            CREATE_TOOLS_MISSING_MESSAGE,
-        )?;
         if self.archive_path.try_exists().map_err(|source_err| {
             err(path_source_message(
                 "archive 경로 확인 실패",
@@ -661,98 +406,6 @@ impl Drop for XlsxContainer {
         }
     }
 }
-impl ProcessCommandOpsExt for ProcessCommandOps {
-    fn command_timeout(&self) -> Option<Duration> {
-        env::var("FCUPDATER_COMMAND_TIMEOUT_SECS")
-            .ok()
-            .and_then(|timeout_text| timeout_text.trim().parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .map(Duration::from_secs)
-    }
-    fn format_process_failure(&self, program: &str, output: &process::Output) -> String {
-        let stderr = trimmed_lossy_owned(&output.stderr);
-        let stdout = trimmed_lossy_owned(&output.stdout);
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        if detail.is_empty() {
-            let mut out = String::with_capacity(
-                program
-                    .len()
-                    .saturating_add(12)
-                    .saturating_add(" 비정상 종료(code=)".len()),
-            );
-            out.push_str(program);
-            out.push_str(" 비정상 종료(code=");
-            match output.status.code() {
-                Some(status_code) => push_display(&mut out, status_code),
-                None => out.push_str("None"),
-            }
-            out.push(')');
-            out
-        } else {
-            let mut out = String::with_capacity(
-                program
-                    .len()
-                    .saturating_add(12)
-                    .saturating_add(detail.len())
-                    .saturating_add(" 비정상 종료(code=): ".len()),
-            );
-            out.push_str(program);
-            out.push_str(" 비정상 종료(code=");
-            match output.status.code() {
-                Some(status_code) => push_display(&mut out, status_code),
-                None => out.push_str("None"),
-            }
-            out.push_str("): ");
-            out.push_str(&detail);
-            out
-        }
-    }
-    fn wait_with_optional_timeout(
-        &self,
-        mut child: process::Child,
-        program: &str,
-        timeout: Option<Duration>,
-    ) -> Result<process::Output> {
-        let Some(limit) = timeout else {
-            return child.wait_with_output().map_err(|source_err| {
-                err(program_source_message(program, "실행 실패", source_err))
-            });
-        };
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    return child.wait_with_output().map_err(|source_err| {
-                        err(program_source_message(
-                            program,
-                            "실행 결과 수집 실패",
-                            source_err,
-                        ))
-                    });
-                }
-                Ok(None) => {
-                    if start.elapsed() >= limit {
-                        let cleanup_diagnostic = stop_process_with_diagnostics(&mut child);
-                        let mut message = String::with_capacity(program.len().saturating_add(32));
-                        message.push_str(program);
-                        message.push_str(" 실행 제한시간 초과: ");
-                        push_display(&mut message, limit.as_secs());
-                        message.push('초');
-                        append_cleanup_diagnostic(&mut message, cleanup_diagnostic.as_deref());
-                        return Err(err(message));
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(source_err) => {
-                    let cleanup_diagnostic = stop_process_with_diagnostics(&mut child);
-                    let mut message = program_source_message(program, "상태 확인 실패", source_err);
-                    append_cleanup_diagnostic(&mut message, cleanup_diagnostic.as_deref());
-                    return Err(err(message));
-                }
-            }
-        }
-    }
-}
 #[cfg(not(windows))]
 fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::Error) {
     let mut err = stderr().lock();
@@ -780,21 +433,6 @@ fn create_unique_work_dir() -> Result<PathBuf> {
         "임시 작업 폴더 생성 실패",
         "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
     )
-}
-fn ensure_tools_ready(
-    lock: &OnceLock<()>,
-    tools_ready: bool,
-    missing_message: &'static str,
-) -> Result<()> {
-    if lock.get().is_none() {
-        if !tools_ready {
-            return Err(err(missing_message));
-        }
-        match lock.set(()) {
-            Ok(()) | Err(()) => {}
-        }
-    }
-    Ok(())
 }
 fn create_dir_all_checked(path: &Path, failure_label: &str) -> Result<()> {
     fs::create_dir_all(path)
@@ -834,134 +472,11 @@ where
     Err(err(exhausted_message))
 }
 fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
-    cfg_select! {
-        windows => {
-            let mut attempts = Vec::with_capacity(2);
-            let script = build_powershell_archive_script(
-                "Expand-Archive -LiteralPath '",
-                archive_path,
-                "' -DestinationPath '",
-                unpack_dir,
-                "' -Force",
-            );
-            if let Some(shell_program) = detect_powershell_program() {
-                match run_powershell(shell_program, &script) {
-                    Ok(()) => return Ok(()),
-                    Err(command_err) => push_attempt(&mut attempts, shell_program, command_err),
-                }
-            }
-            match run_command(
-                "tar",
-                &[
-                    "-xf".into(),
-                    archive_path.as_os_str().to_os_string(),
-                    "-C".into(),
-                    unpack_dir.as_os_str().to_os_string(),
-                ],
-                None,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(command_err) => attempts.push(attempt_source_message("tar", command_err)),
-            }
-            Err(err(archive_attempts_message(
-                "xlsx 압축 해제 실패",
-                archive_path,
-                unpack_dir,
-                &attempts,
-            )))
-        }
-        _ => {
-            let mut attempts = Vec::with_capacity(3);
-            match run_command(
-                "unzip",
-                &[
-                    "-o".into(),
-                    archive_path.as_os_str().to_os_string(),
-                    "-d".into(),
-                    unpack_dir.as_os_str().to_os_string(),
-                ],
-                None,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(source_err) => attempts.push(attempt_source_message("unzip", source_err)),
-            }
-            match run_command(
-                "python3",
-                &[
-                    "-m".into(),
-                    "zipfile".into(),
-                    "-e".into(),
-                    archive_path.as_os_str().to_os_string(),
-                    unpack_dir.as_os_str().to_os_string(),
-                ],
-                None,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(source_err) => {
-                    attempts.push(attempt_source_message("python3 -m zipfile", source_err));
-                }
-            }
-            match run_command(
-                "python",
-                &[
-                    "-m".into(),
-                    "zipfile".into(),
-                    "-e".into(),
-                    archive_path.as_os_str().to_os_string(),
-                    unpack_dir.as_os_str().to_os_string(),
-                ],
-                None,
-            ) {
-                Ok(()) => return Ok(()),
-                Err(source_err) => {
-                    attempts.push(attempt_source_message("python -m zipfile", source_err));
-                }
-            }
-            Err(err(archive_attempts_message(
-                "xlsx 압축 해제 실패",
-                archive_path,
-                unpack_dir,
-                &attempts,
-            )))
-        }
-    }
-}
-fn archive_attempts_message(label: &str, from: &Path, to: &Path, attempts: &[String]) -> String {
-    if attempts.is_empty() {
-        path_pair_source_message(label, from, to, "원인 정보 없음")
-    } else {
-        let attempts_text = attempts.join(" / ");
-        path_pair_source_message(label, from, to, attempts_text)
-    }
+    zip_archive::ZipArchiveOps.extract_to_directory(archive_path, unpack_dir)
 }
 #[cfg(windows)]
 fn encode_path_wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(once(0)).collect()
-}
-#[cfg(windows)]
-fn build_powershell_archive_script(
-    prefix: &str,
-    first_path: &Path,
-    middle: &str,
-    second_path: &Path,
-    suffix: &str,
-) -> String {
-    let first_quoted = ps_quote(first_path);
-    let second_quoted = ps_quote(second_path);
-    let mut script = String::with_capacity(
-        prefix
-            .len()
-            .saturating_add(first_quoted.len())
-            .saturating_add(middle.len())
-            .saturating_add(second_quoted.len())
-            .saturating_add(suffix.len()),
-    );
-    script.push_str(prefix);
-    script.push_str(&first_quoted);
-    script.push_str(middle);
-    script.push_str(&second_quoted);
-    script.push_str(suffix);
-    script
 }
 fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
     let mut out = String::with_capacity(prefix.len().saturating_add(relative_path.len()));
@@ -988,133 +503,6 @@ fn windows_file_op_error_message(
     push_display(&mut out, code);
     out.push(')');
     out
-}
-fn attempt_source_message(program: &str, source: impl Display) -> String {
-    let mut out = String::with_capacity(program.len().saturating_add(64));
-    out.push_str(program);
-    out.push_str(": ");
-    push_display(&mut out, source);
-    out
-}
-#[cfg(windows)]
-fn push_attempt(attempts: &mut Vec<String>, program: &str, source: impl Display) {
-    attempts.push(attempt_source_message(program, source));
-}
-fn trimmed_lossy_owned(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim().to_owned()
-}
-fn append_cleanup_diagnostic(message: &mut String, cleanup_diagnostic: Option<&str>) {
-    if let Some(cleanup) = cleanup_diagnostic {
-        message.push_str(" (정리 경고: ");
-        message.push_str(cleanup);
-        message.push(')');
-    }
-}
-fn stop_process_with_diagnostics(child: &mut process::Child) -> Option<String> {
-    let mut diagnostic = String::with_capacity(96);
-    match child.try_wait() {
-        Ok(Some(_)) => return None,
-        Ok(None) => {}
-        Err(source_err) => {
-            diagnostic.push_str("상태 확인 실패: ");
-            push_display(&mut diagnostic, source_err);
-        }
-    }
-    match child.kill() {
-        Ok(()) => {}
-        Err(source_err) if source_err.kind() == ErrorKind::InvalidInput => {}
-        Err(source_err) => {
-            if !diagnostic.is_empty() {
-                diagnostic.push_str(" / ");
-            }
-            diagnostic.push_str("종료 실패: ");
-            push_display(&mut diagnostic, source_err);
-        }
-    }
-    match child.wait() {
-        Ok(_) => {}
-        Err(source_err) => {
-            if !diagnostic.is_empty() {
-                diagnostic.push_str(" / ");
-            }
-            diagnostic.push_str("대기 실패: ");
-            push_display(&mut diagnostic, source_err);
-        }
-    }
-    if diagnostic.is_empty() {
-        None
-    } else {
-        Some(diagnostic)
-    }
-}
-fn run_command_capture(
-    program: &str,
-    args: &[OsString],
-    current_dir: Option<&Path>,
-) -> Result<process::Output> {
-    let mut cmd = process::Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(dir) = current_dir {
-        cmd.current_dir(dir);
-    }
-    let child = (cmd
-        .spawn()
-        .map_err(|source_err| err(program_source_message(program, "실행 실패", source_err))))?;
-    let command_ops = ProcessCommandOps;
-    let output =
-        command_ops.wait_with_optional_timeout(child, program, command_ops.command_timeout())?;
-    if output.status.success() {
-        return Ok(output);
-    }
-    Err(err(command_ops.format_process_failure(program, &output)))
-}
-fn run_command(program: &str, args: &[OsString], current_dir: Option<&Path>) -> Result<()> {
-    run_command_capture(program, args, current_dir).map(|_| ())
-}
-fn command_exists(program: &str, args: &[&str], current_dir: Option<&Path>) -> bool {
-    let mut cmd = process::Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(dir) = current_dir {
-        cmd.current_dir(dir);
-    }
-    cmd.status().is_ok_and(|status| status.success())
-}
-#[cfg(windows)]
-fn detect_powershell_program() -> Option<&'static str> {
-    if command_exists("pwsh", &["-NoProfile", "-Command", "exit 0"], None) {
-        return Some("pwsh");
-    }
-    if command_exists("powershell", &["-NoProfile", "-Command", "exit 0"], None) {
-        return Some("powershell");
-    }
-    None
-}
-#[cfg(windows)]
-fn run_powershell(program: &str, script: &str) -> Result<()> {
-    let child = (process::Command::new(program)
-        .args(["-NoProfile", "-Command", script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source_err| err(program_source_message(program, "실행 실패", source_err))))?;
-    let command_ops = ProcessCommandOps;
-    let output =
-        command_ops.wait_with_optional_timeout(child, program, command_ops.command_timeout())?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(err(command_ops.format_process_failure(program, &output)))
-}
-#[cfg(windows)]
-fn ps_quote(path: &Path) -> String {
-    path.to_string_lossy().replace('\'', "''")
 }
 #[cfg(not(windows))]
 fn durability_strict_mode() -> bool {

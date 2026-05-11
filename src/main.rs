@@ -23,10 +23,6 @@ use std::{
     env, fs,
     io::{Error as IoError, ErrorKind, Write, stderr, stdout},
     path::{Path, PathBuf},
-};
-#[cfg(not(windows))]
-use std::{
-    process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
 };
 pub(crate) mod change_log;
@@ -39,6 +35,22 @@ mod source_sync;
 const MAX_CONFLICT_ATTEMPTS: u32 = 100_000;
 const RESERVATION_MAGIC: &[u8] = b"FCUPDATER_RESERVED_v1\n";
 const STALE_RESERVATION_AGE: Duration = Duration::from_hours(1);
+const DAYS_PER_100_YEARS_I64: i64 = 36_524;
+const DAYS_PER_400_YEARS_I64: i64 = 146_097;
+const DAYS_PER_4_YEARS_I64: i64 = 1_460;
+const DAYS_PER_COMMON_YEAR_I64: i64 = 365;
+const DAYS_UNTIL_UNIX_EPOCH_I64: i64 = 719_468;
+const KST_OFFSET: Duration = Duration::from_hours(9);
+const LEAP_YEAR_CENTURY_DIVISOR_I32: i32 = 100;
+const LEAP_YEAR_DIVISOR_I32: i32 = 4;
+const LEAP_YEAR_ERA_DIVISOR_I32: i32 = 400;
+const MARCH_BASE_MONTH_OFFSET_I64: i64 = 3;
+const MARCH_MONTH_THRESHOLD: u32 = 2;
+const MONTH_TERM_DIVISOR_I64: i64 = 5;
+const MONTH_TERM_MULTIPLIER_I64: i64 = 153;
+const MONTH_TERM_OFFSET_I64: i64 = 2;
+const PRE_MARCH_MONTH_OFFSET_I64: i64 = 9;
+const SECS_PER_DAY_U64: u64 = 86_400;
 const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
     ("충청남도", "충남"),
     ("충청북도", "충북"),
@@ -157,17 +169,20 @@ struct UpdateSummary<'data> {
     source_paths: &'data [PathBuf],
     source_report: &'data source_sync::SourceIndexBuildReport,
 }
-#[cfg(not(windows))]
-struct SystemDateFallback;
 struct UpdateRunContext<'args, 'out> {
     args: &'args Args,
     out: &'out mut dyn Write,
 }
-#[cfg(not(windows))]
-trait SystemDateFallbackExt {
-    fn resolve_today_from_system_time<F>(&self, is_yyyy_mm_dd: F) -> Result<String>
-    where
-        F: Fn(&str) -> bool;
+struct KstDateCalculator;
+trait KstDateCalculatorExt {
+    fn civil_from_days(&self, z: i32) -> Option<(i32, u32, u32)>;
+    fn format_ymd(
+        &self,
+        prefix: &str,
+        year: impl Display,
+        month: impl Display,
+        day: impl Display,
+    ) -> String;
 }
 trait UpdateRunContextExt {
     fn build_source_index_and_report(
@@ -209,89 +224,59 @@ trait UpdateRunContextExt {
     fn score_source_record(&self, record: &source_sync::SourceRecord) -> SourceScore;
     fn split_natural_parts(&self, text: &str) -> Vec<NaturalPart>;
 }
-#[cfg(not(windows))]
-impl SystemDateFallbackExt for SystemDateFallback {
-    fn resolve_today_from_system_time<F>(&self, is_yyyy_mm_dd: F) -> Result<String>
-    where
-        F: Fn(&str) -> bool,
-    {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|source| err(prefixed_message("현재 시간 조회 실패: ", source)))?;
-        let checked_date_calc = |value: Option<i64>| {
-            value.ok_or_else(|| err("UTC 날짜 계산 중 범위 오류가 발생했습니다."))
-        };
-        let days_u64 = now
-            .as_secs()
-            .checked_div(86_400)
-            .ok_or_else(|| err("UTC 날짜 계산 중 일수 나눗셈에 실패했습니다."))?;
-        let days = i64::try_from(days_u64).map_err(|source| {
-            err_with_source("UTC 날짜 계산 중 일수 변환에 실패했습니다.", source)
-        })?;
-        let shifted_days = checked_date_calc(days.checked_add(719_468))?;
-        let era = shifted_days.div_euclid(146_097);
-        let doe = shifted_days.rem_euclid(146_097);
-        let yoe_after_first =
-            checked_date_calc(doe.checked_sub(checked_date_calc(doe.checked_div(1_460))?))?;
-        let yoe_after_second = checked_date_calc(
-            yoe_after_first.checked_add(checked_date_calc(doe.checked_div(36_524))?),
+impl KstDateCalculatorExt for KstDateCalculator {
+    fn civil_from_days(&self, z: i32) -> Option<(i32, u32, u32)> {
+        let shifted_days = i64::from(z).checked_add(DAYS_UNTIL_UNIX_EPOCH_I64)?;
+        let era = shifted_days.div_euclid(DAYS_PER_400_YEARS_I64);
+        let doe = shifted_days.rem_euclid(DAYS_PER_400_YEARS_I64);
+        let yoe_after_first = doe.checked_sub(doe.checked_div(DAYS_PER_4_YEARS_I64)?)?;
+        let yoe_after_second =
+            yoe_after_first.checked_add(doe.checked_div(DAYS_PER_100_YEARS_I64)?)?;
+        let yoe_numerator =
+            yoe_after_second.checked_sub(doe.checked_div(DAYS_PER_400_YEARS_I64 - 1_i64)?)?;
+        let yoe = yoe_numerator.checked_div(DAYS_PER_COMMON_YEAR_I64)?;
+        let y = yoe.checked_add(era.checked_mul(i64::from(LEAP_YEAR_ERA_DIVISOR_I32))?)?;
+        let year_days = DAYS_PER_COMMON_YEAR_I64.checked_mul(yoe)?;
+        let leap_days = yoe.checked_div(i64::from(LEAP_YEAR_DIVISOR_I32))?;
+        let skipped_centuries = yoe.checked_div(i64::from(LEAP_YEAR_CENTURY_DIVISOR_I32))?;
+        let doy = doe.checked_sub(
+            year_days
+                .checked_add(leap_days)?
+                .checked_sub(skipped_centuries)?,
         )?;
-        let yoe_numerator = checked_date_calc(
-            yoe_after_second.checked_sub(checked_date_calc(doe.checked_div(146_096))?),
-        )?;
-        let yoe = checked_date_calc(yoe_numerator.checked_div(365))?;
-        let year_of_era =
-            checked_date_calc(yoe.checked_add(checked_date_calc(era.checked_mul(400))?))?;
-        let year_days = checked_date_calc(365_i64.checked_mul(yoe))?;
-        let leap_days = checked_date_calc(yoe.checked_div(4))?;
-        let skipped_centuries = checked_date_calc(yoe.checked_div(100))?;
-        let day_of_year = checked_date_calc(doe.checked_sub(checked_date_calc(
-            checked_date_calc(year_days.checked_add(leap_days))?.checked_sub(skipped_centuries),
-        )?))?;
-        let month_phase = checked_date_calc(
-            checked_date_calc(
-                5_i64
-                    .checked_mul(day_of_year)
-                    .and_then(|value| value.checked_add(2)),
-            )?
-            .checked_div(153),
-        )?;
-        let month_term = checked_date_calc(
-            checked_date_calc(
-                153_i64
-                    .checked_mul(month_phase)
-                    .and_then(|value| value.checked_add(2)),
-            )?
-            .checked_div(5),
-        )?;
-        let day_i64 = checked_date_calc(
-            checked_date_calc(day_of_year.checked_sub(month_term))?.checked_add(1),
-        )?;
-        let day = u32::try_from(day_i64).map_err(|source| {
-            err_with_source("UTC 날짜 계산 중 일 변환에 실패했습니다.", source)
-        })?;
-        let month_i64 = if month_phase < 10 {
-            checked_date_calc(month_phase.checked_add(3))?
+        let mp = MONTH_TERM_DIVISOR_I64
+            .checked_mul(doy)?
+            .checked_add(MONTH_TERM_OFFSET_I64)?
+            .checked_div(MONTH_TERM_MULTIPLIER_I64)?;
+        let month_term = MONTH_TERM_MULTIPLIER_I64
+            .checked_mul(mp)?
+            .checked_add(MONTH_TERM_OFFSET_I64)?
+            .checked_div(MONTH_TERM_DIVISOR_I64)?;
+        let day = u32::try_from(doy.checked_sub(month_term)?.checked_add(1_i64)?).ok()?;
+        let month_i64 = if mp < 10_i64 {
+            mp.checked_add(MARCH_BASE_MONTH_OFFSET_I64)?
         } else {
-            checked_date_calc(month_phase.checked_sub(9))?
+            mp.checked_sub(PRE_MARCH_MONTH_OFFSET_I64)?
         };
-        let month = u32::try_from(month_i64).map_err(|source| {
-            err_with_source("UTC 날짜 계산 중 월 변환에 실패했습니다.", source)
-        })?;
-        let year_i64 = checked_date_calc(year_of_era.checked_add(i64::from(month <= 2)))?;
-        let year = i32::try_from(year_i64).map_err(|source| {
-            err_with_source("UTC 날짜 계산 중 연도 변환에 실패했습니다.", source)
-        })?;
-        let today = format_ymd("", year, month, day);
-        if !is_yyyy_mm_dd(&today) {
-            return Err(err(format_ymd(
-                "오늘 날짜 형식이 올바르지 않습니다: ",
-                year,
-                month,
-                day,
-            )));
+        let month = u32::try_from(month_i64).ok()?;
+        let year_adjust = i64::from(month <= MARCH_MONTH_THRESHOLD);
+        let year = i32::try_from(y.checked_add(year_adjust)?).ok()?;
+        Some((year, month, day))
+    }
+    fn format_ymd(
+        &self,
+        prefix: &str,
+        year: impl Display,
+        month: impl Display,
+        day: impl Display,
+    ) -> String {
+        let capacity = prefix.len().saturating_add(10);
+        let mut out = String::with_capacity(capacity);
+        out.push_str(prefix);
+        match write!(&mut out, "{year:04}-{month:02}-{day:02}") {
+            Ok(()) | Err(_) => {}
         }
-        Ok(today)
+        out
     }
 }
 impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
@@ -849,70 +834,28 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                 .iter()
                 .all(u8::is_ascii_digit)
         };
-        cfg_select! {
-            windows => {
-                let mut system_time = excel::windows_api::SystemTime {
-                    year: 0,
-                    month: 0,
-                    day_of_week: 0,
-                    day: 0,
-                    hour: 0,
-                    minute: 0,
-                    second: 0,
-                    milliseconds: 0,
-                };
-                // SAFETY: `system_time` points to a valid writable `SystemTime` value for the duration of the call.
-                unsafe { excel::windows_api::GetLocalTime(&raw mut system_time) };
-                if system_time.month == 0
-                    || system_time.month > 12
-                    || system_time.day == 0
-                    || system_time.day > 31
-                {
-                    return Err(err(format_ymd(
-                        "OS 날짜 조회 결과가 비정상적입니다: ",
-                        system_time.year,
-                        system_time.month,
-                        system_time.day,
-                    )));
-                }
-                let today = format_ymd("", system_time.year, system_time.month, system_time.day);
-                if !is_yyyy_mm_dd(&today) {
-                    return Err(err(prefixed_message(
-                        "오늘 날짜 형식이 올바르지 않습니다: ",
-                        &today,
-                    )));
-                }
-                Ok(today)
-            }
-            _ => {
-                let mut detected_today =
-                    if let Ok(output) = Command::new("date").args(["+%Y-%m-%d"]).output()
-                    && output.status.success()
-                    {
-                        valid_today_from_output(&output, is_yyyy_mm_dd)
-                    } else {
-                        None
-                    };
-                if detected_today.is_none() {
-                    let script =
-                        "from datetime import datetime;print(datetime.now().strftime('%Y-%m-%d'))";
-                    for program in ["python3", "python"] {
-                        if let Ok(output) = Command::new(program).args(["-c", script]).output()
-                            && output.status.success()
-                        {
-                            detected_today = valid_today_from_output(&output, is_yyyy_mm_dd);
-                            if detected_today.is_some() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some(today) = detected_today {
-                    return Ok(today);
-                }
-                SystemDateFallback.resolve_today_from_system_time(is_yyyy_mm_dd)
-            }
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|source| err(prefixed_message("현재 시간 조회 실패: ", source)))?;
+        let kst_secs = since_epoch
+            .as_secs()
+            .checked_add(KST_OFFSET.as_secs())
+            .ok_or_else(|| err("KST 날짜 초 계산 중 범위 오류가 발생했습니다."))?;
+        let day_index_i64 = i64::try_from(kst_secs.div_euclid(SECS_PER_DAY_U64))
+            .map_err(|source| err_with_source("KST 날짜 일수 변환에 실패했습니다.", source))?;
+        let day_index = i32::try_from(day_index_i64)
+            .map_err(|source| err_with_source("KST 날짜 범위 변환에 실패했습니다.", source))?;
+        let (year, month, day) = KstDateCalculator
+            .civil_from_days(day_index)
+            .ok_or_else(|| err("KST 날짜 계산 중 범위 오류가 발생했습니다."))?;
+        let today = KstDateCalculator.format_ymd("", year, month, day);
+        if !is_yyyy_mm_dd(&today) {
+            return Err(err(prefixed_message(
+                "오늘 날짜 형식이 올바르지 않습니다: ",
+                &today,
+            )));
         }
+        Ok(today)
     }
     fn run_update(&mut self) -> Result<()> {
         let master_exists = self.args.master.try_exists().map_err(|source_err| {
@@ -1123,14 +1066,6 @@ fn extend_source_records(
     }
     Ok(())
 }
-#[cfg(not(windows))]
-fn valid_today_from_output(
-    output: &Output,
-    is_yyyy_mm_dd: impl Fn(&str) -> bool,
-) -> Option<String> {
-    let today = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    is_yyyy_mm_dd(&today).then_some(today)
-}
 fn err(msg: impl Into<String>) -> BoxError {
     IoError::other(msg.into()).into()
 }
@@ -1193,16 +1128,6 @@ pub(crate) fn path_pair_source_message(
     out.push_str(" (");
     push_display(&mut out, source);
     out.push(')');
-    out
-}
-pub(crate) fn program_source_message(program: &str, phase: &str, source: impl Display) -> String {
-    let capacity = program.len().saturating_add(phase.len()).saturating_add(64);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(program);
-    out.push(' ');
-    out.push_str(phase);
-    out.push_str(": ");
-    push_display(&mut out, source);
     out
 }
 pub(crate) fn write_line_ignored(output: &mut dyn Write, args: Arguments<'_>) {
@@ -1474,15 +1399,6 @@ fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
         err(out)
     })
 }
-fn format_ymd(prefix: &str, year: impl Display, month: impl Display, day: impl Display) -> String {
-    let capacity = prefix.len().saturating_add(10);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    match write!(&mut out, "{year:04}-{month:02}-{day:02}") {
-        Ok(()) | Err(_) => {}
-    }
-    out
-}
 fn normalize_address_key(addr: &str) -> String {
     let mut rest = addr.trim();
     let capacity = rest.len();
@@ -1570,4 +1486,30 @@ fn is_metropolitan_token(token: &str) -> bool {
         token,
         "서울" | "부산" | "대구" | "인천" | "광주" | "대전" | "울산" | "세종"
     )
+}
+#[cfg(test)]
+mod tests {
+    use super::{KstDateCalculator, KstDateCalculatorExt as _};
+    use crate::{Result, err};
+    #[test]
+    fn converts_unix_days_to_kst_date_parts() -> Result<()> {
+        let Some((epoch_year, epoch_month, epoch_day)) = KstDateCalculator.civil_from_days(0)
+        else {
+            return Err(err("UNIX epoch 날짜 변환 실패"));
+        };
+        let epoch_formatted = KstDateCalculator.format_ymd("", epoch_year, epoch_month, epoch_day);
+        if epoch_formatted != "1970-01-01" {
+            return Err(err(format!(
+                "UNIX epoch 날짜 변환 불일치: {epoch_formatted}"
+            )));
+        }
+        let Some((kst_year, kst_month, kst_day)) = KstDateCalculator.civil_from_days(20_584) else {
+            return Err(err("KST 날짜 변환 테스트 실패"));
+        };
+        let kst_formatted = KstDateCalculator.format_ymd("updated_", kst_year, kst_month, kst_day);
+        if kst_formatted != "updated_2026-05-11" {
+            return Err(err(format!("KST 날짜 변환 불일치: {kst_formatted}")));
+        }
+        Ok(())
+    }
 }
