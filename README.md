@@ -21,7 +21,7 @@
 - Windows: `pwsh` 또는 `powershell` 또는 `tar`
 - macOS/Linux: 해제는 `unzip` 또는 `python3`/`python`(zipfile), 생성은 `zip` 또는 `python3`/`python`(zipfile)
 - macOS/Linux 현행화 일자: `date` 명령 우선 사용, 실패 시 `python3`/`python` 시도, 둘 다 불가하면 UTC 날짜로 대체
-- macOS/Linux CP949 디코딩 정확도 향상(권장): `iconv` 또는 `python3`/`python`
+- macOS/Linux CP949 디코딩: native `iconv` 사용
 ## 빌드
 ```bash
 cargo build --release
@@ -100,7 +100,6 @@ fcupdater.exe --skip-download
 - `FCUPDATER_CP949_STRICT`: `1/true/yes/on`일 때 CP949 디코딩 실패 시 대체문자 처리 대신 즉시 오류 반환
 - `FCUPDATER_DURABILITY_STRICT`: `1/true/yes/on`이면 비Windows 저장 후 `sync_all` 실패를 경고가 아닌 오류로 처리
 - `FCUPDATER_COMMAND_TIMEOUT_SECS`: 압축/해제 등 외부 명령 제한 시간(초). 미설정/0이면 제한 없음(기본)
-- `FCUPDATER_DECODER_TIMEOUT_SECS`: CP949 디코더 외부 명령 제한 시간(초). 미설정/0이면 제한 없음(기본)
 예시:
 ```bash
 fcupdater.exe --master "C:\path\fuel_cost_chungcheong.xlsx" --sources-dir "C:\path\sources" --output out.xlsx

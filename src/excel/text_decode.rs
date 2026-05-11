@@ -1,26 +1,24 @@
 use crate::{Result, err};
 #[cfg(not(windows))]
 use alloc::collections::VecDeque;
-#[cfg(windows)]
+#[cfg(not(windows))]
+use core::ffi::{c_char, c_int, c_void};
 use core::ptr::null_mut;
 #[cfg(not(windows))]
-use core::{
-    fmt::{Arguments, Write as _},
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::env;
 #[cfg(not(windows))]
 use std::{
     collections::HashMap,
-    io::{ErrorKind, Write as _, stderr},
-    process::{Child, Command, Output, Stdio},
+    io::{Write as _, stderr},
     sync::{LazyLock, Mutex},
-    thread::sleep,
-    time::Instant,
 };
 #[cfg(not(windows))]
 const CP949_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(not(windows))]
+const ICONV_FROM_CP949: &[u8] = b"CP949\0";
+#[cfg(not(windows))]
+const ICONV_TO_UTF8: &[u8] = b"UTF-8\0";
 const WINDOWS_1252_EXTENDED_CHARS: [char; 32] = [
     '€', '�', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '�', 'Ž', '�', '�', '‘', '’',
     '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '�', 'ž', 'Ÿ',
@@ -28,14 +26,7 @@ const WINDOWS_1252_EXTENDED_CHARS: [char; 32] = [
 #[cfg(not(windows))]
 static WARNED_NON_WINDOWS_CP949_FALLBACK: AtomicBool = AtomicBool::new(false);
 #[cfg(not(windows))]
-static CP949_ICONV_AVAILABLE: LazyLock<bool> =
-    LazyLock::new(|| command_available("iconv", &["--version"]));
-#[cfg(not(windows))]
-static CP949_PYTHON3_AVAILABLE: LazyLock<bool> =
-    LazyLock::new(|| command_available("python3", &["-V"]));
-#[cfg(not(windows))]
-static CP949_PYTHON_AVAILABLE: LazyLock<bool> =
-    LazyLock::new(|| command_available("python", &["-V"]));
+static CP949_ICONV_AVAILABLE: LazyLock<bool> = LazyLock::new(|| IconvDecoder::open().is_some());
 #[cfg(not(windows))]
 static CP949_DECODE_CACHE: LazyLock<Mutex<Cp949DecodeCache>> =
     LazyLock::new(|| Mutex::new(Cp949DecodeCache::default()));
@@ -54,16 +45,119 @@ trait NonWindowsCp949Ext {
     fn cache_put(&self, bytes: &[u8], decoded: &str);
     fn decode(&self, bytes: &[u8]) -> Option<String>;
     fn decode_with_iconv(&self, bytes: &[u8]) -> Option<String>;
-    fn decode_with_python(&self, bytes: &[u8]) -> Option<String>;
-    fn decoder_timeout(&self) -> Option<Duration>;
-    fn run_decoder_command(&self, program: &str, args: &[&str], input: &[u8]) -> Option<String>;
-    fn wait_decoder_with_optional_timeout(
-        &self,
-        program: &str,
-        child: Child,
-        timeout: Option<Duration>,
-    ) -> Option<Output>;
     fn warn_once(&self, code_page: u16);
+}
+#[cfg(not(windows))]
+type IconvDescriptor = *mut c_void;
+#[cfg(not(windows))]
+struct IconvDecoder {
+    descriptor: IconvDescriptor,
+}
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn iconv_open(tocode: *const c_char, fromcode: *const c_char) -> IconvDescriptor;
+    fn iconv(
+        cd: IconvDescriptor,
+        inbuf: *mut *mut c_char,
+        inbytesleft: *mut usize,
+        outbuf: *mut *mut c_char,
+        outbytesleft: *mut usize,
+    ) -> usize;
+    fn iconv_close(cd: IconvDescriptor) -> c_int;
+}
+#[cfg(not(windows))]
+impl IconvDecoder {
+    fn decode(&mut self, bytes: &[u8]) -> Option<String> {
+        let initial_len = bytes.len().checked_mul(3)?.checked_add(16)?.max(16);
+        let mut output = vec![0_u8; initial_len];
+        let mut input = bytes.as_ptr().cast::<c_char>().cast_mut();
+        let mut input_left = bytes.len();
+        let mut output_len = 0_usize;
+        while input_left > 0 {
+            if output_len == output.len() {
+                grow_iconv_output(&mut output)?;
+            }
+            // SAFETY: `output_len` is kept within `output.len()` by the loop guard and updates below.
+            let mut out = unsafe { output.as_mut_ptr().add(output_len) }.cast::<c_char>();
+            let mut out_left = output.len().saturating_sub(output_len);
+            let out_capacity = out_left;
+            // SAFETY: `input` points into `bytes`, `out` points into `output`, and the byte counters describe the remaining valid ranges.
+            let converted = unsafe {
+                iconv(
+                    self.descriptor,
+                    &raw mut input,
+                    &raw mut input_left,
+                    &raw mut out,
+                    &raw mut out_left,
+                )
+            };
+            output_len = output_len.saturating_add(out_capacity.saturating_sub(out_left));
+            if converted != usize::MAX {
+                continue;
+            }
+            if out_left < 4 {
+                grow_iconv_output(&mut output)?;
+                continue;
+            }
+            return None;
+        }
+        self.flush(&mut output, &mut output_len)?;
+        output.truncate(output_len);
+        String::from_utf8(output).ok()
+    }
+    fn flush(&mut self, output: &mut Vec<u8>, output_len: &mut usize) -> Option<()> {
+        loop {
+            if *output_len == output.len() {
+                grow_iconv_output(output)?;
+            }
+            let mut input = null_mut::<c_char>();
+            let mut input_left = 0_usize;
+            // SAFETY: `*output_len` is kept within `output.len()` by the loop guard and updates below.
+            let mut out = unsafe { output.as_mut_ptr().add(*output_len) }.cast::<c_char>();
+            let mut out_left = output.len().saturating_sub(*output_len);
+            let out_capacity = out_left;
+            // SAFETY: A null input pointer asks iconv to flush/reset shift state, and `out` describes the remaining output buffer.
+            let converted = unsafe {
+                iconv(
+                    self.descriptor,
+                    &raw mut input,
+                    &raw mut input_left,
+                    &raw mut out,
+                    &raw mut out_left,
+                )
+            };
+            *output_len = (*output_len).saturating_add(out_capacity.saturating_sub(out_left));
+            if converted != usize::MAX {
+                return Some(());
+            }
+            if out_left < 4 {
+                grow_iconv_output(output)?;
+                continue;
+            }
+            return None;
+        }
+    }
+    fn open() -> Option<Self> {
+        // SAFETY: Both encoding names are static NUL-terminated C strings.
+        let descriptor = unsafe {
+            iconv_open(
+                ICONV_TO_UTF8.as_ptr().cast::<c_char>(),
+                ICONV_FROM_CP949.as_ptr().cast::<c_char>(),
+            )
+        };
+        if descriptor.addr() == usize::MAX {
+            None
+        } else {
+            Some(Self { descriptor })
+        }
+    }
+}
+#[cfg(not(windows))]
+impl Drop for IconvDecoder {
+    fn drop(&mut self) {
+        // SAFETY: `descriptor` was returned by `iconv_open` and is owned by this decoder.
+        let _: c_int = unsafe { iconv_close(self.descriptor) };
+    }
 }
 #[cfg(not(windows))]
 impl NonWindowsCp949Ext for NonWindowsCp949 {
@@ -120,92 +214,34 @@ impl NonWindowsCp949Ext for NonWindowsCp949 {
             return Some(cached);
         }
         self.decode_with_iconv(bytes)
-            .or_else(|| self.decode_with_python(bytes))
             .inspect(|text| self.cache_put(bytes, text))
     }
     fn decode_with_iconv(&self, bytes: &[u8]) -> Option<String> {
         if !*CP949_ICONV_AVAILABLE {
             return None;
         }
-        self.run_decoder_command("iconv", &["-f", "CP949", "-t", "UTF-8"], bytes)
-    }
-    fn decode_with_python(&self, bytes: &[u8]) -> Option<String> {
-        let script = "import sys;data=sys.stdin.buffer.read();sys.stdout.buffer.write(data.decode('cp949','strict').encode('utf-8'))";
-        if *CP949_PYTHON3_AVAILABLE
-            && let Some(decoded) = self.run_decoder_command("python3", &["-c", script], bytes)
-        {
-            return Some(decoded);
-        }
-        if !*CP949_PYTHON_AVAILABLE {
-            return None;
-        }
-        self.run_decoder_command("python", &["-c", script], bytes)
-    }
-    fn decoder_timeout(&self) -> Option<Duration> {
-        env::var("FCUPDATER_DECODER_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .map(Duration::from_secs)
-    }
-    fn run_decoder_command(&self, program: &str, args: &[&str], input: &[u8]) -> Option<String> {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        if let Some(mut stdin) = child.stdin.take()
-            && stdin.write_all(input).is_err()
-        {
-            report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
-            return None;
-        }
-        let output =
-            self.wait_decoder_with_optional_timeout(program, child, self.decoder_timeout())?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8(output.stdout).ok()
-    }
-    fn wait_decoder_with_optional_timeout(
-        &self,
-        program: &str,
-        mut child: Child,
-        timeout: Option<Duration>,
-    ) -> Option<Output> {
-        let Some(limit) = timeout else {
-            return child.wait_with_output().ok();
-        };
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return child.wait_with_output().ok(),
-                Ok(None) => {
-                    if start.elapsed() >= limit {
-                        report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
-                        return None;
-                    }
-                    sleep(Duration::from_millis(25));
-                }
-                Err(_) => {
-                    report_decoder_cleanup_issue(program, stop_decoder_child(&mut child));
-                    return None;
-                }
-            }
-        }
+        IconvDecoder::open()?.decode(bytes)
     }
     fn warn_once(&self, code_page: u16) {
         if WARNED_NON_WINDOWS_CP949_FALLBACK
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            write_nonfatal_stderr_line(format_args!(
+            let mut err = stderr().lock();
+            match writeln!(
+                err,
                 "주의: 비Windows 환경에서 code page {code_page}는 완전 디코딩이 불가하여 비ASCII 문자를 대체문자(�)로 처리합니다."
-            ));
+            ) {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
+}
+#[cfg(not(windows))]
+fn grow_iconv_output(output: &mut Vec<u8>) -> Option<()> {
+    let next_len = output.len().checked_mul(2)?;
+    output.resize(next_len, 0);
+    Some(())
 }
 fn decode_bytes_to_string(bytes: &[u8], mut map_byte: impl FnMut(u8) -> char) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -305,73 +341,19 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
         _ => Ok(decode_bytes_to_string(bytes, char::from)),
     }
 }
-#[cfg(not(windows))]
-fn command_available(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-#[cfg(not(windows))]
-fn report_decoder_cleanup_issue(program: &str, cleanup_diagnostic: Option<String>) {
-    let Some(cleanup) = cleanup_diagnostic else {
-        return;
-    };
-    write_nonfatal_stderr_line(format_args!(
-        "주의: {program} 디코더 프로세스 정리 중 문제가 발생했습니다: {cleanup}"
-    ));
-}
-#[cfg(not(windows))]
-fn stop_decoder_child(child: &mut Child) -> Option<String> {
-    let mut diagnostic = String::with_capacity(96);
-    match child.try_wait() {
-        Ok(Some(_)) => return None,
-        Ok(None) => {}
-        Err(source_err) => {
-            diagnostic.push_str("상태 확인 실패: ");
-            match write!(&mut diagnostic, "{source_err}") {
-                Ok(()) | Err(_) => {}
-            }
+#[cfg(test)]
+mod tests {
+    #[cfg(not(windows))]
+    use super::{CP949_ICONV_AVAILABLE, NonWindowsCp949, NonWindowsCp949Ext as _};
+    #[cfg(not(windows))]
+    #[test]
+    fn decodes_cp949_with_native_iconv_when_available() {
+        if !*CP949_ICONV_AVAILABLE {
+            return;
         }
-    }
-    match child.kill() {
-        Ok(()) => {}
-        Err(source_err) if source_err.kind() == ErrorKind::InvalidInput => {}
-        Err(source_err) => {
-            if !diagnostic.is_empty() {
-                diagnostic.push_str(" / ");
-            }
-            diagnostic.push_str("종료 실패: ");
-            match write!(&mut diagnostic, "{source_err}") {
-                Ok(()) | Err(_) => {}
-            }
-        }
-    }
-    match child.wait() {
-        Ok(_) => {}
-        Err(source_err) => {
-            if !diagnostic.is_empty() {
-                diagnostic.push_str(" / ");
-            }
-            diagnostic.push_str("대기 실패: ");
-            match write!(&mut diagnostic, "{source_err}") {
-                Ok(()) | Err(_) => {}
-            }
-        }
-    }
-    if diagnostic.is_empty() {
-        None
-    } else {
-        Some(diagnostic)
-    }
-}
-#[cfg(not(windows))]
-fn write_nonfatal_stderr_line(args: Arguments<'_>) {
-    let mut err = stderr().lock();
-    match writeln!(err, "{args}") {
-        Ok(()) | Err(_) => {}
+        assert_eq!(
+            NonWindowsCp949.decode_with_iconv(&[0xB0, 0xA1]).as_deref(),
+            Some("가")
+        );
     }
 }
