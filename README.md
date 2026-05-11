@@ -39,10 +39,10 @@ cargo build --release
 Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어 업로드합니다. Windows는 빌드 결과를 `fcupdater-windows-x64.exe`로 이름만 바꿔 그대로 업로드합니다.
 ## GitHub Actions 현행화 실행
 `.github/workflows/update_master.yml`은 GitHub Actions에서 마스터 엑셀을 직접 현행화하고 결과 `.xlsx`를 Artifact로 받는 수동 실행 워크플로입니다.
-- Runner: `windows-latest`
+- Runner: `ubuntu-latest`
 - Rust: 최신 stable을 설치해 `cargo build --release --locked` 수행
 - 캐시: 없음
-- 자동 다운로드: Windows WinHTTP 기반으로 실행, 별도 브라우저/WebDriver 불필요
+- 자동 다운로드: Linux native libcurl 기반으로 실행, 별도 브라우저/WebDriver 불필요
 - 결과물: `artifacts/<artifact_name>.xlsx` (기본: `artifacts/fcupdater-result.xlsx`)
 실행 방법:
 1. GitHub 저장소의 `Actions` 탭에서 `Update Master Excel` 워크플로를 선택합니다.
@@ -60,7 +60,7 @@ Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어
 - `skip_download: true`를 사용하려면 저장소 안에 `현재 판매가격(주유소)*.xls/.xlsx` 파일이 있어야 합니다.
 - GitHub Actions 수동 실행 화면은 임의 파일 업로드를 직접 받지 않으므로, 기준 엑셀과 수동 소스 파일을 쓰려면 먼저 저장소에 커밋해 두어야 합니다.
 - 결과 파일은 저장소에 커밋되지 않고 Artifact로만 업로드됩니다.
-- Opinet 인증서 폐기목록 조회가 runner에서 실패하는 경우를 위해 Windows 자동 다운로드는 CRL을 내려받지 못한 경우만 허용합니다. 인증서 이름/만료/CA 검증은 계속 유지됩니다.
+- GitHub Actions 현행화는 Windows runner의 Schannel/CRL 차이를 피하기 위해 Linux runner와 libcurl 경로를 사용합니다.
 ## 빠른 사용
 1. 아래 파일과 실행 환경을 준비합니다.
 - `fuel_cost_chungcheong.xlsx`

@@ -36,7 +36,7 @@ permissions:
   contents: read
 jobs:
   update:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
@@ -46,6 +46,8 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: stable
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Build release binary
         run: cargo build --release --locked
       - name: Run updater
@@ -58,7 +60,7 @@ jobs:
           FCUPDATER_NO_CHANGE_LOG: ${{ inputs.no_change_log }}
           FCUPDATER_FAST_SAVE: ${{ inputs.fast_save }}
           FCUPDATER_ARTIFACT_NAME: ${{ inputs.artifact_name }}
-        run: .\.github\scripts\run-update-master.ps1
+        run: ./.github/scripts/run-update-master.ps1
       - name: Upload result artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
