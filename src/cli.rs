@@ -236,8 +236,7 @@ pub fn usage_text() -> String {
     out.push_str(" [OPTIONS]\n\n\
 옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일명 접두어 (경로 아님, 기본: 현재 판매가격(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --sources-prefix 는 파일명 접두어만 허용 (경로 구분자, Windows 금지 문자, 끝 공백/점 불가)\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음");
     out.push_str(
-        "\n\n환경 변수(선택):\n  FCUPDATER_SOURCE_HEADER_SCAN_ROWS\n  FCUPDATER_MASTER_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_COLS\n  FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW\n  FCUPDATER_CP949_STRICT\n  FCUPDATER_DURABILITY_STRICT",
+        "\n\n환경 변수(선택):\n  FCUPDATER_SOURCE_HEADER_SCAN_ROWS\n  FCUPDATER_MASTER_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_COLS\n  FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW\n  FCUPDATER_DURABILITY_STRICT",
     );
-    out.push_str("\n  FCUPDATER_COMMAND_TIMEOUT_SECS\n  FCUPDATER_DECODER_TIMEOUT_SECS");
     out
 }
