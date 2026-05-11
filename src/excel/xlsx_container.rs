@@ -5,15 +5,7 @@ use super::{
 use crate::{
     Result, err, path_pair_source_message, path_source_message, prefixed_message, push_display,
 };
-#[cfg(windows)]
-use core::iter::once;
-#[cfg(windows)]
-use core::ptr::{null, null_mut};
 use core::{mem, time::Duration};
-#[cfg(not(windows))]
-use std::io::{Write as _, stderr};
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt as _;
 use std::{
     env, fs,
     io::{self, ErrorKind},
@@ -21,6 +13,16 @@ use std::{
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
 };
+cfg_select! {
+    windows => {
+        use core::iter::once;
+        use core::ptr::{null, null_mut};
+        use std::os::windows::ffi::OsStrExt as _;
+    }
+    _ => {
+        use std::io::{stderr, Write as _};
+    }
+}
 #[derive(Debug)]
 pub struct XlsxContainer {
     archive_path: PathBuf,

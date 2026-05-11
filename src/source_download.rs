@@ -16,8 +16,7 @@ use std::{
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod libcurl {
     use super::{
-        HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, checked_http_buffer_len,
-        enforce_http_content_length_limit,
+        HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, enforce_http_content_length_limit,
     };
     use alloc::{ffi::CString, string::String};
     use core::{
@@ -209,21 +208,7 @@ mod libcurl {
             }
             let status = u32::try_from(raw_status)
                 .map_err(|source| format!("HTTP 상태 코드 변환 실패: {source}"))?;
-            let text = String::from_utf8_lossy(&response_buffers.headers.bytes);
-            let normalized = text.replace("\r\n", "\n");
-            let selected = normalized
-                .split("\n\n")
-                .filter(|block| !block.trim().is_empty())
-                .last()
-                .unwrap_or("");
-            let headers = selected
-                .lines()
-                .filter(|line| !line.starts_with("HTTP/"))
-                .filter_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    Some((name.trim().to_owned(), value.trim().to_owned()))
-                })
-                .collect();
+            let headers = response_buffers.parsed_headers();
             enforce_http_content_length_limit(&headers, HTTP_MAX_BODY_BYTES)?;
             Ok(HttpResponse {
                 body: response_buffers.body.bytes,
@@ -233,19 +218,16 @@ mod libcurl {
         }
     }
     impl BoundedResponseBuffer {
-        const fn new(label: &'static str, limit: usize) -> Self {
-            Self {
-                bytes: Vec::new(),
-                error: None,
-                label,
-                limit,
-            }
-        }
         fn append(&mut self, bytes: &[u8]) -> bool {
-            if let Err(error) =
-                checked_http_buffer_len(self.label, self.bytes.len(), bytes.len(), self.limit)
-            {
-                self.error = Some(error);
+            let Some(next_len) = self.bytes.len().checked_add(bytes.len()) else {
+                self.error = Some(format!("HTTP 응답 {} 크기 계산 실패", self.label));
+                return false;
+            };
+            if next_len > self.limit {
+                self.error = Some(format!(
+                    "HTTP 응답 {} 크기가 허용 한도({} bytes)를 초과했습니다.",
+                    self.label, self.limit
+                ));
                 return false;
             }
             if let Err(source) = self.bytes.try_reserve(bytes.len()) {
@@ -258,8 +240,33 @@ mod libcurl {
             self.bytes.extend_from_slice(bytes);
             true
         }
+        const fn new(label: &'static str, limit: usize) -> Self {
+            Self {
+                bytes: Vec::new(),
+                error: None,
+                label,
+                limit,
+            }
+        }
     }
     impl ResponseBuffers {
+        fn parsed_headers(&self) -> Vec<(String, String)> {
+            let text = String::from_utf8_lossy(&self.headers.bytes);
+            let normalized = text.replace("\r\n", "\n");
+            let selected = normalized
+                .split("\n\n")
+                .filter(|block| !block.trim().is_empty())
+                .last()
+                .unwrap_or("");
+            selected
+                .lines()
+                .filter(|line| !line.starts_with("HTTP/"))
+                .filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    Some((name.trim().to_owned(), value.trim().to_owned()))
+                })
+                .collect::<Vec<_>>()
+        }
         fn take_error(&mut self) -> Option<String> {
             self.body.error.take().or_else(|| self.headers.error.take())
         }
@@ -1328,17 +1335,22 @@ impl HttpClientExt for HttpClient {
         if let Some(cookie_text) = cookie_header.as_deref() {
             merged_headers.push(("Cookie", cookie_text));
         }
-        #[cfg(windows)]
-        let response = winhttp::CLIENT.request(method, host, path, body, &merged_headers)?;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let response = libcurl::CLIENT.request(method, host, path, body, &merged_headers)?;
-        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let response = {
-            let _unused = (method, host, path, body, headers);
-            return Err(String::from(
-                "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.",
-            ));
-        };
+            cfg_select! {
+                windows => {
+                    winhttp::CLIENT.request(method, host, path, body, &merged_headers)
+                }
+                any(target_os = "linux", target_os = "macos") => {
+                    libcurl::CLIENT.request(method, host, path, body, &merged_headers)
+                }
+                _ => {
+                    let _unused = (method, host, path, body, headers, &merged_headers);
+                    Err(String::from(
+                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.",
+                    ))
+                }
+            }
+        }?;
         enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
         self.store_response_cookies(&response)?;
         if !(200..300).contains(&response.status) {
@@ -1427,6 +1439,7 @@ impl HttpClientExt for HttpClient {
         Ok(())
     }
 }
+#[cfg(windows)]
 fn checked_http_buffer_len(
     label: &str,
     current_len: usize,
