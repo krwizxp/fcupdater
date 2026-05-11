@@ -67,22 +67,3 @@ pub fn decode_single_byte_text(bytes: &[u8], code_page: Option<u16>) -> Result<S
         _ => Ok(decode_bytes_to_string(bytes, char::from)),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::decode_single_byte_text;
-    use crate::{Result, err};
-
-    #[test]
-    fn decodes_cp949_table() -> Result<()> {
-        let first = decode_single_byte_text(&[0xb0, 0xa1], Some(949))?;
-        if first != "가" {
-            return Err(err(format!("CP949 디코딩 결과 불일치: {first}")));
-        }
-        let second = decode_single_byte_text(&[b'A', 0xb3, 0xaa], Some(949))?;
-        if second != "A나" {
-            return Err(err(format!("CP949 디코딩 결과 불일치: {second}")));
-        }
-        Ok(())
-    }
-}

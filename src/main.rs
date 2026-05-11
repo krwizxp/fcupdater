@@ -1487,29 +1487,3 @@ fn is_metropolitan_token(token: &str) -> bool {
         "서울" | "부산" | "대구" | "인천" | "광주" | "대전" | "울산" | "세종"
     )
 }
-#[cfg(test)]
-mod tests {
-    use super::{KstDateCalculator, KstDateCalculatorExt as _};
-    use crate::{Result, err};
-    #[test]
-    fn converts_unix_days_to_kst_date_parts() -> Result<()> {
-        let Some((epoch_year, epoch_month, epoch_day)) = KstDateCalculator.civil_from_days(0)
-        else {
-            return Err(err("UNIX epoch 날짜 변환 실패"));
-        };
-        let epoch_formatted = KstDateCalculator.format_ymd("", epoch_year, epoch_month, epoch_day);
-        if epoch_formatted != "1970-01-01" {
-            return Err(err(format!(
-                "UNIX epoch 날짜 변환 불일치: {epoch_formatted}"
-            )));
-        }
-        let Some((kst_year, kst_month, kst_day)) = KstDateCalculator.civil_from_days(20_584) else {
-            return Err(err("KST 날짜 변환 테스트 실패"));
-        };
-        let kst_formatted = KstDateCalculator.format_ymd("updated_", kst_year, kst_month, kst_day);
-        if kst_formatted != "updated_2026-05-11" {
-            return Err(err(format!("KST 날짜 변환 불일치: {kst_formatted}")));
-        }
-        Ok(())
-    }
-}

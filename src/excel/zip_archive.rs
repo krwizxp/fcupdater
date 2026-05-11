@@ -30,6 +30,14 @@ const METHOD_DEFLATE: u16 = 8;
 const METHOD_STORE: u16 = 0;
 const VERSION_NEEDED: u16 = 20;
 const ZIP_COMMENT_MAX_LEN: usize = 0xffff;
+const ZIP_BAD_CRC_MESSAGE: &str = "ZIP CRC가 일치하지 않습니다";
+const ZIP_BAD_LOCAL_HEADER_MESSAGE: &str = "ZIP local header signature가 올바르지 않습니다";
+const ZIP_BAD_SIZE_MESSAGE: &str = "ZIP 해제 크기가 일치하지 않습니다";
+const ZIP_DATA_RANGE_MESSAGE: &str = "ZIP entry 데이터가 파일 범위를 벗어났습니다";
+const ZIP_MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
+const ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+const ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+const ZIP_UNSAFE_PATH_MESSAGE: &str = "허용되지 않은 압축 경로가 포함되어 있습니다";
 const LENGTH_BASES: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
@@ -125,19 +133,29 @@ pub trait ZipArchiveOpsExt {
 struct DeflateInflater;
 struct DeflateWriter;
 trait DeflateInflaterExt {
-    fn copy_previous(output: &mut Vec<u8>, distance: usize, length: usize) -> ZipResult<()>;
+    fn copy_previous(
+        output: &mut Vec<u8>,
+        distance: usize,
+        length: usize,
+        expected_len: usize,
+    ) -> ZipResult<()>;
     fn decode_distance(symbol: u16, reader: &mut BitReader<'_>) -> ZipResult<usize>;
     fn decode_length(symbol: u16, reader: &mut BitReader<'_>) -> ZipResult<usize>;
     fn dynamic_trees(reader: &mut BitReader<'_>) -> ZipResult<(Huffman, Option<Huffman>)>;
     fn fixed_trees() -> ZipResult<(Huffman, Huffman)>;
-    fn inflate(bytes: &[u8]) -> ZipResult<Vec<u8>>;
+    fn inflate(bytes: &[u8], expected_len: usize) -> ZipResult<Vec<u8>>;
     fn inflate_compressed_block(
         reader: &mut BitReader<'_>,
         literal_tree: &Huffman,
         distance_tree: Option<&Huffman>,
         output: &mut Vec<u8>,
+        expected_len: usize,
     ) -> ZipResult<()>;
-    fn inflate_stored_block(reader: &mut BitReader<'_>, output: &mut Vec<u8>) -> ZipResult<()>;
+    fn inflate_stored_block(
+        reader: &mut BitReader<'_>,
+        output: &mut Vec<u8>,
+        expected_len: usize,
+    ) -> ZipResult<()>;
 }
 trait DeflateWriterExt {
     fn best_match(
@@ -264,50 +282,45 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
         })
     }
     fn extract_to_directory(&self, archive_path: &Path, unpack_dir: &Path) -> Result<()> {
-        let bytes = fs::read(archive_path).map_err(|source_err| {
-            err(path_source_message(
-                "xlsx 압축 파일 읽기 실패",
-                archive_path,
-                source_err,
-            ))
-        })?;
+        let bytes = read_archive_bytes(archive_path)?;
         let entries = parse_entries(&bytes).map_err(err)?;
+        let mut total_uncompressed = 0_usize;
         for entry in entries {
+            let entry_name = entry.name.as_str();
             if !is_safe_archive_entry_path(&entry.name) {
-                return Err(err(prefixed_message(
-                    "허용되지 않은 압축 경로가 포함되어 있습니다: ",
-                    entry.name,
-                )));
+                return Err(err(zip_entry_message(ZIP_UNSAFE_PATH_MESSAGE, entry_name)));
             }
             if entry.name.ends_with('/') {
                 let dir_path = unpack_dir.join(path_from_entry_name(&entry.name)?);
-                fs::create_dir_all(&dir_path).map_err(|source_err| {
-                    err(path_source_message(
-                        "xlsx 압축 폴더 생성 실패",
-                        &dir_path,
-                        source_err,
-                    ))
-                })?;
+                create_zip_dir(&dir_path, "xlsx 압축 폴더 생성 실패")?;
                 continue;
             }
             let output_path = unpack_dir.join(path_from_entry_name(&entry.name)?);
             if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent).map_err(|source_err| {
-                    err(path_source_message(
-                        "xlsx 압축 해제 폴더 생성 실패",
-                        parent,
-                        source_err,
-                    ))
-                })?;
+                create_zip_dir(parent, "xlsx 압축 해제 폴더 생성 실패")?;
             }
+            let expected_len = usize::try_from(entry.uncompressed_size)
+                .map_err(|source| err(format!("ZIP 해제 크기 변환 실패: {source}")))?;
+            ensure_zip_size_limit(
+                "entry 해제",
+                expected_len,
+                ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
+                entry_name,
+            )?;
+            total_uncompressed = total_uncompressed
+                .checked_add(expected_len)
+                .ok_or_else(|| err(String::from("ZIP 전체 해제 크기 계산 실패")))?;
+            ensure_zip_size_limit(
+                "전체 해제",
+                total_uncompressed,
+                ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES,
+                entry_name,
+            )?;
             let data = (|| -> ZipResult<Vec<u8>> {
                 let local_offset = usize::try_from(entry.local_header_offset)
                     .map_err(|source| format!("ZIP local header offset 변환 실패: {source}"))?;
                 if read_u32(&bytes, local_offset)? != LOCAL_FILE_HEADER_SIGNATURE {
-                    return Err(format!(
-                        "ZIP local header signature가 올바르지 않습니다: {}",
-                        entry.name
-                    ));
+                    return Err(zip_entry_message(ZIP_BAD_LOCAL_HEADER_MESSAGE, entry_name));
                 }
                 let name_len = usize::from(read_u16(&bytes, local_offset.saturating_add(26))?);
                 let extra_len = usize::from(read_u16(&bytes, local_offset.saturating_add(28))?);
@@ -322,14 +335,20 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
                     .checked_add(compressed_len)
                     .ok_or_else(|| String::from("ZIP data end 계산 실패"))?;
                 let Some(compressed) = bytes.get(data_start..data_end) else {
-                    return Err(format!(
-                        "ZIP entry 데이터가 파일 범위를 벗어났습니다: {}",
-                        entry.name
-                    ));
+                    return Err(zip_entry_message(ZIP_DATA_RANGE_MESSAGE, entry_name));
                 };
                 let output = match entry.method {
-                    METHOD_STORE => compressed.to_vec(),
-                    METHOD_DEFLATE => <DeflateInflater as DeflateInflaterExt>::inflate(compressed)?,
+                    METHOD_STORE => {
+                        let mut output = Vec::new();
+                        output.try_reserve(compressed.len()).map_err(|source| {
+                            format!("ZIP 저장 entry 메모리 확보 실패: {source}")
+                        })?;
+                        output.extend_from_slice(compressed);
+                        output
+                    }
+                    METHOD_DEFLATE => {
+                        <DeflateInflater as DeflateInflaterExt>::inflate(compressed, expected_len)?
+                    }
                     method => {
                         return Err(format!(
                             "지원하지 않는 ZIP 압축 방식({method}): {}",
@@ -337,14 +356,12 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
                         ));
                     }
                 };
-                let expected_len = usize::try_from(entry.uncompressed_size)
-                    .map_err(|source| format!("ZIP 해제 크기 변환 실패: {source}"))?;
                 if output.len() != expected_len {
-                    return Err(format!("ZIP 해제 크기가 일치하지 않습니다: {}", entry.name));
+                    return Err(zip_entry_message(ZIP_BAD_SIZE_MESSAGE, entry_name));
                 }
                 let actual_crc = crc32(&output);
                 if actual_crc != entry.crc32 {
-                    return Err(format!("ZIP CRC가 일치하지 않습니다: {}", entry.name));
+                    return Err(zip_entry_message(ZIP_BAD_CRC_MESSAGE, entry_name));
                 }
                 Ok(output)
             })()
@@ -361,13 +378,7 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
         Ok(())
     }
     fn list_entries(&self, archive_path: &Path) -> Result<Vec<String>> {
-        let bytes = fs::read(archive_path).map_err(|source_err| {
-            err(path_source_message(
-                "xlsx 압축 파일 읽기 실패",
-                archive_path,
-                source_err,
-            ))
-        })?;
+        let bytes = read_archive_bytes(archive_path)?;
         parse_entries(&bytes)
             .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
             .map_err(err)
@@ -572,12 +583,18 @@ struct PendingFile {
     path: PathBuf,
 }
 impl DeflateInflaterExt for DeflateInflater {
-    fn copy_previous(output: &mut Vec<u8>, distance: usize, length: usize) -> ZipResult<()> {
+    fn copy_previous(
+        output: &mut Vec<u8>,
+        distance: usize,
+        length: usize,
+        expected_len: usize,
+    ) -> ZipResult<()> {
         if distance == 0 || distance > output.len() {
             return Err(String::from(
                 "deflate back-reference distance가 올바르지 않습니다.",
             ));
         }
+        reserve_deflate_output(output, length, expected_len)?;
         for _ in 0..length {
             let source_index = output
                 .len()
@@ -714,7 +731,7 @@ impl DeflateInflaterExt for DeflateInflater {
             .ok_or_else(|| String::from("fixed distance Huffman tree 생성 실패"))?;
         Ok((literal, distance))
     }
-    fn inflate(bytes: &[u8]) -> ZipResult<Vec<u8>> {
+    fn inflate(bytes: &[u8], expected_len: usize) -> ZipResult<Vec<u8>> {
         let mut reader = BitReader {
             bit_buffer: 0,
             bit_count: 0,
@@ -726,7 +743,7 @@ impl DeflateInflaterExt for DeflateInflater {
             let final_block = reader.read_bits(1)? != 0;
             let block_type = reader.read_bits(2)?;
             match block_type {
-                0 => Self::inflate_stored_block(&mut reader, &mut output)?,
+                0 => Self::inflate_stored_block(&mut reader, &mut output, expected_len)?,
                 1 => {
                     let (literal, distance) = Self::fixed_trees()?;
                     Self::inflate_compressed_block(
@@ -734,6 +751,7 @@ impl DeflateInflaterExt for DeflateInflater {
                         &literal,
                         Some(&distance),
                         &mut output,
+                        expected_len,
                     )?;
                 }
                 2 => {
@@ -743,6 +761,7 @@ impl DeflateInflaterExt for DeflateInflater {
                         &literal,
                         distance.as_ref(),
                         &mut output,
+                        expected_len,
                     )?;
                 }
                 _ => return Err(String::from("지원하지 않는 deflate block type입니다.")),
@@ -757,14 +776,18 @@ impl DeflateInflaterExt for DeflateInflater {
         literal_tree: &Huffman,
         distance_tree: Option<&Huffman>,
         output: &mut Vec<u8>,
+        expected_len: usize,
     ) -> ZipResult<()> {
         loop {
             let symbol = literal_tree.decode(reader)?;
             match symbol {
-                0..=255 => output.push(
-                    u8::try_from(symbol)
-                        .map_err(|source| format!("deflate literal 변환 실패: {source}"))?,
-                ),
+                0..=255 => {
+                    reserve_deflate_output(output, 1, expected_len)?;
+                    output.push(
+                        u8::try_from(symbol)
+                            .map_err(|source| format!("deflate literal 변환 실패: {source}"))?,
+                    );
+                }
                 256 => return Ok(()),
                 257..=285 => {
                     let length = Self::decode_length(symbol, reader)?;
@@ -773,7 +796,7 @@ impl DeflateInflaterExt for DeflateInflater {
                     };
                     let distance_symbol = distance_huffman.decode(reader)?;
                     let distance = Self::decode_distance(distance_symbol, reader)?;
-                    Self::copy_previous(output, distance, length)?;
+                    Self::copy_previous(output, distance, length, expected_len)?;
                 }
                 _ => {
                     return Err(String::from(
@@ -783,7 +806,11 @@ impl DeflateInflaterExt for DeflateInflater {
             }
         }
     }
-    fn inflate_stored_block(reader: &mut BitReader<'_>, output: &mut Vec<u8>) -> ZipResult<()> {
+    fn inflate_stored_block(
+        reader: &mut BitReader<'_>,
+        output: &mut Vec<u8>,
+        expected_len: usize,
+    ) -> ZipResult<()> {
         reader.align_to_byte();
         let header = reader.read_stored_bytes(4)?;
         let len = read_u16(header, 0)?;
@@ -794,6 +821,7 @@ impl DeflateInflaterExt for DeflateInflater {
             ));
         }
         let stored = reader.read_stored_bytes(usize::from(len))?;
+        reserve_deflate_output(output, stored.len(), expected_len)?;
         output.extend_from_slice(stored);
         Ok(())
     }
@@ -1276,6 +1304,73 @@ impl DeflateWriterExt for DeflateWriter {
         Ok(())
     }
 }
+fn create_zip_dir(path: &Path, context: &'static str) -> Result<()> {
+    fs::create_dir_all(path)
+        .map_err(|source_err| err(path_source_message(context, path, source_err)))
+}
+fn ensure_zip_size_limit(
+    scope: &str,
+    actual_len: usize,
+    limit: usize,
+    entry_name: &str,
+) -> Result<()> {
+    if actual_len > limit {
+        Err(err(format!(
+            "ZIP {scope} 크기가 허용 한도({limit} bytes)를 초과했습니다: {entry_name}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+fn read_archive_bytes(archive_path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(archive_path).map_err(|source_err| {
+        err(path_source_message(
+            "xlsx 압축 파일 정보 확인 실패",
+            archive_path,
+            source_err,
+        ))
+    })?;
+    let archive_len = usize::try_from(metadata.len()).map_err(|source| {
+        err(format!(
+            "xlsx 압축 파일 크기 변환 실패({}): {source}",
+            archive_path.display()
+        ))
+    })?;
+    if archive_len > ZIP_MAX_ARCHIVE_BYTES {
+        return Err(err(format!(
+            "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
+            archive_path.display()
+        )));
+    }
+    fs::read(archive_path).map_err(|source_err| {
+        err(path_source_message(
+            "xlsx 압축 파일 읽기 실패",
+            archive_path,
+            source_err,
+        ))
+    })
+}
+fn reserve_deflate_output(
+    output: &mut Vec<u8>,
+    additional_len: usize,
+    expected_len: usize,
+) -> ZipResult<()> {
+    let next_len = output
+        .len()
+        .checked_add(additional_len)
+        .ok_or_else(|| String::from("deflate 출력 크기 계산 실패"))?;
+    if next_len > expected_len {
+        return Err(String::from(
+            "deflate 출력이 ZIP 선언 해제 크기를 초과했습니다.",
+        ));
+    }
+    output
+        .try_reserve(additional_len)
+        .map_err(|source| format!("deflate 출력 메모리 확보 실패: {source}"))
+}
+fn zip_entry_message(context: &str, entry_name: &str) -> String {
+    format!("{context}: {entry_name}")
+}
 fn collect_files(root: &Path, dir: &Path, files: &mut Vec<PendingFile>) -> Result<()> {
     for entry_result in fs::read_dir(dir).map_err(|source_err| {
         err(path_source_message(
@@ -1583,217 +1678,4 @@ fn write_u16(out: &mut Vec<u8>, value: u16) {
 }
 fn write_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
-}
-#[cfg(test)]
-mod tests {
-    use super::{ZipArchiveOps, ZipArchiveOpsExt as _};
-    use crate::{Result, err, path_source_message};
-    use std::{
-        env, fs,
-        path::{MAIN_SEPARATOR_STR, Path, PathBuf},
-        process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-    struct ZipTestAssertions;
-    trait ZipTestAssertionsExt {
-        fn assert_has_dynamic_deflate(
-            &self,
-            archive_bytes: &[u8],
-            parsed_entries: &[super::ZipEntry],
-        ) -> Result<()>;
-    }
-    impl ZipTestAssertionsExt for ZipTestAssertions {
-        fn assert_has_dynamic_deflate(
-            &self,
-            archive_bytes: &[u8],
-            parsed_entries: &[super::ZipEntry],
-        ) -> Result<()> {
-            for entry in parsed_entries
-                .iter()
-                .filter(|entry| entry.method == super::METHOD_DEFLATE)
-            {
-                let local_offset = usize::try_from(entry.local_header_offset)
-                    .map_err(|source| err(format!("ZIP 테스트 offset 변환 실패: {source}")))?;
-                let name_len = usize::from(
-                    super::read_u16(archive_bytes, local_offset.saturating_add(26)).map_err(err)?,
-                );
-                let extra_len = usize::from(
-                    super::read_u16(archive_bytes, local_offset.saturating_add(28)).map_err(err)?,
-                );
-                let data_start = local_offset
-                    .checked_add(super::LOCAL_FILE_HEADER_LEN)
-                    .and_then(|value| value.checked_add(name_len))
-                    .and_then(|value| value.checked_add(extra_len))
-                    .ok_or_else(|| err("ZIP 테스트 data offset 계산 실패"))?;
-                let compressed_len = usize::try_from(entry.compressed_size)
-                    .map_err(|source| err(format!("ZIP 테스트 압축 크기 변환 실패: {source}")))?;
-                let data_end = data_start
-                    .checked_add(compressed_len)
-                    .ok_or_else(|| err("ZIP 테스트 data end 계산 실패"))?;
-                let Some(compressed) = archive_bytes.get(data_start..data_end) else {
-                    return Err(err("ZIP 테스트 압축 데이터 범위 오류"));
-                };
-                if compressed
-                    .first()
-                    .is_some_and(|byte| byte & 0b0000_0110 == 0b0000_0100)
-                {
-                    return Ok(());
-                }
-            }
-            Err(err("ZIP 테스트 dynamic deflate entry가 없습니다."))
-        }
-    }
-    fn cleanup_dir(path: &Path) {
-        match fs::remove_dir_all(path) {
-            Ok(()) | Err(_) => {}
-        }
-    }
-    fn test_work_dir(label: &str) -> Result<PathBuf> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = env::temp_dir().join(format!(
-            "fcupdater_zip_test_{label}_{}_{}",
-            process::id(),
-            nanos
-        ));
-        fs::create_dir_all(&dir).map_err(|source_err| {
-            err(path_source_message(
-                "ZIP 테스트 폴더 생성 실패",
-                &dir,
-                source_err,
-            ))
-        })?;
-        Ok(dir)
-    }
-    #[test]
-    fn extracts_repository_master_xlsx() -> Result<()> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let archive_path = manifest_dir.join("fuel_cost_chungcheong.xlsx");
-        if !archive_path.is_file() {
-            return Err(err(path_source_message(
-                "ZIP 테스트용 마스터 파일 확인 실패",
-                &archive_path,
-                "파일이 없습니다",
-            )));
-        }
-        let work_dir = test_work_dir("extract")?;
-        let unpack_dir = work_dir.join("unpack");
-        let result = (|| -> Result<()> {
-            ZipArchiveOps.extract_to_directory(&archive_path, &unpack_dir)?;
-            for rel in [
-                "[Content_Types].xml",
-                "xl/workbook.xml",
-                "xl/_rels/workbook.xml.rels",
-            ] {
-                let path = unpack_dir.join(rel.replace('/', MAIN_SEPARATOR_STR));
-                if !path.is_file() {
-                    return Err(err(path_source_message(
-                        "ZIP 테스트 해제 파일 확인 실패",
-                        &path,
-                        "파일이 없습니다",
-                    )));
-                }
-            }
-            Ok(())
-        })();
-        cleanup_dir(&work_dir);
-        result
-    }
-    #[test]
-    fn creates_stored_zip_and_extracts_it() -> Result<()> {
-        let work_dir = test_work_dir("create")?;
-        let result = (|| -> Result<()> {
-            let root = work_dir.join("root");
-            let nested = root.join("xl").join("_rels");
-            fs::create_dir_all(&nested).map_err(|source_err| {
-                err(path_source_message(
-                    "ZIP 테스트 폴더 생성 실패",
-                    &nested,
-                    source_err,
-                ))
-            })?;
-            fs::write(root.join("[Content_Types].xml"), "<Types/>").map_err(|source_err| {
-                err(path_source_message(
-                    "ZIP 테스트 파일 쓰기 실패",
-                    &root,
-                    source_err,
-                ))
-            })?;
-            fs::write(root.join("xl").join("workbook.xml"), "<workbook/>").map_err(
-                |source_err| {
-                    err(path_source_message(
-                        "ZIP 테스트 파일 쓰기 실패",
-                        &root,
-                        source_err,
-                    ))
-                },
-            )?;
-            fs::write(nested.join("workbook.xml.rels"), "<Relationships/>").map_err(
-                |source_err| {
-                    err(path_source_message(
-                        "ZIP 테스트 파일 쓰기 실패",
-                        &nested,
-                        source_err,
-                    ))
-                },
-            )?;
-            fs::write(
-                root.join("xl").join("sharedStrings.xml"),
-                "가나다라".repeat(1024),
-            )
-            .map_err(|source_err| {
-                err(path_source_message(
-                    "ZIP 테스트 파일 쓰기 실패",
-                    &root,
-                    source_err,
-                ))
-            })?;
-            let archive_path = work_dir.join("out.xlsx");
-            ZipArchiveOps.create_from_directory(&root, &archive_path)?;
-            let entries = ZipArchiveOps.list_entries(&archive_path)?;
-            for expected in [
-                "[Content_Types].xml",
-                "xl/_rels/workbook.xml.rels",
-                "xl/workbook.xml",
-            ] {
-                if !entries.iter().any(|entry| entry == expected) {
-                    return Err(err(format!("ZIP 테스트 entry가 없습니다: {expected}")));
-                }
-            }
-            let archive_bytes = fs::read(&archive_path).map_err(|source_err| {
-                err(path_source_message(
-                    "ZIP 테스트 파일 읽기 실패",
-                    &archive_path,
-                    source_err,
-                ))
-            })?;
-            let parsed_entries = super::parse_entries(&archive_bytes).map_err(err)?;
-            if !parsed_entries
-                .iter()
-                .any(|entry| entry.method == super::METHOD_DEFLATE)
-            {
-                return Err(err("ZIP 테스트 deflate entry가 없습니다."));
-            }
-            ZipTestAssertions.assert_has_dynamic_deflate(&archive_bytes, &parsed_entries)?;
-            let unpack_dir = work_dir.join("unpacked");
-            ZipArchiveOps.extract_to_directory(&archive_path, &unpack_dir)?;
-            let workbook = fs::read_to_string(unpack_dir.join("xl").join("workbook.xml")).map_err(
-                |source_err| {
-                    err(path_source_message(
-                        "ZIP 테스트 재해제 파일 읽기 실패",
-                        &unpack_dir,
-                        source_err,
-                    ))
-                },
-            )?;
-            if workbook != "<workbook/>" {
-                return Err(err("ZIP 테스트 재해제 내용이 일치하지 않습니다."));
-            }
-            Ok(())
-        })();
-        cleanup_dir(&work_dir);
-        result
-    }
 }

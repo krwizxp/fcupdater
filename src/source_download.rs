@@ -15,7 +15,10 @@ use std::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod libcurl {
-    use super::HttpResponse;
+    use super::{
+        HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, checked_http_buffer_len,
+        enforce_http_content_length_limit,
+    };
     use alloc::{ffi::CString, string::String};
     use core::{
         ffi::{CStr, c_char, c_int, c_long, c_void},
@@ -33,6 +36,7 @@ mod libcurl {
     const CURLOPT_HEADERDATA: CurlOption = 10_029;
     const CURLOPT_HEADERFUNCTION: CurlOption = 20_079;
     const CURLOPT_HTTPHEADER: CurlOption = 10_023;
+    const CURLOPT_MAXFILESIZE_LARGE: CurlOption = 30_117;
     const CURLOPT_NOSIGNAL: CurlOption = 99;
     const CURLOPT_POST: CurlOption = 47;
     const CURLOPT_POSTFIELDS: CurlOption = 10_015;
@@ -60,9 +64,15 @@ mod libcurl {
     }
     struct EasyHandle(*mut Curl);
     struct HeaderList(*mut CurlSlist);
+    struct BoundedResponseBuffer {
+        bytes: Vec<u8>,
+        error: Option<String>,
+        label: &'static str,
+        limit: usize,
+    }
     struct ResponseBuffers {
-        body: Vec<u8>,
-        headers: Vec<u8>,
+        body: BoundedResponseBuffer,
+        headers: BoundedResponseBuffer,
     }
     #[link(name = "curl")]
     unsafe extern "C" {
@@ -132,8 +142,8 @@ mod libcurl {
             }
             let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
             let mut response_buffers = ResponseBuffers {
-                body: Vec::new(),
-                headers: Vec::new(),
+                body: BoundedResponseBuffer::new("본문", HTTP_MAX_BODY_BYTES),
+                headers: BoundedResponseBuffer::new("헤더", HTTP_MAX_HEADER_BYTES),
             };
             setopt_str(handle.0, CURLOPT_URL, url.as_ptr())?;
             setopt_ptr(handle.0, CURLOPT_HTTPHEADER, header_list.0)?;
@@ -142,6 +152,11 @@ mod libcurl {
             setopt_callback(handle.0, CURLOPT_HEADERFUNCTION, write_vec_callback)?;
             for (option, value) in [
                 (CURLOPT_CONNECTTIMEOUT, 30),
+                (
+                    CURLOPT_MAXFILESIZE_LARGE,
+                    c_long::try_from(HTTP_MAX_BODY_BYTES)
+                        .map_err(|source| format!("HTTP 본문 한도 변환 실패: {source}"))?,
+                ),
                 (CURLOPT_TIMEOUT, 60),
                 (CURLOPT_NOSIGNAL, 1),
             ] {
@@ -170,6 +185,9 @@ mod libcurl {
             }
             // SAFETY: handle.0 is configured with callbacks and buffers that live until the call returns.
             let perform_code = unsafe { curl_easy_perform(handle.0) };
+            if let Some(callback_error) = response_buffers.take_error() {
+                return Err(callback_error);
+            }
             if perform_code != CURLE_OK {
                 if error_buffer.first().copied().unwrap_or_default() != 0 {
                     // SAFETY: libcurl writes a NUL-terminated error string into CURLOPT_ERRORBUFFER.
@@ -191,7 +209,7 @@ mod libcurl {
             }
             let status = u32::try_from(raw_status)
                 .map_err(|source| format!("HTTP 상태 코드 변환 실패: {source}"))?;
-            let text = String::from_utf8_lossy(&response_buffers.headers);
+            let text = String::from_utf8_lossy(&response_buffers.headers.bytes);
             let normalized = text.replace("\r\n", "\n");
             let selected = normalized
                 .split("\n\n")
@@ -206,11 +224,44 @@ mod libcurl {
                     Some((name.trim().to_owned(), value.trim().to_owned()))
                 })
                 .collect();
+            enforce_http_content_length_limit(&headers, HTTP_MAX_BODY_BYTES)?;
             Ok(HttpResponse {
-                body: response_buffers.body,
+                body: response_buffers.body.bytes,
                 headers,
                 status,
             })
+        }
+    }
+    impl BoundedResponseBuffer {
+        const fn new(label: &'static str, limit: usize) -> Self {
+            Self {
+                bytes: Vec::new(),
+                error: None,
+                label,
+                limit,
+            }
+        }
+        fn append(&mut self, bytes: &[u8]) -> bool {
+            if let Err(error) =
+                checked_http_buffer_len(self.label, self.bytes.len(), bytes.len(), self.limit)
+            {
+                self.error = Some(error);
+                return false;
+            }
+            if let Err(source) = self.bytes.try_reserve(bytes.len()) {
+                self.error = Some(format!(
+                    "HTTP 응답 {} 메모리 확보 실패: {source}",
+                    self.label
+                ));
+                return false;
+            }
+            self.bytes.extend_from_slice(bytes);
+            true
+        }
+    }
+    impl ResponseBuffers {
+        fn take_error(&mut self) -> Option<String> {
+            self.body.error.take().or_else(|| self.headers.error.take())
         }
     }
     fn cstring(label: &str, value: &str) -> Result<CString, String> {
@@ -247,12 +298,11 @@ mod libcurl {
         }
         // SAFETY: libcurl passes a valid buffer with len bytes for the duration of this callback.
         let bytes = unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) };
-        // SAFETY: userdata is the Vec<u8> pointer set before curl_easy_perform.
-        let target = unsafe { &mut *userdata.cast::<Vec<u8>>() };
-        if target.try_reserve(bytes.len()).is_err() {
+        // SAFETY: userdata is the BoundedResponseBuffer pointer set before curl_easy_perform.
+        let target = unsafe { &mut *userdata.cast::<BoundedResponseBuffer>() };
+        if !target.append(bytes) {
             return 0;
         }
-        target.extend_from_slice(bytes);
         len
     }
     fn setopt_callback(
@@ -298,7 +348,10 @@ mod libcurl {
 }
 #[cfg(windows)]
 mod winhttp {
-    use super::HttpResponse;
+    use super::{
+        HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, checked_http_buffer_len,
+        enforce_http_content_length_limit,
+    };
     use alloc::{string::String, vec::Vec};
     use core::{
         ffi::c_void,
@@ -309,7 +362,6 @@ mod winhttp {
     const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
     const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
     const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
-    const WINHTTP_OPTION_IGNORE_CERT_REVOCATION_OFFLINE: u32 = 155;
     const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
     const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
     const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
@@ -370,12 +422,6 @@ mod winhttp {
             total_length: u32,
             context: usize,
         ) -> i32;
-        fn WinHttpSetOption(
-            h_internet: HInternet,
-            option: u32,
-            buffer: *mut c_void,
-            buffer_length: u32,
-        ) -> i32;
         fn WinHttpSetTimeouts(
             h_internet: HInternet,
             resolve_timeout: i32,
@@ -434,8 +480,10 @@ mod winhttp {
             if last_error != ERROR_INSUFFICIENT_BUFFER {
                 return Err(self.last_error_message("WinHttpQueryHeaders"));
             }
-            let units = usize::try_from(bytes)
-                .map_err(|source| format!("응답 헤더 길이 변환 실패: {source}"))?
+            let header_bytes = usize::try_from(bytes)
+                .map_err(|source| format!("응답 헤더 길이 변환 실패: {source}"))?;
+            checked_http_buffer_len("헤더", 0, header_bytes, HTTP_MAX_HEADER_BYTES)?;
+            let units = header_bytes
                 .checked_div(2)
                 .ok_or_else(|| String::from("응답 헤더 길이 계산 실패"))?;
             let mut buffer = vec![0_u16; units];
@@ -504,9 +552,11 @@ mod winhttp {
                 let chunk_len = usize::try_from(available)
                     .map_err(|source| format!("응답 chunk 길이 변환 실패: {source}"))?;
                 let old_len = body.len();
+                let buffered_len =
+                    checked_http_buffer_len("본문", old_len, chunk_len, HTTP_MAX_BODY_BYTES)?;
                 body.try_reserve(chunk_len)
                     .map_err(|source| format!("응답 본문 메모리 확보 실패: {source}"))?;
-                body.resize(old_len.saturating_add(chunk_len), 0);
+                body.resize(buffered_len, 0);
                 let mut read = 0_u32;
                 // SAFETY: old_len is within body after resize, so the pointer covers available writable bytes.
                 let chunk_ptr = unsafe { body.as_mut_ptr().add(old_len).cast::<c_void>() };
@@ -518,7 +568,9 @@ mod winhttp {
                 }
                 let read_len = usize::try_from(read)
                     .map_err(|source| format!("응답 read 길이 변환 실패: {source}"))?;
-                body.truncate(old_len.saturating_add(read_len));
+                let actual_len =
+                    checked_http_buffer_len("본문", old_len, read_len, HTTP_MAX_BODY_BYTES)?;
+                body.truncate(actual_len);
                 if read == 0 {
                     break;
                 }
@@ -573,7 +625,6 @@ mod winhttp {
                 )
             };
             let request = self.non_null_handle(raw_request, "WinHttpOpenRequest")?;
-            self.set_ignore_revocation_offline(request.0)?;
             let mut headers_text = String::new();
             for header in headers {
                 let name = header.0;
@@ -617,6 +668,7 @@ mod winhttp {
             }
             let status = self.query_status(request.0)?;
             let response_headers = self.query_headers(request.0)?;
+            enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
             let response_body = self.read_body(request.0)?;
             Ok(HttpResponse {
                 body: response_body,
@@ -624,30 +676,13 @@ mod winhttp {
                 status,
             })
         }
-        fn set_ignore_revocation_offline(&self, request: HInternet) -> Result<(), String> {
-            let mut enabled = 1_u32;
-            let buffer_length = u32::try_from(size_of::<u32>())
-                .map_err(|source| format!("WinHTTP 옵션 길이 변환 실패: {source}"))?;
-            // SAFETY: request is a valid WinHTTP request handle and enabled points to a u32 option value.
-            let ok = unsafe {
-                WinHttpSetOption(
-                    request,
-                    WINHTTP_OPTION_IGNORE_CERT_REVOCATION_OFFLINE,
-                    (&raw mut enabled).cast::<c_void>(),
-                    buffer_length,
-                )
-            };
-            if ok == 0_i32 {
-                Err(self.last_error_message("WinHttpSetOption IGNORE_CERT_REVOCATION_OFFLINE"))
-            } else {
-                Ok(())
-            }
-        }
     }
     fn wide(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().chain([0]).collect()
     }
 }
+const HTTP_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+const HTTP_MAX_HEADER_BYTES: usize = 1024 * 1024;
 const OPINET_HOST: &str = "www.opinet.co.kr";
 const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
 const OPDOWNLOAD_PATH: &str = "/user/opdown/opDownload.do";
@@ -1304,6 +1339,7 @@ impl HttpClientExt for HttpClient {
                 "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.",
             ));
         };
+        enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
         self.store_response_cookies(&response)?;
         if !(200..300).contains(&response.status) {
             let body_preview = String::from_utf8_lossy(
@@ -1390,4 +1426,43 @@ impl HttpClientExt for HttpClient {
         }
         Ok(())
     }
+}
+fn checked_http_buffer_len(
+    label: &str,
+    current_len: usize,
+    additional_len: usize,
+    limit: usize,
+) -> StdResult<usize, String> {
+    let next_len = current_len
+        .checked_add(additional_len)
+        .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
+    if next_len > limit {
+        Err(format!(
+            "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
+        ))
+    } else {
+        Ok(next_len)
+    }
+}
+fn enforce_http_content_length_limit(
+    headers: &[(String, String)],
+    limit: usize,
+) -> StdResult<(), String> {
+    for header in headers {
+        let name = &header.0;
+        let value = &header.1;
+        if !name.eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
+        let parsed = value
+            .trim()
+            .parse::<usize>()
+            .map_err(|source| format!("HTTP Content-Length 해석 실패: {source}"))?;
+        if parsed > limit {
+            return Err(format!(
+                "HTTP Content-Length가 허용 한도({limit} bytes)를 초과했습니다."
+            ));
+        }
+    }
+    Ok(())
 }
