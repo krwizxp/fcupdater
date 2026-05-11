@@ -54,6 +54,7 @@ struct IconvDecoder {
     descriptor: IconvDescriptor,
 }
 #[cfg(not(windows))]
+#[cfg_attr(any(target_os = "macos", target_os = "ios"), link(name = "iconv"))]
 unsafe extern "C" {
     fn iconv_open(tocode: *const c_char, fromcode: *const c_char) -> IconvDescriptor;
     fn iconv(
