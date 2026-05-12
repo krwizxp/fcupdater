@@ -1167,7 +1167,7 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
         })
     }
     fn region_has_explicit_sigungu(&self, region: &str) -> bool {
-        let mut tokens = region.split_whitespace().filter(|token| !token.is_empty());
+        let mut tokens = region.split_whitespace();
         let Some(first_token) = tokens.next() else {
             return false;
         };
