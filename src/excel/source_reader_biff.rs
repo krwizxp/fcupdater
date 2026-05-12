@@ -1700,7 +1700,7 @@ fn read_le_array<const N: usize>(
     let end = checked_offset_add(offset, N, label)?;
     let arr = bytes
         .get(offset..end)
-        .and_then(|slice| slice.first_chunk::<N>())
+        .and_then(|slice| slice.as_array::<N>())
         .copied()
         .ok_or_else(|| err(prefixed_display_message(out_of_range_prefix, offset)))?;
     Ok(arr)

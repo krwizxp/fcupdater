@@ -1,6 +1,6 @@
 use crate::{Result, err, path_pair_source_message, path_source_message, prefixed_message};
 use alloc::{string::String, vec::Vec};
-use core::{cmp::Ordering, iter::repeat_n, result::Result as StdResult, str};
+use core::{array::from_fn, cmp::Ordering, iter::repeat_n, result::Result as StdResult, str};
 use std::{
     fs,
     io::Write as _,
@@ -711,20 +711,13 @@ impl DeflateInflaterExt for DeflateInflater {
         Ok((literal, distance))
     }
     fn fixed_trees() -> ZipResult<(Huffman, Huffman)> {
-        let mut literal_lengths = vec![0_u8; FIXED_LITERAL_SYMBOLS];
-        for len in literal_lengths.iter_mut().take(144) {
-            *len = 8;
-        }
-        for len in literal_lengths.iter_mut().take(256).skip(144) {
-            *len = 9;
-        }
-        for len in literal_lengths.iter_mut().take(280).skip(256) {
-            *len = 7;
-        }
-        for len in literal_lengths.iter_mut().skip(280) {
-            *len = 8;
-        }
-        let distance_lengths = vec![5_u8; FIXED_DISTANCE_SYMBOLS];
+        let literal_lengths: [u8; FIXED_LITERAL_SYMBOLS] = from_fn(|symbol| match symbol {
+            0..=143 | 280..=287 => 8,
+            144..=255 => 9,
+            256..=279 => 7,
+            _ => 0,
+        });
+        let distance_lengths = [5_u8; FIXED_DISTANCE_SYMBOLS];
         let literal = Huffman::from_lengths(&literal_lengths)?
             .ok_or_else(|| String::from("fixed literal Huffman tree 생성 실패"))?;
         let distance = Huffman::from_lengths(&distance_lengths)?
@@ -1441,9 +1434,10 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 fn hash3(bytes: &[u8], position: usize) -> Option<usize> {
-    let first = usize::from(*bytes.get(position)?);
-    let second = usize::from(*bytes.get(position.checked_add(1)?)?);
-    let third = usize::from(*bytes.get(position.checked_add(2)?)?);
+    let &[first_byte, second_byte, third_byte] = bytes.get(position..)?.first_chunk::<3>()?;
+    let first = usize::from(first_byte);
+    let second = usize::from(second_byte);
+    let third = usize::from(third_byte);
     Some(((first << 10_usize) ^ (second << 5_usize) ^ third) & HASH_SIZE.saturating_sub(1))
 }
 fn is_safe_archive_entry_path(entry_name: &str) -> bool {
@@ -1451,7 +1445,7 @@ fn is_safe_archive_entry_path(entry_name: &str) -> bool {
         return false;
     }
     let bytes = entry_name.as_bytes();
-    if let Some((&first, &colon)) = bytes.first().zip(bytes.get(1))
+    if let Some(&[first, colon]) = bytes.first_chunk::<2>()
         && colon == b':'
         && first.is_ascii_alphabetic()
     {
@@ -1477,19 +1471,30 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
         .len()
         .saturating_sub(END_OF_CENTRAL_DIRECTORY_LEN.saturating_add(ZIP_COMMENT_MAX_LEN));
     let max_offset = bytes.len().saturating_sub(END_OF_CENTRAL_DIRECTORY_LEN);
+    let search_end = max_offset.saturating_add(4_usize);
+    let search_bytes = bytes
+        .get(min_offset..search_end)
+        .ok_or_else(|| String::from("ZIP EOCD 검색 범위 오류"))?;
+    let eocd_signature = END_OF_CENTRAL_DIRECTORY_SIGNATURE.to_le_bytes();
+    let mut search_len = search_bytes.len();
     let mut eocd_offset_candidate = None;
-    for offset in (min_offset..=max_offset).rev() {
-        if read_u32(bytes, offset)? == END_OF_CENTRAL_DIRECTORY_SIGNATURE {
-            let comment_len = usize::from(read_u16(bytes, offset.saturating_add(20))?);
-            if offset
-                .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
-                .and_then(|value| value.checked_add(comment_len))
-                == Some(bytes.len())
-            {
-                eocd_offset_candidate = Some(offset);
-                break;
-            }
+    while let Some(relative_offset) = search_bytes
+        .get(..search_len)
+        .ok_or_else(|| String::from("ZIP EOCD 검색 범위 오류"))?
+        .array_windows::<4>()
+        .rposition(|window| *window == eocd_signature)
+    {
+        let offset = min_offset.saturating_add(relative_offset);
+        let comment_len = usize::from(read_u16(bytes, offset.saturating_add(20))?);
+        if offset
+            .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
+            .and_then(|value| value.checked_add(comment_len))
+            == Some(bytes.len())
+        {
+            eocd_offset_candidate = Some(offset);
+            break;
         }
+        search_len = relative_offset;
     }
     let Some(eocd_offset) = eocd_offset_candidate else {
         return Err(String::from("ZIP EOCD를 찾지 못했습니다."));
@@ -1585,20 +1590,28 @@ fn push_repeated(lengths: &mut Vec<u8>, value: u8, repeat: usize, total: usize) 
     Ok(())
 }
 fn read_u16(bytes: &[u8], offset: usize) -> ZipResult<u16> {
-    let Some(raw) = bytes.get(offset..offset.saturating_add(2)) else {
+    let Some(end) = offset.checked_add(2) else {
         return Err(String::from("ZIP u16 읽기 범위 오류"));
     };
-    let raw_bytes =
-        <[u8; 2]>::try_from(raw).map_err(|source| format!("ZIP u16 변환 실패: {source}"))?;
-    Ok(u16::from_le_bytes(raw_bytes))
+    let Some(raw_bytes) = bytes
+        .get(offset..end)
+        .and_then(|slice| slice.as_array::<2>())
+    else {
+        return Err(String::from("ZIP u16 읽기 범위 오류"));
+    };
+    Ok(u16::from_le_bytes(*raw_bytes))
 }
 fn read_u32(bytes: &[u8], offset: usize) -> ZipResult<u32> {
-    let Some(raw) = bytes.get(offset..offset.saturating_add(4)) else {
+    let Some(end) = offset.checked_add(4) else {
         return Err(String::from("ZIP u32 읽기 범위 오류"));
     };
-    let raw_bytes =
-        <[u8; 4]>::try_from(raw).map_err(|source| format!("ZIP u32 변환 실패: {source}"))?;
-    Ok(u32::from_le_bytes(raw_bytes))
+    let Some(raw_bytes) = bytes
+        .get(offset..end)
+        .and_then(|slice| slice.as_array::<4>())
+    else {
+        return Err(String::from("ZIP u32 읽기 범위 오류"));
+    };
+    Ok(u32::from_le_bytes(*raw_bytes))
 }
 fn reverse_bits(mut value: u16, count: u8) -> u16 {
     let mut out = 0_u16;
