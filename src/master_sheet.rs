@@ -1869,7 +1869,7 @@ fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> String {
     );
     amount.push_str(sign);
     for (index, ch) in digits.chars().enumerate() {
-        if index != 0 && digits.len().saturating_sub(index).rem_euclid(3) == 0 {
+        if index != 0 && digits.len().saturating_sub(index).is_multiple_of(3) {
             amount.push(',');
         }
         amount.push(ch);

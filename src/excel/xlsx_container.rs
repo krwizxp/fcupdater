@@ -16,7 +16,6 @@ use std::{
 cfg_select! {
     windows => {
         use core::iter::once;
-        use core::ptr::{null, null_mut};
         use std::os::windows::ffi::OsStrExt as _;
     }
     _ => {
@@ -65,22 +64,14 @@ impl ArchiveOpsExt for ArchiveOps {
                         source_err,
                     ))
                 })? {
-                    // SAFETY: Both UTF-16 path buffers are NUL-terminated and live across the call; optional pointers are intentionally null.
-                    let replaced = unsafe {
-                        super::windows_api::ReplaceFileW(
-                            destination_w.as_ptr(),
-                            replacement_w.as_ptr(),
-                            null(),
-                            super::windows_api::REPLACEFILE_WRITE_THROUGH,
-                            null_mut(),
-                            null_mut(),
-                        )
-                    };
-                    if replaced != 0_i32 {
+                    if super::windows_api::WindowsFileApi::run(
+                        super::windows_api::WindowsFileOperation::ReplaceWriteThrough,
+                        &destination_w,
+                        &replacement_w,
+                    ) {
                         return Ok(());
                     }
-                    // SAFETY: Called immediately after the failing Windows API call on the same thread.
-                    let code = unsafe { super::windows_api::GetLastError() };
+                    let code = super::windows_api::WindowsFileApi::last_error();
                     return Err(err(windows_file_op_error_message(
                         "파일 교체 실패(ReplaceFileW): ",
                         output_xlsx,
@@ -89,20 +80,14 @@ impl ArchiveOpsExt for ArchiveOps {
                         code,
                     )));
                 }
-                // SAFETY: Both UTF-16 path buffers are NUL-terminated and valid for the duration of the call.
-                let moved = unsafe {
-                    super::windows_api::MoveFileExW(
-                        replacement_w.as_ptr(),
-                        destination_w.as_ptr(),
-                        super::windows_api::MOVEFILE_REPLACE_EXISTING
-                            | super::windows_api::MOVEFILE_WRITE_THROUGH,
-                    )
-                };
-                if moved != 0_i32 {
+                if super::windows_api::WindowsFileApi::run(
+                    super::windows_api::WindowsFileOperation::MoveReplaceWriteThrough,
+                    &replacement_w,
+                    &destination_w,
+                ) {
                     return Ok(());
                 }
-                // SAFETY: Called immediately after the failing Windows API call on the same thread.
-                let code = unsafe { super::windows_api::GetLastError() };
+                let code = super::windows_api::WindowsFileApi::last_error();
                 Err(err(windows_file_op_error_message(
                     "파일 이동 실패(MoveFileExW): ",
                     temp_output,
@@ -202,7 +187,7 @@ impl ArchiveOps {
             return false;
         }
         let bytes = entry_name.as_bytes();
-        if let Some((&first, &colon)) = bytes.first().zip(bytes.get(1))
+        if let Some(&[first, colon]) = bytes.first_chunk::<2>()
             && colon == b':'
             && first.is_ascii_alphabetic()
         {
@@ -357,13 +342,7 @@ impl XlsxContainer {
                 push_display(&mut temp_name, seq);
                 parent.join(temp_name)
             },
-            |path| {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                    .map(|_| ())
-            },
+            |path| fs::File::create_new(path).map(|_| ()),
             "임시 출력 파일 생성 실패",
             prefixed_message("임시 출력 파일 경로 생성 실패: ", output_xlsx.display()),
         )?;

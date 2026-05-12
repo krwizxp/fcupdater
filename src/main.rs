@@ -1176,11 +1176,7 @@ fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
     let mut seq = 0_u32;
     loop {
         let candidate = candidate_with_suffix(path, seq);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match fs::File::create_new(&candidate) {
             Ok(mut file) => {
                 if let Err(write_err) = file
                     .write_all(RESERVATION_MAGIC)

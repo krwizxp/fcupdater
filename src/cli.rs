@@ -56,6 +56,15 @@ impl Default for Args {
         }
     }
 }
+impl Args {
+    fn set_explicit_output_target(&mut self, value: PathBuf) -> Result<()> {
+        if matches!(self.output_target, OutputTarget::InPlace) {
+            return Err(err("--in-place 와 --output 은 동시에 사용할 수 없습니다."));
+        }
+        self.output_target = OutputTarget::Explicit(value);
+        Ok(())
+    }
+}
 impl TryFrom<&[OsString]> for ParseAction {
     type Error = crate::BoxError;
     fn try_from(raw_args: &[OsString]) -> Result<Self> {
@@ -128,27 +137,32 @@ impl TryFrom<&[OsString]> for ParseAction {
                 args.sources_prefix = parse_sources_prefix(value_str)?;
             } else if token == OsStr::new("--output") {
                 let value = take_option_value(raw_args, &mut arg_index, "--output")?;
-                if matches!(args.output_target, OutputTarget::InPlace) {
-                    return Err(err("--in-place 와 --output 은 동시에 사용할 수 없습니다."));
-                }
-                args.output_target = OutputTarget::Explicit(value.into());
-            } else if let Some(token_str) = token.to_str() {
-                if let Some(option_value) = token_str.strip_prefix("--master=") {
-                    args.master = option_value.into();
-                } else if let Some(option_value) = token_str.strip_prefix("--sources-dir=") {
-                    args.sources_dir = option_value.into();
-                } else if let Some(option_value) = token_str.strip_prefix("--sources-prefix=") {
-                    args.sources_prefix = parse_sources_prefix(option_value)?;
-                } else if let Some(option_value) = token_str.strip_prefix("--output=") {
-                    if matches!(args.output_target, OutputTarget::InPlace) {
-                        return Err(err("--in-place 와 --output 은 동시에 사용할 수 없습니다."));
-                    }
-                    args.output_target = OutputTarget::Explicit(option_value.into());
-                } else {
-                    return Err(err(unknown_option_message(token_str)));
-                }
+                args.set_explicit_output_target(value.into())?;
             } else {
-                return Err(err(unknown_option_message(&token.to_string_lossy())));
+                match token.to_str() {
+                    Some(token_str)
+                        if let Some(option_value) = token_str.strip_prefix("--master=") =>
+                    {
+                        args.master = option_value.into();
+                    }
+                    Some(token_str)
+                        if let Some(option_value) = token_str.strip_prefix("--sources-dir=") =>
+                    {
+                        args.sources_dir = option_value.into();
+                    }
+                    Some(token_str)
+                        if let Some(option_value) = token_str.strip_prefix("--sources-prefix=") =>
+                    {
+                        args.sources_prefix = parse_sources_prefix(option_value)?;
+                    }
+                    Some(token_str)
+                        if let Some(option_value) = token_str.strip_prefix("--output=") =>
+                    {
+                        args.set_explicit_output_target(option_value.into())?;
+                    }
+                    Some(token_str) => return Err(err(unknown_option_message(token_str))),
+                    None => return Err(err(unknown_option_message(&token.to_string_lossy()))),
+                }
             }
             advance_arg_index(&mut arg_index)?;
         }

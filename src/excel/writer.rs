@@ -342,7 +342,7 @@ impl WorkbookSharedStringsExt for Workbook {
             new_si_xml.push_str(&text);
             new_si_xml.push_str("</t></si>");
         }
-        let updated_xml = if open_tag.trim_end().ends_with("/>") {
+        let updated_xml = if open_tag.trim_ascii_end().ends_with("/>") {
             let mut replacement = build_open_tag("sst", &attrs);
             replacement.push_str(&new_si_xml);
             replacement.push_str("</sst>");
@@ -572,20 +572,23 @@ impl Worksheet {
         parse_i32_str(&text)
     }
     fn get_or_create_cell_mut(&mut self, col: u32, row: u32) -> &mut Cell {
-        let row_obj = self.rows.entry(row).or_insert_with(|| Row {
-            attrs: vec![owned_attr("r", display_string(row))],
+        let row_obj = self.rows.entry(row).or_insert_with_key(|&row_key| Row {
+            attrs: vec![owned_attr("r", display_string(row_key))],
             cells: BTreeMap::default(),
         });
         if get_attr(&row_obj.attrs, "r").is_none() {
             set_attr(&mut row_obj.attrs, "r", display_string(row));
         }
-        row_obj.cells.entry(col).or_insert_with(|| Cell {
-            attrs: vec![
-                owned_attr("r", ref_with_locks(col, row, false, false)),
-                owned_attr("s", "0"),
-            ],
-            inner_xml: None,
-        })
+        row_obj
+            .cells
+            .entry(col)
+            .or_insert_with_key(|&col_key| Cell {
+                attrs: vec![
+                    owned_attr("r", ref_with_locks(col_key, row, false, false)),
+                    owned_attr("s", "0"),
+                ],
+                inner_xml: None,
+            })
     }
     pub fn has_any_row_format(&self, row: u32, max_col: u32) -> bool {
         let Some(row_obj) = self.rows.get(&row) else {
@@ -855,7 +858,7 @@ impl Worksheet {
                 }
                 let new_ref = build_ref_range("A", header_row, end_col, target_last_row);
                 set_attr(&mut attrs, "ref", new_ref);
-                let new_tag = if tag.trim_end().ends_with("/>") {
+                let new_tag = if tag.trim_ascii_end().ends_with("/>") {
                     build_self_closing_tag("autoFilter", &attrs)
                 } else {
                     build_open_tag("autoFilter", &attrs)
@@ -1448,7 +1451,7 @@ fn replace_formula_tag_with_plain_formula(inner_xml: &str, formula: &str) -> Res
     let prefix = inner_xml
         .get(..f_start)
         .ok_or_else(|| err("cell formula prefix 범위가 손상되었습니다."))?;
-    let suffix = if open_tag.trim_end().ends_with("/>") {
+    let suffix = if open_tag.trim_ascii_end().ends_with("/>") {
         inner_xml
             .get(checked_usize_add(f_end, 1, "cell formula suffix 시작")?..)
             .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?
@@ -1602,7 +1605,7 @@ where
         let attrs = parse_tag_attrs(&tag_xml)?;
         let next_cursor = checked_usize_add(tag_end, 1, "XML 태그 다음 cursor")?;
         if should_remove(&attrs) {
-            let tag_end_exclusive = if tag_xml.trim_end().ends_with("/>") {
+            let tag_end_exclusive = if tag_xml.trim_ascii_end().ends_with("/>") {
                 checked_usize_add(tag_end, 1, "XML self-closing 태그 끝")?
             } else {
                 let close_search_from = checked_usize_add(tag_end, 1, "XML 종료 태그 검색 시작")?;
