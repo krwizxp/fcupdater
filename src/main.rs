@@ -1430,10 +1430,7 @@ fn display_region_label_from_source(region: &str, address: &str) -> String {
     region.trim().to_owned()
 }
 fn parse_region_label(text: &str) -> Option<String> {
-    let mut tokens = text.split_whitespace().filter_map(|token| {
-        let trimmed = token.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
-    });
+    let mut tokens = text.split_whitespace();
     let first = tokens.next()?;
     let second = tokens.next();
     for suffix in REGION_LABEL_SUFFIXES {
