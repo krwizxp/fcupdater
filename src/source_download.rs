@@ -1,9 +1,9 @@
 use crate::{
-    Result, err, err_with_source, is_metropolitan_token, is_province_token, normalize_address_key,
-    path_source_message, prefixed_message, push_display, source_sync::SourceRecord,
-    strip_basic_region_suffix,
+    Result, err, err_with_source, has_basic_region_suffix, is_metropolitan_token,
+    is_province_token, normalize_address_key, path_source_message, prefixed_message,
+    source_sync::SourceRecord, strip_basic_region_suffix,
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{result::Result as StdResult, time::Duration};
 use std::{
     fs,
@@ -175,7 +175,10 @@ cfg_select! {
             Ok(())
         }
         fn as_ptr(&self) -> *mut CurlSlist {
-            self.0.map_or(null_mut(), NonNull::as_ptr)
+            match self.0 {
+                Some(list) => list.as_ptr(),
+                None => null_mut(),
+            }
         }
     }
     impl Client {
@@ -309,17 +312,17 @@ cfg_select! {
         fn parsed_headers(&self) -> Vec<(String, String)> {
             let text = String::from_utf8_lossy(&self.headers.bytes);
             let normalized = text.replace("\r\n", "\n");
-            let selected = normalized
+            let Some(selected) = normalized
                 .rsplit("\n\n")
                 .find(|block| !block.trim_ascii().is_empty())
-                .unwrap_or("");
+            else {
+                return Vec::new();
+            };
             selected
                 .lines()
                 .filter(|line| !line.starts_with("HTTP/"))
-                .filter_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    Some((name.trim_ascii().to_owned(), value.trim_ascii().to_owned()))
-                })
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim_ascii().to_owned(), value.trim_ascii().to_owned()))
                 .collect::<Vec<_>>()
         }
         fn take_error(&mut self) -> Option<String> {
@@ -333,15 +336,14 @@ cfg_select! {
     fn curl_error(context: &str, code: CurlCode) -> String {
         // SAFETY: curl_easy_strerror returns either null or a static NUL-terminated message for code.
         let raw_ptr = unsafe { curl_easy_strerror(code) };
-        let message = NonNull::new(raw_ptr.cast_mut()).map_or_else(
-            || String::from("unknown curl error"),
-            |message_ptr| {
-                // SAFETY: libcurl guarantees a valid NUL-terminated string for non-null strerror results.
-                unsafe { CStr::from_ptr(message_ptr.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned()
-            },
-        );
+        let message = if raw_ptr.is_null() {
+            String::from("unknown curl error")
+        } else {
+            // SAFETY: libcurl guarantees a valid NUL-terminated string for non-null strerror results.
+            unsafe { CStr::from_ptr(raw_ptr) }
+                .to_string_lossy()
+                .into_owned()
+        };
         format!("{context} 실패: {message} ({code})")
     }
     unsafe extern "C" fn write_vec_callback(
@@ -392,6 +394,10 @@ cfg_select! {
     const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
     const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
     const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+    const WINHTTP_CONNECT_TIMEOUT_MS: i32 = 30_000;
+    const WINHTTP_RECEIVE_TIMEOUT_MS: i32 = 60_000;
+    const WINHTTP_RESOLVE_TIMEOUT_MS: i32 = 30_000;
+    const WINHTTP_SEND_TIMEOUT_MS: i32 = 60_000;
     pub(super) const CLIENT: Client = Client {
         get_last_error: GetLastError,
     };
@@ -529,7 +535,15 @@ cfg_select! {
             };
             let session = self.non_null_handle(raw_session, "WinHttpOpen")?;
             // SAFETY: session is a valid WinHTTP session handle.
-            unsafe { WinHttpSetTimeouts(session.as_ptr(), 30_000, 30_000, 60_000, 60_000) };
+            unsafe {
+                WinHttpSetTimeouts(
+                    session.as_ptr(),
+                    WINHTTP_RESOLVE_TIMEOUT_MS,
+                    WINHTTP_CONNECT_TIMEOUT_MS,
+                    WINHTTP_SEND_TIMEOUT_MS,
+                    WINHTTP_RECEIVE_TIMEOUT_MS,
+                )
+            };
             Ok(session)
         }
         fn query_data_available(&self, request: &Handle) -> Result<u32, String> {
@@ -694,20 +708,28 @@ cfg_select! {
             let session = self.open_session(&user_agent)?;
             let connect = self.connect(&session, &host_wide)?;
             let request = self.open_request(&connect, &method_wide, &path_wide)?;
+            let header_capacity = headers.iter().fold(0_usize, |acc, &(name, value)| {
+                acc.saturating_add(name.len())
+                    .saturating_add(value.len())
+                    .saturating_add(4)
+            });
             let mut headers_text = String::new();
+            headers_text
+                .try_reserve(header_capacity)
+                .map_err(|source| format!("요청 헤더 메모리 확보 실패: {source}"))?;
             for header in headers {
                 let name = header.0;
                 let value = header.1;
-                headers_text
-                    .try_reserve(name.len().saturating_add(value.len()).saturating_add(4))
-                    .map_err(|source| format!("요청 헤더 메모리 확보 실패: {source}"))?;
                 headers_text.push_str(name);
                 headers_text.push_str(": ");
                 headers_text.push_str(value);
                 headers_text.push_str("\r\n");
             }
             let headers_wide = wide(&headers_text);
-            let body_slice = request_body.unwrap_or(&[]);
+            let body_slice = match request_body {
+                Some(body) => body,
+                None => &[],
+            };
             let body_len = u32::try_from(body_slice.len())
                 .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?;
             self.send_request(&request, &headers_wide, body_slice, body_len)?;
@@ -756,7 +778,7 @@ cfg_select! {
         }
     }
     fn wide(value: &str) -> Vec<u16> {
-        OsStr::new(value).encode_wide().chain([0]).collect()
+        OsStr::new(value).encode_wide().chain([0]).collect::<Vec<_>>()
     }
         }
     }
@@ -915,6 +937,7 @@ trait HttpClientExt {
         path: &str,
         referer: Option<&str>,
     ) -> StdResult<String, String>;
+    fn percent_encoded(bytes: &[u8]) -> String;
     fn post_form(
         &mut self,
         host: &str,
@@ -950,11 +973,11 @@ impl SourceDownloadOpsExt for SourceDownloadOps {
         filtered
             .try_reserve_exact(records.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("필터링 소스 레코드 목록 메모리 확보 실패: ");
-                push_display(&mut message, records.len());
-                message.push_str(" records");
-                err_with_source(message, source)
+                let record_count = records.len();
+                err_with_source(
+                    format!("필터링 소스 레코드 목록 메모리 확보 실패: {record_count} records"),
+                    source,
+                )
             })?;
         for record in records {
             if self.record_matches_any_task(&record, matchers) {
@@ -992,17 +1015,7 @@ impl SourceDownloadOpsExt for SourceDownloadOps {
 }
 impl SourceDownloadWorkflowExt for SourceDownloadOps {
     fn auto_source_name(&self, prefix: &str, extension: &str) -> String {
-        let capacity = prefix
-            .len()
-            .saturating_add(AUTO_SOURCE_MARKER.len())
-            .saturating_add("_opdownload_current_price.".len())
-            .saturating_add(extension.len());
-        let mut auto_source_name = String::with_capacity(capacity);
-        auto_source_name.push_str(prefix);
-        auto_source_name.push_str(AUTO_SOURCE_MARKER);
-        auto_source_name.push_str("_opdownload_current_price.");
-        auto_source_name.push_str(extension);
-        auto_source_name
+        format!("{prefix}{AUTO_SOURCE_MARKER}_opdownload_current_price.{extension}")
     }
     fn cleanup_auto_source_files(&self, dir: &Path, prefix: &str) -> StdResult<usize, String> {
         let mut removed = 0_usize;
@@ -1085,12 +1098,7 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
             .starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
             || response.body.starts_with(b"PK\x03\x04");
         if !has_excel_signature {
-            let preview = String::from_utf8_lossy(
-                response
-                    .body
-                    .get(..response.body.len().min(512))
-                    .unwrap_or(&[]),
-            );
+            let preview = lossy_prefix(&response.body, 512);
             return Err(prefixed_message(
                 "다운로드 응답이 Excel 파일이 아닙니다: ",
                 preview,
@@ -1152,15 +1160,7 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
                 }
             }
             let combined = combined_key.get_or_insert_with(|| {
-                let capacity = record
-                    .region
-                    .len()
-                    .saturating_add(record.address.len())
-                    .saturating_add(1);
-                let mut combined_source = String::with_capacity(capacity);
-                combined_source.push_str(&record.region);
-                combined_source.push(' ');
-                combined_source.push_str(&record.address);
+                let combined_source = format!("{} {}", record.region, record.address);
                 normalize_address_key(&combined_source)
             });
             combined.contains(&matcher.sido_key) && matches_task(combined)
@@ -1171,13 +1171,9 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
         let Some(first_token) = tokens.next() else {
             return false;
         };
-        if strip_basic_region_suffix(first_token).is_some() {
-            return true;
-        }
-        (is_province_token(first_token) || is_metropolitan_token(first_token))
-            && tokens
-                .next()
-                .is_some_and(|second_token| strip_basic_region_suffix(second_token).is_some())
+        has_basic_region_suffix(first_token)
+            || ((is_province_token(first_token) || is_metropolitan_token(first_token))
+                && tokens.next().is_some_and(has_basic_region_suffix))
     }
     fn task_match_keys(&self, task: &Task) -> Vec<String> {
         let mut keys = Vec::with_capacity(4);
@@ -1186,20 +1182,16 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
             if !alias_key.is_empty() && !keys.contains(&alias_key) {
                 keys.push(alias_key);
             }
-            let stripped = strip_basic_region_suffix(alias)
-                .map(normalize_address_key)
-                .unwrap_or_default();
-            if !stripped.is_empty() && !keys.contains(&stripped) {
-                keys.push(stripped);
+            if let Some(stripped_alias) = strip_basic_region_suffix(alias) {
+                let stripped = normalize_address_key(stripped_alias);
+                if !stripped.is_empty() && !keys.contains(&stripped) {
+                    keys.push(stripped);
+                }
             }
         };
         push_alias_key(task.sigungu);
         if task.sigungu == "세종시" {
             push_alias_key("세종특별자치시");
-        }
-        let sigungu_key = normalize_address_key(task.sigungu);
-        if !sigungu_key.is_empty() && !keys.contains(&sigungu_key) {
-            keys.push(sigungu_key);
         }
         keys
     }
@@ -1212,7 +1204,7 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
                     sido_key: normalize_address_key(task.sido),
                     task_keys: ops.task_match_keys(task),
                 })
-                .collect()
+                .collect::<Vec<_>>()
         });
         TASK_MATCHERS.as_slice()
     }
@@ -1249,33 +1241,18 @@ impl HttpClientExt for HttpClient {
         if self.cookies.is_empty() {
             return None;
         }
-        let mut capacity = self.cookies.len().saturating_sub(1).saturating_mul(2);
-        for cookie in &self.cookies {
-            capacity = capacity
-                .saturating_add(cookie.name.len())
-                .saturating_add(cookie.value.len())
-                .saturating_add(1);
-        }
-        let mut out = String::with_capacity(capacity);
-        for (index, cookie) in self.cookies.iter().enumerate() {
-            if index > 0 {
-                out.push_str("; ");
-            }
-            out.push_str(&cookie.name);
-            out.push('=');
-            out.push_str(&cookie.value);
-        }
-        Some(out)
+        let pairs = self
+            .cookies
+            .iter()
+            .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+            .collect::<Vec<_>>();
+        Some(pairs.join("; "))
     }
     fn extract_netfunnel_key(result: &str) -> StdResult<String, String> {
-        let Some(start) = result.find("key=") else {
+        let Some((_, tail)) = result.split_once("key=") else {
             return Err(prefixed_message("NetFunnel key 없음: ", result));
         };
-        let value_start = start.saturating_add("key=".len());
-        let tail = result
-            .get(value_start..)
-            .ok_or_else(|| prefixed_message("NetFunnel key 범위 오류: ", result))?;
-        let value = tail.split('&').next().unwrap_or(tail);
+        let value = split_head_or_all(tail, '&');
         if value.is_empty() {
             return Err(prefixed_message("NetFunnel key 비어 있음: ", result));
         }
@@ -1300,10 +1277,8 @@ impl HttpClientExt for HttpClient {
             if matches!(code, 201 | 202 | 302) {
                 current_key = Some(Self::extract_netfunnel_key(&result)?);
                 let wait_secs = result
-                    .find("ttl=")
-                    .and_then(|start| start.checked_add("ttl=".len()))
-                    .and_then(|start| result.get(start..))
-                    .and_then(|tail| tail.split('&').next())
+                    .split_once("ttl=")
+                    .map(|(_, tail)| split_head_or_all(tail, '&'))
                     .and_then(|ttl_text| ttl_text.parse::<u32>().ok())
                     .unwrap_or(1)
                     .clamp(1, 30);
@@ -1332,6 +1307,11 @@ impl HttpClientExt for HttpClient {
         String::from_utf8(response.body)
             .map_err(|source| prefixed_message("HTTP 응답 UTF-8 변환 실패: ", source))
     }
+    fn percent_encoded(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len().saturating_mul(3));
+        Self::push_percent_encoded(&mut out, bytes);
+        out
+    }
     fn post_form(
         &mut self,
         host: &str,
@@ -1340,17 +1320,17 @@ impl HttpClientExt for HttpClient {
         referer: Option<&str>,
         ajax: bool,
     ) -> StdResult<HttpResponse, String> {
-        let mut body = String::new();
-        for indexed_pair in form.iter().enumerate() {
-            let index = indexed_pair.0;
-            let pair = *indexed_pair.1;
-            if index > 0 {
-                body.push('&');
-            }
-            Self::push_percent_encoded(&mut body, pair.0.as_bytes());
-            body.push('=');
-            Self::push_percent_encoded(&mut body, pair.1.as_bytes());
-        }
+        let body = form
+            .iter()
+            .map(|&(name, value)| {
+                format!(
+                    "{}={}",
+                    Self::percent_encoded(name.as_bytes()),
+                    Self::percent_encoded(value.as_bytes())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
         let mut headers = Vec::with_capacity(6);
         headers.push((
             "Content-Type",
@@ -1420,7 +1400,7 @@ impl HttpClientExt for HttpClient {
                     libcurl::CLIENT.request(method, host, path, body, &merged_headers)
                 }
                 _ => {
-                    let _unused = (method, host, path, body, headers, &merged_headers);
+                    let _ = (method, host, path, body, headers, &merged_headers);
                     Err(String::from(
                         "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.",
                     ))
@@ -1430,18 +1410,9 @@ impl HttpClientExt for HttpClient {
         enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
         self.store_response_cookies(&response)?;
         if !(200..300).contains(&response.status) {
-            let body_preview = String::from_utf8_lossy(
-                response
-                    .body
-                    .get(..response.body.len().min(512))
-                    .unwrap_or(&[]),
-            );
-            let mut out = String::with_capacity(body_preview.len().saturating_add(64));
-            out.push_str("HTTP ");
-            push_display(&mut out, response.status);
-            out.push_str(": ");
-            out.push_str(&body_preview);
-            return Err(out);
+            let body_preview = lossy_prefix(&response.body, 512);
+            let status = response.status;
+            return Err(format!("HTTP {status}: {body_preview}"));
         }
         Ok(response)
     }
@@ -1456,26 +1427,13 @@ impl HttpClientExt for HttpClient {
             .map(|duration| duration.as_millis())
             .map_err(|source| prefixed_message("현재 시간 조회 실패: ", source))?;
         let opcode = if key.is_some() { "5002" } else { "5101" };
-        let mut path = String::with_capacity(256);
-        path.push_str("/ts.wseq?opcode=");
-        path.push_str(opcode);
-        if let Some(key_value) = key {
-            path.push_str("&key=");
-            Self::push_percent_encoded(&mut path, key_value.as_bytes());
-        }
-        path.push_str("&nfid=0&prefix=NetFunnel.gRtype%3D");
-        path.push_str(opcode);
-        path.push_str("%3B");
-        if let Some(ttl_value) = ttl {
-            path.push_str("&ttl=");
-            push_display(&mut path, ttl_value);
-        }
-        path.push_str("&sid=");
-        path.push_str(NETFUNNEL_SERVICE_ID);
-        path.push_str("&aid=");
-        path.push_str(action_id);
-        path.push_str("&js=yes&");
-        push_display(&mut path, timestamp);
+        let key_fragment = key.map_or_else(String::new, |key_value| {
+            format!("&key={}", Self::percent_encoded(key_value.as_bytes()))
+        });
+        let ttl_fragment = ttl.map_or_else(String::new, |ttl_value| format!("&ttl={ttl_value}"));
+        let path = format!(
+            "/ts.wseq?opcode={opcode}{key_fragment}&nfid=0&prefix=NetFunnel.gRtype%3D{opcode}%3B{ttl_fragment}&sid={NETFUNNEL_SERVICE_ID}&aid={action_id}&js=yes&{timestamp}"
+        );
         let response = self.request(
             "GET",
             NETFUNNEL_HOST,
@@ -1486,13 +1444,9 @@ impl HttpClientExt for HttpClient {
         let text = String::from_utf8(response.body)
             .map_err(|source| prefixed_message("NetFunnel 응답 UTF-8 변환 실패: ", source))?;
         let result = text
-            .find("result='")
-            .and_then(|start| start.checked_add("result='".len()))
-            .and_then(|start| text.get(start..))
-            .and_then(|rest| {
-                let end = rest.find('\'')?;
-                rest.get(..end)
-            });
+            .split_once("result='")
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(value, _)| value);
         result
             .map(str::to_owned)
             .ok_or_else(|| prefixed_message("NetFunnel result 파싱 실패: ", text))
@@ -1504,15 +1458,26 @@ impl HttpClientExt for HttpClient {
             if !name.eq_ignore_ascii_case("set-cookie") {
                 continue;
             }
-            let cookie_pair = value
-                .split_once(';')
-                .map_or(value.as_str(), |(head, _)| head);
+            let cookie_pair = split_head_or_all(value, ';');
             let Some((cookie_name, cookie_value)) = cookie_pair.split_once('=') else {
                 continue;
             };
             self.add_cookie(cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
         }
         Ok(())
+    }
+}
+fn lossy_prefix(bytes: &[u8], max_len: usize) -> Cow<'_, str> {
+    let prefix_len = bytes.len().min(max_len);
+    let Some((prefix, _)) = bytes.split_at_checked(prefix_len) else {
+        return String::from_utf8_lossy(bytes);
+    };
+    String::from_utf8_lossy(prefix)
+}
+fn split_head_or_all(value: &str, separator: char) -> &str {
+    match value.split_once(separator) {
+        Some((head, _)) => head,
+        None => value,
     }
 }
 #[cfg(windows)]

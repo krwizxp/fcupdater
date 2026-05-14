@@ -1,5 +1,4 @@
 use crate::{Result, err};
-use core::fmt::Write as _;
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -93,16 +92,7 @@ impl TryFrom<&[OsString]> for ParseAction {
                 return Ok(Self::Help(usage_text()));
             }
             if token == OsStr::new("--version") {
-                let mut version_text = String::with_capacity(
-                    APP_NAME
-                        .len()
-                        .saturating_add(APP_VERSION.len())
-                        .saturating_add(1),
-                );
-                version_text.push_str(APP_NAME);
-                version_text.push(' ');
-                version_text.push_str(APP_VERSION);
-                return Ok(Self::Version(version_text));
+                return Ok(Self::Version(format!("{APP_NAME} {APP_VERSION}")));
             }
             if token == OsStr::new("--in-place") {
                 if matches!(args.output_target, OutputTarget::Explicit(_)) {
@@ -126,13 +116,9 @@ impl TryFrom<&[OsString]> for ParseAction {
             } else if token == OsStr::new("--sources-prefix") {
                 let raw_value = take_option_value(raw_args, &mut arg_index, "--sources-prefix")?;
                 let value_str: &str = raw_value.try_into().map_err(|source| {
-                    let mut out = String::with_capacity(96);
-                    out.push_str("--sources-prefix 값은 UTF-8 문자열이어야 합니다. (");
-                    match write!(&mut out, "{source}") {
-                        Ok(()) | Err(_) => {}
-                    }
-                    out.push(')');
-                    err(out)
+                    err(format!(
+                        "--sources-prefix 값은 UTF-8 문자열이어야 합니다. ({source})"
+                    ))
                 })?;
                 args.sources_prefix = parse_sources_prefix(value_str)?;
             } else if token == OsStr::new("--output") {
@@ -175,20 +161,13 @@ pub fn take_option_value<'args>(
 ) -> Result<&'args OsStr> {
     advance_arg_index(i)?;
     let Some(value) = raw_args.get(*i) else {
-        let capacity = opt_name.len().saturating_add(16);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(opt_name);
-        out.push_str(" 옵션에 값이 필요합니다.");
-        return Err(err(out));
+        return Err(err(format!("{opt_name} 옵션에 값이 필요합니다.")));
     };
     if value.to_str().is_some_and(|text| text.starts_with("--")) {
-        let capacity = opt_name.len().saturating_add(64);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(opt_name);
-        out.push_str(" 옵션에 값이 필요합니다. (다음 토큰: ");
-        out.push_str(value.to_string_lossy().as_ref());
-        out.push(')');
-        return Err(err(out));
+        let next_token = value.to_string_lossy();
+        return Err(err(format!(
+            "{opt_name} 옵션에 값이 필요합니다. (다음 토큰: {next_token})"
+        )));
     }
     Ok(value.as_os_str())
 }
@@ -200,13 +179,7 @@ pub fn advance_arg_index(i: &mut usize) -> Result<()> {
 }
 fn unknown_option_message(token: &str) -> String {
     let usage = usage_text();
-    let capacity = token.len().saturating_add(usage.len()).saturating_add(32);
-    let mut out = String::with_capacity(capacity);
-    out.push_str("알 수 없는 옵션: ");
-    out.push_str(token);
-    out.push_str("\n\n");
-    out.push_str(&usage);
-    out
+    format!("알 수 없는 옵션: {token}\n\n{usage}")
 }
 pub fn parse_sources_prefix(value: &str) -> Result<String> {
     if value.is_empty() {
@@ -217,20 +190,17 @@ pub fn parse_sources_prefix(value: &str) -> Result<String> {
             "--sources-prefix 에는 '.' 또는 '..' 를 사용할 수 없습니다.",
         ));
     }
-    if value.chars().any(|ch| matches!(ch, '/' | '\\')) {
+    if value.contains(['/', '\\']) {
         return Err(err(
             "--sources-prefix 에는 경로 구분자(/, \\\\)를 사용할 수 없습니다.",
         ));
     }
-    if value
-        .chars()
-        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-    {
+    if value.contains(['<', '>', ':', '"', '|', '?', '*']) {
         return Err(err(
             "--sources-prefix 에는 파일명에 사용할 수 없는 문자를 넣을 수 없습니다. (< > : \" | ? *)",
         ));
     }
-    if value.ends_with(' ') || value.ends_with('.') {
+    if value.ends_with([' ', '.']) {
         return Err(err(
             "--sources-prefix 는 공백 또는 '.'으로 끝날 수 없습니다.",
         ));
@@ -238,19 +208,12 @@ pub fn parse_sources_prefix(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 pub fn usage_text() -> String {
-    let mut out = String::with_capacity(1024);
-    out.push_str(APP_NAME);
-    out.push(' ');
-    out.push_str(APP_VERSION);
-    out.push_str(
-        "\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n\
-사용법:\n  ",
+    let usage = format!(
+        "{APP_NAME} {APP_VERSION}\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n\
+사용법:\n  {APP_NAME} [OPTIONS]\n\n\
+옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일명 접두어 (경로 아님, 기본: 현재 판매가격(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --sources-prefix 는 파일명 접두어만 허용 (경로 구분자, Windows 금지 문자, 끝 공백/점 불가)\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음"
     );
-    out.push_str(APP_NAME);
-    out.push_str(" [OPTIONS]\n\n\
-옵션:\n  --master <PATH>          마스터 파일 경로 (기본: fuel_cost_chungcheong.xlsx)\n  --sources-dir <PATH>     소스 폴더/자동 다운로드 저장 폴더 (기본: .)\n  --sources-prefix <TEXT>  소스 파일명 접두어 (경로 아님, 기본: 현재 판매가격(주유소))\n  --skip-download          Opinet 자동 다운로드 생략, 기존 소스 파일만 사용\n  --output <PATH>          출력 파일 경로\n  --in-place               마스터 파일 덮어쓰기(백업 생성)\n  --no-change-log          변경내역 시트 갱신 안 함\n  --dry-run                파일 저장 없이 요약만 출력\n  --fast-save              저장 후 무결성 재검증 생략(속도 우선)\n  -h, --help               도움말\n  --version                버전\n\n주의:\n  기본 동작은 Opinet 자동 다운로드 후 현행화\n  --sources-prefix 는 파일명 접두어만 허용 (경로 구분자, Windows 금지 문자, 끝 공백/점 불가)\n  --in-place 와 --output 은 동시에 사용할 수 없음\n  --dry-run 과 --fast-save 는 동시에 사용할 수 없음");
-    out.push_str(
-        "\n\n환경 변수(선택):\n  FCUPDATER_SOURCE_HEADER_SCAN_ROWS\n  FCUPDATER_MASTER_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_COLS\n  FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW\n  FCUPDATER_DURABILITY_STRICT",
-    );
-    out
+    format!(
+        "{usage}\n\n환경 변수(선택):\n  FCUPDATER_SOURCE_HEADER_SCAN_ROWS\n  FCUPDATER_MASTER_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS\n  FCUPDATER_CHANGELOG_HEADER_SCAN_COLS\n  FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW\n  FCUPDATER_DURABILITY_STRICT"
+    )
 }

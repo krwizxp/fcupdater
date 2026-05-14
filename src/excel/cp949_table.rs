@@ -1,4 +1,4 @@
-pub const CP949_DECODE: &[(u16, u32)] = &[
+pub(super) const CP949_DECODE: &[(u16, u32)] = &[
     (0x8141, 0xAC02),
     (0x8142, 0xAC03),
     (0x8143, 0xAC05),

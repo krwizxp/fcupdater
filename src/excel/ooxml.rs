@@ -6,7 +6,7 @@ use super::{
         find_tag_end,
     },
 };
-use crate::{Result, err, err_with_source, push_display};
+use crate::{Result, err, err_with_source};
 use std::{
     collections::HashMap,
     path::{Component, PathBuf},
@@ -17,18 +17,17 @@ pub struct SheetCatalog {
     pub sheet_order: Vec<String>,
 }
 pub fn load_sheet_catalog(container: &XlsxContainer) -> Result<SheetCatalog> {
-    let workbook_xml = (container.read_text("xl/workbook.xml"))?;
-    let rels_xml = (container.read_text("xl/_rels/workbook.xml.rels"))?;
+    let workbook_xml = container.read_text("xl/workbook.xml")?;
+    let rels_xml = container.read_text("xl/_rels/workbook.xml.rels")?;
     let relationship_count = rels_xml.matches("<Relationship").count();
     let mut rid_to_target: HashMap<String, String> = HashMap::new();
     rid_to_target
         .try_reserve(relationship_count)
         .map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("workbook 관계 맵 메모리 확보 실패: ");
-            push_display(&mut message, relationship_count);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("workbook 관계 맵 메모리 확보 실패: {relationship_count} entries"),
+                source,
+            )
         })?;
     for tag in iter_start_tags(&rels_xml, "Relationship")? {
         let Some(id) = extract_attr(tag, "Id") else {
@@ -44,21 +43,19 @@ pub fn load_sheet_catalog(container: &XlsxContainer) -> Result<SheetCatalog> {
     sheet_name_to_path
         .try_reserve(sheet_count)
         .map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("시트 경로 맵 메모리 확보 실패: ");
-            push_display(&mut message, sheet_count);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("시트 경로 맵 메모리 확보 실패: {sheet_count} entries"),
+                source,
+            )
         })?;
     let mut sheet_order: Vec<String> = Vec::new();
     sheet_order
         .try_reserve_exact(sheet_count)
         .map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("시트 순서 목록 메모리 확보 실패: ");
-            push_display(&mut message, sheet_count);
-            message.push_str(" sheets");
-            err_with_source(message, source)
+            err_with_source(
+                format!("시트 순서 목록 메모리 확보 실패: {sheet_count} sheets"),
+                source,
+            )
         })?;
     for tag in iter_start_tags(&workbook_xml, "sheet")? {
         let Some(name) = extract_attr(tag, "name") else {
@@ -86,18 +83,17 @@ pub fn load_sheet_catalog(container: &XlsxContainer) -> Result<SheetCatalog> {
                     Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
                 }
             }
-            let capacity = target.len();
-            let mut normalized_text = String::with_capacity(capacity);
-            for component in normalized.components() {
-                let Component::Normal(path_segment) = component else {
-                    continue;
-                };
-                if !normalized_text.is_empty() {
-                    normalized_text.push('/');
-                }
-                normalized_text.push_str(path_segment.to_string_lossy().as_ref());
-            }
-            normalized_text
+            normalized
+                .components()
+                .filter_map(|component| {
+                    if let Component::Normal(path_segment) = component {
+                        Some(path_segment.to_string_lossy())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/")
         };
         sheet_name_to_path.insert(name.clone(), resolved);
         sheet_order.push(name);
@@ -116,11 +112,7 @@ pub fn load_sheet_xml(
     sheet_name: &str,
 ) -> Result<String> {
     let Some(path) = catalog.sheet_name_to_path.get(sheet_name) else {
-        let capacity = sheet_name.len().saturating_add(16);
-        let mut out = String::with_capacity(capacity);
-        out.push_str("시트를 찾지 못했습니다: ");
-        out.push_str(sheet_name);
-        return Err(err(out));
+        return Err(err(format!("시트를 찾지 못했습니다: {sheet_name}")));
     };
     container.read_text(path)
 }
@@ -129,27 +121,22 @@ pub fn load_shared_strings(container: &XlsxContainer) -> Result<Vec<String>> {
         .unpack_dir()
         .join(path_from_slashes("xl/sharedStrings.xml"));
     if !(path.try_exists().map_err(|source_err| {
-        let capacity = 96;
-        let mut out = String::with_capacity(capacity);
-        out.push_str("sharedStrings.xml 경로 확인 실패: ");
-        push_display(&mut out, path.display());
-        out.push_str(" (");
-        push_display(&mut out, source_err);
-        out.push(')');
-        err(out)
+        err(format!(
+            "sharedStrings.xml 경로 확인 실패: {} ({source_err})",
+            path.display()
+        ))
     }))? {
-        return Ok(Vec::default());
+        return Ok(Vec::new());
     }
-    let xml = (container.read_text("xl/sharedStrings.xml"))?;
+    let xml = container.read_text("xl/sharedStrings.xml")?;
     let shared_string_count = xml.matches("<si").count();
     let mut out: Vec<String> = Vec::new();
     out.try_reserve_exact(shared_string_count)
         .map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("sharedStrings 메모리 확보 실패: ");
-            push_display(&mut message, shared_string_count);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("sharedStrings 메모리 확보 실패: {shared_string_count} entries"),
+                source,
+            )
         })?;
     let mut cursor = 0_usize;
     while let Some(si_start) = find_start_tag(&xml, "si", cursor) {
@@ -180,11 +167,10 @@ fn iter_start_tags<'xml>(xml: &'xml str, tag_name: &str) -> Result<Vec<&'xml str
     let tag_count = xml.matches(tag_name).count();
     let mut out: Vec<&'xml str> = Vec::new();
     out.try_reserve_exact(tag_count).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str("OOXML 태그 목록 메모리 확보 실패: ");
-        push_display(&mut message, tag_count);
-        message.push_str(" entries");
-        err_with_source(message, source)
+        err_with_source(
+            format!("OOXML 태그 목록 메모리 확보 실패: {tag_count} entries"),
+            source,
+        )
     })?;
     let mut cursor = 0_usize;
     while let Some(start) = find_start_tag(xml, tag_name, cursor) {

@@ -13,7 +13,7 @@ use crate::{
 use alloc::collections::BTreeMap;
 use core::{
     error::Error,
-    fmt::{Arguments, Display, Write as _},
+    fmt::{Arguments, Display},
     mem,
     result::Result as StdResult,
     time::Duration,
@@ -25,12 +25,12 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-pub(crate) mod change_log;
+mod change_log;
 mod cli;
 mod excel;
-pub(crate) mod master_sheet;
+mod master_sheet;
 mod numeric;
-pub(crate) mod source_download;
+mod source_download;
 mod source_sync;
 const MAX_CONFLICT_ATTEMPTS: u32 = 100_000;
 const RESERVATION_MAGIC: &[u8] = b"FCUPDATER_RESERVED_v1\n";
@@ -270,13 +270,7 @@ impl KstDateCalculatorExt for KstDateCalculator {
         month: impl Display,
         day: impl Display,
     ) -> String {
-        let capacity = prefix.len().saturating_add(10);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(prefix);
-        match write!(&mut out, "{year:04}-{month:02}-{day:02}") {
-            Ok(()) | Err(_) => {}
-        }
-        out
+        format!("{prefix}{year:04}-{month:02}-{day:02}")
     }
 }
 impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
@@ -290,32 +284,31 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         let source_index_capacity = source_paths.len().saturating_mul(32);
         let mut map: HashMap<String, SourceIndexEntry> = HashMap::new();
         map.try_reserve(source_index_capacity).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("소스 index 맵 메모리 확보 실패: ");
-            push_display(&mut message, source_index_capacity);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("소스 index 맵 메모리 확보 실패: {source_index_capacity} entries"),
+                source,
+            )
         })?;
         let mut report = source_sync::SourceIndexBuildReport::default();
         let mut sampled_keys: HashSet<String> = HashSet::new();
         sampled_keys
             .try_reserve(source_sync::MAX_CONFLICT_SAMPLES)
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("소스 충돌 sample key 집합 메모리 확보 실패: ");
-                push_display(&mut message, source_sync::MAX_CONFLICT_SAMPLES);
-                message.push_str(" entries");
-                err_with_source(message, source)
+                let sample_count = source_sync::MAX_CONFLICT_SAMPLES;
+                err_with_source(
+                    format!("소스 충돌 sample key 집합 메모리 확보 실패: {sample_count} entries"),
+                    source,
+                )
             })?;
         for (file_order, path) in source_paths.iter().enumerate() {
             let records = source_download::SourceDownloadOps
                 .filter_target_region_records(self.read_source_records(path)?)?;
             map.try_reserve(records.len()).map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("소스 index 맵 추가 메모리 확보 실패: ");
-                push_display(&mut message, records.len());
-                message.push_str(" entries");
-                err_with_source(message, source)
+                let record_count = records.len();
+                err_with_source(
+                    format!("소스 index 맵 추가 메모리 확보 실패: {record_count} entries"),
+                    source,
+                )
             })?;
             for record in records {
                 let key = normalize_address_key(&record.address);
@@ -333,13 +326,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                             && sampled_keys.insert(occupied.key().clone())
                         {
                             let previous_source = source_paths.get(prev_order).map_or_else(
-                                || {
-                                    let capacity = 12;
-                                    let mut out = String::with_capacity(capacity);
-                                    out.push('#');
-                                    push_display(&mut out, prev_order);
-                                    out
-                                },
+                                || format!("#{prev_order}"),
                                 |previous_path| source_label(previous_path),
                             );
                             let incoming_source = source_label(path);
@@ -368,11 +355,10 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         let map_len = map.len();
         let mut index: HashMap<String, source_sync::SourceRecord> = HashMap::new();
         index.try_reserve(map_len).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("최종 소스 index 메모리 확보 실패: ");
-            push_display(&mut message, map_len);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("최종 소스 index 메모리 확보 실패: {map_len} entries"),
+                source,
+            )
         })?;
         index.extend(
             map.into_iter()
@@ -392,6 +378,8 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         let mut next_row_num = 1_usize;
         let mut scanned_rows = 0_usize;
         let header_scan_rows = excel::source_reader::source_header_scan_rows();
+        let max_xlsx_row = usize::try_from(excel::source_reader::MAX_XLSX_ROW)
+            .map_err(|source| err_with_source("xlsx 최대 행 번호 변환 실패", source))?;
         let mut header_indices = None;
         while let Some((parsed_row_num, row_body, next_cursor)) =
             parse_next_sheet_row(sheet_data, cursor)?
@@ -401,20 +389,16 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             } else {
                 parsed_row_num
             };
-            if row_num > usize::try_from(excel::source_reader::MAX_XLSX_ROW).unwrap_or(usize::MAX) {
-                let capacity = 64;
-                let mut message = String::with_capacity(capacity);
-                message.push_str("xlsx 행 번호가 비정상적입니다: ");
-                push_display(&mut message, row_num);
-                message.push_str(" (최대 ");
-                push_display(&mut message, excel::source_reader::MAX_XLSX_ROW);
-                message.push(')');
-                return Err(err(message));
+            if row_num > max_xlsx_row {
+                return Err(err(format!(
+                    "xlsx 행 번호가 비정상적입니다: {row_num} (최대 {})",
+                    excel::source_reader::MAX_XLSX_ROW
+                )));
             }
             let row_cells = if let Some(row_xml_body) = row_body {
                 excel::source_reader::parse_xlsx_row_cells(row_xml_body, row_num, shared_strings)?
             } else {
-                Vec::default()
+                Vec::new()
             };
             next_row_num = row_num.saturating_add(1);
             cursor = next_cursor;
@@ -466,10 +450,12 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             if !path.is_file() {
                 continue;
             }
-            let ext = path
+            let Some(ext) = path
                 .extension()
                 .and_then(|extension_os| extension_os.to_str())
-                .unwrap_or_default();
+            else {
+                continue;
+            };
             if !(ext.eq_ignore_ascii_case("xls") || ext.eq_ignore_ascii_case("xlsx")) {
                 continue;
             }
@@ -516,14 +502,11 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         )?;
         source_paths.extend(candidates.into_iter().map(|candidate| candidate.path));
         if source_paths.is_empty() {
-            let capacity = self.args.sources_prefix.len().saturating_add(96);
-            let mut out = String::with_capacity(capacity);
-            out.push_str("소스 파일을 찾지 못했습니다. 폴더: ");
-            push_display(&mut out, self.args.sources_dir.display());
-            out.push_str(" / prefix: ");
-            out.push_str(&self.args.sources_prefix);
-            out.push_str(" / 확장자: .xls,.xlsx");
-            return Err(err(out));
+            return Err(err(format!(
+                "소스 파일을 찾지 못했습니다. 폴더: {} / prefix: {} / 확장자: .xls,.xlsx",
+                self.args.sources_dir.display(),
+                self.args.sources_prefix
+            )));
         }
         Ok(source_paths)
     }
@@ -533,23 +516,9 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         let requested = match self.args.output_target.clone() {
             OutputTarget::InPlace => self.args.master.clone(),
             OutputTarget::Auto => {
-                let stem = self
-                    .args
-                    .master
-                    .file_stem()
-                    .and_then(|stem_os| stem_os.to_str())
-                    .unwrap_or("fuel_cost_chungcheong");
-                let parent = self.args.master.parent().unwrap_or_else(|| Path::new("."));
-                let capacity = stem
-                    .len()
-                    .saturating_add(today.len())
-                    .saturating_add("_updated_.xlsx".len());
-                let mut file_name = String::with_capacity(capacity);
-                file_name.push_str(stem);
-                file_name.push_str("_updated_");
-                file_name.push_str(today);
-                file_name.push_str(".xlsx");
-                parent.join(file_name)
+                let stem = path_file_stem_or(&self.args.master, "fuel_cost_chungcheong");
+                let parent = path_parent_or_current(&self.args.master);
+                parent.join(format!("{stem}_updated_{today}.xlsx"))
             }
             OutputTarget::Explicit(path) => path,
         };
@@ -596,11 +565,9 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             let downloaded = source_download::SourceDownloadOps
                 .refresh_sources(&self.args.sources_dir, &self.args.sources_prefix, self.out)
                 .map_err(|source_err| {
-                    let capacity = 128;
-                    let mut out = String::with_capacity(capacity);
-                    push_display(&mut out, source_err);
-                    out.push_str("\n자동 다운로드를 건너뛰려면 --skip-download 를 지정하세요.");
-                    err(out)
+                    err(format!(
+                        "{source_err}\n자동 다운로드를 건너뛰려면 --skip-download 를 지정하세요."
+                    ))
                 })?;
             write_line_ignored(
                 self.out,
@@ -722,17 +689,24 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         write_line_ignored(self.out, format_args!("=====================\n"));
     }
     fn read_source_records(&self, path: &Path) -> Result<Vec<source_sync::SourceRecord>> {
-        match path
+        let Some(ext) = path
             .extension()
             .and_then(|extension_os| extension_os.to_str())
-            .unwrap_or_default()
-        {
-            ext if ext.eq_ignore_ascii_case("xlsx") => self.read_xlsx_source_file(path),
-            ext if ext.eq_ignore_ascii_case("xls") => SourceReader.read_xls_source(path),
-            _ => Err(err(prefixed_message(
+        else {
+            return Err(err(prefixed_message(
                 "지원하지 않는 소스 확장자입니다: ",
                 path.display(),
-            ))),
+            )));
+        };
+        if ext.eq_ignore_ascii_case("xlsx") {
+            self.read_xlsx_source_file(path)
+        } else if ext.eq_ignore_ascii_case("xls") {
+            SourceReader.read_xls_source(path)
+        } else {
+            Err(err(prefixed_message(
+                "지원하지 않는 소스 확장자입니다: ",
+                path.display(),
+            )))
         }
         .map_err(|source_err| err(path_source_message("소스 파일 읽기 실패", path, source_err)))
     }
@@ -761,7 +735,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                     let rows = {
                         let sheet_data = excel::source_reader::sheet_data_body(&sheet_xml)?;
                         let mut rows_map: BTreeMap<usize, Vec<excel::source_reader::CellValue>> =
-                            BTreeMap::default();
+                            BTreeMap::new();
                         let mut cursor = 0_usize;
                         let mut next_row_num = 1_usize;
                         while let Some((parsed_row_num, row_body, next_cursor)) =
@@ -779,7 +753,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                                     &shared_strings,
                                 )?
                             } else {
-                                Vec::default()
+                                Vec::new()
                             };
                             rows_map.insert(row_num, row_cells);
                             next_row_num = row_num.saturating_add(1);
@@ -799,14 +773,10 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
                         Ok(records) => {
                             extend_source_records(&mut all, records)?;
                         }
-                        Err(legacy_err) => {
-                            let capacity = 128;
-                            let mut out = String::with_capacity(capacity);
-                            out.push_str("스트리밍 파싱 실패: ");
-                            push_display(&mut out, stream_err);
-                            out.push_str("; 구형 파싱 실패: ");
-                            push_display(&mut out, legacy_err);
-                            last_err = Some(err(out));
+                        Err(row_build_err) => {
+                            last_err = Some(err(format!(
+                                "스트리밍 파싱 실패: {stream_err}; 구형 파싱 실패: {row_build_err}"
+                            )));
                         }
                     }
                 }
@@ -816,12 +786,9 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             return Ok(all);
         }
         if let Some(source_err) = last_err {
-            let capacity = 96;
-            let mut out = String::with_capacity(capacity);
-            out.push_str("xlsx 시트에서 유효한 소스 데이터를 찾지 못했습니다. (");
-            push_display(&mut out, source_err);
-            out.push(')');
-            return Err(err(out));
+            return Err(err(format!(
+                "xlsx 시트에서 유효한 소스 데이터를 찾지 못했습니다. ({source_err})"
+            )));
         }
         Err(err("xlsx 시트에서 유효한 소스 데이터를 찾지 못했습니다."))
     }
@@ -913,20 +880,9 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
             return Ok(());
         }
         if matches!(self.args.output_target, OutputTarget::InPlace) {
-            let parent = self.args.master.parent().unwrap_or_else(|| Path::new("."));
-            let stem = self
-                .args
-                .master
-                .file_stem()
-                .and_then(|stem_os| stem_os.to_str())
-                .unwrap_or("fuel_cost_chungcheong");
-            let capacity = stem.len().saturating_add(today.len()).saturating_add(13);
-            let mut file_name = String::with_capacity(capacity);
-            file_name.push_str(stem);
-            file_name.push_str("_backup_");
-            file_name.push_str(today);
-            file_name.push_str(".xlsx");
-            let base = parent.join(file_name);
+            let parent = path_parent_or_current(&self.args.master);
+            let stem = path_file_stem_or(&self.args.master, "fuel_cost_chungcheong");
+            let base = parent.join(format!("{stem}_backup_{today}.xlsx"));
             let backup = reserve_nonconflicting_path(&base)?;
             if let Err(copy_err) = fs::copy(&self.args.master, &backup) {
                 match fs::remove_file(&backup) {
@@ -1027,30 +983,15 @@ impl UpdateRunContextExt for UpdateRunContext<'_, '_> {
         out
     }
 }
-pub(crate) fn push_display(out: &mut String, value: impl Display) {
-    match write!(out, "{value}") {
-        Ok(()) | Err(_) => {}
-    }
-}
 fn try_reserve_vec<T>(values: &mut Vec<T>, additional: usize, context: &str) -> Result<()> {
-    values.try_reserve(additional).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str(context);
-        message.push_str(": ");
-        push_display(&mut message, additional);
-        message.push_str(" entries");
-        err_with_source(message, source)
-    })
+    values
+        .try_reserve(additional)
+        .map_err(|source| err_with_source(format!("{context}: {additional} entries"), source))
 }
 fn try_reserve_vec_exact<T>(values: &mut Vec<T>, additional: usize, context: &str) -> Result<()> {
-    values.try_reserve_exact(additional).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str(context);
-        message.push_str(": ");
-        push_display(&mut message, additional);
-        message.push_str(" entries");
-        err_with_source(message, source)
-    })
+    values
+        .try_reserve_exact(additional)
+        .map_err(|source| err_with_source(format!("{context}: {additional} entries"), source))
 }
 fn extend_source_records(
     out: &mut Vec<source_sync::SourceRecord>,
@@ -1071,66 +1012,24 @@ fn err(msg: impl Into<String>) -> BoxError {
 }
 fn err_with_source(context: impl Into<String>, source: impl Display) -> BoxError {
     let context_text = context.into();
-    let capacity = context_text.len().saturating_add(64);
-    let mut message = String::with_capacity(capacity);
-    message.push_str(&context_text);
-    message.push_str(": ");
-    push_display(&mut message, source);
-    IoError::other(message).into()
+    IoError::other(format!("{context_text}: {source}")).into()
 }
-pub(crate) fn prefixed_message(prefix: &str, detail: impl Display) -> String {
-    let capacity = prefix.len().saturating_add(64);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    push_display(&mut out, detail);
-    out
+fn prefixed_message(prefix: &str, detail: impl Display) -> String {
+    format!("{prefix}{detail}")
 }
 fn xlsx_row_offset_message(prefix: &str, offset: usize) -> String {
-    let capacity = prefix.len().saturating_add(16);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    push_display(&mut out, offset);
-    out.push(')');
-    out
+    format!("{prefix}{offset})")
 }
 fn xlsx_row_number_message(prefix: &str, row_num: u32) -> String {
-    let capacity = prefix.len().saturating_add(16);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    push_display(&mut out, row_num);
-    out.push(')');
-    out
+    format!("{prefix}{row_num})")
 }
-pub(crate) fn path_source_message(label: &str, path: &Path, source: impl Display) -> String {
-    let capacity = label.len().saturating_add(96);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(label);
-    out.push_str(": ");
-    push_display(&mut out, path.display());
-    out.push_str(" (");
-    push_display(&mut out, source);
-    out.push(')');
-    out
+fn path_source_message(label: &str, path: &Path, source: impl Display) -> String {
+    format!("{label}: {} ({source})", path.display())
 }
-pub(crate) fn path_pair_source_message(
-    label: &str,
-    from: &Path,
-    to: &Path,
-    source: impl Display,
-) -> String {
-    let capacity = label.len().saturating_add(128);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(label);
-    out.push_str(": ");
-    push_display(&mut out, from.display());
-    out.push_str(" -> ");
-    push_display(&mut out, to.display());
-    out.push_str(" (");
-    push_display(&mut out, source);
-    out.push(')');
-    out
+fn path_pair_source_message(label: &str, from: &Path, to: &Path, source: impl Display) -> String {
+    format!("{label}: {} -> {} ({source})", from.display(), to.display())
 }
-pub(crate) fn write_line_ignored(output: &mut dyn Write, args: Arguments<'_>) {
+fn write_line_ignored(output: &mut dyn Write, args: Arguments<'_>) {
     match output.write_fmt(args) {
         Ok(()) | Err(_) => {}
     }
@@ -1142,30 +1041,19 @@ fn candidate_with_suffix(path: &Path, seq: u32) -> PathBuf {
     if seq == 0 {
         return path.to_path_buf();
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_stem()
-        .and_then(|stem_os| stem_os.to_str())
-        .unwrap_or("output");
+    let parent = path_parent_or_current(path);
+    let stem = path_file_stem_or(path, "output");
     let ext = path
         .extension()
         .and_then(|extension_os| extension_os.to_str());
-    let capacity = stem
-        .len()
-        .saturating_add(12)
-        .saturating_add(ext.map_or(1, |file_ext| file_ext.len().saturating_add(2)));
-    let mut file_name = String::with_capacity(capacity);
-    file_name.push_str(stem);
-    file_name.push('_');
-    push_display(&mut file_name, seq);
-    if let Some(file_ext) = ext {
-        file_name.push('.');
-        file_name.push_str(file_ext);
-    }
+    let file_name = ext.map_or_else(
+        || format!("{stem}_{seq}"),
+        |file_ext| format!("{stem}_{seq}.{file_ext}"),
+    );
     parent.join(file_name)
 }
 fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path_parent_or_current(path);
     fs::create_dir_all(parent).map_err(|source_err| {
         err(path_source_message(
             "출력 폴더 생성 실패",
@@ -1232,6 +1120,14 @@ fn reserve_nonconflicting_path(path: &Path) -> Result<PathBuf> {
         }
     }
 }
+fn path_parent_or_current(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+fn path_file_stem_or<'a>(path: &'a Path, default: &'a str) -> &'a str {
+    path.file_stem()
+        .and_then(|stem_os| stem_os.to_str())
+        .unwrap_or(default)
+}
 fn source_label(path: &Path) -> String {
     path.file_name()
         .and_then(|file_name_os| file_name_os.to_str())
@@ -1264,19 +1160,11 @@ fn parse_next_sheet_row(
         ))
     })?;
     let row_num_u32 = row_tag
-        .find("r=\"")
-        .and_then(|start| {
-            let offset =
-                excel::source_reader::checked_xml_offset_add(start, 3, "xlsx row 번호 속성")
-                    .ok()?;
-            row_tag.get(offset..)
-        })
-        .and_then(|tail| {
-            let end = tail.find('"')?;
-            tail.get(..end)
-        })
+        .split_once("r=\"")
+        .and_then(|(_, tail)| tail.split_once('"'))
+        .map(|(value, _)| value)
         .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
+        .unwrap_or_default();
     let row_num = usize::try_from(row_num_u32).map_err(|source| {
         err_with_source(
             prefixed_message("xlsx 행 번호 변환 실패: ", row_num_u32),
@@ -1321,7 +1209,7 @@ fn parse_next_sheet_row(
 }
 fn main() -> Result<()> {
     let mut out = stdout();
-    let raw_args: Vec<_> = env::args_os().skip(1).collect();
+    let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
     let action = ParseAction::try_from(raw_args.as_slice())?;
     match action {
         ParseAction::Run(run_args) => {
@@ -1365,12 +1253,7 @@ fn parse_i32_str(text: &str) -> Option<i32> {
 }
 fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
     u32::try_from(value).map_err(|source| {
-        let capacity = context.len().saturating_add(32);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(context);
-        out.push_str(" 값이 너무 큽니다. (value=");
-        push_display(&mut out, value);
-        out.push(')');
+        let out = format!("{context} 값이 너무 큽니다. (value={value})");
         err_with_source(out, source)
     })
 }
@@ -1384,32 +1267,30 @@ fn shift_row(row: u32, increase: u32, decrease: u32) -> u32 {
 fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
     let offset_u32 = usize_to_u32(offset, context)?;
     base_row.checked_add(offset_u32).ok_or_else(|| {
-        let capacity = context.len().saturating_add(48);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(context);
-        out.push_str(" 계산 중 overflow가 발생했습니다. (");
-        push_display(&mut out, base_row);
-        out.push_str(" + ");
-        push_display(&mut out, offset_u32);
-        out.push(')');
-        err(out)
+        err(format!(
+            "{context} 계산 중 overflow가 발생했습니다. ({base_row} + {offset_u32})"
+        ))
     })
 }
 fn normalize_address_key(addr: &str) -> String {
     let mut rest = addr.trim();
     let capacity = rest.len();
     let mut out = String::with_capacity(capacity);
-    while let Some(ch) = rest.chars().next() {
-        if let Some((from, to)) = ADDRESS_KEY_REPLACEMENTS
+    while !rest.is_empty() {
+        if let Some((tail, to)) = ADDRESS_KEY_REPLACEMENTS
             .iter()
             .copied()
-            .find(|candidate| rest.starts_with(candidate.0))
+            .find_map(|(from, to)| rest.strip_prefix(from).map(|tail| (tail, to)))
         {
             out.push_str(to);
-            rest = rest.get(from.len()..).unwrap_or_default();
+            rest = tail;
             continue;
         }
-        rest = rest.get(ch.len_utf8()..).unwrap_or_default();
+        let mut chars = rest.chars();
+        let Some(ch) = chars.next() else {
+            break;
+        };
+        rest = chars.as_str();
         if ch.is_whitespace() {
             continue;
         }
@@ -1441,34 +1322,29 @@ fn parse_region_label(text: &str) -> Option<String> {
         }
     }
     if is_province_token(first) {
-        return second.map_or_else(
-            || None,
-            |token| {
-                Some(
-                    strip_basic_region_suffix(token)
-                        .map_or_else(|| token.to_owned(), str::to_owned),
-                )
-            },
-        );
+        return second.map(|token| {
+            strip_basic_region_suffix(token).map_or_else(|| token.to_owned(), str::to_owned)
+        });
     }
     if is_metropolitan_token(first) {
         return Some(first.to_owned());
     }
-    strip_basic_region_suffix(first).map_or_else(
-        || (second.is_none()).then(|| first.to_owned()),
-        |label| Some(label.to_owned()),
-    )
+    match strip_basic_region_suffix(first) {
+        Some(label) => Some(label.to_owned()),
+        None if second.is_none() => Some(first.to_owned()),
+        None => None,
+    }
 }
 fn strip_basic_region_suffix(token: &str) -> Option<&str> {
     token
-        .strip_suffix('시')
-        .or_else(|| token.strip_suffix('군'))
-        .or_else(|| token.strip_suffix('구'))
+        .strip_suffix(['시', '군', '구'])
         .filter(|label| !label.is_empty())
+}
+fn has_basic_region_suffix(token: &str) -> bool {
+    strip_basic_region_suffix(token).is_some()
 }
 fn is_province_token(token: &str) -> bool {
     token.ends_with('도')
-        || token.ends_with("특별자치도")
         || matches!(
             token,
             "충남" | "충북" | "경기" | "강원" | "전북" | "전남" | "경북" | "경남" | "제주"

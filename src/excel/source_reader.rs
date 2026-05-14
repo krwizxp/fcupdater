@@ -5,12 +5,9 @@ use super::xml::{
 };
 use crate::{
     Result, canon_header, err, err_with_source, numeric::round_f64_to_i32, parse_i32_str,
-    push_display, source_sync::SourceRecord,
+    source_sync::SourceRecord,
 };
-use core::{
-    error::Error as CoreError,
-    fmt::{Display, Write as _},
-};
+use core::{error::Error as CoreError, fmt::Display};
 use std::env;
 #[path = "source_reader_biff.rs"]
 pub mod biff;
@@ -67,32 +64,36 @@ impl XlsxRowCellParserExt for XlsxRowCellParser<'_, '_> {
     }
     fn parse_cell_value(&self, cell_tag: &str, cell_body: &str) -> CellValue {
         let cell_type = extract_attr(cell_tag, "t");
-        if matches!(cell_type.as_deref(), Some("inlineStr"))
-            && let Some(text_value) = extract_all_tag_text(cell_body, "t")
-        {
-            return CellValue::Text(decode_xml_entities(&text_value));
-        }
-        let Some(v_raw) = extract_first_tag_text(cell_body, "v") else {
-            return CellValue::Empty;
-        };
-        let decoded = decode_xml_entities(&v_raw);
-        if matches!(cell_type.as_deref(), Some("s"))
-            && let Ok(idx) = decoded.parse::<usize>()
-            && let Some(shared_text) = self.shared_strings.get(idx)
-        {
-            CellValue::Text(shared_text.to_owned())
-        } else if matches!(cell_type.as_deref(), Some("s" | "str")) {
-            CellValue::Text(decoded)
-        } else if matches!(cell_type.as_deref(), Some("b")) {
-            CellValue::Text(if decoded == "1" {
-                "TRUE".into()
-            } else {
-                "FALSE".into()
-            })
-        } else if let Ok(number) = decoded.parse::<f64>() {
-            CellValue::Number(number)
-        } else {
-            CellValue::Text(decoded)
+        match cell_type.as_deref() {
+            Some("inlineStr") => extract_all_tag_text(cell_body, "t")
+                .map_or(CellValue::Empty, |text_value| {
+                    CellValue::Text(decode_xml_entities(&text_value))
+                }),
+            ordinary_type => {
+                let Some(v_raw) = extract_first_tag_text(cell_body, "v") else {
+                    return CellValue::Empty;
+                };
+                let decoded = decode_xml_entities(&v_raw);
+                match ordinary_type {
+                    Some("s") => decoded
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|idx| self.shared_strings.get(idx))
+                        .map_or_else(
+                            || CellValue::Text(decoded),
+                            |shared_text| CellValue::Text(shared_text.to_owned()),
+                        ),
+                    Some("str") => CellValue::Text(decoded),
+                    Some("b") => CellValue::Text(if decoded == "1" {
+                        "TRUE".into()
+                    } else {
+                        "FALSE".into()
+                    }),
+                    _ => decoded
+                        .parse::<f64>()
+                        .map_or_else(|_| CellValue::Text(decoded), CellValue::Number),
+                }
+            }
         }
     }
     fn parse_col_index(&self, cell_tag: &str) -> Option<usize> {
@@ -131,11 +132,9 @@ impl XlsxRowCellParserExt for XlsxRowCellParser<'_, '_> {
         let col_index = self.parse_col_index(cell_tag).unwrap_or(self.next_col);
         let col_num = checked_one_based_index(col_index, "xlsx 열 번호")?;
         if col_index >= MAX_XLSX_COL {
-            let capacity = 48;
-            let mut out = String::with_capacity(capacity);
-            out.push_str("xlsx 열 인덱스가 비정상적으로 큽니다: ");
-            push_display(&mut out, col_num);
-            return Err(err(out));
+            return Err(err(format!(
+                "xlsx 열 인덱스가 비정상적으로 큽니다: {col_num}"
+            )));
         }
         if self.row_cells.len() <= col_index {
             let next_len = checked_one_based_index(col_index, "xlsx row 셀 개수")?;
@@ -143,11 +142,10 @@ impl XlsxRowCellParserExt for XlsxRowCellParser<'_, '_> {
             self.row_cells
                 .try_reserve_exact(additional)
                 .map_err(|source| {
-                    let mut message = String::with_capacity(64);
-                    message.push_str("xlsx row 셀 확장 메모리 확보 실패: ");
-                    push_display(&mut message, additional);
-                    message.push_str(" cells");
-                    err_with_source(message, source)
+                    err_with_source(
+                        format!("xlsx row 셀 확장 메모리 확보 실패: {additional} cells"),
+                        source,
+                    )
                 })?;
             self.row_cells.resize(next_len, CellValue::Empty);
         }
@@ -189,14 +187,7 @@ impl XlsxRowCellParserExt for XlsxRowCellParser<'_, '_> {
         middle: &str,
         value: impl Display,
     ) -> Box<dyn CoreError + Send + Sync> {
-        let capacity = prefix.len().saturating_add(middle.len()).saturating_add(48);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(prefix);
-        push_display(&mut out, self.row_num);
-        out.push_str(middle);
-        push_display(&mut out, value);
-        out.push(')');
-        err(out)
+        err(format!("{prefix}{}{middle}{value})", self.row_num))
     }
 }
 pub fn sheet_data_body(sheet_xml: &str) -> Result<&str> {
@@ -222,26 +213,16 @@ fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
 }
 pub fn checked_xml_offset_add(base: usize, add: usize, context: &str) -> Result<usize> {
     base.checked_add(add).ok_or_else(|| {
-        let capacity = context.len().saturating_add(64);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(context);
-        out.push_str(" 오프셋 계산 중 overflow가 발생했습니다. (base=");
-        push_display(&mut out, base);
-        out.push_str(", add=");
-        push_display(&mut out, add);
-        out.push(')');
-        err(out)
+        err(format!(
+            "{context} 오프셋 계산 중 overflow가 발생했습니다. (base={base}, add={add})"
+        ))
     })
 }
 fn checked_one_based_index(zero_based: usize, context: &str) -> Result<usize> {
     zero_based.checked_add(1).ok_or_else(|| {
-        let capacity = context.len().saturating_add(48);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(context);
-        out.push_str(" 계산 중 overflow가 발생했습니다. (index=");
-        push_display(&mut out, zero_based);
-        out.push(')');
-        err(out)
+        err(format!(
+            "{context} 계산 중 overflow가 발생했습니다. (index={zero_based})"
+        ))
     })
 }
 pub fn parse_xlsx_row_cells(
@@ -252,11 +233,10 @@ pub fn parse_xlsx_row_cells(
     let cell_count = row_xml.matches("<c").count();
     let mut row_cells: Vec<CellValue> = Vec::new();
     row_cells.try_reserve_exact(cell_count).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str("xlsx row 셀 메모리 확보 실패: ");
-        push_display(&mut message, cell_count);
-        message.push_str(" cells");
-        err_with_source(message, source)
+        err_with_source(
+            format!("xlsx row 셀 메모리 확보 실패: {cell_count} cells"),
+            source,
+        )
     })?;
     XlsxRowCellParser {
         cursor: 0,
@@ -279,15 +259,14 @@ pub fn build_source_records_from_rows(
             parse_source_header_indices(&row_entry.1).map(|indices| (idx, indices))
         })
         .ok_or_else(|| err("헤더 행을 찾지 못했습니다"))?;
-    let data_row_start = found_header_row_idx.checked_add(1).unwrap_or(rows.len());
+    let data_row_start = found_header_row_idx.saturating_add(1);
     let data_row_capacity = rows.len().saturating_sub(data_row_start);
     let mut out: Vec<SourceRecord> = Vec::new();
     out.try_reserve_exact(data_row_capacity).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str("소스 레코드 목록 메모리 확보 실패: ");
-        push_display(&mut message, data_row_capacity);
-        message.push_str(" rows");
-        err_with_source(message, source)
+        err_with_source(
+            format!("소스 레코드 목록 메모리 확보 실패: {data_row_capacity} rows"),
+            source,
+        )
     })?;
     for row_entry in rows.iter().skip(data_row_start) {
         let row = &row_entry.1;
@@ -325,9 +304,9 @@ pub fn parse_source_header_indices(header: &[CellValue]) -> Option<SourceHeaderI
             _ => {}
         }
     }
-    let name_idx = (idx_name)?;
-    let addr_idx = (idx_addr)?;
-    let region_idx = (idx_region)?;
+    let name_idx = idx_name?;
+    let addr_idx = idx_addr?;
+    let region_idx = idx_region?;
     Some(SourceHeaderIndices {
         region: Some(region_idx),
         name: name_idx,
@@ -348,21 +327,14 @@ pub fn build_source_record_from_row(
     if address.trim().is_empty() {
         return None;
     }
-    let brand = header_indices
-        .brand
-        .map(|i| get_row_string(row, i))
-        .unwrap_or_default();
-    let self_yn = header_indices
-        .self_yn
-        .map(|i| get_row_string(row, i))
-        .unwrap_or_default();
+    let optional_text =
+        |index: Option<usize>| index.map_or_else(String::new, |i| get_row_string(row, i));
+    let brand = optional_text(header_indices.brand);
+    let self_yn = optional_text(header_indices.self_yn);
     let gasoline = normalize_fuel_price(header_indices.gasoline.and_then(|i| get_row_i32(row, i)));
     let premium = normalize_fuel_price(header_indices.premium.and_then(|i| get_row_i32(row, i)));
     let diesel = normalize_fuel_price(header_indices.diesel.and_then(|i| get_row_i32(row, i)));
-    let region = header_indices
-        .region
-        .map(|i| get_row_string(row, i))
-        .unwrap_or_default();
+    let region = optional_text(header_indices.region);
     Some(SourceRecord {
         address,
         brand,
@@ -398,24 +370,13 @@ fn cell_to_string(cell: CellValue) -> String {
                 if number_value == 0.0 {
                     "0".into()
                 } else {
-                    let mut out = String::with_capacity(32);
-                    match write!(&mut out, "{number_value:.0}") {
-                        Ok(()) | Err(_) => {}
-                    }
-                    out
+                    format!("{number_value:.0}")
                 }
             } else {
-                let mut text = String::with_capacity(32);
-                match write!(&mut text, "{number_value}") {
-                    Ok(()) | Err(_) => {}
-                }
+                let mut text = format!("{number_value}");
                 if text.contains('.') {
-                    while text.ends_with('0') {
-                        text.pop();
-                    }
-                    if text.ends_with('.') {
-                        text.pop();
-                    }
+                    let trimmed_len = text.trim_end_matches('0').trim_end_matches('.').len();
+                    text.truncate(trimmed_len);
                 }
                 text
             }
@@ -424,11 +385,12 @@ fn cell_to_string(cell: CellValue) -> String {
     }
 }
 pub fn source_header_scan_rows() -> usize {
-    env::var("FCUPDATER_SOURCE_HEADER_SCAN_ROWS")
+    let Some(parsed_value) = env::var("FCUPDATER_SOURCE_HEADER_SCAN_ROWS")
         .ok()
         .and_then(|parsed_value| parsed_value.parse::<usize>().ok())
         .filter(|parsed_value| *parsed_value > 0)
-        .map_or(DEFAULT_SOURCE_HEADER_SCAN_ROWS, |parsed_value| {
-            parsed_value.min(10_000)
-        })
+    else {
+        return DEFAULT_SOURCE_HEADER_SCAN_ROWS;
+    };
+    parsed_value.min(10_000)
 }

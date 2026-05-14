@@ -1,7 +1,6 @@
 use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, canon_header, err, err_with_source,
     excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
-    push_display,
 };
 use std::{collections::HashMap, env};
 const HEADER_KEYS_REGION: [&str; 1] = ["지역"];
@@ -121,11 +120,10 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         entries
             .try_reserve_exact(entry_capacity)
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("변경내역 entry 메모리 확보 실패: ");
-                push_display(&mut message, entry_capacity);
-                message.push_str(" entries");
-                err_with_source(message, source)
+                err_with_source(
+                    format!("변경내역 entry 메모리 확보 실패: {entry_capacity} entries"),
+                    source,
+                )
             })?;
         for change in changes {
             entries.push(ChangeLogEntry {
@@ -184,36 +182,31 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             layout.col_old_diesel,
             layout.col_new_diesel,
         ];
-        let mut last_row = None;
-        for row in self
+        let last_row = self
             .worksheet
             .rows
             .range(layout.data_start_row..)
+            .rev()
             .map(|(row, _)| *row)
-        {
-            if self
-                .worksheet
-                .row_has_any_data(row, &cols, self.shared_string_table)
-            {
-                last_row = Some(row);
-            }
-        }
+            .find(|&row| {
+                self.worksheet
+                    .row_has_any_data(row, &cols, self.shared_string_table)
+            });
         if let Some(last_data_row) = last_row {
             let estimated_rows = last_data_row
                 .saturating_sub(layout.data_start_row)
                 .saturating_add(1);
             let cell_capacity = usize::try_from(estimated_rows)
-                .unwrap_or(0)
+                .map_err(|source| err_with_source("변경내역 clear 행 수 변환 실패", source))?
                 .saturating_mul(8);
             let mut cells_to_clear: Vec<(u32, u32)> = Vec::new();
             cells_to_clear
                 .try_reserve_exact(cell_capacity)
                 .map_err(|source| {
-                    let mut message = String::with_capacity(64);
-                    message.push_str("변경내역 clear 대상 메모리 확보 실패: ");
-                    push_display(&mut message, cell_capacity);
-                    message.push_str(" cells");
-                    err_with_source(message, source)
+                    err_with_source(
+                        format!("변경내역 clear 대상 메모리 확보 실패: {cell_capacity} cells"),
+                        source,
+                    )
                 })?;
             for (row, row_obj) in self
                 .worksheet
@@ -234,17 +227,15 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         let Some(row_obj) = self.worksheet.rows.get(&row) else {
             return Ok(HashMap::new());
         };
-        let header_capacity = row_obj
-            .cells
-            .len()
-            .min(usize::try_from(max_cols).unwrap_or(0));
+        let max_cols_usize = usize::try_from(max_cols)
+            .map_err(|source| err_with_source("변경내역 헤더 열 수 변환 실패", source))?;
+        let header_capacity = row_obj.cells.len().min(max_cols_usize);
         let mut headers: HashMap<String, u32> = HashMap::new();
         headers.try_reserve(header_capacity).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("변경내역 헤더 맵 메모리 확보 실패: ");
-            push_display(&mut message, header_capacity);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("변경내역 헤더 맵 메모리 확보 실패: {header_capacity} entries"),
+                source,
+            )
         })?;
         for (&col, _) in row_obj.cells.range(1..=max_cols) {
             let key = canon_header(
@@ -277,11 +268,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             };
             let required_col = |keys: &[&str], display_name: &str| {
                 get_header_col_optional(keys).ok_or_else(|| {
-                    let mut message = String::with_capacity(display_name.len().saturating_add(36));
-                    message.push_str("변경내역 헤더에 '");
-                    message.push_str(display_name);
-                    message.push_str("' 컬럼이 없습니다.");
-                    err(message)
+                    err(format!("변경내역 헤더에 '{display_name}' 컬럼이 없습니다."))
                 })
             };
             let Some(col_region) = get_header_col_optional(&HEADER_KEYS_REGION) else {
@@ -376,9 +363,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         added: &[StoreRow],
         deleted: &[StoreRow],
     ) -> Result<()> {
-        let mut date_text = String::with_capacity(today.len().saturating_add(16));
-        date_text.push_str("현행화 일자: ");
-        date_text.push_str(today);
+        let date_text = format!("현행화 일자: {today}");
         self.worksheet.set_string_at(1, 2, &date_text);
         let layout = self.find_layout()?;
         let style_template_row = self.select_style_template_row(&layout);
@@ -400,6 +385,23 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         let new_premium_col = col_to_name(layout.col_new_premium);
         let old_diesel_col = col_to_name(layout.col_old_diesel);
         let new_diesel_col = col_to_name(layout.col_new_diesel);
+        let delta_columns = [
+            (
+                layout.col_delta_gas,
+                old_gas_col.as_str(),
+                new_gas_col.as_str(),
+            ),
+            (
+                layout.col_delta_premium,
+                old_premium_col.as_str(),
+                new_premium_col.as_str(),
+            ),
+            (
+                layout.col_delta_diesel,
+                old_diesel_col.as_str(),
+                new_diesel_col.as_str(),
+            ),
+        ];
         for (index, entry) in entries.iter().enumerate() {
             let row = add_row_offset(layout.data_start_row, index, "변경내역 데이터 쓰기")?;
             if row > style_template_row {
@@ -426,26 +428,14 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 .set_i32_at(layout.col_old_diesel, row, entry.old_diesel);
             self.worksheet
                 .set_i32_at(layout.col_new_diesel, row, entry.new_diesel);
-            if let Some(col) = layout.col_delta_gas {
-                self.worksheet.set_formula_at(
-                    col,
-                    row,
-                    &delta_formula(&old_gas_col, &new_gas_col, row),
+            for (delta_col, old_col, new_col) in delta_columns {
+                let Some(delta_col_num) = delta_col else {
+                    continue;
+                };
+                let formula = format!(
+                    "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
                 );
-            }
-            if let Some(col) = layout.col_delta_premium {
-                self.worksheet.set_formula_at(
-                    col,
-                    row,
-                    &delta_formula(&old_premium_col, &new_premium_col, row),
-                );
-            }
-            if let Some(col) = layout.col_delta_diesel {
-                self.worksheet.set_formula_at(
-                    col,
-                    row,
-                    &delta_formula(&old_diesel_col, &new_diesel_col, row),
-                );
+                self.worksheet.set_formula_at(delta_col_num, row, &formula);
             }
         }
         if entries.is_empty() {
@@ -456,16 +446,14 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             entries.len().saturating_sub(1),
             "변경내역 마지막 행 계산",
         )?;
-        let mut target_cols = Vec::with_capacity(3);
-        if let Some(col) = layout.col_delta_gas {
-            target_cols.push(col);
-        }
-        if let Some(col) = layout.col_delta_premium {
-            target_cols.push(col);
-        }
-        if let Some(col) = layout.col_delta_diesel {
-            target_cols.push(col);
-        }
+        let target_cols: Vec<_> = [
+            layout.col_delta_gas,
+            layout.col_delta_premium,
+            layout.col_delta_diesel,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         self.worksheet.extend_conditional_formats(
             last_change_row,
             &target_cols,
@@ -474,34 +462,12 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
     }
 }
 fn change_log_env_u32(name: &str, default: u32, max: Option<u32>) -> u32 {
-    env::var(name)
+    let Some(parsed_value) = env::var(name)
         .ok()
         .and_then(|parsed_value| parsed_value.parse::<u32>().ok())
         .filter(|parsed_value| *parsed_value > 0)
-        .map_or(default, |parsed_value| {
-            max.map_or(parsed_value, |max_value| parsed_value.min(max_value))
-        })
-}
-fn delta_formula(old_col: &str, new_col: &str, row: u32) -> String {
-    let mut out = String::with_capacity(
-        old_col
-            .len()
-            .saturating_add(new_col.len())
-            .saturating_mul(2)
-            .saturating_add(48),
-    );
-    out.push_str("IF(OR(");
-    out.push_str(old_col);
-    push_display(&mut out, row);
-    out.push_str("=\"\",");
-    out.push_str(new_col);
-    push_display(&mut out, row);
-    out.push_str("=\"\"),\"\",");
-    out.push_str(new_col);
-    push_display(&mut out, row);
-    out.push('-');
-    out.push_str(old_col);
-    push_display(&mut out, row);
-    out.push(')');
-    out
+    else {
+        return default;
+    };
+    max.map_or(parsed_value, |max_value| parsed_value.min(max_value))
 }

@@ -2,7 +2,7 @@ use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, canon_header, display_region_label_from_source,
     err, err_with_source, excel,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
-    normalize_address_key, push_display, same_trimmed, shift_row,
+    normalize_address_key, same_trimmed, shift_row,
     source_sync::SourceRecord,
     usize_to_u32,
 };
@@ -349,10 +349,10 @@ impl RowMapper {
             && old_ref_row >= self.data_start_row
             && old_ref_row <= self.old_end_row
         {
-            let deleted_le = u32::try_from(match self.deleted_rows.binary_search(&old_ref_row) {
-                Ok(idx) => idx.saturating_add(1),
-                Err(idx) => idx,
-            })
+            let deleted_le = u32::try_from(
+                self.deleted_rows
+                    .partition_point(|deleted_row| *deleted_row <= old_ref_row),
+            )
             .unwrap_or(self.old_count_u32);
             return old_ref_row.saturating_sub(deleted_le);
         }
@@ -386,28 +386,21 @@ impl MasterSheetOpsExt for MasterSheetOps {
         {
             return None;
         }
-        let capacity = 32;
-        let mut reasons = String::with_capacity(capacity);
-        let mut push_reason = |reason: &str| {
-            if !reasons.is_empty() {
-                reasons.push_str(", ");
-            }
-            reasons.push_str(reason);
-        };
+        let mut reasons = Vec::with_capacity(4);
         if gas_changed || premium_changed || diesel_changed {
-            push_reason("가격변동");
+            reasons.push("가격변동");
         }
         if name_changed {
-            push_reason("상호변경");
+            reasons.push("상호변경");
         }
         if brand_changed {
-            push_reason("상표변경");
+            reasons.push("상표변경");
         }
         if self_yn_changed {
-            push_reason("셀프여부변경");
+            reasons.push("셀프여부변경");
         }
         Some(ChangeRow {
-            reason: reasons,
+            reason: reasons.join(", "),
             region: old.region.to_owned(),
             name: src.name.clone(),
             address: src.address.clone(),
@@ -424,12 +417,15 @@ impl MasterSheetOpsExt for MasterSheetOps {
         old_rows: &[u32],
         kept_source_rows: &[(u32, Option<SourceRecord>)],
     ) -> Vec<u32> {
-        let kept_old_rows: HashSet<u32> = kept_source_rows.iter().map(|entry| entry.0).collect();
+        let kept_old_rows: HashSet<u32> = kept_source_rows
+            .iter()
+            .map(|entry| entry.0)
+            .collect::<HashSet<_>>();
         let mut deleted_rows: Vec<u32> = old_rows
             .iter()
             .copied()
             .filter(|row_num| !kept_old_rows.contains(row_num))
-            .collect();
+            .collect::<Vec<_>>();
         deleted_rows.sort_unstable();
         deleted_rows
     }
@@ -482,12 +478,10 @@ impl MasterSheetOpsExt for MasterSheetOps {
             .currency_apply
             .map(|col| ws.get_display_at(col, row, shared_strings))
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("Y"));
-        let region_rate = if total_price.is_some() && currency_apply {
-            sort_context
-                .region_rates
-                .get(region.trim())
-                .copied()
-                .unwrap_or(0)
+        let region_rate = if currency_apply {
+            total_price
+                .and_then(|_| sort_context.region_rates.get(region.trim()).copied())
+                .unwrap_or_default()
         } else {
             0
         };
@@ -542,9 +536,15 @@ impl MasterSheetOpsExt for MasterSheetOps {
         ws: &excel::writer::Worksheet,
         shared_strings: &[String],
     ) -> RankSortContext {
-        let gasoline_qty = self.get_f64_at(ws, 2, 4, shared_strings).unwrap_or(0);
-        let premium_qty = self.get_f64_at(ws, 2, 5, shared_strings).unwrap_or(0);
-        let diesel_qty = self.get_f64_at(ws, 2, 6, shared_strings).unwrap_or(0);
+        let gasoline_qty = self
+            .get_f64_at(ws, 2, 4, shared_strings)
+            .unwrap_or_default();
+        let premium_qty = self
+            .get_f64_at(ws, 2, 5, shared_strings)
+            .unwrap_or_default();
+        let diesel_qty = self
+            .get_f64_at(ws, 2, 6, shared_strings)
+            .unwrap_or_default();
         let mut region_rates = HashMap::with_capacity(10);
         for row in 4..=13 {
             let region = ws.get_display_at(3, row, shared_strings).trim().to_owned();
@@ -569,7 +569,9 @@ impl MasterSheetOpsExt for MasterSheetOps {
             premium_qty,
             diesel_qty,
             total_qty,
-            smart_discount: self.get_f64_at(ws, 2, 13, shared_strings).unwrap_or(0),
+            smart_discount: self
+                .get_f64_at(ws, 2, 13, shared_strings)
+                .unwrap_or_default(),
             region_rates,
         }
     }
@@ -580,7 +582,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         old_end_row: u32,
         row_mapper: &RowMapper,
     ) -> BTreeMap<u32, StdRow> {
-        let mut new_rows_map = BTreeMap::default();
+        let mut new_rows_map = BTreeMap::new();
         for (row_ref, row_obj) in original_rows {
             let row_num = *row_ref;
             if row_mapper.has_old_rows && row_num >= data_start_row && row_num <= old_end_row {
@@ -611,11 +613,11 @@ impl MasterSheetOpsExt for MasterSheetOps {
     ) -> Result<Vec<u32>> {
         let mut rows: Vec<u32> = Vec::new();
         rows.try_reserve_exact(ws.rows.len()).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("마스터 데이터 행 목록 메모리 확보 실패: ");
-            push_display(&mut message, ws.rows.len());
-            message.push_str(" rows");
-            err_with_source(message, source)
+            let row_count = ws.rows.len();
+            err_with_source(
+                format!("마스터 데이터 행 목록 메모리 확보 실패: {row_count} rows"),
+                source,
+            )
         })?;
         for row in ws.rows.range(data_start_row..).map(|(row, _)| *row) {
             let region = ws.get_display_at(layout.region, row, shared_strings);
@@ -643,8 +645,8 @@ impl MasterSheetOpsExt for MasterSheetOps {
                     rec,
                 )
             })
-            .collect();
-        new_sources.sort_by(|left, right| {
+            .collect::<Vec<_>>();
+        new_sources.sort_unstable_by(|left, right| {
             left.0
                 .cmp(&right.0)
                 .then_with(|| left.1.name.cmp(&right.1.name))
@@ -653,7 +655,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         new_sources
             .into_iter()
             .map(|(_, rec)| rec.clone())
-            .collect()
+            .collect::<Vec<_>>()
     }
     fn compare_out_of_rank_fuels(&self, left: &RankSortKey, right: &RankSortKey) -> Ordering {
         left.gasoline
@@ -719,7 +721,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
                 .region_rates
                 .get(region.trim())
                 .copied()
-                .unwrap_or(0)
+                .unwrap_or_default()
         } else {
             0
         };
@@ -789,13 +791,8 @@ impl MasterSheetOpsExt for MasterSheetOps {
     }
     fn default_row(&self, row_num: u32) -> StdRow {
         StdRow {
-            attrs: vec![("r".into(), {
-                let capacity = 12;
-                let mut row_text = String::with_capacity(capacity);
-                push_display(&mut row_text, row_num);
-                row_text
-            })],
-            cells: BTreeMap::default(),
+            attrs: vec![("r".into(), { row_num.to_string() })],
+            cells: BTreeMap::new(),
         }
     }
     fn evaluate_master_row(
@@ -897,41 +894,41 @@ impl MasterSheetOpsExt for MasterSheetOps {
         matched_source_keys
             .try_reserve(old_rows.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("매칭 소스 키 집합 메모리 확보 실패: ");
-                push_display(&mut message, old_rows.len());
-                message.push_str(" entries");
-                err_with_source(message, source)
+                let old_row_count = old_rows.len();
+                err_with_source(
+                    format!("매칭 소스 키 집합 메모리 확보 실패: {old_row_count} entries"),
+                    source,
+                )
             })?;
         let mut kept_source_rows: Vec<(u32, Option<SourceRecord>)> = Vec::new();
         kept_source_rows
             .try_reserve_exact(old_rows.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("유지 행 목록 메모리 확보 실패: ");
-                push_display(&mut message, old_rows.len());
-                message.push_str(" rows");
-                err_with_source(message, source)
+                let old_row_count = old_rows.len();
+                err_with_source(
+                    format!("유지 행 목록 메모리 확보 실패: {old_row_count} rows"),
+                    source,
+                )
             })?;
         let mut changes: Vec<ChangeRow> = Vec::new();
         changes
             .try_reserve_exact(old_rows.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("변경 행 목록 메모리 확보 실패: ");
-                push_display(&mut message, old_rows.len());
-                message.push_str(" rows");
-                err_with_source(message, source)
+                let old_row_count = old_rows.len();
+                err_with_source(
+                    format!("변경 행 목록 메모리 확보 실패: {old_row_count} rows"),
+                    source,
+                )
             })?;
         let mut deleted: Vec<StoreRow> = Vec::new();
         deleted
             .try_reserve_exact(old_rows.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("삭제 행 목록 메모리 확보 실패: ");
-                push_display(&mut message, old_rows.len());
-                message.push_str(" rows");
-                err_with_source(message, source)
+                let old_row_count = old_rows.len();
+                err_with_source(
+                    format!("삭제 행 목록 메모리 확보 실패: {old_row_count} rows"),
+                    source,
+                )
             })?;
         for old_row in old_rows.iter().copied() {
             let MasterRowDecision {
@@ -966,14 +963,14 @@ impl MasterSheetOpsExt for MasterSheetOps {
     ) -> Result<(u32, MasterSheetLayout)> {
         let max_cols = self.master_header_scan_cols(ws);
         for row in 1..=self.master_header_scan_rows() {
-            let header_capacity = usize::try_from(max_cols).unwrap_or(0);
+            let header_capacity = usize::try_from(max_cols)
+                .map_err(|source| err_with_source("마스터 헤더 열 수 변환 실패", source))?;
             let mut headers: HashMap<String, u32> = HashMap::new();
             headers.try_reserve(header_capacity).map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("마스터 헤더 맵 메모리 확보 실패: ");
-                push_display(&mut message, header_capacity);
-                message.push_str(" entries");
-                err_with_source(message, source)
+                err_with_source(
+                    format!("마스터 헤더 맵 메모리 확보 실패: {header_capacity} entries"),
+                    source,
+                )
             })?;
             for col in 1..=max_cols {
                 let key = canon_header(ws.get_display_at(col, row, shared_strings).trim());
@@ -1083,14 +1080,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         display_name: &str,
     ) -> Result<u32> {
         self.get_master_header_col_optional(headers, keys)
-            .ok_or_else(|| {
-                let capacity = display_name.len().saturating_add(32);
-                let mut message = String::with_capacity(capacity);
-                message.push_str("유류비 헤더에 '");
-                message.push_str(display_name);
-                message.push_str("' 컬럼이 없습니다.");
-                err(message)
-            })
+            .ok_or_else(|| err(format!("유류비 헤더에 '{display_name}' 컬럼이 없습니다.")))
     }
     fn is_zero(&self, value: ScaledDecimal) -> bool {
         value == 0
@@ -1099,11 +1089,14 @@ impl MasterSheetOpsExt for MasterSheetOps {
         ws.max_cell_col().clamp(20, 200)
     }
     fn master_header_scan_rows(&self) -> u32 {
-        env::var("FCUPDATER_MASTER_HEADER_SCAN_ROWS")
+        let Some(parsed_value) = env::var("FCUPDATER_MASTER_HEADER_SCAN_ROWS")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
-            .map_or(200, |value| value.min(20_000))
+        else {
+            return 200;
+        };
+        parsed_value.min(20_000)
     }
     fn normalize_fuel_price(&self, value: Option<i32>) -> Option<i32> {
         value.filter(|price| *price > 0_i32)
@@ -1120,16 +1113,14 @@ impl MasterSheetOpsExt for MasterSheetOps {
         } else {
             trimmed
         };
-        let (sign, digits) = normalized
-            .strip_prefix('-')
-            .map_or((1_i64, normalized), |rest| (-1_i64, rest));
+        let (sign, digits) = split_negative_prefix(normalized, 1_i64, -1_i64);
         let (whole_text, fraction_text) = digits.split_once('.').unwrap_or((digits, ""));
         let whole = whole_text.parse::<i64>().ok()?;
         let mut fraction = 0_i64;
         let mut fraction_digit_count = 0_u8;
-        for ch in fraction_text.chars().filter(char::is_ascii_digit).take(6) {
-            let digit = ch.to_digit(10)?;
-            fraction = fraction.checked_mul(10)?.checked_add(i64::from(digit))?;
+        for digit_byte in fraction_text.bytes().filter(u8::is_ascii_digit).take(6) {
+            let digit = i64::from(digit_byte.checked_sub(b'0')?);
+            fraction = fraction.checked_mul(10)?.checked_add(digit)?;
             fraction_digit_count = fraction_digit_count.checked_add(1)?;
         }
         while fraction_digit_count < 6 {
@@ -1152,11 +1143,11 @@ impl MasterSheetOpsExt for MasterSheetOps {
         kept_rows
             .try_reserve_exact(kept_source_rows.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("유지 마스터 행 메모리 확보 실패: ");
-                push_display(&mut message, kept_source_rows.len());
-                message.push_str(" rows");
-                err_with_source(message, source)
+                let kept_row_count = kept_source_rows.len();
+                err_with_source(
+                    format!("유지 마스터 행 메모리 확보 실패: {kept_row_count} rows"),
+                    source,
+                )
             })?;
         for (i, kept_source_row) in kept_source_rows.iter().enumerate() {
             let old_row = kept_source_row.0;
@@ -1200,11 +1191,11 @@ impl MasterSheetOpsExt for MasterSheetOps {
         new_rows_from_sources
             .try_reserve_exact(new_sources.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("신규 소스 행 메모리 확보 실패: ");
-                push_display(&mut message, new_sources.len());
-                message.push_str(" rows");
-                err_with_source(message, source)
+                let new_source_count = new_sources.len();
+                err_with_source(
+                    format!("신규 소스 행 메모리 확보 실패: {new_source_count} rows"),
+                    source,
+                )
             })?;
         for (i, src) in new_sources.iter().cloned().enumerate() {
             let offset = kept_count
@@ -1317,12 +1308,16 @@ impl MasterSheetOpsExt for MasterSheetOps {
             ws.rows = original_rows;
             return Err(error);
         }
-        let filter_end_col = ws
+        let filter_end_col = if let Some((&col, _)) = ws
             .rows
             .get(&header_row)
-            .and_then(|row| row.cells.last_key_value().map(|(&col, _)| col))
-            .unwrap_or(1)
-            .max(ws.max_cell_col());
+            .and_then(|row| row.cells.last_key_value())
+        {
+            col
+        } else {
+            1
+        }
+        .max(ws.max_cell_col());
         if let Err(error) = ws.update_dimension() {
             ws.rows = original_rows;
             return Err(error);
@@ -1347,16 +1342,17 @@ impl MasterSheetOpsExt for MasterSheetOps {
                 .saturating_sub(data_start_row)
                 .saturating_add(1),
         )
-        .unwrap_or(0);
+        .unwrap_or_default();
         let mut rank_totals: Vec<(u32, Option<ScaledSortKey>)> = Vec::new();
         rank_totals
             .try_reserve_exact(capacity_for_rank_totals_init)
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("랭크 캐시 목록 메모리 확보 실패: ");
-                push_display(&mut message, capacity_for_rank_totals_init);
-                message.push_str(" rows");
-                err_with_source(message, source)
+                err_with_source(
+                    format!(
+                        "랭크 캐시 목록 메모리 확보 실패: {capacity_for_rank_totals_init} rows"
+                    ),
+                    source,
+                )
             })?;
         for row in data_start_row..=data_end_row {
             let cache = self.build_rank_formula_cache(
@@ -1370,8 +1366,10 @@ impl MasterSheetOpsExt for MasterSheetOps {
             self.write_rank_formula_cache(ws, row, layout, &cache);
             rank_totals.push((row, cache.rank_total));
         }
-        let mut visible_rank_totals: Vec<ScaledSortKey> =
-            rank_totals.iter().filter_map(|entry| entry.1).collect();
+        let mut visible_rank_totals: Vec<ScaledSortKey> = rank_totals
+            .iter()
+            .filter_map(|entry| entry.1)
+            .collect::<Vec<_>>();
         visible_rank_totals.sort_unstable();
         for (row, rank_total) in rank_totals {
             let rank_text = rank_total.map(|current| {
@@ -1417,11 +1415,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         data_end_row: u32,
     ) -> String {
         let sort_key_col_name = excel::writer::col_to_name(sort_key_col);
-        let capacity = sort_key_col_name.len().saturating_add(2);
-        let mut range_marker = String::with_capacity(capacity);
-        range_marker.push('$');
-        range_marker.push_str(&sort_key_col_name);
-        range_marker.push('$');
+        let range_marker = format!("${sort_key_col_name}$");
         let Some(first_col_pos) = formula.find(&range_marker) else {
             return formula.to_owned();
         };
@@ -1472,36 +1466,19 @@ impl MasterSheetOpsExt for MasterSheetOps {
         let Some(suffix) = formula.get(end_digits_end..) else {
             return formula.to_owned();
         };
-        let mut out = String::with_capacity(
-            prefix
-                .len()
-                .saturating_add(suffix.len())
-                .saturating_add(sort_key_col_name.len().saturating_mul(2))
-                .saturating_add(24)
-                .saturating_add(7),
-        );
-        out.push_str(prefix);
-        out.push('$');
-        out.push_str(&sort_key_col_name);
-        out.push('$');
-        push_display(&mut out, data_start_row);
-        out.push(':');
-        out.push('$');
-        out.push_str(&sort_key_col_name);
-        out.push('$');
-        push_display(&mut out, data_end_row);
-        out.push_str(suffix);
-        out
+        format!(
+            "{prefix}${sort_key_col_name}${data_start_row}:${sort_key_col_name}${data_end_row}{suffix}"
+        )
     }
     fn rows_from_sources(&self, new_sources: &[SourceRecord]) -> Result<Vec<StoreRow>> {
         let mut rows = Vec::new();
         rows.try_reserve_exact(new_sources.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("신규 StoreRow 목록 메모리 확보 실패: ");
-                push_display(&mut message, new_sources.len());
-                message.push_str(" rows");
-                err_with_source(message, source)
+                let new_source_count = new_sources.len();
+                err_with_source(
+                    format!("신규 StoreRow 목록 메모리 확보 실패: {new_source_count} rows"),
+                    source,
+                )
             })?;
         for src in new_sources {
             rows.push(StoreRow {
@@ -1532,14 +1509,13 @@ impl MasterSheetOpsExt for MasterSheetOps {
                 .saturating_sub(data_start_row)
                 .saturating_add(1),
         )
-        .unwrap_or(0);
+        .unwrap_or_default();
         let mut data_rows: Vec<(u32, RankSortKey)> = Vec::new();
         data_rows.try_reserve_exact(row_count).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("정렬 대상 행 메모리 확보 실패: ");
-            push_display(&mut message, row_count);
-            message.push_str(" rows");
-            err_with_source(message, source)
+            err_with_source(
+                format!("정렬 대상 행 메모리 확보 실패: {row_count} rows"),
+                source,
+            )
         })?;
         for row_num in data_start_row..=data_end_row {
             if !ws.rows.contains_key(&row_num) {
@@ -1552,11 +1528,11 @@ impl MasterSheetOpsExt for MasterSheetOps {
         data_rows.sort_by(|left, right| self.compare_rank_sort_key(&left.1, &right.1));
         let mut row_mapping: HashMap<u32, u32> = HashMap::new();
         row_mapping.try_reserve(data_rows.len()).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("정렬 행 매핑 메모리 확보 실패: ");
-            push_display(&mut message, data_rows.len());
-            message.push_str(" entries");
-            err_with_source(message, source)
+            let data_row_count = data_rows.len();
+            err_with_source(
+                format!("정렬 행 매핑 메모리 확보 실패: {data_row_count} entries"),
+                source,
+            )
         })?;
         for (index, data_row) in data_rows.iter().enumerate() {
             let old_row = data_row.0;
@@ -1567,11 +1543,11 @@ impl MasterSheetOpsExt for MasterSheetOps {
         detached_rows
             .try_reserve(data_rows.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("정렬 분리 행 메모리 확보 실패: ");
-                push_display(&mut message, data_rows.len());
-                message.push_str(" entries");
-                err_with_source(message, source)
+                let data_row_count = data_rows.len();
+                err_with_source(
+                    format!("정렬 분리 행 메모리 확보 실패: {data_row_count} entries"),
+                    source,
+                )
             })?;
         for old_row in data_start_row..=data_end_row {
             let row = ws
@@ -1582,11 +1558,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         }
         for (old_row, _) in data_rows {
             let Some(&new_row) = row_mapping.get(&old_row) else {
-                let capacity = 48;
-                let mut out = String::with_capacity(capacity);
-                out.push_str("정렬 후 행 매핑을 찾지 못했습니다: ");
-                push_display(&mut out, old_row);
-                return Err(err(out));
+                return Err(err(format!("정렬 후 행 매핑을 찾지 못했습니다: {old_row}")));
             };
             let mut row = detached_rows
                 .remove(&old_row)
@@ -1622,29 +1594,10 @@ impl MasterSheetOpsExt for MasterSheetOps {
         data_end_col: u32,
     ) {
         let end_col = excel::writer::col_to_name(data_end_col.max(1));
-        let mut replacement = String::with_capacity(
-            "유류비!$A$:$$"
-                .len()
-                .saturating_add(end_col.len())
-                .saturating_add(24),
-        );
-        replacement.push_str("유류비!$A$");
-        push_display(&mut replacement, data_start_row);
-        replacement.push(':');
-        replacement.push_str(&end_col);
-        replacement.push('$');
-        push_display(&mut replacement, data_end_row);
+        let replacement = format!("유류비!$A${data_start_row}:{end_col}${data_end_row}");
         let marker = "_xlnm._FilterDatabase";
-        let marker_attr_double_capacity = marker.len().saturating_add(7);
-        let mut marker_attr_double = String::with_capacity(marker_attr_double_capacity);
-        marker_attr_double.push_str("name=\"");
-        marker_attr_double.push_str(marker);
-        marker_attr_double.push('"');
-        let marker_attr_single_capacity = marker.len().saturating_add(7);
-        let mut marker_attr_single = String::with_capacity(marker_attr_single_capacity);
-        marker_attr_single.push_str("name='");
-        marker_attr_single.push_str(marker);
-        marker_attr_single.push('\'');
+        let marker_attr_double = format!("name=\"{marker}\"");
+        let marker_attr_single = format!("name='{marker}'");
         let sheet_ref_plain = "유류비!";
         let sheet_ref_quoted = "'유류비'!";
         let mut cursor = 0_usize;
@@ -1755,78 +1708,68 @@ impl MasterSheetOpsExt for MasterSheetOps {
         layout: MasterSheetLayout,
         cache: &RankFormulaCache,
     ) {
-        if let Some(col) = layout.smart_discount {
-            let smart_discount_text =
-                format_scaled_value(i128::from(cache.smart_discount), i128::from(DECIMAL_SCALE));
-            ws.set_formula_cached_value_at(col, row, Some(&smart_discount_text), None);
-        }
-        if let Some(col) = layout.adjusted_gasoline {
-            let text = cache
-                .adjusted_gasoline
-                .map(|value| format_scaled_value(i128::from(value), i128::from(DECIMAL_SCALE)));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
-        }
-        if let Some(col) = layout.adjusted_premium {
-            let text = cache
-                .adjusted_premium
-                .map(|value| format_scaled_value(i128::from(value), i128::from(DECIMAL_SCALE)));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
-        }
-        if let Some(col) = layout.adjusted_diesel {
-            let text = cache
-                .adjusted_diesel
-                .map(|value| format_scaled_value(i128::from(value), i128::from(DECIMAL_SCALE)));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
-        }
-        if let Some(col) = layout.fuel_total_text {
-            ws.set_formula_cached_value_at(col, row, cache.fuel_total_text.as_deref(), Some("str"));
-        }
-        if let Some(col) = layout.total_price {
-            let text = cache
-                .total_price
-                .map(|value| format_scaled_value(value, DECIMAL_SCALE_SQUARED));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
-        }
-        if let Some(col) = layout.region_rate {
-            let text = cache
-                .region_rate
-                .map(|value| format_scaled_value(i128::from(value), i128::from(DECIMAL_SCALE)));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
-        }
-        if let Some(col) = layout.region_discount {
-            let text = cache
-                .regional_discount
-                .map(|value| format_scaled_value(value, DECIMAL_SCALE_SQUARED));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
-        }
-        if let Some(col) = layout.regional_total {
-            let text = cache
-                .rank_total
-                .map(|value| format_scaled_value(value, DECIMAL_SCALE_SQUARED));
-            ws.set_formula_cached_value_at(col, row, text.as_deref(), None);
-        }
-        if let Some(col) = layout.sort_key {
-            let text = cache.rank_total.map_or_else(
-                || "1000000000000000".to_owned(),
-                |value| format_scaled_value(value, DECIMAL_SCALE_SQUARED),
-            );
-            ws.set_formula_cached_value_at(col, row, Some(&text), None);
-        }
-        if let Some(col) = layout.unit_price_with_currency {
-            ws.set_formula_cached_value_at(
-                col,
-                row,
+        let decimal_scale = i128::from(DECIMAL_SCALE);
+        let smart_discount_text =
+            format_scaled_value(i128::from(cache.smart_discount), decimal_scale);
+        let adjusted_gasoline = cache
+            .adjusted_gasoline
+            .map(|value| format_scaled_value(i128::from(value), decimal_scale));
+        let adjusted_premium = cache
+            .adjusted_premium
+            .map(|value| format_scaled_value(i128::from(value), decimal_scale));
+        let adjusted_diesel = cache
+            .adjusted_diesel
+            .map(|value| format_scaled_value(i128::from(value), decimal_scale));
+        let total_price = cache
+            .total_price
+            .map(|value| format_scaled_value(value, DECIMAL_SCALE_SQUARED));
+        let region_rate = cache
+            .region_rate
+            .map(|value| format_scaled_value(i128::from(value), decimal_scale));
+        let region_discount = cache
+            .regional_discount
+            .map(|value| format_scaled_value(value, DECIMAL_SCALE_SQUARED));
+        let regional_total = cache
+            .rank_total
+            .map(|value| format_scaled_value(value, DECIMAL_SCALE_SQUARED));
+        let sort_key = cache.rank_total.map_or_else(
+            || "1000000000000000".to_owned(),
+            |value| format_scaled_value(value, DECIMAL_SCALE_SQUARED),
+        );
+        for (formula_col, value, value_type) in [
+            (
+                layout.smart_discount,
+                Some(smart_discount_text.as_str()),
+                None,
+            ),
+            (layout.adjusted_gasoline, adjusted_gasoline.as_deref(), None),
+            (layout.adjusted_premium, adjusted_premium.as_deref(), None),
+            (layout.adjusted_diesel, adjusted_diesel.as_deref(), None),
+            (
+                layout.fuel_total_text,
+                cache.fuel_total_text.as_deref(),
+                Some("str"),
+            ),
+            (layout.total_price, total_price.as_deref(), None),
+            (layout.region_rate, region_rate.as_deref(), None),
+            (layout.region_discount, region_discount.as_deref(), None),
+            (layout.regional_total, regional_total.as_deref(), None),
+            (layout.sort_key, Some(sort_key.as_str()), None),
+            (
+                layout.unit_price_with_currency,
                 cache.unit_price_with_currency.as_deref(),
                 None,
-            );
-        }
-        if let Some(col) = layout.unit_price_without_currency {
-            ws.set_formula_cached_value_at(
-                col,
-                row,
+            ),
+            (
+                layout.unit_price_without_currency,
                 cache.unit_price_without_currency.as_deref(),
                 None,
-            );
+            ),
+        ] {
+            let Some(formula_col_num) = formula_col else {
+                continue;
+            };
+            ws.set_formula_cached_value_at(formula_col_num, row, value, value_type);
         }
     }
     fn write_source_rows_to_master(
@@ -1858,9 +1801,7 @@ fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> String {
         .unwrap_or(total)
         .div_euclid(DECIMAL_SCALE_SQUARED);
     let raw = rounded.to_string();
-    let (sign, digits) = raw
-        .strip_prefix('-')
-        .map_or(("", raw.as_str()), |rest| ("-", rest));
+    let (sign, digits) = split_negative_prefix(raw.as_str(), "", "-");
     let groups = digits.len().saturating_sub(1).div_euclid(3);
     let mut amount = String::with_capacity(
         sign.len()
@@ -1874,45 +1815,30 @@ fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> String {
         }
         amount.push(ch);
     }
-    let capacity = label.len().saturating_add(amount.len()).saturating_add(2);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(label);
-    out.push(' ');
-    out.push_str(&amount);
-    out.push('원');
-    out
+    format!("{label} {amount}원")
+}
+fn split_negative_prefix<T>(value: &str, positive: T, negative: T) -> (T, &str) {
+    value
+        .strip_prefix('-')
+        .map_or((positive, value), |rest| (negative, rest))
 }
 fn format_scaled_value(value: i128, scale: i128) -> String {
     let sign = if value < 0 { "-" } else { "" };
     let abs = value.abs();
     let whole = abs.div_euclid(scale);
     let frac = abs.rem_euclid(scale);
+    let whole_text = whole.to_string();
     if frac == 0 {
-        let capacity = sign.len().saturating_add(whole.to_string().len());
-        let mut out = String::with_capacity(capacity);
-        out.push_str(sign);
-        push_display(&mut out, whole);
-        return out;
+        return format!("{sign}{whole_text}");
     }
     let mut frac_text = frac.to_string();
-    let width = scale.to_string().len().saturating_sub(1);
+    let width = usize::try_from(scale.ilog10()).unwrap_or_default();
     while frac_text.len() < width {
         frac_text.insert(0, '0');
     }
-    while frac_text.ends_with('0') {
-        frac_text.pop();
-    }
-    let capacity = sign
-        .len()
-        .saturating_add(whole.to_string().len())
-        .saturating_add(frac_text.len())
-        .saturating_add(1);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(sign);
-    push_display(&mut out, whole);
-    out.push('.');
-    out.push_str(&frac_text);
-    out
+    let trimmed_frac_len = frac_text.trim_end_matches('0').len();
+    frac_text.truncate(trimmed_frac_len);
+    format!("{sign}{whole_text}.{frac_text}")
 }
 fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -> Option<String> {
     if qty == 0 {
@@ -1923,12 +1849,9 @@ fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -> Option<St
     let abs = total.abs();
     let whole = abs.div_euclid(denominator);
     let mut remainder = abs.rem_euclid(denominator);
+    let whole_text = whole.to_string();
     if remainder == 0 {
-        let capacity = sign.len().saturating_add(whole.to_string().len());
-        let mut out = String::with_capacity(capacity);
-        out.push_str(sign);
-        push_display(&mut out, whole);
-        return Some(out);
+        return Some(format!("{sign}{whole_text}"));
     }
     let mut frac_text = String::with_capacity(15);
     while frac_text.len() < 15 && remainder != 0 {
@@ -1938,25 +1861,10 @@ fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -> Option<St
         frac_text.push(char::from(b'0'.saturating_add(digit_u8)));
         remainder = remainder.rem_euclid(denominator);
     }
-    while frac_text.ends_with('0') {
-        frac_text.pop();
-    }
-    let capacity = sign
-        .len()
-        .saturating_add(whole.to_string().len())
-        .saturating_add(frac_text.len())
-        .saturating_add(1);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(sign);
-    push_display(&mut out, whole);
-    out.push('.');
-    out.push_str(&frac_text);
-    Some(out)
+    let trimmed_frac_len = frac_text.trim_end_matches('0').len();
+    frac_text.truncate(trimmed_frac_len);
+    Some(format!("{sign}{whole_text}.{frac_text}"))
 }
 fn missing_sort_target_row_error(row_num: u32) -> Box<dyn Error + Send + Sync> {
-    let capacity = 40;
-    let mut out = String::with_capacity(capacity);
-    out.push_str("정렬 대상 행을 찾지 못했습니다: ");
-    push_display(&mut out, row_num);
-    err(out)
+    err(format!("정렬 대상 행을 찾지 못했습니다: {row_num}"))
 }
