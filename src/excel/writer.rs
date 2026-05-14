@@ -6,9 +6,9 @@ use super::{
         find_start_tag, find_tag_end,
     },
 };
-use crate::{Result, err, err_with_source, parse_i32_str, push_display};
+use crate::{Result, err, err_with_source, parse_i32_str};
 use alloc::collections::BTreeMap;
-use core::fmt::Display;
+use core::fmt::{Display, Write as _};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 const MAX_A1_COL: u32 = 0x4000;
@@ -81,8 +81,8 @@ impl Workbook {
             None
         };
         let shared_strings = load_shared_strings(&container)?;
-        let mut sheet_paths = BTreeMap::default();
-        let mut sheets = BTreeMap::default();
+        let mut sheet_paths = BTreeMap::new();
+        let mut sheets = BTreeMap::new();
         for sheet_name in &catalog.sheet_order {
             let Some(sheet_path) = catalog.sheet_name_to_path.get(sheet_name) else {
                 continue;
@@ -111,11 +111,13 @@ impl Workbook {
             let mut seen: HashSet<&str> = HashSet::new();
             seen.try_reserve(self.shared_strings.len())
                 .map_err(|source| {
-                    let mut message = String::with_capacity(64);
-                    message.push_str("shared string 중복 집합 메모리 확보 실패: ");
-                    push_display(&mut message, self.shared_strings.len());
-                    message.push_str(" entries");
-                    err_with_source(message, source)
+                    let shared_string_count = self.shared_strings.len();
+                    err_with_source(
+                        format!(
+                            "shared string 중복 집합 메모리 확보 실패: {shared_string_count} entries"
+                        ),
+                        source,
+                    )
                 })?;
             for value in &self.shared_strings {
                 seen.insert(value);
@@ -126,11 +128,13 @@ impl Workbook {
         index_map
             .try_reserve(self.shared_strings.len())
             .map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("shared string index map 메모리 확보 실패: ");
-                push_display(&mut message, self.shared_strings.len());
-                message.push_str(" entries");
-                err_with_source(message, source)
+                let shared_string_count = self.shared_strings.len();
+                err_with_source(
+                    format!(
+                        "shared string index map 메모리 확보 실패: {shared_string_count} entries"
+                    ),
+                    source,
+                )
             })?;
         for (idx, value) in self.shared_strings.iter().enumerate() {
             index_map.entry(value.clone()).or_insert(idx);
@@ -320,28 +324,17 @@ impl WorkbookSharedStringsExt for Workbook {
         let new_unique = existing_unique.saturating_add(new_values.len());
         set_attr(&mut attrs, "count", display_string(new_total));
         set_attr(&mut attrs, "uniqueCount", display_string(new_unique));
-        let mut new_values_len = 0_usize;
-        for value in new_values {
-            new_values_len = new_values_len.saturating_add(value.len());
-        }
-        let capacity = new_values_len
-            .saturating_add(new_values.len().saturating_mul("<si><t></t></si>".len()))
-            .saturating_add(
-                new_values
-                    .len()
-                    .saturating_mul(" xml:space=\"preserve\"".len()),
-            );
-        let mut new_si_xml = String::with_capacity(capacity);
-        for value in new_values {
-            let text = xml_escape_text(value);
-            if needs_xml_space_preserve(value) {
-                new_si_xml.push_str("<si><t xml:space=\"preserve\">");
-            } else {
-                new_si_xml.push_str("<si><t>");
-            }
-            new_si_xml.push_str(&text);
-            new_si_xml.push_str("</t></si>");
-        }
+        let new_si_xml = new_values
+            .iter()
+            .map(|value| {
+                let text = xml_escape_text(value);
+                if needs_xml_space_preserve(value) {
+                    format!("<si><t xml:space=\"preserve\">{text}</t></si>")
+                } else {
+                    format!("<si><t>{text}</t></si>")
+                }
+            })
+            .collect::<String>();
         let updated_xml = if open_tag.trim_ascii_end().ends_with("/>") {
             let mut replacement = build_open_tag("sst", &attrs);
             replacement.push_str(&new_si_xml);
@@ -456,13 +449,12 @@ impl Worksheet {
                         ranges_out
                             .try_reserve_exact(range_count)
                             .map_err(|source| {
-                                let mut message = String::with_capacity(64);
-                                message.push_str(
-                                    "conditionalFormatting range 목록 메모리 확보 실패: ",
-                                );
-                                push_display(&mut message, range_count);
-                                message.push_str(" ranges");
-                                err_with_source(message, source)
+                                err_with_source(
+                                    format!(
+                                        "conditionalFormatting range 목록 메모리 확보 실패: {range_count} ranges"
+                                    ),
+                                    source,
+                                )
                             })?;
                         for token in sqref.split_whitespace() {
                             let (start_ref, end_ref) = parse_range_token(token);
@@ -497,15 +489,7 @@ impl Worksheet {
                             );
                             let new_end =
                                 ref_with_locks(end_col, last_data_row, end_col_lock, end_row_lock);
-                            let capacity = new_start
-                                .len()
-                                .saturating_add(new_end.len())
-                                .saturating_add(1);
-                            let mut range = String::with_capacity(capacity);
-                            range.push_str(&new_start);
-                            range.push(':');
-                            range.push_str(&new_end);
-                            ranges_out.push(range);
+                            ranges_out.push(format!("{new_start}:{new_end}"));
                             changed = true;
                         }
                         if changed { ranges_out.join(" ") } else { sqref }
@@ -535,24 +519,26 @@ impl Worksheet {
         };
         let cell_type = get_attr(&cell.attrs, "t");
         let inner = cell.inner_xml.as_deref().unwrap_or_default();
-        let display = if matches!(cell_type, Some("inlineStr")) {
-            extract_all_tag_text(inner, "t").map(|value| decode_xml_entities(&value))
-        } else {
-            let raw_v = extract_first_tag_text(inner, "v").unwrap_or_default();
-            let decoded = decode_xml_entities(&raw_v);
-            if matches!(cell_type, Some("s")) {
-                let Some(idx) = decoded.parse::<usize>().ok() else {
-                    return String::new();
-                };
-                shared_strings.get(idx).cloned()
-            } else if matches!(cell_type, Some("b")) {
-                Some(if decoded == "1" {
-                    "TRUE".into()
-                } else {
-                    "FALSE".into()
-                })
-            } else {
-                Some(decoded)
+        let display = match cell_type {
+            Some("inlineStr") => {
+                extract_all_tag_text(inner, "t").map(|value| decode_xml_entities(&value))
+            }
+            ordinary_type => {
+                let raw_v = extract_first_tag_text(inner, "v").unwrap_or_default();
+                let decoded = decode_xml_entities(&raw_v);
+                match ordinary_type {
+                    Some("s") => decoded
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|idx| shared_strings.get(idx))
+                        .cloned(),
+                    Some("b") => Some(if decoded == "1" {
+                        "TRUE".into()
+                    } else {
+                        "FALSE".into()
+                    }),
+                    _ => Some(decoded),
+                }
             }
         };
         display.unwrap_or_default()
@@ -574,7 +560,7 @@ impl Worksheet {
     fn get_or_create_cell_mut(&mut self, col: u32, row: u32) -> &mut Cell {
         let row_obj = self.rows.entry(row).or_insert_with_key(|&row_key| Row {
             attrs: vec![owned_attr("r", display_string(row_key))],
-            cells: BTreeMap::default(),
+            cells: BTreeMap::new(),
         });
         if get_attr(&row_obj.attrs, "r").is_none() {
             set_attr(&mut row_obj.attrs, "r", display_string(row));
@@ -591,35 +577,34 @@ impl Worksheet {
             })
     }
     pub fn has_any_row_format(&self, row: u32, max_col: u32) -> bool {
-        let Some(row_obj) = self.rows.get(&row) else {
-            return false;
-        };
-        if !row_obj.attrs.is_empty() {
-            return true;
-        }
-        if max_col == 0 {
-            return false;
-        }
-        row_obj.cells.range(1..=max_col).next().is_some()
+        self.rows.get(&row).is_some_and(|row_obj| {
+            !row_obj.attrs.is_empty()
+                || (max_col > 0 && row_obj.cells.range(1..=max_col).next().is_some())
+        })
     }
     pub fn max_cell_col(&self) -> u32 {
         self.rows
             .values()
-            .filter_map(|row| row.cells.last_key_value().map(|(&col, _)| col))
+            .filter_map(|row| row.cells.last_key_value())
+            .map(|(&col, _)| col)
             .max()
             .unwrap_or(1)
     }
     pub fn max_row_num(&self) -> u32 {
-        self.rows.last_key_value().map_or(1, |(&row, _)| row)
+        if let Some((&row, _)) = self.rows.last_key_value() {
+            row
+        } else {
+            1
+        }
     }
     fn normalize_shared_formulas(&mut self) -> Result<()> {
         let mut heads: HashMap<String, SharedFormulaHead> = HashMap::new();
         heads.try_reserve(self.rows.len()).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("shared formula head 맵 메모리 확보 실패: ");
-            push_display(&mut message, self.rows.len());
-            message.push_str(" entries");
-            err_with_source(message, source)
+            let row_count = self.rows.len();
+            err_with_source(
+                format!("shared formula head 맵 메모리 확보 실패: {row_count} entries"),
+                source,
+            )
         })?;
         for (row_num, row) in &self.rows {
             for (col_num, cell) in &row.cells {
@@ -654,15 +639,11 @@ impl Worksheet {
                     continue;
                 };
                 let head = heads.get(&spec.si).ok_or_else(|| {
-                    let capacity = 64;
-                    let mut message = String::with_capacity(capacity);
-                    message.push_str("shared formula head를 찾지 못했습니다. (si=");
-                    message.push_str(&spec.si);
-                    message.push_str(", cell=");
-                    message.push_str(col_to_name(*col_num).as_str());
-                    push_display(&mut message, *row_num);
-                    message.push_str(" )");
-                    err(message)
+                    let col_name = col_to_name(*col_num);
+                    err(format!(
+                        "shared formula head를 찾지 못했습니다. (si={}, cell={col_name}{row_num} )",
+                        spec.si
+                    ))
                 })?;
                 let formula = if let Some(text) = spec.formula_text {
                     text
@@ -741,9 +722,9 @@ impl Worksheet {
         let encoded = value.map(xml_escape_text);
         let value_text = encoded.as_deref().unwrap_or_default();
         if !replace_first_tag_text(inner, "v", value_text) && !inner.contains("<v>") {
-            inner.push_str("<v>");
-            inner.push_str(value_text);
-            inner.push_str("</v>");
+            match write!(inner, "<v>{value_text}</v>") {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
     pub fn set_i32_at(&mut self, col: u32, row: u32, value: Option<i32>) {
@@ -759,20 +740,11 @@ impl Worksheet {
         let cell = self.get_or_create_cell_mut(col, row);
         set_attr(&mut cell.attrs, "t", "inlineStr");
         let text = xml_escape_text(value);
-        let preserve = needs_xml_space_preserve(value);
-        let capacity = text.len().saturating_add(if preserve {
-            "<is><t xml:space=\"preserve\"></t></is>".len()
+        let inner = if needs_xml_space_preserve(value) {
+            format!("<is><t xml:space=\"preserve\">{text}</t></is>")
         } else {
-            "<is><t></t></is>".len()
-        });
-        let mut inner = String::with_capacity(capacity);
-        inner.push_str("<is><t");
-        if preserve {
-            inner.push_str(" xml:space=\"preserve\"");
-        }
-        inner.push('>');
-        inner.push_str(&text);
-        inner.push_str("</t></is>");
+            format!("<is><t>{text}</t></is>")
+        };
         cell.inner_xml = Some(inner);
     }
     pub fn to_xml(&self) -> String {
@@ -784,7 +756,7 @@ impl Worksheet {
             estimated_cell_count = estimated_cell_count.saturating_add(row.cells.len());
             for cell in row.cells.values() {
                 estimated_inner_len = estimated_inner_len
-                    .saturating_add(cell.inner_xml.as_ref().map_or(0, String::len));
+                    .saturating_add(cell.inner_xml.as_deref().map_or(0, str::len));
             }
         }
         let capacity = self
@@ -952,9 +924,13 @@ impl WorksheetXmlParseExt for Worksheet {
                 ))
             })?;
             let mut attrs = parse_tag_attrs(cell_tag)?;
-            let col = get_attr(&attrs, "r")
-                .and_then(|value| parse_ref_with_locks(value).map(|(col_num, _, _, _)| col_num))
-                .unwrap_or(next_col);
+            let col = if let Some((col_num, _, _, _)) =
+                get_attr(&attrs, "r").and_then(parse_ref_with_locks)
+            {
+                col_num
+            } else {
+                next_col
+            };
             set_attr(&mut attrs, "r", ref_with_locks(col, row_num, false, false));
             if cell_tag.ends_with("/>") {
                 row.cells.insert(
@@ -1004,7 +980,7 @@ impl WorksheetXmlParseExt for Worksheet {
         Ok(())
     }
     fn parse_rows_from_sheet_data(body: &str) -> Result<BTreeMap<u32, Row>> {
-        let mut rows = BTreeMap::default();
+        let mut rows = BTreeMap::new();
         let mut cursor = 0_usize;
         while let Some(row_open_rel) = body.get(cursor..).and_then(|tail| tail.find("<row")) {
             let row_open = checked_usize_add(cursor, row_open_rel, "sheetData row 시작")?;
@@ -1036,7 +1012,7 @@ impl WorksheetXmlParseExt for Worksheet {
                     row_num,
                     Row {
                         attrs: row_attrs,
-                        cells: BTreeMap::default(),
+                        cells: BTreeMap::new(),
                     },
                 );
                 cursor = row_tag_end.saturating_add(1);
@@ -1062,7 +1038,7 @@ impl WorksheetXmlParseExt for Worksheet {
             })?;
             let mut row = Row {
                 attrs: row_attrs,
-                cells: BTreeMap::default(),
+                cells: BTreeMap::new(),
             };
             Self::parse_row_cells(row_body, row_num, &mut row)?;
             rows.insert(row_num, row);
@@ -1073,15 +1049,9 @@ impl WorksheetXmlParseExt for Worksheet {
 }
 fn checked_usize_add(base: usize, add: usize, context: &str) -> Result<usize> {
     base.checked_add(add).ok_or_else(|| {
-        let capacity = context.len().saturating_add(64);
-        let mut out = String::with_capacity(capacity);
-        out.push_str(context);
-        out.push_str(" offset 계산 중 overflow가 발생했습니다. (base=");
-        push_display(&mut out, base);
-        out.push_str(", add=");
-        push_display(&mut out, add);
-        out.push(')');
-        err(out)
+        err(format!(
+            "{context} offset 계산 중 overflow가 발생했습니다. (base={base}, add={add})"
+        ))
     })
 }
 pub fn remap_row_numbers(row: &mut Row, new_row: u32, resolver: &dyn Fn(u32) -> u32) {
@@ -1132,12 +1102,7 @@ pub fn col_to_name(mut col: u32) -> String {
         rev.push(letter);
         col = base.div_euclid(26);
     }
-    let capacity = rev.len();
-    let mut out = String::with_capacity(capacity);
-    for ch in rev.into_iter().rev() {
-        out.push(ch);
-    }
-    out
+    rev.into_iter().rev().collect()
 }
 pub fn name_to_col(name: &str) -> Option<u32> {
     let mut out = 0_u32;
@@ -1167,42 +1132,26 @@ fn attr_sort_key(name: &str) -> (u8, &str) {
     }
 }
 fn push_sorted_attrs_xml(out: &mut String, attrs: &[(String, String)]) {
-    let mut sorted_attrs: Vec<_> = attrs.iter().collect();
-    sorted_attrs.sort_by(|left, right| attr_sort_key(&left.0).cmp(&attr_sort_key(&right.0)));
+    let mut sorted_attrs = attrs.iter().collect::<Vec<_>>();
+    sorted_attrs
+        .sort_unstable_by(|left, right| attr_sort_key(&left.0).cmp(&attr_sort_key(&right.0)));
     for attr in sorted_attrs {
-        out.push(' ');
-        out.push_str(&attr.0);
-        out.push_str("=\"");
-        append_xml_escaped(out, &attr.1, true);
-        out.push('"');
+        out.push_str(&attr_to_xml(attr));
     }
 }
 fn attrs_to_xml(attrs: &[(String, String)]) -> String {
-    let mut estimated_len = 0_usize;
-    for attr in attrs {
-        estimated_len = estimated_len
-            .saturating_add(attr.0.len().saturating_add(attr.1.len()).saturating_add(4));
-    }
-    let mut out = String::with_capacity(estimated_len);
-    for attr in attrs {
-        out.push(' ');
-        out.push_str(&attr.0);
-        out.push_str("=\"");
-        append_xml_escaped(&mut out, &attr.1, true);
-        out.push('"');
-    }
-    out
+    attrs.iter().map(attr_to_xml).collect()
+}
+fn attr_to_xml(attr: &(String, String)) -> String {
+    let mut escaped = String::with_capacity(attr.1.len());
+    append_xml_escaped(&mut escaped, &attr.1, true);
+    let name = &attr.0;
+    format!(" {name}=\"{escaped}\"")
 }
 fn parse_tag_attrs(tag: &str) -> Result<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
     reserve_xml_attrs(&mut out, 4, "XML 속성 목록 메모리 확보 실패", true)?;
-    let parse_error = |prefix: &str| {
-        let capacity = prefix.len().saturating_add(tag.len());
-        let mut message = String::with_capacity(capacity);
-        message.push_str(prefix);
-        message.push_str(tag);
-        err(message)
-    };
+    let parse_error = |prefix: &str| err(format!("{prefix}{tag}"));
     let Some(lt) = tag.find('<') else {
         return Err(parse_error(
             "XML 태그 파싱 실패: '<'를 찾지 못했습니다. tag=",
@@ -1240,29 +1189,26 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<(String, String)>> {
         while matches!(bytes.get(i), Some(ch) if ch.is_ascii_whitespace()) {
             i = i.saturating_add(1);
         }
-        if bytes.get(i).is_none() {
+        let Some(&equals) = bytes.get(i) else {
             return Err(parse_error(
                 "XML 속성 파싱 실패: '='를 찾지 못했습니다. tag=",
             ));
-        }
-        if bytes.get(i) != Some(&b'=') {
+        };
+        if equals != b'=' {
             return Err(parse_error("XML 속성 파싱 실패: '='가 필요합니다. tag="));
         }
         i = i.saturating_add(1);
         while matches!(bytes.get(i), Some(ch) if ch.is_ascii_whitespace()) {
             i = i.saturating_add(1);
         }
-        if bytes.get(i).is_none() {
+        let Some(&quote) = bytes.get(i) else {
             return Err(parse_error("XML 속성 파싱 실패: 값 quote가 없습니다. tag="));
-        }
-        if !matches!(bytes.get(i), Some(b'"' | b'\'')) {
+        };
+        if !matches!(quote, b'"' | b'\'') {
             return Err(parse_error(
                 "XML 속성 파싱 실패: 속성 값은 quote로 감싸야 합니다. tag=",
             ));
         }
-        let Some(&quote) = bytes.get(i) else {
-            return Err(parse_error("XML 속성 파싱 실패: 값 quote가 없습니다. tag="));
-        };
         i = i.saturating_add(1);
         let value_start = i;
         while matches!(bytes.get(i), Some(ch) if *ch != quote) {
@@ -1299,19 +1245,14 @@ fn reserve_xml_attrs(
     } else {
         attrs.try_reserve(additional)
     };
-    reserve_result.map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str(context);
-        message.push_str(": ");
-        push_display(&mut message, additional);
-        message.push_str(" entries");
-        err_with_source(message, source)
-    })
+    reserve_result
+        .map_err(|source| err_with_source(format!("{context}: {additional} entries"), source))
 }
 fn get_attr<'attrs>(attrs: &'attrs [(String, String)], name: &str) -> Option<&'attrs str> {
     attrs
         .iter()
-        .find_map(|attr| (attr.0 == name).then_some(attr.1.as_str()))
+        .find(|attr| attr.0 == name)
+        .map(|attr| attr.1.as_str())
 }
 fn owned_attr(name: &str, value: impl Into<String>) -> (String, String) {
     (name.to_owned(), value.into())
@@ -1357,11 +1298,11 @@ where
 {
     let mut chars: Vec<char> = Vec::new();
     chars.try_reserve_exact(formula.len()).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str("formula 문자 목록 메모리 확보 실패: ");
-        push_display(&mut message, formula.len());
-        message.push_str(" chars");
-        err_with_source(message, source)
+        let formula_len = formula.len();
+        err_with_source(
+            format!("formula 문자 목록 메모리 확보 실패: {formula_len} chars"),
+            source,
+        )
     })?;
     for ch in formula.chars() {
         chars.push(ch);
@@ -1465,18 +1406,7 @@ fn replace_formula_tag_with_plain_formula(inner_xml: &str, formula: &str) -> Res
             .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?
     };
     let escaped_formula = xml_escape_text(formula);
-    let capacity = prefix
-        .len()
-        .saturating_add(suffix.len())
-        .saturating_add(escaped_formula.len())
-        .saturating_add("<f></f>".len());
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    out.push_str("<f>");
-    out.push_str(&escaped_formula);
-    out.push_str("</f>");
-    out.push_str(suffix);
-    Ok(out)
+    Ok(format!("{prefix}<f>{escaped_formula}</f>{suffix}"))
 }
 fn try_parse_and_rewrite_cell_ref<F>(
     chars: &[char],
@@ -1630,9 +1560,7 @@ where
     Ok(out)
 }
 fn replace_first_tag_text(xml: &mut String, tag_name: &str, new_text: &str) -> bool {
-    let mut open_pattern = String::with_capacity(tag_name.len().saturating_add(1));
-    open_pattern.push('<');
-    open_pattern.push_str(tag_name);
+    let open_pattern = format!("<{tag_name}");
     let Some(open_start) = xml.find(&open_pattern) else {
         return false;
     };
@@ -1647,10 +1575,7 @@ fn replace_first_tag_text(xml: &mut String, tag_name: &str, new_text: &str) -> b
     else {
         return false;
     };
-    let mut close_pattern = String::with_capacity(tag_name.len().saturating_add(3));
-    close_pattern.push_str("</");
-    close_pattern.push_str(tag_name);
-    close_pattern.push('>');
+    let close_pattern = format!("</{tag_name}>");
     let Some(close_rel) = xml
         .get(content_start..)
         .and_then(|tail| tail.find(&close_pattern))
@@ -1675,9 +1600,7 @@ fn parse_range_token(token: &str) -> (&str, &str) {
     token.split_once(':').unwrap_or((token, token))
 }
 fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, bool)> {
-    let (col_lock, after_col_lock) = reference
-        .strip_prefix('$')
-        .map_or((false, reference), |tail| (true, tail));
+    let (col_lock, after_col_lock) = strip_ref_lock_prefix(reference);
     let col_end = after_col_lock
         .find(|ch: char| !ch.is_ascii_alphabetic())
         .unwrap_or(after_col_lock.len());
@@ -1686,9 +1609,7 @@ fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, bool)> {
     }
     let col_s = after_col_lock.get(..col_end)?;
     let after_col = after_col_lock.get(col_end..)?;
-    let (row_lock, row_part) = after_col
-        .strip_prefix('$')
-        .map_or((false, after_col), |tail| (true, tail));
+    let (row_lock, row_part) = strip_ref_lock_prefix(after_col);
     let row_end = row_part
         .find(|ch: char| !ch.is_ascii_digit())
         .unwrap_or(row_part.len());
@@ -1702,52 +1623,33 @@ fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, bool)> {
     let row = row_part.parse::<u32>().ok()?;
     Some((col, row, col_lock, row_lock))
 }
+fn strip_ref_lock_prefix(reference: &str) -> (bool, &str) {
+    reference
+        .strip_prefix('$')
+        .map_or((false, reference), |tail| (true, tail))
+}
 fn ref_with_locks(col: u32, row: u32, col_lock: bool, row_lock: bool) -> String {
     let col_name = col_to_name(col);
-    let capacity = col_name.len().saturating_add(12);
-    let mut out = String::with_capacity(capacity);
-    if col_lock {
-        out.push('$');
-    }
-    out.push_str(&col_name);
-    if row_lock {
-        out.push('$');
-    }
-    push_display(&mut out, row);
-    out
+    let col_prefix = if col_lock { "$" } else { "" };
+    let row_prefix = if row_lock { "$" } else { "" };
+    format!("{col_prefix}{col_name}{row_prefix}{row}")
 }
 const fn is_ref_neighbor_identifier(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'
 }
 fn shift_formula_index(value: u32, delta: i64, max: u32) -> Result<u32> {
     let shifted = i64::from(value).checked_add(delta).ok_or_else(|| {
-        let capacity = 80;
-        let mut message = String::with_capacity(capacity);
-        message.push_str("shared formula index 계산 overflow: ");
-        push_display(&mut message, value);
-        message.push_str(" + ");
-        push_display(&mut message, delta);
-        err(message)
+        err(format!(
+            "shared formula index 계산 overflow: {value} + {delta}"
+        ))
     })?;
     if !(1..=i64::from(max)).contains(&shifted) {
-        let capacity = 112;
-        let mut message = String::with_capacity(capacity);
-        message.push_str("shared formula 상대참조 이동 범위를 벗어났습니다. (");
-        push_display(&mut message, value);
-        message.push_str(" + ");
-        push_display(&mut message, delta);
-        message.push_str(", max=");
-        push_display(&mut message, max);
-        message.push(')');
-        return Err(err(message));
+        return Err(err(format!(
+            "shared formula 상대참조 이동 범위를 벗어났습니다. ({value} + {delta}, max={max})"
+        )));
     }
-    u32::try_from(shifted).map_err(|source| {
-        let capacity = 96;
-        let mut message = String::with_capacity(capacity);
-        message.push_str("shared formula index 변환 실패: ");
-        push_display(&mut message, source);
-        err(message)
-    })
+    u32::try_from(shifted)
+        .map_err(|source| err(format!("shared formula index 변환 실패: {source}")))
 }
 fn append_xml_escaped(out: &mut String, text: &str, escape_quotes: bool) {
     for ch in text.chars() {
@@ -1762,106 +1664,38 @@ fn append_xml_escaped(out: &mut String, text: &str, escape_quotes: bool) {
     }
 }
 fn build_formula_with_empty_value(formula_text: &str) -> String {
-    let capacity = formula_text.len().saturating_add(14);
-    let mut out = String::with_capacity(capacity);
-    out.push_str("<f>");
-    out.push_str(formula_text);
-    out.push_str("</f>");
-    out.push_str("<v></v>");
-    out
+    format!("<f>{formula_text}</f><v></v>")
 }
 fn build_open_tag(name: &str, attrs: &[(String, String)]) -> String {
     let attrs_xml = attrs_to_xml(attrs);
-    let capacity = name.len().saturating_add(attrs_xml.len()).saturating_add(2);
-    let mut out = String::with_capacity(capacity);
-    out.push('<');
-    out.push_str(name);
-    out.push_str(&attrs_xml);
-    out.push('>');
-    out
+    format!("<{name}{attrs_xml}>")
 }
 fn build_self_closing_tag(name: &str, attrs: &[(String, String)]) -> String {
     let attrs_xml = attrs_to_xml(attrs);
-    let capacity = name.len().saturating_add(attrs_xml.len()).saturating_add(4);
-    let mut out = String::with_capacity(capacity);
-    out.push('<');
-    out.push_str(name);
-    out.push_str(&attrs_xml);
-    out.push_str("/>");
-    out
+    format!("<{name}{attrs_xml}/>")
 }
 fn build_display_text_tag(name: &str, value: impl Display) -> String {
-    let capacity = name.len().saturating_mul(2).saturating_add(16);
-    let mut out = String::with_capacity(capacity);
-    out.push('<');
-    out.push_str(name);
-    out.push('>');
-    push_display(&mut out, value);
-    out.push_str("</");
-    out.push_str(name);
-    out.push('>');
-    out
+    format!("<{name}>{value}</{name}>")
 }
 fn build_ref_range(start_col_text: &str, start_row: u32, end_col: u32, end_row: u32) -> String {
     let end_ref = ref_with_locks(end_col, end_row, false, false);
-    let capacity = start_col_text
-        .len()
-        .saturating_add(12)
-        .saturating_add(1)
-        .saturating_add(end_ref.len());
-    let mut out = String::with_capacity(capacity);
-    out.push_str(start_col_text);
-    push_display(&mut out, start_row);
-    out.push(':');
-    out.push_str(&end_ref);
-    out
+    format!("{start_col_text}{start_row}:{end_ref}")
 }
 fn display_string(value: impl Display) -> String {
-    let capacity = 16;
-    let mut out = String::with_capacity(capacity);
-    push_display(&mut out, value);
-    out
+    format!("{value}")
 }
 fn offset_only_error(prefix: &str, offset: usize) -> String {
-    let capacity = prefix.len().saturating_add(24);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    push_display(&mut out, offset);
-    out.push(')');
-    out
+    format!("{prefix}{offset})")
 }
 fn row_only_error(prefix: &str, row_num: u32) -> String {
-    let capacity = prefix.len().saturating_add(24);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    push_display(&mut out, row_num);
-    out.push(')');
-    out
+    format!("{prefix}{row_num})")
 }
 fn row_offset_error(prefix: &str, row_num: u32, offset: usize) -> String {
-    let capacity = prefix.len().saturating_add(40);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    push_display(&mut out, row_num);
-    out.push_str(", offset=");
-    push_display(&mut out, offset);
-    out.push(')');
-    out
+    format!("{prefix}{row_num}, offset={offset})")
 }
 fn row_col_error(prefix: &str, row_num: u32, col: u32) -> String {
-    let capacity = prefix.len().saturating_add(40);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(prefix);
-    push_display(&mut out, row_num);
-    out.push_str(", col=");
-    push_display(&mut out, col);
-    out.push(')');
-    out
+    format!("{prefix}{row_num}, col={col})")
 }
 fn tag_error_message(tag_name: &str, suffix: &str) -> String {
-    let capacity = tag_name.len().saturating_add(suffix.len());
-    let mut out = String::with_capacity(capacity);
-    out.push_str(tag_name);
-    out.push_str(suffix);
-    out
+    format!("{tag_name}{suffix}")
 }

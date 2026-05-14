@@ -3,14 +3,13 @@ use super::{
     build_source_records_from_rows,
 };
 use crate::{
-    Result, err, err_with_source, path_source_message, prefixed_message, push_display,
-    source_sync::SourceRecord,
+    Result, err, err_with_source, path_source_message, prefixed_message, source_sync::SourceRecord,
 };
 use alloc::collections::BTreeMap;
 use core::{
     char::{REPLACEMENT_CHARACTER, decode_utf16},
     error::Error,
-    fmt::{Display, Write as _},
+    fmt::Display,
     ops::Div as _,
 };
 use std::{collections::HashSet, fs, path::Path};
@@ -228,13 +227,7 @@ impl CfbFileExt for CfbFile {
         let mut fat: Vec<u32> = Vec::new();
         fat.try_reserve_exact(total_entries).map_err(|source| {
             err_with_source(
-                {
-                    let mut out = String::with_capacity(48);
-                    out.push_str("CFB FAT 메모리 확보 실패: ");
-                    push_display(&mut out, total_entries);
-                    out.push_str(" entries");
-                    out
-                },
+                format!("CFB FAT 메모리 확보 실패: {total_entries} entries"),
                 source,
             )
         })?;
@@ -254,20 +247,16 @@ impl CfbFileExt for CfbFile {
         max_sector_count: usize,
     ) -> Result<Vec<u32>> {
         if header.num_mini_fat_sectors == 0 || !is_regular_sector_id(header.first_mini_fat_sector) {
-            return Ok(Vec::default());
+            return Ok(Vec::new());
         }
         let mini_fat_sector_count =
             usize::try_from(header.num_mini_fat_sectors).map_err(|source| {
                 err_with_source("CFB mini FAT sector 개수 변환에 실패했습니다.", source)
             })?;
         if mini_fat_sector_count > max_sector_count {
-            let mut message = String::with_capacity(96);
-            message.push_str("CFB mini FAT sector 개수가 비정상적으로 큽니다: ");
-            push_display(&mut message, mini_fat_sector_count);
-            message.push_str(" (최대 ");
-            push_display(&mut message, max_sector_count);
-            message.push(')');
-            return Err(err(message));
+            return Err(err(format!(
+                "CFB mini FAT sector 개수가 비정상적으로 큽니다: {mini_fat_sector_count} (최대 {max_sector_count})"
+            )));
         }
         let sector_size_u64 = u64::try_from(header.sector_size)
             .map_err(|source| err_with_source("CFB sector size 변환에 실패했습니다.", source))?;
@@ -285,11 +274,11 @@ impl CfbFileExt for CfbFile {
         let (chunks, _) = mini_fat_bytes.as_chunks::<4>();
         let mut out: Vec<u32> = Vec::new();
         out.try_reserve_exact(chunks.len()).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("CFB mini FAT 메모리 확보 실패: ");
-            push_display(&mut message, chunks.len());
-            message.push_str(" entries");
-            err_with_source(message, source)
+            let chunk_count = chunks.len();
+            err_with_source(
+                format!("CFB mini FAT 메모리 확보 실패: {chunk_count} entries"),
+                source,
+            )
         })?;
         for chunk in chunks {
             out.push(u32::from_le_bytes(*chunk));
@@ -336,11 +325,10 @@ impl CfbFileExt for CfbFile {
         let mut sid = header.first_difat_sector;
         let mut seen: HashSet<u32> = HashSet::new();
         seen.try_reserve(num_difat_sectors).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("CFB DIFAT 방문 집합 메모리 확보 실패: ");
-            push_display(&mut message, num_difat_sectors);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("CFB DIFAT 방문 집합 메모리 확보 실패: {num_difat_sectors} entries"),
+                source,
+            )
         })?;
         for _ in 0..num_difat_sectors {
             if !is_regular_sector_id(sid) {
@@ -374,10 +362,13 @@ impl CfbFileExt for CfbFile {
         Ok(difat_entries)
     }
     fn max_regular_sector_count(data_len: usize, sector_size: usize) -> usize {
-        data_len
-            .checked_sub(512)
-            .and_then(|payload| payload.checked_div(sector_size))
-            .unwrap_or(0)
+        let Some(payload) = data_len.checked_sub(512) else {
+            return 0;
+        };
+        let Some(sector_count) = payload.checked_div(sector_size) else {
+            return 0;
+        };
+        sector_count
     }
     fn open(path: &Path) -> Result<Self> {
         let file_size = fs::metadata(path)
@@ -390,25 +381,26 @@ impl CfbFileExt for CfbFile {
             })?
             .len();
         if file_size > MAX_XLS_FILE_SIZE_BYTES {
-            let mut message = String::with_capacity(160);
-            message.push_str("xls 파일이 너무 큽니다: ");
-            push_display(&mut message, path.display());
-            message.push_str(" (");
-            push_display(&mut message, file_size);
-            message.push_str(" bytes, 최대 ");
-            push_display(&mut message, MAX_XLS_FILE_SIZE_BYTES);
-            message.push_str(" bytes)");
-            return Err(err(message));
+            return Err(err(format!(
+                "xls 파일이 너무 큽니다: {} ({file_size} bytes, 최대 {MAX_XLS_FILE_SIZE_BYTES} bytes)",
+                path.display()
+            )));
         }
         let data = fs::read(path)
             .map_err(|error| err(path_source_message("xls 파일 읽기 실패", path, error)))?;
-        if data.len() < 512 || data.get(..CFB_SIGNATURE.len()) != Some(CFB_SIGNATURE.as_slice()) {
+        let Some(cfb_header_block) = data.first_chunk::<512>() else {
+            return Err(err(prefixed_message(
+                "유효한 OLE2(CFB) xls 파일이 아닙니다: ",
+                path.display(),
+            )));
+        };
+        if !cfb_header_block.starts_with(&CFB_SIGNATURE) {
             return Err(err(prefixed_message(
                 "유효한 OLE2(CFB) xls 파일이 아닙니다: ",
                 path.display(),
             )));
         }
-        let header = Self::parse_cfb_header(&data)?;
+        let header = Self::parse_cfb_header(cfb_header_block)?;
         let max_sector_count = Self::max_regular_sector_count(data.len(), header.sector_size);
         if max_sector_count == 0 {
             return Err(err("CFB sector 개수가 비정상적입니다."));
@@ -417,25 +409,19 @@ impl CfbFileExt for CfbFile {
             err_with_source("CFB FAT sector 개수 변환에 실패했습니다.", source)
         })?;
         if declared_fat_sectors > max_sector_count {
-            let mut message = String::with_capacity(96);
-            message.push_str("CFB FAT sector 개수가 비정상적으로 큽니다: ");
-            push_display(&mut message, declared_fat_sectors);
-            message.push_str(" (최대 ");
-            push_display(&mut message, max_sector_count);
-            message.push(')');
-            return Err(err(message));
+            return Err(err(format!(
+                "CFB FAT sector 개수가 비정상적으로 큽니다: {declared_fat_sectors} (최대 {max_sector_count})"
+            )));
         }
         let difat_entries = Self::collect_difat_entries(&data, &header, max_sector_count)?;
         if declared_fat_sectors == 0 || difat_entries.is_empty() {
             return Err(err("CFB FAT 정보를 찾지 못했습니다."));
         }
         if difat_entries.len() < declared_fat_sectors {
-            let mut message = String::with_capacity(96);
-            message.push_str("CFB FAT 엔트리가 부족합니다: 필요 ");
-            push_display(&mut message, declared_fat_sectors);
-            message.push_str(", 실제 ");
-            push_display(&mut message, difat_entries.len());
-            return Err(err(message));
+            let difat_entry_count = difat_entries.len();
+            return Err(err(format!(
+                "CFB FAT 엔트리가 부족합니다: 필요 {declared_fat_sectors}, 실제 {difat_entry_count}"
+            )));
         }
         let fat_sector_ids = difat_entries
             .get(..declared_fat_sectors)
@@ -494,12 +480,9 @@ impl CfbFileExt for CfbFile {
         }
         if (major_version == 3 && sector_size != 512) || (major_version == 4 && sector_size != 4096)
         {
-            let mut message = String::with_capacity(96);
-            message.push_str("CFB 헤더 버전/sector size 조합이 유효하지 않습니다: version=");
-            push_display(&mut message, major_version);
-            message.push_str(", sector=");
-            push_display(&mut message, sector_size);
-            return Err(err(message));
+            return Err(err(format!(
+                "CFB 헤더 버전/sector size 조합이 유효하지 않습니다: version={major_version}, sector={sector_size}"
+            )));
         }
         if mini_sector_size != 64 {
             return Err(err(prefixed_display_message(
@@ -527,11 +510,11 @@ impl CfbFileExt for CfbFile {
         let (chunks, _) = dir_stream.as_chunks::<128>();
         let mut entries: Vec<CfbDirectoryEntry> = Vec::new();
         entries.try_reserve_exact(chunks.len()).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("CFB 디렉터리 메모리 확보 실패: ");
-            push_display(&mut message, chunks.len());
-            message.push_str(" entries");
-            err_with_source(message, source)
+            let chunk_count = chunks.len();
+            err_with_source(
+                format!("CFB 디렉터리 메모리 확보 실패: {chunk_count} entries"),
+                source,
+            )
         })?;
         for entry in chunks {
             let name_len = usize::from(read_u16_le(entry, 0x40)?);
@@ -594,24 +577,18 @@ impl CfbFileExt for CfbFile {
         name: &str,
     ) -> Result<Vec<u8>> {
         let mut remaining = usize::try_from(size).map_err(|source| {
-            let mut message = String::with_capacity(name.len().saturating_add(64));
-            message.push_str("mini stream 길이 변환 실패: ");
-            push_display(&mut message, size);
-            message.push_str(" (");
-            message.push_str(name);
-            message.push(')');
-            err_with_source(message, source)
+            err_with_source(
+                format!("mini stream 길이 변환 실패: {size} ({name})"),
+                source,
+            )
         })?;
         let mut out = Vec::new();
         out.try_reserve_exact(remaining.min(self.root_stream.len()))
             .map_err(|source| {
-                let mut message = String::with_capacity(name.len().saturating_add(64));
-                message.push_str("mini stream 메모리 확보 실패: ");
-                push_display(&mut message, remaining);
-                message.push_str(" bytes (");
-                message.push_str(name);
-                message.push(')');
-                err_with_source(message, source)
+                err_with_source(
+                    format!("mini stream 메모리 확보 실패: {remaining} bytes ({name})"),
+                    source,
+                )
             })?;
         let mut sid = start_mini_sector;
         let seen_capacity = self.mini_fat.len().min(64);
@@ -697,19 +674,17 @@ impl CfbFileExt for CfbFile {
 impl SourceReaderBiffExt for SourceReader {
     fn read_xls_source_impl(&self, path: &Path) -> Result<Vec<SourceRecord>> {
         let cfb = <CfbFile as CfbFileExt>::open(path)?;
-        let workbook = match cfb.read_stream_by_name("Workbook") {
-            Ok(workbook_stream) => workbook_stream,
-            Err(_) => cfb.read_stream_by_name("Book")?,
-        };
+        let workbook = cfb
+            .read_stream_by_name("Workbook")
+            .or_else(|_| cfb.read_stream_by_name("Book"))?;
         let globals = self.parse_biff_globals(&workbook)?;
         let all_capacity = globals.boundsheets.len().saturating_mul(32);
         let mut all: Vec<SourceRecord> = Vec::new();
         all.try_reserve_exact(all_capacity).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("BIFF 소스 레코드 메모리 확보 실패: ");
-            push_display(&mut message, all_capacity);
-            message.push_str(" rows");
-            err_with_source(message, source)
+            err_with_source(
+                format!("BIFF 소스 레코드 메모리 확보 실패: {all_capacity} rows"),
+                source,
+            )
         })?;
         let mut last_err: Option<Box<dyn Error + Send + Sync>> = None;
         for sheet in globals
@@ -761,7 +736,7 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
                 .ok_or_else(|| err("SST chunk index overflow가 발생했습니다."))?;
             self.offset_in_chunk = 0;
         }
-        if self.chunks.get(self.chunk_index).is_none() {
+        if self.chunk_index >= self.chunks.len() {
             return Err(err("SST data가 예상보다 짧습니다."));
         }
         Ok(())
@@ -791,11 +766,7 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
         }
         let mut out = Vec::new();
         out.try_reserve_exact(len).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("SST 버퍼 메모리 확보 실패: ");
-            push_display(&mut message, len);
-            message.push_str(" bytes");
-            err_with_source(message, source)
+            err_with_source(format!("SST 버퍼 메모리 확보 실패: {len} bytes"), source)
         })?;
         while out.len() < len {
             self.ensure_available()?;
@@ -846,11 +817,10 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
     fn read_xl_unicode_chars(&mut self, char_count: usize, mut high_byte: bool) -> Result<String> {
         let mut out = String::new();
         out.try_reserve_exact(char_count).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("SST 문자열 메모리 확보 실패: ");
-            push_display(&mut message, char_count);
-            message.push_str(" chars");
-            err_with_source(message, source)
+            err_with_source(
+                format!("SST 문자열 메모리 확보 실패: {char_count} chars"),
+                source,
+            )
         })?;
         let mut remaining = char_count;
         let mut continuation = false;
@@ -870,10 +840,10 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
                 .checked_sub(self.offset_in_chunk)
                 .ok_or_else(|| err("SST chunk 남은 길이 계산에 실패했습니다."))?;
             let bytes_per_char = if high_byte { 2 } else { 1 };
-            let chars_here = available_bytes
-                .checked_div(bytes_per_char)
-                .unwrap_or(0)
-                .min(remaining);
+            let Some(available_chars) = available_bytes.checked_div(bytes_per_char) else {
+                return Err(err("SST chunk 문자 수 계산에 실패했습니다."));
+            };
+            let chars_here = available_chars.min(remaining);
             if chars_here == 0 {
                 self.chunk_index = self
                     .chunk_index
@@ -890,7 +860,11 @@ impl<'chunks, 'chunk> SstChunkReaderExt<'chunks, 'chunk> for SstChunkReader<'chu
                 .get(self.offset_in_chunk..self.offset_in_chunk.saturating_add(byte_len))
                 .ok_or_else(|| err("SST 문자열 slice 범위 오류"))?;
             if high_byte {
-                push_utf16_le_lossy(&mut out, bytes);
+                let (chunks, _) = bytes.as_chunks::<2>();
+                out.extend(
+                    decode_utf16(chunks.iter().map(|unit| u16::from_le_bytes(*unit)))
+                        .map(|decoded| decoded.unwrap_or(REPLACEMENT_CHARACTER)),
+                );
             } else {
                 let decoded = decode_single_byte_text(bytes, self.code_page)?;
                 out.push_str(&decoded);
@@ -995,19 +969,19 @@ impl SourceReaderBiffParseExt for SourceReader {
         rows_map: BTreeMap<usize, BTreeMap<usize, CellValue>>,
     ) -> Result<Vec<(usize, Vec<CellValue>)>> {
         if rows_map.is_empty() {
-            return Ok(Vec::default());
+            return Ok(Vec::new());
         }
         let mut rows: Vec<(usize, Vec<CellValue>)> = Vec::new();
         rows.try_reserve_exact(rows_map.len()).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("BIFF worksheet 행 메모리 확보 실패: ");
-            push_display(&mut message, rows_map.len());
-            message.push_str(" rows");
-            err_with_source(message, source)
+            let row_count = rows_map.len();
+            err_with_source(
+                format!("BIFF worksheet 행 메모리 확보 실패: {row_count} rows"),
+                source,
+            )
         })?;
         for (row_num, cells) in rows_map {
             let Some(max_col) = cells.last_key_value().map(|(&col, _)| col) else {
-                rows.push((row_num, Vec::default()));
+                rows.push((row_num, Vec::new()));
                 continue;
             };
             let row_len = max_col
@@ -1015,11 +989,10 @@ impl SourceReaderBiffParseExt for SourceReader {
                 .ok_or_else(|| err("worksheet row 길이 계산 중 overflow가 발생했습니다."))?;
             let mut row_values: Vec<CellValue> = Vec::new();
             row_values.try_reserve_exact(row_len).map_err(|source| {
-                let mut message = String::with_capacity(64);
-                message.push_str("BIFF worksheet 셀 메모리 확보 실패: ");
-                push_display(&mut message, row_len);
-                message.push_str(" cells");
-                err_with_source(message, source)
+                err_with_source(
+                    format!("BIFF worksheet 셀 메모리 확보 실패: {row_len} cells"),
+                    source,
+                )
             })?;
             row_values.resize(row_len, CellValue::Empty);
             for (col, value) in cells {
@@ -1037,19 +1010,14 @@ impl SourceReaderBiffParseExt for SourceReader {
         code_page: Option<u16>,
         rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
     ) -> Result<()> {
-        if data.len() < 9 {
-            return Ok(());
-        }
-        let Some(text) = self.parse_biff8_label(
-            data.get(6..)
-                .ok_or_else(|| err("LABEL 레코드 문자열 범위 오류"))?,
-            code_page,
-        )?
-        else {
+        let Some((header, text_data)) = data.split_first_chunk::<6>() else {
             return Ok(());
         };
-        let row = usize::from(read_u16_le(data, 0)?) + 1;
-        let col = usize::from(read_u16_le(data, 2)?);
+        let Some(text) = self.parse_biff8_label(text_data, code_page)? else {
+            return Ok(());
+        };
+        let row = usize::from(read_u16_le(header, 0)?) + 1;
+        let col = usize::from(read_u16_le(header, 2)?);
         self.validate_sheet_cell_bounds(row, col)?;
         self.insert_sparse_cell(rows_map, row, col, CellValue::Text(text));
         Ok(())
@@ -1060,13 +1028,13 @@ impl SourceReaderBiffParseExt for SourceReader {
         shared_strings: &[String],
         rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
     ) -> Result<()> {
-        if data.len() < 10 {
+        let Some(header) = data.first_chunk::<10>() else {
             return Ok(());
-        }
-        let row = usize::from(read_u16_le(data, 0)?) + 1;
-        let col = usize::from(read_u16_le(data, 2)?);
+        };
+        let row = usize::from(read_u16_le(header, 0)?) + 1;
+        let col = usize::from(read_u16_le(header, 2)?);
         self.validate_sheet_cell_bounds(row, col)?;
-        let idx = usize::try_from(read_u32_le(data, 6)?).ok();
+        let idx = usize::try_from(read_u32_le(header, 6)?).ok();
         let value = idx
             .and_then(|i| shared_strings.get(i).cloned())
             .unwrap_or_default();
@@ -1078,11 +1046,11 @@ impl SourceReaderBiffParseExt for SourceReader {
         data: &[u8],
         rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
     ) -> Result<()> {
-        if data.len() < 10 {
+        let Some(header) = data.first_chunk::<10>() else {
             return Ok(());
-        }
-        let row = usize::from(read_u16_le(data, 0)?) + 1;
-        let col_first = usize::from(read_u16_le(data, 2)?);
+        };
+        let row = usize::from(read_u16_le(header, 0)?) + 1;
+        let col_first = usize::from(read_u16_le(header, 2)?);
         let Some(last_col_offset) = data.len().checked_sub(2) else {
             return Ok(());
         };
@@ -1114,17 +1082,17 @@ impl SourceReaderBiffParseExt for SourceReader {
         data: &[u8],
         rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
     ) -> Result<()> {
-        if data.len() < 14 {
+        let Some(header) = data.first_chunk::<14>() else {
             return Ok(());
-        }
-        let row = usize::from(read_u16_le(data, 0)?) + 1;
-        let col = usize::from(read_u16_le(data, 2)?);
+        };
+        let row = usize::from(read_u16_le(header, 0)?) + 1;
+        let col = usize::from(read_u16_le(header, 2)?);
         self.validate_sheet_cell_bounds(row, col)?;
         self.insert_sparse_cell(
             rows_map,
             row,
             col,
-            CellValue::Number(f64::from_bits(read_u64_le(data, 6)?)),
+            CellValue::Number(f64::from_bits(read_u64_le(header, 6)?)),
         );
         Ok(())
     }
@@ -1133,13 +1101,13 @@ impl SourceReaderBiffParseExt for SourceReader {
         data: &[u8],
         rows_map: &mut BTreeMap<usize, BTreeMap<usize, CellValue>>,
     ) -> Result<()> {
-        if data.len() < 10 {
+        let Some(header) = data.first_chunk::<10>() else {
             return Ok(());
-        }
-        let row = usize::from(read_u16_le(data, 0)?) + 1;
-        let col = usize::from(read_u16_le(data, 2)?);
+        };
+        let row = usize::from(read_u16_le(header, 0)?) + 1;
+        let col = usize::from(read_u16_le(header, 2)?);
         self.validate_sheet_cell_bounds(row, col)?;
-        let rk = read_u32_le(data, 6)?;
+        let rk = read_u32_le(header, 6)?;
         self.insert_sparse_cell(rows_map, row, col, CellValue::Number(decode_rk_number(rk)));
         Ok(())
     }
@@ -1172,13 +1140,11 @@ impl SourceReaderBiffParseExt for SourceReader {
         rows_map.entry(row).or_default().insert(col, value);
     }
     fn parse_biff8_label(&self, data: &[u8], code_page: Option<u16>) -> Result<Option<String>> {
-        if data.len() < 3 {
-            return Ok(None);
-        }
-        let cch = usize::from(read_u16_le(data, 0)?);
-        let Some(flags) = data.get(2) else {
+        let Some(header) = data.first_chunk::<3>() else {
             return Ok(None);
         };
+        let [cch_lo, cch_hi, flags] = *header;
+        let cch = usize::from(u16::from_le_bytes([cch_lo, cch_hi]));
         let high_byte = (flags & 0x01) != 0;
         let byte_len = if high_byte {
             cch.saturating_mul(2)
@@ -1230,13 +1196,11 @@ impl SourceReaderBiffParseExt for SourceReader {
                 .get(data_start..data_end)
                 .ok_or_else(|| err("xls BIFF globals 레코드 범위 오류"))?;
             match record_id {
-                0x0085 if data.len() >= 8 => {
-                    let offset = usize::try_from(read_u32_le(data, 0)?).map_err(|source| {
+                0x0085 if let Some(header) = data.first_chunk::<8>() => {
+                    let offset = usize::try_from(read_u32_le(header, 0)?).map_err(|source| {
                         err_with_source("xls BoundSheet offset 변환에 실패했습니다.", source)
                     })?;
-                    let sheet_type = *data
-                        .get(5)
-                        .ok_or_else(|| err("xls BoundSheet sheet_type 범위 오류"))?;
+                    let sheet_type = header[5];
                     reserve_vec_entries(
                         &mut boundsheets,
                         1,
@@ -1244,8 +1208,8 @@ impl SourceReaderBiffParseExt for SourceReader {
                     )?;
                     boundsheets.push(BiffBoundSheet { offset, sheet_type });
                 }
-                0x0042 if data.len() >= 2 => {
-                    code_page = Some(read_u16_le(data, 0)?);
+                0x0042 if let Some(header) = data.first_chunk::<2>() => {
+                    code_page = Some(read_u16_le(header, 0)?);
                 }
                 0x00FC => {
                     let (chunks, next) =
@@ -1304,7 +1268,7 @@ impl SourceReaderBiffParseExt for SourceReader {
         code_page: Option<u16>,
     ) -> Result<Vec<String>> {
         if chunks.is_empty() {
-            return Ok(Vec::default());
+            return Ok(Vec::new());
         }
         let total_chunk_bytes = chunks.iter().try_fold(0_usize, |acc, chunk| {
             acc.checked_add(chunk.len())
@@ -1318,10 +1282,9 @@ impl SourceReaderBiffParseExt for SourceReader {
         let _total_count = reader.read_u32()?;
         let unique_count = usize::try_from(reader.read_u32()?)
             .map_err(|source| err_with_source("SST unique count 변환에 실패했습니다.", source))?;
-        let max_unique_count = total_chunk_bytes
-            .saturating_sub(8)
-            .checked_div(3)
-            .unwrap_or(0);
+        let Some(max_unique_count) = total_chunk_bytes.saturating_sub(8).checked_div(3) else {
+            return Err(err("SST unique count 한도 계산에 실패했습니다."));
+        };
         if unique_count > max_unique_count {
             return Err(err(display_limit_message(
                 "SST unique count가 비정상적으로 큽니다: ",
@@ -1332,11 +1295,10 @@ impl SourceReaderBiffParseExt for SourceReader {
         }
         let mut out: Vec<String> = Vec::new();
         out.try_reserve_exact(unique_count).map_err(|source| {
-            let mut message = String::with_capacity(64);
-            message.push_str("SST 문자열 테이블 메모리 확보 실패: ");
-            push_display(&mut message, unique_count);
-            message.push_str(" entries");
-            err_with_source(message, source)
+            err_with_source(
+                format!("SST 문자열 테이블 메모리 확보 실패: {unique_count} entries"),
+                source,
+            )
         })?;
         for _ in 0..unique_count {
             let char_count = usize::from(reader.read_u16()?);
@@ -1404,7 +1366,17 @@ impl SourceReaderBiffParseExt for SourceReader {
         Ok(Some((record_id, data)))
     }
     fn validate_sheet_cell_bounds(&self, row: usize, col: usize) -> Result<()> {
-        let row_u32 = u32::try_from(row).unwrap_or(MAX_XLSX_ROW.saturating_add(1));
+        let row_u32 = u32::try_from(row).map_err(|source| {
+            err_with_source(
+                display_limit_message(
+                    "시트 행 인덱스가 비정상적으로 큽니다: ",
+                    row,
+                    "최대 ",
+                    MAX_XLSX_ROW,
+                ),
+                source,
+            )
+        })?;
         if row_u32 == 0 || row_u32 > MAX_XLSX_ROW {
             return Err(err(display_limit_message(
                 "시트 행 인덱스가 비정상적으로 큽니다: ",
@@ -1416,35 +1388,25 @@ impl SourceReaderBiffParseExt for SourceReader {
         if col >= MAX_XLSX_COL {
             return Err(err(prefixed_display_message(
                 "시트 열 인덱스가 비정상적으로 큽니다: ",
-                col.checked_add(1).unwrap_or(col),
+                col.saturating_add(1),
             )));
         }
         Ok(())
     }
 }
 fn reserve_vec_entries<T>(values: &mut Vec<T>, additional: usize, context: &str) -> Result<()> {
-    values.try_reserve(additional).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str(context);
-        message.push_str(": ");
-        push_display(&mut message, additional);
-        message.push_str(" entries");
-        err_with_source(message, source)
-    })
+    values
+        .try_reserve(additional)
+        .map_err(|source| err_with_source(format!("{context}: {additional} entries"), source))
 }
 fn reserve_vec_entries_exact<T>(
     values: &mut Vec<T>,
     additional: usize,
     context: &str,
 ) -> Result<()> {
-    values.try_reserve_exact(additional).map_err(|source| {
-        let mut message = String::with_capacity(64);
-        message.push_str(context);
-        message.push_str(": ");
-        push_display(&mut message, additional);
-        message.push_str(" entries");
-        err_with_source(message, source)
-    })
+    values
+        .try_reserve_exact(additional)
+        .map_err(|source| err_with_source(format!("{context}: {additional} entries"), source))
 }
 fn reserve_seen_set(
     seen: &mut HashSet<u32>,
@@ -1453,46 +1415,29 @@ fn reserve_seen_set(
     stream_name: &str,
 ) -> Result<()> {
     seen.try_reserve(additional).map_err(|source| {
-        let mut message = String::with_capacity(stream_name.len().saturating_add(64));
-        message.push_str(context);
-        message.push_str(": ");
-        push_display(&mut message, additional);
-        message.push_str(" entries (");
-        message.push_str(stream_name);
-        message.push(')');
-        err_with_source(message, source)
+        err_with_source(
+            format!("{context}: {additional} entries ({stream_name})"),
+            source,
+        )
     })
 }
 fn checked_pow2_from_shift(shift: u16, context: &str) -> Result<usize> {
     let shift_u32 = u32::from(shift);
     if shift_u32 >= usize::BITS {
-        let mut message = String::with_capacity(context.len().saturating_add(96));
-        message.push_str(context);
-        message.push_str("가 비정상적으로 큽니다: ");
-        push_display(&mut message, shift_u32);
-        message.push_str(" (usize bits=");
-        push_display(&mut message, usize::BITS);
-        message.push(')');
-        return Err(err(message));
+        return Err(err(format!(
+            "{context}가 비정상적으로 큽니다: {shift_u32} (usize bits={})",
+            usize::BITS
+        )));
     }
-    1_usize.checked_shl(shift_u32).ok_or_else(|| {
-        let mut message = String::with_capacity(context.len().saturating_add(64));
-        message.push_str(context);
-        message.push_str(" 계산에 실패했습니다: shift=");
-        push_display(&mut message, shift_u32);
-        err(message)
-    })
+    1_usize
+        .checked_shl(shift_u32)
+        .ok_or_else(|| err(format!("{context} 계산에 실패했습니다: shift={shift_u32}")))
 }
 fn checked_offset_add(offset: usize, add: usize, context: &str) -> Result<usize> {
     offset.checked_add(add).ok_or_else(|| {
-        let mut message = String::with_capacity(context.len().saturating_add(80));
-        message.push_str(context);
-        message.push_str(" 오프셋 계산 중 overflow가 발생했습니다. (offset=");
-        push_display(&mut message, offset);
-        message.push_str(", add=");
-        push_display(&mut message, add);
-        message.push(')');
-        err(message)
+        err(format!(
+            "{context} 오프셋 계산 중 overflow가 발생했습니다. (offset={offset}, add={add})"
+        ))
     })
 }
 fn checked_index_offset(base: usize, index: usize, stride: usize, context: &str) -> Result<usize> {
@@ -1500,16 +1445,9 @@ fn checked_index_offset(base: usize, index: usize, stride: usize, context: &str)
         .checked_mul(stride)
         .and_then(|delta| base.checked_add(delta))
         .ok_or_else(|| {
-            let mut message = String::with_capacity(context.len().saturating_add(96));
-            message.push_str(context);
-            message.push_str(" 오프셋 계산 중 overflow가 발생했습니다. (base=");
-            push_display(&mut message, base);
-            message.push_str(", index=");
-            push_display(&mut message, index);
-            message.push_str(", stride=");
-            push_display(&mut message, stride);
-            message.push(')');
-            err(message)
+            err(format!(
+                "{context} 오프셋 계산 중 overflow가 발생했습니다. (base={base}, index={index}, stride={stride})"
+            ))
         })
 }
 const fn is_regular_sector_id(sector_id: u32) -> bool {
@@ -1559,31 +1497,25 @@ fn read_stream_from_fat_chain(
     stream_name: &str,
 ) -> Result<Vec<u8>> {
     if !is_regular_sector_id(start_sector) {
-        return Ok(Vec::default());
+        return Ok(Vec::new());
     }
     let mut remaining = size_limit
         .map(|limit| {
             usize::try_from(limit).map_err(|source| {
-                let mut message = String::with_capacity(stream_name.len().saturating_add(48));
-                message.push_str("FAT stream 길이 변환 실패: ");
-                push_display(&mut message, limit);
-                message.push_str(" (");
-                message.push_str(stream_name);
-                message.push(')');
-                err_with_source(message, source)
+                err_with_source(
+                    format!("FAT stream 길이 변환 실패: {limit} ({stream_name})"),
+                    source,
+                )
             })
         })
         .transpose()?;
     let reserve_size = remaining.unwrap_or(sector_size);
     let mut out = Vec::new();
     out.try_reserve_exact(reserve_size).map_err(|source| {
-        let mut message = String::with_capacity(stream_name.len().saturating_add(64));
-        message.push_str("FAT stream 메모리 확보 실패: ");
-        push_display(&mut message, reserve_size);
-        message.push_str(" bytes (");
-        message.push_str(stream_name);
-        message.push(')');
-        err_with_source(message, source)
+        err_with_source(
+            format!("FAT stream 메모리 확보 실패: {reserve_size} bytes ({stream_name})"),
+            source,
+        )
     })?;
     let mut sid = start_sector;
     let seen_capacity = fat.len().min(64);
@@ -1595,19 +1527,13 @@ fn read_stream_from_fat_chain(
         stream_name,
     )?;
     while sid != CFB_END_OF_CHAIN {
-        if matches!(remaining, Some(0)) {
+        if remaining.is_some_and(|remaining_len| remaining_len == 0) {
             break;
         }
         if !is_regular_sector_id(sid) {
-            let mut message = String::with_capacity(stream_name.len().saturating_add(48));
-            message.push_str("FAT chain에 잘못된 sector id가 있습니다: ");
-            message.push_str(stream_name);
-            message.push_str(" (");
-            match write!(&mut message, "{sid:#x}") {
-                Ok(()) | Err(_) => {}
-            }
-            message.push(')');
-            return Err(err(message));
+            return Err(err(format!(
+                "FAT chain에 잘못된 sector id가 있습니다: {stream_name} ({sid:#x})"
+            )));
         }
         reserve_seen_set(
             &mut seen,
@@ -1669,15 +1595,10 @@ fn decode_rk_number(rk: u32) -> f64 {
     value
 }
 fn decode_utf16_le(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    push_utf16_le_lossy(&mut out, bytes);
-    out
-}
-fn push_utf16_le_lossy(out: &mut String, bytes: &[u8]) {
     let (chunks, _) = bytes.as_chunks::<2>();
-    for decoded in decode_utf16(chunks.iter().map(|chunk| u16::from_le_bytes(*chunk))) {
-        out.push(decoded.unwrap_or(REPLACEMENT_CHARACTER));
-    }
+    decode_utf16(chunks.iter().map(|chunk| u16::from_le_bytes(*chunk)))
+        .map(|decoded| decoded.unwrap_or(REPLACEMENT_CHARACTER))
+        .collect()
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
     let arr = read_le_array::<2>(bytes, offset, "u16 read", "u16 read out of range at ")?;
@@ -1706,10 +1627,7 @@ fn read_le_array<const N: usize>(
     Ok(arr)
 }
 fn prefixed_display_message(prefix: &str, value: impl Display) -> String {
-    let mut out = String::with_capacity(prefix.len().saturating_add(32));
-    out.push_str(prefix);
-    push_display(&mut out, value);
-    out
+    format!("{prefix}{value}")
 }
 fn display_limit_message(
     prefix: &str,
@@ -1717,33 +1635,13 @@ fn display_limit_message(
     limit_label: &str,
     limit: impl Display,
 ) -> String {
-    let mut out = String::with_capacity(
-        prefix
-            .len()
-            .saturating_add(limit_label.len())
-            .saturating_add(96),
-    );
-    out.push_str(prefix);
-    push_display(&mut out, value);
-    out.push_str(" (");
-    out.push_str(limit_label);
-    push_display(&mut out, limit);
-    out.push(')');
-    out
+    format!("{prefix}{value} ({limit_label}{limit})")
 }
 fn parenthesized_message(prefix: &str, value: impl Display, suffix: &str) -> String {
-    let mut out =
-        String::with_capacity(prefix.len().saturating_add(suffix.len()).saturating_add(32));
-    out.push_str(prefix);
-    push_display(&mut out, value);
-    out.push_str(suffix);
-    out
+    format!("{prefix}{value}{suffix}")
 }
 fn prefixed_name_message(prefix: &str, name: &str) -> String {
-    let mut out = String::with_capacity(prefix.len().saturating_add(name.len()));
-    out.push_str(prefix);
-    out.push_str(name);
-    out
+    format!("{prefix}{name}")
 }
 fn prefixed_name_paren_display_message(
     prefix: &str,
@@ -1751,41 +1649,11 @@ fn prefixed_name_paren_display_message(
     label: &str,
     value: impl Display,
 ) -> String {
-    let mut out = String::with_capacity(
-        prefix
-            .len()
-            .saturating_add(name.len())
-            .saturating_add(label.len())
-            .saturating_add(32)
-            .saturating_add(" ()".len()),
-    );
-    out.push_str(prefix);
-    out.push_str(name);
-    out.push_str(" (");
-    out.push_str(label);
-    push_display(&mut out, value);
-    out.push(')');
-    out
+    format!("{prefix}{name} ({label}{value})")
 }
 fn sector_size_message(prefix: &str, sector_id: u32, sector_size: usize) -> String {
-    let mut out = String::with_capacity(prefix.len().saturating_add(48));
-    out.push_str(prefix);
-    push_display(&mut out, sector_id);
-    out.push_str(", size=");
-    push_display(&mut out, sector_size);
-    out
+    format!("{prefix}{sector_id}, size={sector_size}")
 }
 fn stream_sid_message(prefix: &str, stream_name: &str, sid: impl Display) -> String {
-    let mut out = String::with_capacity(
-        prefix
-            .len()
-            .saturating_add(stream_name.len())
-            .saturating_add(40),
-    );
-    out.push_str(prefix);
-    out.push_str(stream_name);
-    out.push_str(" (sector=");
-    push_display(&mut out, sid);
-    out.push(')');
-    out
+    format!("{prefix}{stream_name} (sector={sid})")
 }

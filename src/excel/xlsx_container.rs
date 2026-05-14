@@ -1,10 +1,8 @@
 use super::{
     path_util::path_from_slashes,
-    zip_archive::{self, ZipArchiveOpsExt as _},
+    zip_archive::{self, ZipArchiveOpsExt as _, is_safe_archive_entry_path},
 };
-use crate::{
-    Result, err, path_pair_source_message, path_source_message, prefixed_message, push_display,
-};
+use crate::{Result, err, path_pair_source_message, path_source_message, prefixed_message};
 use core::{mem, time::Duration};
 use std::{
     env, fs,
@@ -117,8 +115,7 @@ impl ArchiveOpsExt for ArchiveOps {
                             source_err,
                         )));
                     }
-                    let mut output_path = String::with_capacity(64);
-                    push_display(&mut output_path, output_xlsx.display());
+                    let output_path = output_xlsx.display().to_string();
                     write_durability_warning("파일", &output_path, &source_err);
                 }
                 if let Some(parent) = output_xlsx.parent()
@@ -131,8 +128,7 @@ impl ArchiveOpsExt for ArchiveOps {
                             source_err,
                         )));
                     }
-                    let mut parent_path = String::with_capacity(64);
-                    push_display(&mut parent_path, parent.display());
+                    let parent_path = parent.display().to_string();
                     write_durability_warning("폴더", &parent_path, &source_err);
                 }
                 Ok(())
@@ -145,7 +141,7 @@ impl ArchiveOpsExt for ArchiveOps {
         create_dir_all_checked(&verify_unpacked, "저장 검증용 임시 폴더 생성 실패")?;
         let verify_result = (|| -> Result<()> {
             for entry_name in Self::list_archive_entries(saved_archive)? {
-                if !Self::is_safe_archive_entry_path(&entry_name) {
+                if !is_safe_archive_entry_path(&entry_name) {
                     return Err(err(prefixed_message(
                         "허용되지 않은 압축 경로가 포함되어 있습니다: ",
                         entry_name,
@@ -182,29 +178,6 @@ impl ArchiveOpsExt for ArchiveOps {
     }
 }
 impl ArchiveOps {
-    fn is_safe_archive_entry_path(entry_name: &str) -> bool {
-        if entry_name.is_empty() || entry_name.starts_with(['/', '\\']) {
-            return false;
-        }
-        let bytes = entry_name.as_bytes();
-        if let Some(&[first, colon]) = bytes.first_chunk::<2>()
-            && colon == b':'
-            && first.is_ascii_alphabetic()
-        {
-            return false;
-        }
-        let mut has_name = false;
-        for part in entry_name.split(['/', '\\']) {
-            if part.is_empty() || part == "." {
-                continue;
-            }
-            if part == ".." {
-                return false;
-            }
-            has_name = true;
-        }
-        has_name
-    }
     fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>> {
         zip_archive::ZipArchiveOps.list_entries(archive_path)
     }
@@ -239,7 +212,7 @@ impl XlsxContainer {
             ))
         })?;
         for entry_name in ArchiveOps::list_archive_entries(&archive_path)? {
-            if !ArchiveOps::is_safe_archive_entry_path(&entry_name) {
+            if !is_safe_archive_entry_path(&entry_name) {
                 return Err(err(prefixed_message(
                     "허용되지 않은 압축 경로가 포함되어 있습니다: ",
                     entry_name,
@@ -256,12 +229,12 @@ impl XlsxContainer {
         })
     }
     pub fn read_text(&self, relative_path: &str) -> Result<String> {
-        let path = (self.resolve_relative_path(relative_path))?;
+        let path = self.resolve_relative_path(relative_path)?;
         fs::read_to_string(&path)
             .map_err(|source_err| err(path_source_message("파일 읽기 실패", &path, source_err)))
     }
     pub fn remove_file_if_exists(&self, relative_path: &str) -> Result<()> {
-        let path = (self.resolve_relative_path(relative_path))?;
+        let path = self.resolve_relative_path(relative_path)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(io_err) if io_err.kind() == ErrorKind::NotFound => Ok(()),
@@ -314,34 +287,18 @@ impl XlsxContainer {
             })?;
         }
         archive_ops.create_archive(&self.unpack_dir, &self.archive_path)?;
-        output_xlsx
-            .parent()
-            .map(|parent| create_dir_all_checked(parent, "출력 폴더 생성 실패"))
-            .transpose()?;
-        let parent = output_xlsx.parent().unwrap_or_else(|| Path::new("."));
+        let parent = if let Some(parent) = output_xlsx.parent() {
+            create_dir_all_checked(parent, "출력 폴더 생성 실패")?;
+            parent
+        } else {
+            Path::new(".")
+        };
         let file_name = output_xlsx
             .file_name()
             .and_then(|file_name_os| file_name_os.to_str())
             .unwrap_or("output.xlsx");
         let tmp_output = reserve_unique_temp_entry(
-            |pid, nanos, seq| {
-                let mut temp_name = String::with_capacity(
-                    file_name
-                        .len()
-                        .saturating_add(40)
-                        .saturating_add(".tmp___".len())
-                        .saturating_add(1),
-                );
-                temp_name.push('.');
-                temp_name.push_str(file_name);
-                temp_name.push_str(".tmp_");
-                push_display(&mut temp_name, pid);
-                temp_name.push('_');
-                push_display(&mut temp_name, nanos);
-                temp_name.push('_');
-                push_display(&mut temp_name, seq);
-                parent.join(temp_name)
-            },
+            |pid, nanos, seq| parent.join(format!(".{file_name}.tmp_{pid}_{nanos}_{seq}")),
             |path| fs::File::create_new(path).map(|_| ()),
             "임시 출력 파일 생성 실패",
             prefixed_message("임시 출력 파일 경로 생성 실패: ", output_xlsx.display()),
@@ -361,18 +318,15 @@ impl XlsxContainer {
             archive_ops.promote_temp_output(&tmp_output, output_xlsx)?;
             Ok(())
         })();
-        if result.is_err() {
-            match fs::remove_file(&tmp_output) {
-                Ok(()) | Err(_) => {}
-            }
-        }
-        result
+        result.inspect_err(|_| match fs::remove_file(&tmp_output) {
+            Ok(()) | Err(_) => {}
+        })
     }
     pub fn unpack_dir(&self) -> &Path {
         &self.unpack_dir
     }
     pub fn write_text(&self, relative_path: &str, content: &str) -> Result<()> {
-        let path = (self.resolve_relative_path(relative_path))?;
+        let path = self.resolve_relative_path(relative_path)?;
         if let Some(parent) = path.parent() {
             create_dir_all_checked(parent, "폴더 생성 실패")?;
         }
@@ -400,16 +354,7 @@ fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::E
 fn create_unique_work_dir() -> Result<PathBuf> {
     let base = env::temp_dir();
     reserve_unique_temp_entry(
-        |pid, nanos, seq| {
-            let mut dir_name = String::with_capacity("fcupdater__".len().saturating_add(40));
-            dir_name.push_str("fcupdater_");
-            push_display(&mut dir_name, pid);
-            dir_name.push('_');
-            push_display(&mut dir_name, nanos);
-            dir_name.push('_');
-            push_display(&mut dir_name, seq);
-            base.join(dir_name)
-        },
+        |pid, nanos, seq| base.join(format!("fcupdater_{pid}_{nanos}_{seq}")),
         |path| fs::create_dir_all(path),
         "임시 작업 폴더 생성 실패",
         "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
@@ -457,13 +402,13 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
 }
 #[cfg(windows)]
 fn encode_path_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>()
 }
 fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
-    let mut out = String::with_capacity(prefix.len().saturating_add(relative_path.len()));
-    out.push_str(prefix);
-    out.push_str(relative_path);
-    out
+    format!("{prefix}{relative_path}")
 }
 #[cfg(windows)]
 fn windows_file_op_error_message(
@@ -473,17 +418,17 @@ fn windows_file_op_error_message(
     arrow: &str,
     code: u32,
 ) -> String {
-    let mut out = String::with_capacity(prefix.len().saturating_add(96));
-    out.push_str(prefix);
-    push_display(&mut out, from.display());
-    if let Some(target) = to {
-        out.push_str(arrow);
-        push_display(&mut out, target.display());
-    }
-    out.push_str(" (GetLastError=");
-    push_display(&mut out, code);
-    out.push(')');
-    out
+    to.map_or_else(
+        || format!("{prefix}{} (GetLastError={code})", from.display()),
+        |target| {
+            format!(
+                "{prefix}{}{}{} (GetLastError={code})",
+                from.display(),
+                arrow,
+                target.display()
+            )
+        },
+    )
 }
 #[cfg(not(windows))]
 fn durability_strict_mode() -> bool {

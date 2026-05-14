@@ -2,10 +2,7 @@ const fn checked_offset_add(base: usize, add: usize) -> Option<usize> {
     base.checked_add(add)
 }
 pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let capacity = attr_name.len().saturating_add(1);
-    let mut pattern = String::with_capacity(capacity);
-    pattern.push_str(attr_name);
-    pattern.push('=');
+    let pattern = format!("{attr_name}=");
     let bytes = tag.as_bytes();
     let mut cursor = 0_usize;
     while let Some(rel) = tag.get(cursor..)?.find(&pattern) {
@@ -36,7 +33,7 @@ pub(in crate::excel) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -
     while let Some(rel) = xml.get(cursor..)?.find('<') {
         let start = checked_offset_add(cursor, rel)?;
         let rest = xml.get(checked_offset_add(start, 1)?..)?;
-        if rest.starts_with('/') || rest.starts_with('!') || rest.starts_with('?') {
+        if rest.starts_with(['/', '!', '?']) {
             cursor = checked_offset_add(start, 1)?;
             continue;
         }
@@ -78,10 +75,7 @@ pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Opt
     let body_start = checked_offset_add(open_end, 1)?;
     let body_end = find_end_tag(xml, tag_name, body_start)?;
     let text = xml.get(body_start..body_end)?;
-    let capacity = text.len();
-    let mut out = String::with_capacity(capacity);
-    out.push_str(text);
-    Some(out)
+    Some(text.to_owned())
 }
 pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     let mut cursor = 0_usize;
@@ -95,7 +89,7 @@ pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Optio
         let close_tag_len = checked_offset_add(tag_name.len(), 3)?;
         cursor = checked_offset_add(body_end, close_tag_len)?;
     }
-    if out.is_empty() { None } else { Some(out) }
+    (!out.is_empty()).then_some(out)
 }
 pub(in crate::excel) fn decode_xml_entities(text: &str) -> String {
     if !text.contains('&') {
@@ -126,18 +120,14 @@ pub(in crate::excel) fn decode_xml_entities(text: &str) -> String {
                     "quot" => Some('"'),
                     "apos" => Some('\''),
                     "amp" => Some('&'),
-                    _ => entity
-                        .strip_prefix("#x")
-                        .or_else(|| entity.strip_prefix("#X"))
-                        .map_or_else(
-                            || {
-                                entity
-                                    .strip_prefix('#')
-                                    .and_then(|dec| dec.parse::<u32>().ok())
-                                    .and_then(char::from_u32)
-                            },
-                            |hex| u32::from_str_radix(hex, 16).ok().and_then(char::from_u32),
-                        ),
+                    _ => entity.strip_prefix('#').and_then(|body| {
+                        let value = if let Some(hex) = body.strip_prefix(['x', 'X']) {
+                            u32::from_str_radix(hex, 16).ok()?
+                        } else {
+                            body.parse::<u32>().ok()?
+                        };
+                        char::from_u32(value)
+                    }),
                 };
                 if let Some(decoded_char) = decoded {
                     out.push(decoded_char);
@@ -163,5 +153,8 @@ pub(in crate::excel) fn decode_xml_entities(text: &str) -> String {
     out
 }
 fn local_tag_name(name: &str) -> &str {
-    name.rsplit_once(':').map_or(name, |(_, local)| local)
+    match name.rsplit_once(':') {
+        Some((_, local)) => local,
+        None => name,
+    }
 }

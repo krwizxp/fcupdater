@@ -11,6 +11,7 @@ const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const CODE_LENGTH_SYMBOLS: usize = 19;
 const CRC32_POLY: u32 = 0xedb8_8320;
 const DEFLATE_MAX_BITS: usize = 15;
+const DEFLATE_MAX_BITS_U8: u8 = 15;
 const DISTANCE_SYMBOLS: usize = 30;
 const DOS_DATE_1980_01_01: u16 = 33;
 const END_OF_CENTRAL_DIRECTORY_LEN: usize = 22;
@@ -124,8 +125,8 @@ struct HuffmanBuildNode {
     freq: u64,
     parent: Option<usize>,
 }
-pub struct ZipArchiveOps;
-pub trait ZipArchiveOpsExt {
+pub(super) struct ZipArchiveOps;
+pub(super) trait ZipArchiveOpsExt {
     fn create_from_directory(&self, root: &Path, archive_path: &Path) -> Result<()>;
     fn extract_to_directory(&self, archive_path: &Path, unpack_dir: &Path) -> Result<()>;
     fn list_entries(&self, archive_path: &Path) -> Result<Vec<String>>;
@@ -164,7 +165,7 @@ trait DeflateWriterExt {
         head: &[usize],
         previous: &[usize],
     ) -> Option<(usize, usize)>;
-    fn code_length_tokens(lengths: &[u8]) -> Vec<CodeLengthToken>;
+    fn code_length_tokens(lengths: &[u8]) -> ZipResult<Vec<CodeLengthToken>>;
     fn deflate(bytes: &[u8]) -> ZipResult<Vec<u8>>;
     fn deflate_dynamic(tokens: &[DeflateToken]) -> ZipResult<Option<Vec<u8>>>;
     fn deflate_fixed(tokens: &[DeflateToken], byte_len: usize) -> ZipResult<Vec<u8>>;
@@ -191,7 +192,7 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
     fn create_from_directory(&self, root: &Path, archive_path: &Path) -> Result<()> {
         let mut files = Vec::new();
         collect_files(root, root, &mut files)?;
-        files.sort_by(|left, right| left.name.cmp(&right.name));
+        files.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         let mut archive = Vec::new();
         let mut entries = Vec::with_capacity(files.len());
         for file in files {
@@ -380,7 +381,12 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
     fn list_entries(&self, archive_path: &Path) -> Result<Vec<String>> {
         let bytes = read_archive_bytes(archive_path)?;
         parse_entries(&bytes)
-            .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect::<Vec<_>>()
+            })
             .map_err(err)
     }
 }
@@ -491,7 +497,7 @@ impl Huffman {
             };
             *next_slot = code;
         }
-        let mut codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1] = Default::default();
+        let mut codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1] = from_fn(|_| Vec::new());
         for (symbol, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
@@ -863,7 +869,7 @@ impl DeflateWriterExt for DeflateWriter {
         }
         (best_len >= MIN_MATCH).then_some((best_len, best_distance))
     }
-    fn code_length_tokens(lengths: &[u8]) -> Vec<CodeLengthToken> {
+    fn code_length_tokens(lengths: &[u8]) -> ZipResult<Vec<CodeLengthToken>> {
         let mut tokens = Vec::new();
         let mut index = 0_usize;
         while index < lengths.len() {
@@ -882,7 +888,9 @@ impl DeflateWriterExt for DeflateWriter {
                 while remaining >= 11 {
                     let count = remaining.min(138);
                     tokens.push(CodeLengthToken {
-                        extra: u16::try_from(count.saturating_sub(11)).unwrap_or_default(),
+                        extra: u16::try_from(count.saturating_sub(11)).map_err(|source| {
+                            format!("deflate repeat-zero-11 변환 실패: {source}")
+                        })?,
                         extra_bits: 7,
                         symbol: 18,
                     });
@@ -891,7 +899,9 @@ impl DeflateWriterExt for DeflateWriter {
                 if remaining >= 3 {
                     let count = remaining.min(10);
                     tokens.push(CodeLengthToken {
-                        extra: u16::try_from(count.saturating_sub(3)).unwrap_or_default(),
+                        extra: u16::try_from(count.saturating_sub(3)).map_err(|source| {
+                            format!("deflate repeat-zero-3 변환 실패: {source}")
+                        })?,
                         extra_bits: 3,
                         symbol: 17,
                     });
@@ -923,7 +933,9 @@ impl DeflateWriterExt for DeflateWriter {
                 while remaining >= 3 {
                     let count = remaining.min(6);
                     tokens.push(CodeLengthToken {
-                        extra: u16::try_from(count.saturating_sub(3)).unwrap_or_default(),
+                        extra: u16::try_from(count.saturating_sub(3)).map_err(|source| {
+                            format!("deflate repeat-length 변환 실패: {source}")
+                        })?,
                         extra_bits: 2,
                         symbol: 16,
                     });
@@ -940,7 +952,7 @@ impl DeflateWriterExt for DeflateWriter {
                 index = index.saturating_add(1).saturating_add(run);
             }
         }
-        tokens
+        Ok(tokens)
     }
     fn deflate(bytes: &[u8]) -> ZipResult<Vec<u8>> {
         let tokens = Self::tokens(bytes)?;
@@ -958,13 +970,11 @@ impl DeflateWriterExt for DeflateWriter {
         let Some((literal_freq, distance_freq)) = Self::dynamic_frequencies(tokens)? else {
             return Ok(None);
         };
-        let Some(literal_lengths) =
-            Self::huffman_lengths(&literal_freq, u8::try_from(DEFLATE_MAX_BITS).unwrap_or(15))
+        let Some(literal_lengths) = Self::huffman_lengths(&literal_freq, DEFLATE_MAX_BITS_U8)
         else {
             return Ok(None);
         };
-        let Some(distance_lengths) =
-            Self::huffman_lengths(&distance_freq, u8::try_from(DEFLATE_MAX_BITS).unwrap_or(15))
+        let Some(distance_lengths) = Self::huffman_lengths(&distance_freq, DEFLATE_MAX_BITS_U8)
         else {
             return Ok(None);
         };
@@ -987,7 +997,7 @@ impl DeflateWriterExt for DeflateWriter {
                 .get(..distance_count)
                 .ok_or_else(|| String::from("deflate distance length 범위 오류"))?,
         );
-        let code_length_tokens = Self::code_length_tokens(&combined_lengths);
+        let code_length_tokens = Self::code_length_tokens(&combined_lengths)?;
         let mut code_length_freq = [0_u32; CODE_LENGTH_SYMBOLS];
         for token in &code_length_tokens {
             let Some(freq) = code_length_freq.get_mut(usize::from(token.symbol)) else {
@@ -998,10 +1008,17 @@ impl DeflateWriterExt for DeflateWriter {
         let Some(code_lengths) = Self::huffman_lengths(&code_length_freq, 7) else {
             return Ok(None);
         };
-        let code_length_count = CODE_LENGTH_ORDER
-            .iter()
-            .rposition(|&symbol| code_lengths.get(symbol).copied().unwrap_or_default() != 0)
-            .map_or(4, |index| index.saturating_add(1).max(4));
+        let mut code_length_count = 4_usize;
+        for (index, &symbol) in CODE_LENGTH_ORDER.iter().enumerate().rev() {
+            let len = code_lengths
+                .get(symbol)
+                .copied()
+                .ok_or_else(|| String::from("deflate code length order 범위 오류"))?;
+            if len != 0 {
+                code_length_count = index.saturating_add(1).max(4);
+                break;
+            }
+        }
         let literal_huffman = WriteHuffman::from_lengths(literal_lengths)?;
         let distance_huffman = WriteHuffman::from_lengths(distance_lengths)?;
         let code_huffman = WriteHuffman::from_lengths(code_lengths.clone())?;
@@ -1028,7 +1045,10 @@ impl DeflateWriterExt for DeflateWriter {
             4,
         );
         for &symbol in CODE_LENGTH_ORDER.iter().take(code_length_count) {
-            let len = code_lengths.get(symbol).copied().unwrap_or_default();
+            let len = code_lengths
+                .get(symbol)
+                .copied()
+                .ok_or_else(|| String::from("deflate code length 쓰기 범위 오류"))?;
             writer.write_bits(u16::from(len), 3);
         }
         for token in code_length_tokens {
@@ -1138,15 +1158,16 @@ impl DeflateWriterExt for DeflateWriter {
         }
         while active.len() > 1 {
             active.sort_unstable_by(|&left, &right| {
-                nodes
-                    .get(right)
-                    .and_then(|right_node| nodes.get(left).map(|left_node| (right_node, left_node)))
-                    .map_or(Ordering::Equal, |(right_node, left_node)| {
-                        right_node
-                            .freq
-                            .cmp(&left_node.freq)
-                            .then_with(|| right.cmp(&left))
-                    })
+                let Some(right_node) = nodes.get(right) else {
+                    return Ordering::Equal;
+                };
+                let Some(left_node) = nodes.get(left) else {
+                    return Ordering::Equal;
+                };
+                right_node
+                    .freq
+                    .cmp(&left_node.freq)
+                    .then_with(|| right.cmp(&left))
             });
             let left = active.pop()?;
             let right = active.pop()?;
@@ -1440,7 +1461,7 @@ fn hash3(bytes: &[u8], position: usize) -> Option<usize> {
     let third = usize::from(third_byte);
     Some(((first << 10_usize) ^ (second << 5_usize) ^ third) & HASH_SIZE.saturating_sub(1))
 }
-fn is_safe_archive_entry_path(entry_name: &str) -> bool {
+pub(super) fn is_safe_archive_entry_path(entry_name: &str) -> bool {
     if entry_name.is_empty() || entry_name.starts_with(['/', '\\']) {
         return false;
     }
@@ -1477,13 +1498,15 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
         .ok_or_else(|| String::from("ZIP EOCD 검색 범위 오류"))?;
     let eocd_signature = END_OF_CENTRAL_DIRECTORY_SIGNATURE.to_le_bytes();
     let mut search_len = search_bytes.len();
-    let mut eocd_offset_candidate = None;
-    while let Some(relative_offset) = search_bytes
-        .get(..search_len)
-        .ok_or_else(|| String::from("ZIP EOCD 검색 범위 오류"))?
-        .array_windows::<4>()
-        .rposition(|window| *window == eocd_signature)
-    {
+    let eocd_offset = loop {
+        let Some(relative_offset) = search_bytes
+            .get(..search_len)
+            .ok_or_else(|| String::from("ZIP EOCD 검색 범위 오류"))?
+            .array_windows::<4>()
+            .rposition(|window| *window == eocd_signature)
+        else {
+            return Err(String::from("ZIP EOCD를 찾지 못했습니다."));
+        };
         let offset = min_offset.saturating_add(relative_offset);
         let comment_len = usize::from(read_u16(bytes, offset.saturating_add(20))?);
         if offset
@@ -1491,13 +1514,9 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
             .and_then(|value| value.checked_add(comment_len))
             == Some(bytes.len())
         {
-            eocd_offset_candidate = Some(offset);
-            break;
+            break offset;
         }
         search_len = relative_offset;
-    }
-    let Some(eocd_offset) = eocd_offset_candidate else {
-        return Err(String::from("ZIP EOCD를 찾지 못했습니다."));
     };
     let total_entries = usize::from(read_u16(bytes, eocd_offset.saturating_add(10))?);
     let central_dir_size = usize::try_from(read_u32(bytes, eocd_offset.saturating_add(12))?)
@@ -1590,28 +1609,31 @@ fn push_repeated(lengths: &mut Vec<u8>, value: u8, repeat: usize, total: usize) 
     Ok(())
 }
 fn read_u16(bytes: &[u8], offset: usize) -> ZipResult<u16> {
-    let Some(end) = offset.checked_add(2) else {
-        return Err(String::from("ZIP u16 읽기 범위 오류"));
-    };
-    let Some(raw_bytes) = bytes
-        .get(offset..end)
-        .and_then(|slice| slice.as_array::<2>())
-    else {
-        return Err(String::from("ZIP u16 읽기 범위 오류"));
-    };
-    Ok(u16::from_le_bytes(*raw_bytes))
+    Ok(u16::from_le_bytes(read_array::<2>(
+        bytes,
+        offset,
+        "ZIP u16 읽기 범위 오류",
+    )?))
 }
 fn read_u32(bytes: &[u8], offset: usize) -> ZipResult<u32> {
-    let Some(end) = offset.checked_add(4) else {
-        return Err(String::from("ZIP u32 읽기 범위 오류"));
+    Ok(u32::from_le_bytes(read_array::<4>(
+        bytes,
+        offset,
+        "ZIP u32 읽기 범위 오류",
+    )?))
+}
+fn read_array<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+    error_message: &str,
+) -> ZipResult<[u8; N]> {
+    let Some(end) = offset.checked_add(N) else {
+        return Err(String::from(error_message));
     };
-    let Some(raw_bytes) = bytes
-        .get(offset..end)
-        .and_then(|slice| slice.as_array::<4>())
-    else {
-        return Err(String::from("ZIP u32 읽기 범위 오류"));
+    let Some(raw_bytes) = bytes.get(offset..end).and_then(<[u8]>::as_array::<N>) else {
+        return Err(String::from(error_message));
     };
-    Ok(u32::from_le_bytes(*raw_bytes))
+    Ok(*raw_bytes)
 }
 fn reverse_bits(mut value: u16, count: u8) -> u16 {
     let mut out = 0_u16;
