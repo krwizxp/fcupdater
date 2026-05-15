@@ -7,6 +7,7 @@ use super::{
     },
 };
 use crate::{Result, err, err_with_source};
+use core::iter;
 use std::{
     collections::HashMap,
     path::{Component, PathBuf},
@@ -29,7 +30,7 @@ pub fn load_sheet_catalog(container: &XlsxContainer) -> Result<SheetCatalog> {
                 source,
             )
         })?;
-    for tag in iter_start_tags(&rels_xml, "Relationship")? {
+    for tag in iter_start_tags(&rels_xml, "Relationship") {
         let Some(id) = extract_attr(tag, "Id") else {
             continue;
         };
@@ -57,7 +58,7 @@ pub fn load_sheet_catalog(container: &XlsxContainer) -> Result<SheetCatalog> {
                 source,
             )
         })?;
-    for tag in iter_start_tags(&workbook_xml, "sheet")? {
+    for tag in iter_start_tags(&workbook_xml, "sheet") {
         let Some(name) = extract_attr(tag, "name") else {
             continue;
         };
@@ -83,17 +84,22 @@ pub fn load_sheet_catalog(container: &XlsxContainer) -> Result<SheetCatalog> {
                     Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
                 }
             }
-            normalized
-                .components()
-                .filter_map(|component| {
-                    if let Component::Normal(path_segment) = component {
-                        Some(path_segment.to_string_lossy())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("/")
+            let mut resolved_path = String::new();
+            for component in normalized.components() {
+                let Component::Normal(path_segment) = component else {
+                    continue;
+                };
+                let segment = path_segment.to_string_lossy();
+                let separator_len = usize::from(!resolved_path.is_empty());
+                resolved_path
+                    .try_reserve(separator_len.saturating_add(segment.len()))
+                    .map_err(|source| err_with_source("시트 경로 메모리 확보 실패", source))?;
+                if !resolved_path.is_empty() {
+                    resolved_path.push('/');
+                }
+                resolved_path.push_str(&segment);
+            }
+            resolved_path
         };
         sheet_name_to_path.insert(name.clone(), resolved);
         sheet_order.push(name);
@@ -163,28 +169,19 @@ pub fn load_shared_strings(container: &XlsxContainer) -> Result<Vec<String>> {
     }
     Ok(out)
 }
-fn iter_start_tags<'xml>(xml: &'xml str, tag_name: &str) -> Result<Vec<&'xml str>> {
-    let tag_count = xml.matches(tag_name).count();
-    let mut out: Vec<&'xml str> = Vec::new();
-    out.try_reserve_exact(tag_count).map_err(|source| {
-        err_with_source(
-            format!("OOXML 태그 목록 메모리 확보 실패: {tag_count} entries"),
-            source,
-        )
-    })?;
+fn iter_start_tags<'xml, 'tag>(
+    xml: &'xml str,
+    tag_name: &'tag str,
+) -> impl Iterator<Item = &'xml str> + use<'xml, 'tag>
+where
+    'xml: 'tag,
+{
     let mut cursor = 0_usize;
-    while let Some(start) = find_start_tag(xml, tag_name, cursor) {
-        let Some(end) = find_tag_end(xml, start) else {
-            break;
-        };
-        let Some(tag) = xml.get(start..=end) else {
-            break;
-        };
-        out.push(tag);
-        let Some(next_cursor) = end.checked_add(1) else {
-            break;
-        };
-        cursor = next_cursor;
-    }
-    Ok(out)
+    iter::from_fn(move || {
+        let start = find_start_tag(xml, tag_name, cursor)?;
+        let end = find_tag_end(xml, start)?;
+        let tag = xml.get(start..=end)?;
+        cursor = end.checked_add(1)?;
+        Some(tag)
+    })
 }

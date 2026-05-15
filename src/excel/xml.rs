@@ -2,7 +2,13 @@ const fn checked_offset_add(base: usize, add: usize) -> Option<usize> {
     base.checked_add(add)
 }
 pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let pattern = format!("{attr_name}=");
+    let mut pattern = String::new();
+    pattern
+        .try_reserve(attr_name.len().saturating_add(1))
+        .ok()?;
+    pattern.push_str(attr_name);
+    pattern.push('=');
+    let pattern_len = pattern.len();
     let bytes = tag.as_bytes();
     let mut cursor = 0_usize;
     while let Some(rel) = tag.get(cursor..)?.find(&pattern) {
@@ -10,11 +16,11 @@ pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<Strin
         if idx > 0 {
             let prev = *bytes.get(idx.checked_sub(1)?)?;
             if !prev.is_ascii_whitespace() && prev != b'<' {
-                cursor = checked_offset_add(idx, pattern.len())?;
+                cursor = checked_offset_add(idx, pattern_len)?;
                 continue;
             }
         }
-        let quote_idx = checked_offset_add(idx, pattern.len())?;
+        let quote_idx = checked_offset_add(idx, pattern_len)?;
         let quote = *bytes.get(quote_idx)?;
         if quote != b'"' && quote != b'\'' {
             cursor = quote_idx;
@@ -75,12 +81,16 @@ pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Opt
     let body_start = checked_offset_add(open_end, 1)?;
     let body_end = find_end_tag(xml, tag_name, body_start)?;
     let text = xml.get(body_start..body_end)?;
-    Some(text.to_owned())
+    let mut out = String::new();
+    out.try_reserve(text.len()).ok()?;
+    out.push_str(text);
+    Some(out)
 }
 pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     let mut cursor = 0_usize;
     let capacity = xml.len().min(128);
-    let mut out = String::with_capacity(capacity);
+    let mut out = String::new();
+    out.try_reserve(capacity).ok()?;
     while let Some(open_start) = find_start_tag(xml, tag_name, cursor) {
         let open_end = find_tag_end(xml, open_start)?;
         let body_start = checked_offset_add(open_end, 1)?;

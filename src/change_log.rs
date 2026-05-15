@@ -141,7 +141,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         }
         for item in added {
             entries.push(ChangeLogEntry {
-                reason: String::from("신규"),
+                reason: "신규".to_owned(),
                 region: item.region.clone(),
                 name: item.name.clone(),
                 address: item.address.clone(),
@@ -155,7 +155,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         }
         for item in deleted {
             entries.push(ChangeLogEntry {
-                reason: String::from("폐업"),
+                reason: "폐업".to_owned(),
                 region: item.region.clone(),
                 name: item.name.clone(),
                 address: item.address.clone(),
@@ -446,17 +446,27 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             entries.len().saturating_sub(1),
             "변경내역 마지막 행 계산",
         )?;
-        let target_cols: Vec<_> = [
+        let mut target_cols = [0_u32; 3];
+        let mut target_col_count = 0_usize;
+        for col in [
             layout.col_delta_gas,
             layout.col_delta_premium,
             layout.col_delta_diesel,
         ]
         .into_iter()
         .flatten()
-        .collect();
+        {
+            if let Some(slot) = target_cols.get_mut(target_col_count) {
+                *slot = col;
+            }
+            target_col_count = target_col_count.saturating_add(1);
+        }
+        let Some(target_col_slice) = target_cols.get(..target_col_count) else {
+            return Err(err("변경내역 조건부 서식 컬럼 범위 계산 실패"));
+        };
         self.worksheet.extend_conditional_formats(
             last_change_row,
-            &target_cols,
+            target_col_slice,
             layout.data_start_row,
         )
     }

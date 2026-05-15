@@ -373,7 +373,7 @@ fn cell_to_string(cell: CellValue) -> String {
                     format!("{number_value:.0}")
                 }
             } else {
-                let mut text = format!("{number_value}");
+                let mut text = number_value.to_string();
                 if text.contains('.') {
                     let trimmed_len = text.trim_end_matches('0').trim_end_matches('.').len();
                     text.truncate(trimmed_len);
