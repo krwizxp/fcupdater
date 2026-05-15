@@ -117,6 +117,10 @@ impl TaskKeys {
             return;
         }
         let Some(slot) = self.values.get_mut(self.len) else {
+            debug_assert!(
+                self.len < TASK_KEY_CAPACITY,
+                "TASK_KEY_CAPACITY is too small for task aliases"
+            );
             return;
         };
         *slot = key;
