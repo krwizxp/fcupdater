@@ -13,7 +13,6 @@ use std::{
 };
 cfg_select! {
     windows => {
-        use core::iter::once;
         use std::os::windows::ffi::OsStrExt as _;
     }
     _ => {
@@ -53,8 +52,8 @@ impl ArchiveOpsExt for ArchiveOps {
     fn promote_temp_output(&self, temp_output: &Path, output_xlsx: &Path) -> Result<()> {
         cfg_select! {
             windows => {
-                let replacement_w = encode_path_wide(temp_output);
-                let destination_w = encode_path_wide(output_xlsx);
+                let replacement_w = encode_path_wide(temp_output)?;
+                let destination_w = encode_path_wide(output_xlsx)?;
                 if output_xlsx.try_exists().map_err(|source_err| {
                     err(path_source_message(
                         "대상 파일 경로 확인 실패",
@@ -401,11 +400,18 @@ fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
     zip_archive::ZipArchiveOps.extract_to_directory(archive_path, unpack_dir)
 }
 #[cfg(windows)]
-fn encode_path_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(once(0))
-        .collect::<Vec<_>>()
+fn encode_path_wide(path: &Path) -> Result<Vec<u16>> {
+    let unit_count = path.as_os_str().encode_wide().count();
+    let capacity = unit_count
+        .checked_add(1)
+        .ok_or_else(|| err("Windows path wide 문자열 용량 계산 실패"))?;
+    let mut out = Vec::new();
+    out.try_reserve(capacity).map_err(|source| {
+        crate::err_with_source("Windows path wide 문자열 메모리 확보 실패", source)
+    })?;
+    out.extend(path.as_os_str().encode_wide());
+    out.push(0);
+    Ok(out)
 }
 fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
     format!("{prefix}{relative_path}")

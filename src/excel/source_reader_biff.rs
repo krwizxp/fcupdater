@@ -20,6 +20,9 @@ const CFB_FAT_SECT: u32 = 0xFFFF_FFFD;
 const CFB_DIFAT_SECT: u32 = 0xFFFF_FFFC;
 const MAX_XLS_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 pub struct SourceReader;
+pub trait SourceReaderApi {
+    fn read_xls_source(&self, path: &Path) -> Result<Vec<SourceRecord>>;
+}
 #[derive(Debug, Clone)]
 struct CfbDirectoryEntry {
     name: String,
@@ -66,9 +69,6 @@ struct SstChunkReader<'chunks, 'chunk> {
     chunks: &'chunks [&'chunk [u8]],
     code_page: Option<u16>,
     offset_in_chunk: usize,
-}
-pub trait SourceReaderApi {
-    fn read_xls_source(&self, path: &Path) -> Result<Vec<SourceRecord>>;
 }
 trait CfbFileExt {
     fn build_fat_table(data: &[u8], sector_size: usize, fat_sector_ids: &[u32]) -> Result<Vec<u32>>
@@ -532,7 +532,7 @@ impl CfbFileExt for CfbFile {
                 let bytes = entry
                     .get(0..name_len.saturating_sub(2))
                     .ok_or_else(|| err("CFB 디렉터리 이름 범위 오류"))?;
-                decode_utf16_le(bytes)
+                decode_utf16_le(bytes)?
             } else {
                 String::new()
             };
@@ -1161,7 +1161,7 @@ impl SourceReaderBiffParseExt for SourceReader {
             .get(3..text_end)
             .ok_or_else(|| err("LABEL 문자열 범위 오류"))?;
         if high_byte {
-            Ok(Some(decode_utf16_le(text_bytes)))
+            Ok(Some(decode_utf16_le(text_bytes)?))
         } else {
             Ok(Some(decode_single_byte_text(text_bytes, code_page)?))
         }
@@ -1594,11 +1594,22 @@ fn decode_rk_number(rk: u32) -> f64 {
     }
     value
 }
-fn decode_utf16_le(bytes: &[u8]) -> String {
+fn decode_utf16_le(bytes: &[u8]) -> Result<String> {
     let (chunks, _) = bytes.as_chunks::<2>();
-    decode_utf16(chunks.iter().map(|chunk| u16::from_le_bytes(*chunk)))
-        .map(|decoded| decoded.unwrap_or(REPLACEMENT_CHARACTER))
-        .collect()
+    let mut out = String::new();
+    out.try_reserve(chunks.len()).map_err(|source| {
+        err_with_source(
+            format!(
+                "UTF-16 문자열 메모리 확보 실패: {} code units",
+                chunks.len()
+            ),
+            source,
+        )
+    })?;
+    for decoded in decode_utf16(chunks.iter().map(|chunk| u16::from_le_bytes(*chunk))) {
+        out.push(decoded.unwrap_or(REPLACEMENT_CHARACTER));
+    }
+    Ok(out)
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
     let arr = read_le_array::<2>(bytes, offset, "u16 read", "u16 read out of range at ")?;

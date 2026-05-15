@@ -51,7 +51,7 @@ impl Default for Args {
             save_mode: SaveMode::Verify,
             skip_download: false,
             sources_dir: PathBuf::from("."),
-            sources_prefix: String::from("현재 판매가격(주유소)"),
+            sources_prefix: "현재 판매가격(주유소)".to_owned(),
         }
     }
 }
