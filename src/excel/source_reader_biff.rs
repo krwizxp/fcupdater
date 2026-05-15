@@ -1595,7 +1595,10 @@ fn decode_rk_number(rk: u32) -> f64 {
     value
 }
 fn decode_utf16_le(bytes: &[u8]) -> Result<String> {
-    let (chunks, _) = bytes.as_chunks::<2>();
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(err("UTF-16 문자열 길이가 홀수입니다."));
+    }
     let capacity = chunks
         .len()
         .checked_mul(3)
