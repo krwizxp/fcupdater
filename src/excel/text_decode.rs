@@ -10,8 +10,12 @@ trait Cp949DecoderExt {
 }
 impl Cp949DecoderExt for Cp949Decoder {
     fn decode(&self, bytes: &[u8]) -> Result<Option<String>> {
+        let capacity = bytes
+            .len()
+            .checked_mul(3)
+            .ok_or_else(|| err("CP949 문자열 용량 계산 실패"))?;
         let mut out = String::new();
-        out.try_reserve(bytes.len())
+        out.try_reserve(capacity)
             .map_err(|source| err_with_source("CP949 문자열 메모리 확보 실패", source))?;
         let mut index = 0_usize;
         while index < bytes.len() {
@@ -101,8 +105,12 @@ impl Cp949DecoderExt for Cp949Decoder {
     }
 }
 fn decode_bytes_to_string(bytes: &[u8], mut map_byte: impl FnMut(u8) -> char) -> Result<String> {
+    let capacity = bytes
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| err("single-byte 문자열 용량 계산 실패"))?;
     let mut out = String::new();
-    out.try_reserve(bytes.len())
+    out.try_reserve(capacity)
         .map_err(|source| err_with_source("single-byte 문자열 메모리 확보 실패", source))?;
     for byte in bytes {
         out.push(map_byte(*byte));

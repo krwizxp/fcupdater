@@ -1596,8 +1596,12 @@ fn decode_rk_number(rk: u32) -> f64 {
 }
 fn decode_utf16_le(bytes: &[u8]) -> Result<String> {
     let (chunks, _) = bytes.as_chunks::<2>();
+    let capacity = chunks
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| err("UTF-16 문자열 용량 계산 실패"))?;
     let mut out = String::new();
-    out.try_reserve(chunks.len()).map_err(|source| {
+    out.try_reserve(capacity).map_err(|source| {
         err_with_source(
             format!(
                 "UTF-16 문자열 메모리 확보 실패: {} code units",

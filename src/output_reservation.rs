@@ -96,15 +96,15 @@ pub fn path_parent_or_current(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
 pub fn file_has_reservation_magic(path: &Path) -> bool {
-    let mut magic = [0_u8; RESERVATION_MAGIC_LEN + 1];
-    fs::File::open(path)
-        .and_then(|mut file| file.read(&mut magic))
-        .is_ok_and(|read_len| {
-            read_len == RESERVATION_MAGIC_LEN
-                && magic
-                    .get(..RESERVATION_MAGIC_LEN)
-                    .is_some_and(|bytes| bytes == RESERVATION_MAGIC)
-        })
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; RESERVATION_MAGIC_LEN];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    let mut extra = [0_u8; 1];
+    matches!(file.read(&mut extra), Ok(0)) && magic == RESERVATION_MAGIC
 }
 pub fn path_file_stem_or<'a>(path: &'a Path, default: &'a str) -> &'a str {
     path.file_stem()
