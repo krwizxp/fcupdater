@@ -1,5 +1,5 @@
 use super::{
-    ooxml::{load_shared_strings, load_sheet_catalog, load_sheet_xml},
+    ooxml::XlsxOoxmlExt as _,
     xlsx_container::XlsxContainer,
     xml::{
         decode_xml_entities, extract_all_tag_text, extract_first_tag_text, find_end_tag,
@@ -69,8 +69,8 @@ trait WorksheetXmlParseExt {
 }
 impl Workbook {
     pub fn open(path: &Path) -> Result<Self> {
-        let container = XlsxContainer::open_for_update(path)?;
-        let catalog = load_sheet_catalog(&container)?;
+        let container = XlsxContainer::try_from(path)?;
+        let catalog = container.load_sheet_catalog()?;
         let workbook_xml = container.read_text("xl/workbook.xml")?;
         let shared_strings_xml_text = if container
             .unpack_dir()
@@ -82,14 +82,14 @@ impl Workbook {
         } else {
             None
         };
-        let shared_strings = load_shared_strings(&container)?;
+        let shared_strings = container.load_shared_strings()?;
         let mut sheet_paths = BTreeMap::new();
         let mut sheets = BTreeMap::new();
         for sheet_name in &catalog.sheet_order {
             let Some(sheet_path) = catalog.sheet_name_to_path.get(sheet_name) else {
                 continue;
             };
-            let xml = load_sheet_xml(&container, &catalog, sheet_name)?;
+            let xml = container.load_sheet_xml(&catalog, sheet_name)?;
             let mut sheet = <Worksheet as WorksheetXmlParseExt>::parse(&xml)?;
             sheet.normalize_shared_formulas()?;
             sheet_paths.insert(sheet_name.clone(), sheet_path.clone());
@@ -275,7 +275,7 @@ impl Workbook {
         };
         Ok(())
     }
-    pub fn save_as(&mut self, out_path: &Path, verify_saved_file: bool) -> Result<()> {
+    pub fn save(&mut self, target_path: &Path) -> Result<()> {
         self.promote_safe_inline_strings_to_shared()?;
         self.request_full_recalculation()?;
         self.remove_excel_recovery_artifacts()?;
@@ -291,7 +291,7 @@ impl Workbook {
             };
             self.container.write_text(path, &sheet.to_xml())?;
         }
-        self.container.save_as(out_path, verify_saved_file)
+        self.container.save(target_path)
     }
     pub fn with_sheet_mut<R, F>(&mut self, name: &str, mutator: F) -> Option<R>
     where
@@ -1149,22 +1149,6 @@ pub fn col_to_name(mut col: u32) -> String {
         .map(|chars| chars.iter().collect())
         .unwrap_or_default()
 }
-pub fn name_to_col(name: &str) -> Option<u32> {
-    let mut out = 0_u32;
-    if name.is_empty() {
-        return None;
-    }
-    for ch in name.chars() {
-        if !ch.is_ascii_alphabetic() {
-            return None;
-        }
-        let upper = u8::try_from(u32::from(ch.to_ascii_uppercase())).ok()?;
-        out = out
-            .checked_mul(26)?
-            .checked_add(u32::from(upper.saturating_sub(b'A')).saturating_add(1))?;
-    }
-    Some(out)
-}
 fn attr_sort_key(name: &str) -> (u8, &str) {
     if name == "r" {
         (0, name)
@@ -1683,7 +1667,16 @@ fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, bool)> {
     if row_end == 0 || row_end != row_part.len() {
         return None;
     }
-    let col = name_to_col(col_s)?;
+    let mut col = 0_u32;
+    for ch in col_s.chars() {
+        if !ch.is_ascii_alphabetic() {
+            return None;
+        }
+        let upper = u8::try_from(u32::from(ch.to_ascii_uppercase())).ok()?;
+        col = col
+            .checked_mul(26)?
+            .checked_add(u32::from(upper.saturating_sub(b'A')).saturating_add(1))?;
+    }
     if !(1..=MAX_A1_COL).contains(&col) {
         return None;
     }

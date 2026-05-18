@@ -5,7 +5,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-use workflow::SourceDownloadOpsExt as _;
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         mod libcurl;
@@ -36,8 +35,8 @@ const GAS_STATION_API_GBN: &str = "A";
 const DEFAULT_REGION_LABEL: &str = "선택하세요.";
 const USER_AGENT: &str = concat!("fcupdater/", env!("CARGO_PKG_VERSION"));
 const NETFUNNEL_POLL_LIMIT: usize = 20;
-pub const AUTO_SOURCE_MARKER: &str = "__fcupdater_auto__";
 pub struct SourceDownloadOps;
+use workflow::SourceDownloadOpsExt as _;
 impl SourceDownloadOps {
     pub fn filter_target_region_records(
         &self,
@@ -45,13 +44,8 @@ impl SourceDownloadOps {
     ) -> Result<Vec<SourceRecord>> {
         self.filter_target_region_records_impl(records)
     }
-    pub fn refresh_sources(
-        &self,
-        dir: &Path,
-        prefix: &str,
-        out: &mut dyn Write,
-    ) -> Result<Vec<PathBuf>> {
-        self.refresh_sources_impl(dir, prefix, out)
+    pub fn refresh_source(&self, dir: &Path, out: &mut dyn Write) -> Result<PathBuf> {
+        self.refresh_source_impl(dir, out)
     }
 }
 fn lossy_prefix(bytes: &[u8], max_len: usize) -> Cow<'_, str> {
@@ -78,11 +72,6 @@ fn checked_http_buffer_len(
     } else {
         Ok(next_len)
     }
-}
-fn contains_ascii_ignore_case<const N: usize>(text: &str, needle: &[u8; N]) -> bool {
-    text.as_bytes()
-        .array_windows::<N>()
-        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 fn enforce_http_content_length_limit(
     headers: &[(String, String)],

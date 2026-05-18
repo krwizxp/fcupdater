@@ -2,12 +2,12 @@ use core::{
     ffi::c_void,
     ptr::{null, null_mut},
 };
-pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-pub const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-pub const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
-pub struct WindowsFileApi;
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
+pub(super) struct WindowsFileApi;
 #[derive(Clone, Copy)]
-pub enum WindowsFileOperation {
+pub(super) enum WindowsFileOperation {
     MoveReplaceWriteThrough,
     ReplaceWriteThrough,
 }
@@ -24,11 +24,11 @@ unsafe extern "system" {
     fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
 }
 impl WindowsFileApi {
-    pub fn last_error() -> u32 {
+    pub(super) fn last_error() -> u32 {
         // SAFETY: GetLastError has no preconditions.
         unsafe { GetLastError() }
     }
-    pub fn run(
+    pub(super) fn run(
         operation: WindowsFileOperation,
         primary_file_name: &[u16],
         secondary_file_name: &[u16],

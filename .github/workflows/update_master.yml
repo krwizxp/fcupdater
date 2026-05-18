@@ -1,37 +1,6 @@
 name: Update Master Excel
 on:
   workflow_dispatch:
-    inputs:
-      master_path:
-        description: Master workbook path in the repository
-        required: true
-        default: fuel_cost_chungcheong.xlsx
-        type: string
-      sources_prefix:
-        description: Source filename prefix only (not a path)
-        required: true
-        default: 현재 판매가격(주유소)
-        type: string
-      skip_download:
-        description: Skip Opinet auto-download and use existing source files only
-        required: true
-        default: false
-        type: boolean
-      no_change_log:
-        description: Do not update the 변경내역 sheet
-        required: true
-        default: false
-        type: boolean
-      fast_save:
-        description: Skip saved-file verification for faster completion
-        required: true
-        default: false
-        type: boolean
-      artifact_name:
-        description: Output .xlsx filename prefix for the uploaded artifact
-        required: true
-        default: fcupdater-result
-        type: string
 permissions:
   contents: read
 jobs:
@@ -53,81 +22,14 @@ jobs:
       - name: Run updater
         id: run_updater
         shell: bash
-        env:
-          FCUPDATER_MASTER_PATH: ${{ inputs.master_path }}
-          FCUPDATER_SOURCES_PREFIX: ${{ inputs.sources_prefix }}
-          FCUPDATER_SKIP_DOWNLOAD: ${{ inputs.skip_download }}
-          FCUPDATER_NO_CHANGE_LOG: ${{ inputs.no_change_log }}
-          FCUPDATER_FAST_SAVE: ${{ inputs.fast_save }}
-          FCUPDATER_ARTIFACT_NAME: ${{ inputs.artifact_name }}
         run: |
           set -euo pipefail
-
-          trim() {
-            local value="$1"
-            value="${value#"${value%%[![:space:]]*}"}"
-            value="${value%"${value##*[![:space:]]}"}"
-            printf '%s' "$value"
-          }
-
-          require_non_empty() {
-            local value="$1"
-            local name="$2"
-            if [[ -z "${value//[[:space:]]/}" ]]; then
-              echo "$name is required." >&2
-              exit 1
-            fi
-          }
-
-          require_bool() {
-            local value="$1"
-            local name="$2"
-            case "$value" in
-              true|false) ;;
-              *)
-                echo "$name must be either 'true' or 'false'." >&2
-                exit 1
-                ;;
-            esac
-          }
-
-          artifact_stem="$(trim "${FCUPDATER_ARTIFACT_NAME:-}")"
-          if [[ -z "${artifact_stem//[[:space:]]/}" ]]; then
-            artifact_stem="fcupdater-result"
-          fi
-          artifact_stem="$(printf '%s' "$artifact_stem" | sed 's#[\\/:*?"<>|]#-#g')"
-
-          master_path="${FCUPDATER_MASTER_PATH:-}"
-          sources_prefix="${FCUPDATER_SOURCES_PREFIX:-}"
-          require_non_empty "$master_path" "master_path"
-          require_non_empty "$sources_prefix" "sources_prefix"
-
-          require_bool "${FCUPDATER_SKIP_DOWNLOAD:-}" "skip_download"
-          require_bool "${FCUPDATER_NO_CHANGE_LOG:-}" "no_change_log"
-          require_bool "${FCUPDATER_FAST_SAVE:-}" "fast_save"
-
+          ./target/release/fcupdater
           artifact_dir="$PWD/artifacts"
           mkdir -p "$artifact_dir"
-          output_path="$artifact_dir/$artifact_stem.xlsx"
-
-          args=(
-            "--master" "$master_path"
-            "--sources-dir" "."
-            "--sources-prefix" "$sources_prefix"
-            "--output" "$output_path"
-          )
-          if [[ "$FCUPDATER_SKIP_DOWNLOAD" == "true" ]]; then
-            args+=("--skip-download")
-          fi
-          if [[ "$FCUPDATER_NO_CHANGE_LOG" == "true" ]]; then
-            args+=("--no-change-log")
-          fi
-          if [[ "$FCUPDATER_FAST_SAVE" == "true" ]]; then
-            args+=("--fast-save")
-          fi
-
-          ./target/release/fcupdater "${args[@]}"
-          echo "artifact_path=$output_path" >> "$GITHUB_OUTPUT"
+          artifact_path="$artifact_dir/fcupdater-result.xlsx"
+          cp fuel_cost_chungcheong.xlsx "$artifact_path"
+          echo "artifact_path=$artifact_path" >> "$GITHUB_OUTPUT"
       - name: Upload result artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
