@@ -33,7 +33,7 @@ struct WorkDirCleanup {
 struct ArchiveOps;
 trait ArchiveOpsExt {
     fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()>;
-    fn promote_temp_output(&self, temp_output: &Path, output_xlsx: &Path) -> Result<()>;
+    fn promote_temp_archive(&self, temp_archive: &Path, target_xlsx: &Path) -> Result<()>;
     fn verify_saved_archive(&self, saved_archive: &Path) -> Result<()>;
 }
 impl Drop for WorkDirCleanup {
@@ -49,15 +49,15 @@ impl ArchiveOpsExt for ArchiveOps {
     fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()> {
         zip_archive::ZipArchiveOps.create_from_directory(unpack_dir, archive_path)
     }
-    fn promote_temp_output(&self, temp_output: &Path, output_xlsx: &Path) -> Result<()> {
+    fn promote_temp_archive(&self, temp_archive: &Path, target_xlsx: &Path) -> Result<()> {
         cfg_select! {
             windows => {
-                let replacement_w = encode_path_wide(temp_output)?;
-                let destination_w = encode_path_wide(output_xlsx)?;
-                if output_xlsx.try_exists().map_err(|source_err| {
+                let replacement_w = encode_path_wide(temp_archive)?;
+                let destination_w = encode_path_wide(target_xlsx)?;
+                if target_xlsx.try_exists().map_err(|source_err| {
                     err(path_source_message(
                         "대상 파일 경로 확인 실패",
-                        output_xlsx,
+                        target_xlsx,
                         source_err,
                     ))
                 })? {
@@ -71,8 +71,8 @@ impl ArchiveOpsExt for ArchiveOps {
                     let code = super::windows_api::WindowsFileApi::last_error();
                     return Err(err(windows_file_op_error_message(
                         "파일 교체 실패(ReplaceFileW): ",
-                        output_xlsx,
-                        Some(temp_output),
+                        target_xlsx,
+                        Some(temp_archive),
                         " <- ",
                         code,
                     )));
@@ -87,46 +87,32 @@ impl ArchiveOpsExt for ArchiveOps {
                 let code = super::windows_api::WindowsFileApi::last_error();
                 Err(err(windows_file_op_error_message(
                     "파일 이동 실패(MoveFileExW): ",
-                    temp_output,
-                    Some(output_xlsx),
+                    temp_archive,
+                    Some(target_xlsx),
                     " -> ",
                     code,
                 )))
             }
             _ => {
-                fs::rename(temp_output, output_xlsx).map_err(|source_err| {
+                fs::rename(temp_archive, target_xlsx).map_err(|source_err| {
                     err(path_pair_source_message(
                         "xlsx 저장 실패",
-                        temp_output,
-                        output_xlsx,
+                        temp_archive,
+                        target_xlsx,
                         source_err,
                     ))
                 })?;
                 if let Err(source_err) = fs::OpenOptions::new()
                     .read(true)
-                    .open(output_xlsx)
+                    .open(target_xlsx)
                     .and_then(|file| file.sync_all())
                 {
-                    if durability_strict_mode() {
-                        return Err(err(path_source_message(
-                            "xlsx 저장 내구성 동기화 실패(파일)",
-                            output_xlsx,
-                            source_err,
-                        )));
-                    }
-                    let output_path = output_xlsx.display().to_string();
-                    write_durability_warning("파일", &output_path, &source_err);
+                    let target_path = target_xlsx.display().to_string();
+                    write_durability_warning("파일", &target_path, &source_err);
                 }
-                if let Some(parent) = output_xlsx.parent()
+                if let Some(parent) = target_xlsx.parent()
                     && let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all())
                 {
-                    if durability_strict_mode() {
-                        return Err(err(path_source_message(
-                            "xlsx 저장 내구성 동기화 실패(폴더)",
-                            parent,
-                            source_err,
-                        )));
-                    }
                     let parent_path = parent.display().to_string();
                     write_durability_warning("폴더", &parent_path, &source_err);
                 }
@@ -181,8 +167,9 @@ impl ArchiveOps {
         zip_archive::ZipArchiveOps.list_entries(archive_path)
     }
 }
-impl XlsxContainer {
-    pub fn open_for_update(source_xlsx: &Path) -> Result<Self> {
+impl TryFrom<&Path> for XlsxContainer {
+    type Error = crate::BoxError;
+    fn try_from(source_xlsx: &Path) -> Result<Self> {
         if !source_xlsx.try_exists().map_err(|source_err| {
             err(path_source_message(
                 "xlsx 파일 경로 확인 실패",
@@ -227,6 +214,8 @@ impl XlsxContainer {
             work_dir,
         })
     }
+}
+impl XlsxContainer {
     pub fn read_text(&self, relative_path: &str) -> Result<String> {
         let path = self.resolve_relative_path(relative_path)?;
         fs::read_to_string(&path)
@@ -268,7 +257,7 @@ impl XlsxContainer {
         }
         Ok(self.unpack_dir.join(path))
     }
-    pub fn save_as(&self, output_xlsx: &Path, verify_saved_file: bool) -> Result<()> {
+    pub fn save(&self, target_xlsx: &Path) -> Result<()> {
         let archive_ops = ArchiveOps;
         if self.archive_path.try_exists().map_err(|source_err| {
             err(path_source_message(
@@ -286,38 +275,36 @@ impl XlsxContainer {
             })?;
         }
         archive_ops.create_archive(&self.unpack_dir, &self.archive_path)?;
-        let parent = if let Some(parent) = output_xlsx.parent() {
-            create_dir_all_checked(parent, "출력 폴더 생성 실패")?;
+        let parent = if let Some(parent) = target_xlsx.parent() {
+            create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
             parent
         } else {
             Path::new(".")
         };
-        let file_name = output_xlsx
+        let file_name = target_xlsx
             .file_name()
             .and_then(|file_name_os| file_name_os.to_str())
-            .unwrap_or("output.xlsx");
-        let tmp_output = reserve_unique_temp_entry(
+            .unwrap_or("workbook.xlsx");
+        let tmp_archive = reserve_unique_temp_entry(
             |pid, nanos, seq| parent.join(format!(".{file_name}.tmp_{pid}_{nanos}_{seq}")),
             |path| fs::File::create_new(path).map(|_| ()),
-            "임시 출력 파일 생성 실패",
-            prefixed_message("임시 출력 파일 경로 생성 실패: ", output_xlsx.display()),
+            "임시 저장 파일 생성 실패",
+            prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
         let result = (|| -> Result<()> {
-            fs::copy(&self.archive_path, &tmp_output).map_err(|source_err| {
+            fs::copy(&self.archive_path, &tmp_archive).map_err(|source_err| {
                 err(path_pair_source_message(
                     "xlsx 임시 저장 실패",
                     &self.archive_path,
-                    &tmp_output,
+                    &tmp_archive,
                     source_err,
                 ))
             })?;
-            if verify_saved_file {
-                archive_ops.verify_saved_archive(&tmp_output)?;
-            }
-            archive_ops.promote_temp_output(&tmp_output, output_xlsx)?;
+            archive_ops.verify_saved_archive(&tmp_archive)?;
+            archive_ops.promote_temp_archive(&tmp_archive, target_xlsx)?;
             Ok(())
         })();
-        result.inspect_err(|_| match fs::remove_file(&tmp_output) {
+        result.inspect_err(|_| match fs::remove_file(&tmp_archive) {
             Ok(()) | Err(_) => {}
         })
     }
@@ -435,16 +422,4 @@ fn windows_file_op_error_message(
             )
         },
     )
-}
-#[cfg(not(windows))]
-fn durability_strict_mode() -> bool {
-    env::var("FCUPDATER_DURABILITY_STRICT")
-        .ok()
-        .is_some_and(|value| {
-            let trimmed = value.trim();
-            trimmed == "1"
-                || trimmed.eq_ignore_ascii_case("true")
-                || trimmed.eq_ignore_ascii_case("yes")
-                || trimmed.eq_ignore_ascii_case("on")
-        })
 }

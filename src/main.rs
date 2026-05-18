@@ -2,10 +2,7 @@ extern crate alloc;
 use cli::ParseAction;
 use core::{error::Error, fmt::Display, result::Result as StdResult};
 use io_util::write_line_ignored;
-pub(crate) use region::{
-    display_region_label_from_source, has_basic_region_suffix, is_metropolitan_token,
-    is_province_token, normalize_address_key, strip_basic_region_suffix,
-};
+pub(crate) use region::{display_region_label_from_source, normalize_address_key};
 pub(crate) use rows::{ChangeRow, StoreRow};
 pub(crate) use sheet_util::{
     add_row_offset, canon_header, parse_i32_str, same_trimmed, shift_row, usize_to_u32,
@@ -18,22 +15,16 @@ use std::{
 use update_run::{UpdateRunContext, UpdateRunContextExt as _};
 mod change_log;
 mod cli;
-mod downloaded_source;
 mod excel;
 mod io_util;
 mod kst_date;
 mod master_sheet;
-mod natural_sort;
-mod numeric;
-mod output_reservation;
 mod region;
 mod rows;
 mod sheet_util;
 mod source_download;
 mod source_sync;
 mod update_run;
-mod vec_util;
-mod xlsx_row;
 type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = StdResult<T, BoxError>;
 fn err(msg: impl Into<BoxError>) -> BoxError {
@@ -118,11 +109,8 @@ fn main() -> Result<()> {
     let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
     let action = ParseAction::try_from(raw_args.as_slice())?;
     match action {
-        ParseAction::Run(run_args) => {
-            let mut context = UpdateRunContext {
-                args: &run_args,
-                out: &mut out,
-            };
+        ParseAction::Run => {
+            let mut context = UpdateRunContext { out: &mut out };
             context.run_update()
         }
         ParseAction::Help(text) | ParseAction::Version(text) => {

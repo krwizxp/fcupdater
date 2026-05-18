@@ -2,7 +2,10 @@ use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, canon_header, err, err_with_source,
     excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
 };
-use std::{collections::HashMap, env};
+use std::collections::HashMap;
+const CHANGELOG_HEADER_SCAN_ROWS: u32 = 30;
+const CHANGELOG_HEADER_SCAN_COLS: u32 = 60;
+const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
 const HEADER_KEYS_REGION: [&str; 1] = ["지역"];
 const HEADER_KEYS_NAME: [&str; 1] = ["상호"];
 const HEADER_KEYS_ADDRESS: [&str; 1] = ["주소"];
@@ -250,10 +253,8 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         Ok(headers)
     }
     fn find_layout(&self) -> Result<ChangeLogLayout> {
-        let max_rows = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_ROWS", 30, Some(1_000));
-        let max_cols = change_log_env_u32("FCUPDATER_CHANGELOG_HEADER_SCAN_COLS", 60, Some(500));
-        for (&row, _) in self.worksheet.rows.range(1..=max_rows) {
-            let headers = self.collect_header_columns(row, max_cols)?;
+        for (&row, _) in self.worksheet.rows.range(1..=CHANGELOG_HEADER_SCAN_ROWS) {
+            let headers = self.collect_header_columns(row, CHANGELOG_HEADER_SCAN_COLS)?;
             if headers.is_empty() {
                 continue;
             }
@@ -338,16 +339,15 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         ))
     }
     fn select_style_template_row(&self, layout: &ChangeLogLayout) -> u32 {
-        let preferred_row = change_log_env_u32("FCUPDATER_CHANGELOG_STYLE_TEMPLATE_ROW", 243, None);
-        if preferred_row >= layout.data_start_row
+        if CHANGELOG_STYLE_TEMPLATE_ROW >= layout.data_start_row
             && self
                 .worksheet
-                .has_any_row_format(preferred_row, layout.max_col)
+                .has_any_row_format(CHANGELOG_STYLE_TEMPLATE_ROW, layout.max_col)
         {
-            return preferred_row;
+            return CHANGELOG_STYLE_TEMPLATE_ROW;
         }
-        let end = if preferred_row > layout.data_start_row {
-            preferred_row
+        let end = if CHANGELOG_STYLE_TEMPLATE_ROW > layout.data_start_row {
+            CHANGELOG_STYLE_TEMPLATE_ROW
         } else {
             layout.data_start_row.saturating_add(1)
         };
@@ -470,14 +470,4 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             layout.data_start_row,
         )
     }
-}
-fn change_log_env_u32(name: &str, default: u32, max: Option<u32>) -> u32 {
-    let Some(parsed_value) = env::var(name)
-        .ok()
-        .and_then(|parsed_value| parsed_value.parse::<u32>().ok())
-        .filter(|parsed_value| *parsed_value > 0)
-    else {
-        return default;
-    };
-    max.map_or(parsed_value, |max_value| parsed_value.min(max_value))
 }

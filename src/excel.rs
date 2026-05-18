@@ -1,8 +1,6 @@
-mod cp949_table;
 pub mod ooxml;
 mod path_util;
 pub mod source_reader;
-mod text_decode;
 #[cfg(windows)]
 pub mod windows_api;
 pub mod writer;

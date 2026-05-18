@@ -44,7 +44,7 @@ pub fn display_region_label_from_source(region: &str, address: &str) -> String {
     }
     region.trim().to_owned()
 }
-pub fn parse_region_label(text: &str) -> Option<String> {
+fn parse_region_label(text: &str) -> Option<String> {
     let mut tokens = text.split_whitespace();
     let first = tokens.next()?;
     let second = tokens.next();
@@ -55,12 +55,20 @@ pub fn parse_region_label(text: &str) -> Option<String> {
             return Some(label.to_owned());
         }
     }
-    if is_province_token(first) {
+    if first.ends_with('도')
+        || matches!(
+            first,
+            "충남" | "충북" | "경기" | "강원" | "전북" | "전남" | "경북" | "경남" | "제주"
+        )
+    {
         return second.map(|token| {
             strip_basic_region_suffix(token).map_or_else(|| token.to_owned(), str::to_owned)
         });
     }
-    if is_metropolitan_token(first) {
+    if matches!(
+        first,
+        "서울" | "부산" | "대구" | "인천" | "광주" | "대전" | "울산" | "세종"
+    ) {
         return Some(first.to_owned());
     }
     match strip_basic_region_suffix(first) {
@@ -69,24 +77,8 @@ pub fn parse_region_label(text: &str) -> Option<String> {
         None => None,
     }
 }
-pub fn strip_basic_region_suffix(token: &str) -> Option<&str> {
+fn strip_basic_region_suffix(token: &str) -> Option<&str> {
     token
         .strip_suffix(['시', '군', '구'])
         .filter(|label| !label.is_empty())
-}
-pub fn has_basic_region_suffix(token: &str) -> bool {
-    strip_basic_region_suffix(token).is_some()
-}
-pub fn is_province_token(token: &str) -> bool {
-    token.ends_with('도')
-        || matches!(
-            token,
-            "충남" | "충북" | "경기" | "강원" | "전북" | "전남" | "경북" | "경남" | "제주"
-        )
-}
-pub fn is_metropolitan_token(token: &str) -> bool {
-    matches!(
-        token,
-        "서울" | "부산" | "대구" | "인천" | "광주" | "대전" | "울산" | "세종"
-    )
 }

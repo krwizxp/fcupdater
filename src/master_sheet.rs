@@ -12,11 +12,9 @@ use crate::{
 };
 use alloc::collections::BTreeMap;
 use core::{cmp::Ordering, mem};
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-};
+use std::collections::{HashMap, HashSet};
 mod format;
+const MASTER_HEADER_SCAN_ROWS: u32 = 200;
 const DECIMAL_SCALE: ScaledDecimal = 1_000_000;
 const DECIMAL_SCALE_SQUARED: ScaledSortKey = 1_000_000_000_000;
 const DECIMAL_SCALE_CUBED: ScaledSortKey = 1_000_000_000_000_000_000;
@@ -1130,14 +1128,7 @@ impl MasterSheetOpsExt for MasterSheetOps {
         ws.max_cell_col().clamp(20, 200)
     }
     fn master_header_scan_rows(&self) -> u32 {
-        let Some(parsed_value) = env::var("FCUPDATER_MASTER_HEADER_SCAN_ROWS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| *value > 0)
-        else {
-            return 200;
-        };
-        parsed_value.min(20_000)
+        MASTER_HEADER_SCAN_ROWS
     }
     fn normalize_fuel_price(&self, value: Option<i32>) -> Option<i32> {
         value.filter(|price| *price > 0_i32)

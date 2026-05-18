@@ -231,8 +231,8 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
                 create_zip_dir(&dir_path, "xlsx 압축 폴더 생성 실패")?;
                 continue;
             }
-            let output_path = unpack_dir.join(path_from_entry_name(&entry.name)?);
-            if let Some(parent) = output_path.parent() {
+            let entry_path = unpack_dir.join(path_from_entry_name(&entry.name)?);
+            if let Some(parent) = entry_path.parent() {
                 create_zip_dir(parent, "xlsx 압축 해제 폴더 생성 실패")?;
             }
             let expected_len = usize::try_from(entry.uncompressed_size)
@@ -306,11 +306,11 @@ impl ZipArchiveOpsExt for ZipArchiveOps {
                 Ok(output)
             })()
             .map_err(err)?;
-            fs::write(&output_path, data).map_err(|source_err| {
+            fs::write(&entry_path, data).map_err(|source_err| {
                 err(path_pair_source_message(
                     "xlsx 압축 해제 파일 쓰기 실패",
                     archive_path,
-                    &output_path,
+                    &entry_path,
                     source_err,
                 ))
             })?;
