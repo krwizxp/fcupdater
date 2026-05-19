@@ -3,7 +3,7 @@ use cli::ParseAction;
 use core::{error::Error, fmt::Display, result::Result as StdResult};
 use io_util::write_line_ignored;
 pub(crate) use region::{display_region_label_from_source, normalize_address_key};
-pub(crate) use rows::{ChangeRow, StoreRow};
+pub(crate) use rows::{ChangeRow, SourceRecord, StoreRow};
 pub(crate) use sheet_util::{
     add_row_offset, canon_header, parse_i32_str, same_trimmed, shift_row, usize_to_u32,
 };
@@ -23,7 +23,6 @@ mod region;
 mod rows;
 mod sheet_util;
 mod source_download;
-mod source_sync;
 mod update_run;
 type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = StdResult<T, BoxError>;
@@ -106,8 +105,10 @@ fn path_pair_source_message(label: &str, from: &Path, to: &Path, source: impl Di
 }
 fn main() -> Result<()> {
     let mut out = stdout();
-    let raw_args = env::args_os().skip(1).collect::<Vec<_>>();
-    let action = ParseAction::try_from(raw_args.as_slice())?;
+    let mut raw_args = env::args_os().skip(1);
+    let first_arg = raw_args.next();
+    let has_extra = raw_args.next().is_some();
+    let action = ParseAction::try_from((first_arg, has_extra))?;
     match action {
         ParseAction::Run => {
             let mut context = UpdateRunContext { out: &mut out };

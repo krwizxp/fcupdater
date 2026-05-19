@@ -3,12 +3,10 @@ use self::format::{
     missing_sort_target_row_error, split_negative_prefix,
 };
 use crate::{
-    ChangeRow, Result, StoreRow, add_row_offset, canon_header, display_region_label_from_source,
-    err, err_with_source, excel,
+    ChangeRow, Result, SourceRecord, StoreRow, add_row_offset, canon_header,
+    display_region_label_from_source, err, err_with_source, excel,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
-    normalize_address_key, same_trimmed, shift_row,
-    source_sync::SourceRecord,
-    usize_to_u32,
+    normalize_address_key, same_trimmed, shift_row, usize_to_u32,
 };
 use alloc::collections::BTreeMap;
 use core::{cmp::Ordering, mem};
