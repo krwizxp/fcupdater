@@ -11,16 +11,14 @@ pub enum ParseAction {
     Run,
     Version(String),
 }
-impl TryFrom<&[OsString]> for ParseAction {
+impl TryFrom<(Option<OsString>, bool)> for ParseAction {
     type Error = crate::BoxError;
-    fn try_from(raw_args: &[OsString]) -> Result<Self> {
-        if raw_args.is_empty() {
-            return Ok(Self::Run);
-        }
-        let Some(token) = raw_args.first() else {
+    fn try_from(raw_args: (Option<OsString>, bool)) -> Result<Self> {
+        let (first_arg, has_extra) = raw_args;
+        let Some(token) = first_arg else {
             return Ok(Self::Run);
         };
-        if raw_args.len() != 1 {
+        if has_extra {
             return Err(err(unknown_option_message(&token.to_string_lossy())));
         }
         if token == OsStr::new("-h") || token == OsStr::new("--help") {

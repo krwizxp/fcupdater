@@ -1,29 +1,28 @@
 use crate::{
-    ChangeRow, Result, StoreRow, add_row_offset, canon_header, err, err_with_source,
+    ChangeRow, Result, StoreRow, add_row_offset, err, err_with_source,
     excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
 };
-use std::collections::HashMap;
-const CHANGELOG_HEADER_SCAN_ROWS: u32 = 30;
-const CHANGELOG_HEADER_SCAN_COLS: u32 = 60;
+const CHANGELOG_HEADER_ROW: u32 = 3;
+const CHANGELOG_DATA_START_ROW: u32 = 4;
 const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
-const HEADER_KEYS_REGION: [&str; 1] = ["지역"];
-const HEADER_KEYS_NAME: [&str; 1] = ["상호"];
-const HEADER_KEYS_ADDRESS: [&str; 1] = ["주소"];
-const HEADER_KEYS_REASON: [&str; 3] = ["변경내용", "변경내역", "변경사유"];
-const HEADER_KEYS_OLD_GAS: [&str; 2] = ["휘발유(이전)", "휘발유이전"];
-const HEADER_KEYS_NEW_GAS: [&str; 2] = ["휘발유(신규)", "휘발유신규"];
-const HEADER_KEYS_OLD_PREMIUM: [&str; 2] = ["고급유(이전)", "고급유이전"];
-const HEADER_KEYS_NEW_PREMIUM: [&str; 2] = ["고급유(신규)", "고급유신규"];
-const HEADER_KEYS_OLD_DIESEL: [&str; 2] = ["경유(이전)", "경유이전"];
-const HEADER_KEYS_NEW_DIESEL: [&str; 2] = ["경유(신규)", "경유신규"];
-const HEADER_KEYS_DELTA_GAS: [&str; 4] = ["휘발유Δ", "휘발유△", "휘발유증감", "휘발유차이"];
-const HEADER_KEYS_DELTA_PREMIUM: [&str; 4] = ["고급유Δ", "고급유△", "고급유증감", "고급유차이"];
-const HEADER_KEYS_DELTA_DIESEL: [&str; 4] = ["경유Δ", "경유△", "경유증감", "경유차이"];
+const CHANGELOG_COL_REGION: u32 = 1;
+const CHANGELOG_COL_NAME: u32 = 2;
+const CHANGELOG_COL_ADDRESS: u32 = 3;
+const CHANGELOG_COL_REASON: u32 = 4;
+const CHANGELOG_COL_OLD_GAS: u32 = 5;
+const CHANGELOG_COL_NEW_GAS: u32 = 6;
+const CHANGELOG_COL_DELTA_GAS: u32 = 7;
+const CHANGELOG_COL_OLD_PREMIUM: u32 = 8;
+const CHANGELOG_COL_NEW_PREMIUM: u32 = 9;
+const CHANGELOG_COL_DELTA_PREMIUM: u32 = 10;
+const CHANGELOG_COL_OLD_DIESEL: u32 = 11;
+const CHANGELOG_COL_NEW_DIESEL: u32 = 12;
+const CHANGELOG_COL_DELTA_DIESEL: u32 = 13;
 struct ChangeLogLayout {
     col_address: u32,
-    col_delta_diesel: Option<u32>,
-    col_delta_gas: Option<u32>,
-    col_delta_premium: Option<u32>,
+    col_delta_diesel: u32,
+    col_delta_gas: u32,
+    col_delta_premium: u32,
     col_name: u32,
     col_new_diesel: u32,
     col_new_gas: u32,
@@ -72,7 +71,6 @@ trait ChangeLogUpdaterExt {
         deleted: &[StoreRow],
     ) -> Result<Vec<ChangeLogEntry>>;
     fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<()>;
-    fn collect_header_columns(&self, row: u32, max_cols: u32) -> Result<HashMap<String, u32>>;
     fn find_layout(&self) -> Result<ChangeLogLayout>;
     fn select_style_template_row(&self, layout: &ChangeLogLayout) -> u32;
     fn update(
@@ -82,6 +80,7 @@ trait ChangeLogUpdaterExt {
         added: &[StoreRow],
         deleted: &[StoreRow],
     ) -> Result<()>;
+    fn validate_fixed_header(&self) -> Result<()>;
     fn write_entries(
         &mut self,
         layout: &ChangeLogLayout,
@@ -199,9 +198,16 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             let estimated_rows = last_data_row
                 .saturating_sub(layout.data_start_row)
                 .saturating_add(1);
-            let cell_capacity = usize::try_from(estimated_rows)
-                .map_err(|source| err_with_source("변경내역 clear 행 수 변환 실패", source))?
-                .saturating_mul(8);
+            let estimated_rows_usize = usize::try_from(estimated_rows)
+                .map_err(|source| err_with_source("변경내역 clear 행 수 변환 실패", source))?;
+            let max_col_usize = usize::try_from(layout.max_col)
+                .map_err(|source| err_with_source("변경내역 clear 열 수 변환 실패", source))?;
+            let cell_capacity =
+                estimated_rows_usize
+                    .checked_mul(max_col_usize)
+                    .ok_or_else(|| {
+                        err("변경내역 clear 대상 cell 수 계산 중 overflow가 발생했습니다.")
+                    })?;
             let mut cells_to_clear: Vec<(u32, u32)> = Vec::new();
             cells_to_clear
                 .try_reserve_exact(cell_capacity)
@@ -226,117 +232,25 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         }
         Ok(())
     }
-    fn collect_header_columns(&self, row: u32, max_cols: u32) -> Result<HashMap<String, u32>> {
-        let Some(row_obj) = self.worksheet.rows.get(&row) else {
-            return Ok(HashMap::new());
-        };
-        let max_cols_usize = usize::try_from(max_cols)
-            .map_err(|source| err_with_source("변경내역 헤더 열 수 변환 실패", source))?;
-        let header_capacity = row_obj.cells.len().min(max_cols_usize);
-        let mut headers: HashMap<String, u32> = HashMap::new();
-        headers.try_reserve(header_capacity).map_err(|source| {
-            err_with_source(
-                format!("변경내역 헤더 맵 메모리 확보 실패: {header_capacity} entries"),
-                source,
-            )
-        })?;
-        for (&col, _) in row_obj.cells.range(1..=max_cols) {
-            let key = canon_header(
-                self.worksheet
-                    .get_display_at(col, row, self.shared_string_table)
-                    .trim(),
-            );
-            if !key.is_empty() {
-                headers.entry(key).or_insert(col);
-            }
-        }
-        Ok(headers)
-    }
     fn find_layout(&self) -> Result<ChangeLogLayout> {
-        for (&row, _) in self.worksheet.rows.range(1..=CHANGELOG_HEADER_SCAN_ROWS) {
-            let headers = self.collect_header_columns(row, CHANGELOG_HEADER_SCAN_COLS)?;
-            if headers.is_empty() {
-                continue;
-            }
-            let get_header_col_optional = |keys: &[&str]| {
-                for key in keys {
-                    let canon = canon_header(key);
-                    if let Some(col) = headers.get(&canon) {
-                        return Some(*col);
-                    }
-                }
-                None
-            };
-            let required_col = |keys: &[&str], display_name: &str| {
-                get_header_col_optional(keys).ok_or_else(|| {
-                    err(format!("변경내역 헤더에 '{display_name}' 컬럼이 없습니다."))
-                })
-            };
-            let Some(col_region) = get_header_col_optional(&HEADER_KEYS_REGION) else {
-                continue;
-            };
-            let Some(col_name) = get_header_col_optional(&HEADER_KEYS_NAME) else {
-                continue;
-            };
-            let Some(col_address) = get_header_col_optional(&HEADER_KEYS_ADDRESS) else {
-                continue;
-            };
-            let Some(col_reason) = get_header_col_optional(&HEADER_KEYS_REASON) else {
-                continue;
-            };
-            let col_old_gas = required_col(&HEADER_KEYS_OLD_GAS, "휘발유(이전)")?;
-            let col_new_gas = required_col(&HEADER_KEYS_NEW_GAS, "휘발유(신규)")?;
-            let col_old_premium = required_col(&HEADER_KEYS_OLD_PREMIUM, "고급유(이전)")?;
-            let col_new_premium = required_col(&HEADER_KEYS_NEW_PREMIUM, "고급유(신규)")?;
-            let col_old_diesel = required_col(&HEADER_KEYS_OLD_DIESEL, "경유(이전)")?;
-            let col_new_diesel = required_col(&HEADER_KEYS_NEW_DIESEL, "경유(신규)")?;
-            let col_delta_gas = get_header_col_optional(&HEADER_KEYS_DELTA_GAS);
-            let col_delta_premium = get_header_col_optional(&HEADER_KEYS_DELTA_PREMIUM);
-            let col_delta_diesel = get_header_col_optional(&HEADER_KEYS_DELTA_DIESEL);
-            let mut max_col = [
-                col_region,
-                col_name,
-                col_address,
-                col_reason,
-                col_old_gas,
-                col_new_gas,
-                col_old_premium,
-                col_new_premium,
-                col_old_diesel,
-                col_new_diesel,
-            ]
-            .into_iter()
-            .fold(0, u32::max);
-            for col in [col_delta_gas, col_delta_premium, col_delta_diesel]
-                .into_iter()
-                .flatten()
-            {
-                max_col = max_col.max(col);
-            }
-            let data_start_row = row
-                .checked_add(1)
-                .ok_or_else(|| err("변경내역 데이터 시작 행 계산 중 범위 오류"))?;
-            return Ok(ChangeLogLayout {
-                col_address,
-                col_delta_diesel,
-                col_delta_gas,
-                col_delta_premium,
-                col_name,
-                col_new_diesel,
-                col_new_gas,
-                col_new_premium,
-                col_old_diesel,
-                col_old_gas,
-                col_old_premium,
-                col_reason,
-                col_region,
-                data_start_row,
-                max_col,
-            });
-        }
-        Err(err(
-            "변경내역 시트에서 헤더 행을 찾지 못했습니다. 필수 컬럼(지역/상호/주소/변경내용/휘발유(이전)/휘발유(신규)/고급유(이전)/고급유(신규)/경유(이전)/경유(신규))을 확인하세요.",
-        ))
+        self.validate_fixed_header()?;
+        Ok(ChangeLogLayout {
+            col_address: CHANGELOG_COL_ADDRESS,
+            col_delta_diesel: CHANGELOG_COL_DELTA_DIESEL,
+            col_delta_gas: CHANGELOG_COL_DELTA_GAS,
+            col_delta_premium: CHANGELOG_COL_DELTA_PREMIUM,
+            col_name: CHANGELOG_COL_NAME,
+            col_new_diesel: CHANGELOG_COL_NEW_DIESEL,
+            col_new_gas: CHANGELOG_COL_NEW_GAS,
+            col_new_premium: CHANGELOG_COL_NEW_PREMIUM,
+            col_old_diesel: CHANGELOG_COL_OLD_DIESEL,
+            col_old_gas: CHANGELOG_COL_OLD_GAS,
+            col_old_premium: CHANGELOG_COL_OLD_PREMIUM,
+            col_reason: CHANGELOG_COL_REASON,
+            col_region: CHANGELOG_COL_REGION,
+            data_start_row: CHANGELOG_DATA_START_ROW,
+            max_col: CHANGELOG_COL_DELTA_DIESEL,
+        })
     }
     fn select_style_template_row(&self, layout: &ChangeLogLayout) -> u32 {
         if CHANGELOG_STYLE_TEMPLATE_ROW >= layout.data_start_row
@@ -371,6 +285,35 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
         let entries = self.build_entries(changes, added, deleted)?;
         self.write_entries(&layout, style_template_row, &entries)?;
         self.worksheet.update_dimension()?;
+        Ok(())
+    }
+    fn validate_fixed_header(&self) -> Result<()> {
+        let expected_headers = [
+            (CHANGELOG_COL_REGION, "지역"),
+            (CHANGELOG_COL_NAME, "상호"),
+            (CHANGELOG_COL_ADDRESS, "주소"),
+            (CHANGELOG_COL_REASON, "변경내용"),
+            (CHANGELOG_COL_OLD_GAS, "휘발유(이전)"),
+            (CHANGELOG_COL_NEW_GAS, "휘발유(신규)"),
+            (CHANGELOG_COL_DELTA_GAS, "휘발유 Δ"),
+            (CHANGELOG_COL_OLD_PREMIUM, "고급유(이전)"),
+            (CHANGELOG_COL_NEW_PREMIUM, "고급유(신규)"),
+            (CHANGELOG_COL_DELTA_PREMIUM, "고급유 Δ"),
+            (CHANGELOG_COL_OLD_DIESEL, "경유(이전)"),
+            (CHANGELOG_COL_NEW_DIESEL, "경유(신규)"),
+            (CHANGELOG_COL_DELTA_DIESEL, "경유 Δ"),
+        ];
+        for (col, expected) in expected_headers {
+            let actual =
+                self.worksheet
+                    .get_display_at(col, CHANGELOG_HEADER_ROW, self.shared_string_table);
+            let trimmed = actual.trim();
+            if trimmed != expected {
+                return Err(err(format!(
+                    "변경내역 헤더가 예상과 다릅니다: row={CHANGELOG_HEADER_ROW}, col={col}, expected={expected}, actual={trimmed}"
+                )));
+            }
+        }
         Ok(())
     }
     fn write_entries(
@@ -429,13 +372,10 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             self.worksheet
                 .set_i32_at(layout.col_new_diesel, row, entry.new_diesel);
             for (delta_col, old_col, new_col) in delta_columns {
-                let Some(delta_col_num) = delta_col else {
-                    continue;
-                };
                 let formula = format!(
                     "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
                 );
-                self.worksheet.set_formula_at(delta_col_num, row, &formula);
+                self.worksheet.set_formula_at(delta_col, row, &formula);
             }
         }
         if entries.is_empty() {
@@ -446,27 +386,14 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             entries.len().saturating_sub(1),
             "변경내역 마지막 행 계산",
         )?;
-        let mut target_cols = [0_u32; 3];
-        let mut target_col_count = 0_usize;
-        for col in [
+        let target_cols = [
             layout.col_delta_gas,
             layout.col_delta_premium,
             layout.col_delta_diesel,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(slot) = target_cols.get_mut(target_col_count) {
-                *slot = col;
-            }
-            target_col_count = target_col_count.saturating_add(1);
-        }
-        let Some(target_col_slice) = target_cols.get(..target_col_count) else {
-            return Err(err("변경내역 조건부 서식 컬럼 범위 계산 실패"));
-        };
+        ];
         self.worksheet.extend_conditional_formats(
             last_change_row,
-            target_col_slice,
+            &target_cols,
             layout.data_start_row,
         )
     }

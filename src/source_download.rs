@@ -1,4 +1,4 @@
-use crate::{Result, source_sync::SourceRecord};
+use crate::{Result, SourceRecord};
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::result::Result as StdResult;
 use std::{
@@ -16,8 +16,8 @@ cfg_select! {
 }
 mod http_client;
 mod workflow;
-const HTTP_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-const HTTP_MAX_HEADER_BYTES: usize = 1024 * 1024;
+const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
 const OPINET_HOST: &str = "www.opinet.co.kr";
 const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
 const OPDOWNLOAD_PATH: &str = "/user/opdown/opDownload.do";

@@ -3,7 +3,7 @@ use crate::{
     change_log::{self, ChangeLogSheetServiceExt as _},
     err, err_with_source,
     excel::{
-        source_reader::biff::{SourceReader, SourceReaderApi as _},
+        source_reader::{ReadXlsSource as _, SourceReader},
         writer::Workbook as StdWorkbook,
     },
     io_util::write_line_ignored,
@@ -11,14 +11,14 @@ use crate::{
     master_sheet::{self, MasterSheetApi as _},
     path_source_message, prefixed_message,
     region::normalize_address_key,
-    rows::{ChangeRow, StoreRow},
-    source_download, source_sync,
+    rows::{ChangeRow, SourceRecord, StoreRow},
+    source_download,
 };
 use std::{
     collections::{HashMap, hash_map::Entry},
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
@@ -26,7 +26,7 @@ pub struct UpdateSummary<'data> {
     added: &'data [StoreRow],
     changes: &'data [ChangeRow],
     deleted: &'data [StoreRow],
-    source_path: &'data Path,
+    source_name: &'data str,
 }
 pub struct UpdateRunContext<'out> {
     pub out: &'out mut dyn Write,
@@ -34,24 +34,24 @@ pub struct UpdateRunContext<'out> {
 pub trait UpdateRunContextExt {
     fn build_source_index(
         &self,
-        records: Vec<source_sync::SourceRecord>,
-    ) -> Result<HashMap<String, source_sync::SourceRecord>>;
-    fn load_source(&mut self) -> Result<(PathBuf, HashMap<String, source_sync::SourceRecord>)>;
+        records: Vec<SourceRecord>,
+    ) -> Result<HashMap<String, SourceRecord>>;
+    fn load_source(&mut self) -> Result<(HashMap<String, SourceRecord>, String)>;
     fn print_store_rows(&mut self, title: &str, rows: &[StoreRow]);
     fn print_update_summary(&mut self, summary: &UpdateSummary<'_>);
-    fn read_source_records(&self, path: &Path) -> Result<Vec<source_sync::SourceRecord>>;
+    fn read_source_records(&self, path: &Path) -> Result<Vec<SourceRecord>>;
     fn resolve_today(&self) -> Result<String>;
     fn run_update(&mut self) -> Result<()>;
 }
 impl UpdateRunContextExt for UpdateRunContext<'_> {
     fn build_source_index(
         &self,
-        records: Vec<source_sync::SourceRecord>,
-    ) -> Result<HashMap<String, source_sync::SourceRecord>> {
+        records: Vec<SourceRecord>,
+    ) -> Result<HashMap<String, SourceRecord>> {
         if records.is_empty() {
             return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
         }
-        let mut map: HashMap<String, source_sync::SourceRecord> = HashMap::new();
+        let mut map: HashMap<String, SourceRecord> = HashMap::new();
         map.try_reserve(records.len()).map_err(|source| {
             let record_count = records.len();
             err_with_source(
@@ -65,18 +65,30 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
                 Entry::Vacant(vacant_entry) => {
                     vacant_entry.insert(record);
                 }
-                Entry::Occupied(_) => {}
+                Entry::Occupied(occupied_entry) => {
+                    let existing = occupied_entry.get();
+                    return Err(err(format!(
+                        "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
+                        existing.address, existing.name, record.name
+                    )));
+                }
             }
         }
         Ok(map)
     }
-    fn load_source(&mut self) -> Result<(PathBuf, HashMap<String, source_sync::SourceRecord>)> {
+    fn load_source(&mut self) -> Result<(HashMap<String, SourceRecord>, String)> {
         let source_path =
             source_download::SourceDownloadOps.refresh_source(Path::new("."), self.out)?;
         write_line_ignored(self.out, format_args!("Opinet 소스 파일 준비 완료"));
-        let records = source_download::SourceDownloadOps
-            .filter_target_region_records(self.read_source_records(&source_path)?)?;
-        let source_index = self.build_source_index(records)?;
+        let source_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| source_path.display().to_string(), str::to_owned);
+        let result = (|| -> Result<HashMap<String, SourceRecord>> {
+            let records = source_download::SourceDownloadOps
+                .filter_target_region_records(self.read_source_records(&source_path)?)?;
+            self.build_source_index(records)
+        })();
         match fs::remove_file(&source_path) {
             Ok(()) => write_line_ignored(self.out, format_args!("임시 소스 파일 정리 완료")),
             Err(source_err) => write_line_ignored(
@@ -87,7 +99,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
                 ),
             ),
         }
-        Ok((source_path, source_index))
+        Ok((result?, source_name))
     }
     fn print_store_rows(&mut self, title: &str, rows: &[StoreRow]) {
         if rows.is_empty() {
@@ -118,11 +130,11 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
             added,
             changes,
             deleted,
-            source_path,
+            source_name,
         } = *summary;
         write_line_ignored(self.out, format_args!("\n==== 현행화 요약 ===="));
-        write_line_ignored(self.out, format_args!("- 마스터: {MASTER_PATH}"));
-        write_line_ignored(self.out, format_args!("- 소스: {}", source_path.display()));
+        write_line_ignored(self.out, format_args!("- 파일: {MASTER_PATH}"));
+        write_line_ignored(self.out, format_args!("- 소스: {source_name}"));
         write_line_ignored(
             self.out,
             format_args!("- 기존 업체 변경: {}건", changes.len()),
@@ -135,13 +147,12 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
             self.out,
             format_args!("- 폐업 업체 삭제: {}건", deleted.len()),
         );
-        write_line_ignored(self.out, format_args!("- 저장: {MASTER_PATH}"));
         write_line_ignored(self.out, format_args!("- 저장 검증: 사용"));
         self.print_store_rows("신규 업체 추가 목록 (상위 20개)", added);
         self.print_store_rows("폐업 업체 삭제 목록 (상위 20개)", deleted);
         write_line_ignored(self.out, format_args!("=====================\n"));
     }
-    fn read_source_records(&self, path: &Path) -> Result<Vec<source_sync::SourceRecord>> {
+    fn read_source_records(&self, path: &Path) -> Result<Vec<SourceRecord>> {
         SourceReader.read_xls_source(path).map_err(|source_err| {
             err(path_source_message(
                 "소스 xls 파일 읽기 실패",
@@ -196,7 +207,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
                 MASTER_PATH,
             )));
         }
-        let (source_path, source_index) = self.load_source()?;
+        let (source_index, source_name) = self.load_source()?;
         write_line_ignored(self.out, format_args!("마스터 파일 처리 중..."));
         let mut book = StdWorkbook::open(master_path)?;
         let (changes, added, deleted) =
@@ -210,7 +221,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
             added: &added,
             changes: &changes,
             deleted: &deleted,
-            source_path: &source_path,
+            source_name: &source_name,
         });
         Ok(())
     }

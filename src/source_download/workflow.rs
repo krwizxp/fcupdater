@@ -5,8 +5,8 @@ use super::{
     OPINET_KEY, SourceDownloadOps, http_client, lossy_prefix,
 };
 use crate::{
-    Result, err, err_with_source, normalize_address_key, path_source_message, prefixed_message,
-    source_sync::SourceRecord,
+    Result, SourceRecord, err, err_with_source, normalize_address_key, path_source_message,
+    prefixed_message,
 };
 use alloc::{string::String, vec::Vec};
 use core::result::Result as StdResult;
@@ -15,15 +15,13 @@ use std::{
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
-const TARGET_REGION_KEYS: [&str; 13] = [
+const TARGET_REGION_KEYS: [&str; 11] = [
     "대전대덕구",
     "대전동구",
     "대전서구",
     "대전유성구",
     "대전중구",
-    "세종",
     "세종시",
-    "세종세종시",
     "충북청주시",
     "충남공주시",
     "충남보령시",
