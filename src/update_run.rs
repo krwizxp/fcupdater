@@ -22,6 +22,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
+const MAX_DELETED_RATIO_NUMERATOR: usize = 1;
+const MAX_DELETED_RATIO_DENOMINATOR: usize = 2;
 pub struct UpdateSummary<'data> {
     added: &'data [StoreRow],
     changes: &'data [ChangeRow],
@@ -42,6 +44,11 @@ pub trait UpdateRunContextExt {
     fn read_source_records(&self, path: &Path) -> Result<Vec<SourceRecord>>;
     fn resolve_today(&self) -> Result<String>;
     fn run_update(&mut self) -> Result<()>;
+    fn validate_deleted_ratio(
+        &self,
+        source_index: &HashMap<String, SourceRecord>,
+        deleted: &[StoreRow],
+    ) -> Result<()>;
 }
 impl UpdateRunContextExt for UpdateRunContext<'_> {
     fn build_source_index(
@@ -212,6 +219,7 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
         let mut book = StdWorkbook::open(master_path)?;
         let (changes, added, deleted) =
             master_sheet::MasterSheetOps.update_master_sheet(&mut book, &source_index)?;
+        self.validate_deleted_ratio(&source_index, &deleted)?;
         let today = self.resolve_today()?;
         change_log::ChangeLogSheetService
             .update_change_log_sheet(&mut book, &today, &changes, &added, &deleted)?;
@@ -223,6 +231,31 @@ impl UpdateRunContextExt for UpdateRunContext<'_> {
             deleted: &deleted,
             source_name: &source_name,
         });
+        Ok(())
+    }
+    fn validate_deleted_ratio(
+        &self,
+        source_index: &HashMap<String, SourceRecord>,
+        deleted: &[StoreRow],
+    ) -> Result<()> {
+        let total_considered = source_index.len().saturating_add(deleted.len());
+        if total_considered == 0 {
+            return Err(err("현행화 대상 레코드를 찾지 못했습니다."));
+        }
+        let deleted_scaled = deleted
+            .len()
+            .checked_mul(MAX_DELETED_RATIO_DENOMINATOR)
+            .ok_or_else(|| err("폐업 처리 비율 계산 중 overflow가 발생했습니다."))?;
+        let limit_scaled = total_considered
+            .checked_mul(MAX_DELETED_RATIO_NUMERATOR)
+            .ok_or_else(|| err("폐업 처리 한도 계산 중 overflow가 발생했습니다."))?;
+        if deleted_scaled >= limit_scaled {
+            return Err(err(format!(
+                "폐업 처리 건수가 비정상적으로 많아 저장을 중단합니다: {}건 / {}건",
+                deleted.len(),
+                total_considered
+            )));
+        }
         Ok(())
     }
 }
