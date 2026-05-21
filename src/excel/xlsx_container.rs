@@ -156,9 +156,12 @@ impl TempArchivePromotion<'_> {
                     let target_path = self.target_xlsx.display().to_string();
                     write_durability_warning("파일", &target_path, &source_err);
                 }
-                if let Some(parent) = self.target_xlsx.parent()
-                    && let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all())
-                {
+                let parent = self
+                    .target_xlsx
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
                     let parent_path = parent.display().to_string();
                     write_durability_warning("폴더", &parent_path, &source_err);
                 }
