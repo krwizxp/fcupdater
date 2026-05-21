@@ -1,10 +1,6 @@
-use crate::{Result, SourceRecord};
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String};
 use core::result::Result as StdResult;
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{io::Write, path::Path};
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         mod libcurl;
@@ -35,18 +31,22 @@ const GAS_STATION_API_GBN: &str = "A";
 const DEFAULT_REGION_LABEL: &str = "선택하세요.";
 const USER_AGENT: &str = concat!("fcupdater/", env!("CARGO_PKG_VERSION"));
 const NETFUNNEL_POLL_LIMIT: usize = 20;
-pub struct SourceDownloadOps;
-use workflow::SourceDownloadOpsExt as _;
-impl SourceDownloadOps {
-    pub fn filter_target_region_records(
-        &self,
-        records: Vec<SourceRecord>,
-    ) -> Result<Vec<SourceRecord>> {
-        self.filter_target_region_records_impl(records)
-    }
-    pub fn refresh_source(&self, dir: &Path, out: &mut dyn Write) -> Result<PathBuf> {
-        self.refresh_source_impl(dir, out)
-    }
+pub const TARGET_REGION_KEYS: [&str; 11] = [
+    "대전대덕구",
+    "대전동구",
+    "대전서구",
+    "대전유성구",
+    "대전중구",
+    "세종시",
+    "충북청주시",
+    "충남공주시",
+    "충남보령시",
+    "충남아산시",
+    "충남천안시",
+];
+pub struct SourceDownload<'dir, 'out> {
+    pub dir: &'dir Path,
+    pub out: &'out mut dyn Write,
 }
 fn lossy_prefix(bytes: &[u8], max_len: usize) -> Cow<'_, str> {
     let prefix_len = bytes.len().min(max_len);
@@ -55,23 +55,27 @@ fn lossy_prefix(bytes: &[u8], max_len: usize) -> Cow<'_, str> {
     };
     String::from_utf8_lossy(prefix)
 }
-#[cfg(windows)]
-fn checked_http_buffer_len(
-    label: &str,
-    current_len: usize,
-    additional_len: usize,
-    limit: usize,
-) -> StdResult<usize, String> {
-    let next_len = current_len
-        .checked_add(additional_len)
-        .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
-    if next_len > limit {
-        Err(format!(
-            "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
-        ))
-    } else {
-        Ok(next_len)
+cfg_select! {
+    windows => {
+        fn checked_http_buffer_len(
+            label: &str,
+            current_len: usize,
+            additional_len: usize,
+            limit: usize,
+        ) -> StdResult<usize, String> {
+            let next_len = current_len
+                .checked_add(additional_len)
+                .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
+            if next_len > limit {
+                Err(format!(
+                    "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
+                ))
+            } else {
+                Ok(next_len)
+            }
+        }
     }
+    _ => {}
 }
 fn enforce_http_content_length_limit(
     headers: &[(String, String)],

@@ -48,76 +48,45 @@ struct ChangeLogEntry {
     reason: String,
     region: String,
 }
-struct ChangeLogUpdater<'sheet, 'shared> {
+struct ChangeLogUpdater<'sheet, 'shared, 'data> {
+    added: &'data [StoreRow],
+    changes: &'data [ChangeRow],
+    deleted: &'data [StoreRow],
     shared_string_table: &'shared [String],
+    today: &'data str,
     worksheet: &'sheet mut Worksheet,
 }
-pub struct ChangeLogSheetService;
-pub trait ChangeLogSheetServiceExt {
-    fn update_change_log_sheet(
-        &self,
-        book: &mut StdWorkbook,
-        today: &str,
-        changes: &[ChangeRow],
-        added: &[StoreRow],
-        deleted: &[StoreRow],
-    ) -> Result<()>;
+pub struct ChangeLogSheetService<'book, 'data> {
+    pub added: &'data [StoreRow],
+    pub book: &'book mut StdWorkbook,
+    pub changes: &'data [ChangeRow],
+    pub deleted: &'data [StoreRow],
+    pub today: &'data str,
 }
-trait ChangeLogUpdaterExt {
-    fn build_entries(
-        &self,
-        changes: &[ChangeRow],
-        added: &[StoreRow],
-        deleted: &[StoreRow],
-    ) -> Result<Vec<ChangeLogEntry>>;
-    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<()>;
-    fn find_layout(&self) -> Result<ChangeLogLayout>;
-    fn select_style_template_row(&self, layout: &ChangeLogLayout) -> u32;
-    fn update(
-        &mut self,
-        today: &str,
-        changes: &[ChangeRow],
-        added: &[StoreRow],
-        deleted: &[StoreRow],
-    ) -> Result<()>;
-    fn validate_fixed_header(&self) -> Result<()>;
-    fn write_entries(
-        &mut self,
-        layout: &ChangeLogLayout,
-        style_template_row: u32,
-        entries: &[ChangeLogEntry],
-    ) -> Result<()>;
-}
-impl ChangeLogSheetServiceExt for ChangeLogSheetService {
-    fn update_change_log_sheet(
-        &self,
-        book: &mut StdWorkbook,
-        today: &str,
-        changes: &[ChangeRow],
-        added: &[StoreRow],
-        deleted: &[StoreRow],
-    ) -> Result<()> {
-        book.with_sheet_mut("변경내역", |ws, shared_strings| -> Result<()> {
-            let mut updater = ChangeLogUpdater {
-                shared_string_table: shared_strings,
-                worksheet: ws,
-            };
-            updater.update(today, changes, added, deleted)
-        })
-        .ok_or_else(|| err("마스터 파일에 '변경내역' 시트가 없습니다"))?
+impl ChangeLogSheetService<'_, '_> {
+    pub fn update(&mut self) -> Result<()> {
+        self.book
+            .with_sheet_mut("변경내역", |ws, shared_strings| -> Result<()> {
+                let mut updater = ChangeLogUpdater {
+                    added: self.added,
+                    changes: self.changes,
+                    deleted: self.deleted,
+                    shared_string_table: shared_strings,
+                    today: self.today,
+                    worksheet: ws,
+                };
+                updater.update()
+            })
+            .ok_or_else(|| err("마스터 파일에 '변경내역' 시트가 없습니다"))?
     }
 }
-impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
-    fn build_entries(
-        &self,
-        changes: &[ChangeRow],
-        added: &[StoreRow],
-        deleted: &[StoreRow],
-    ) -> Result<Vec<ChangeLogEntry>> {
-        let entry_capacity = changes
+impl ChangeLogUpdater<'_, '_, '_> {
+    fn build_entries(&self) -> Result<Vec<ChangeLogEntry>> {
+        let entry_capacity = self
+            .changes
             .len()
-            .saturating_add(added.len())
-            .saturating_add(deleted.len());
+            .saturating_add(self.added.len())
+            .saturating_add(self.deleted.len());
         let mut entries: Vec<ChangeLogEntry> = Vec::new();
         entries
             .try_reserve_exact(entry_capacity)
@@ -127,7 +96,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                     source,
                 )
             })?;
-        for change in changes {
+        for change in self.changes {
             entries.push(ChangeLogEntry {
                 reason: change.reason.clone(),
                 region: change.region.clone(),
@@ -141,7 +110,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 new_diesel: change.new_diesel,
             });
         }
-        for item in added {
+        for item in self.added {
             entries.push(ChangeLogEntry {
                 reason: "신규".to_owned(),
                 region: item.region.clone(),
@@ -155,7 +124,7 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
                 new_diesel: item.diesel,
             });
         }
-        for item in deleted {
+        for item in self.deleted {
             entries.push(ChangeLogEntry {
                 reason: "폐업".to_owned(),
                 region: item.region.clone(),
@@ -270,19 +239,13 @@ impl ChangeLogUpdaterExt for ChangeLogUpdater<'_, '_> {
             .find(|row| self.worksheet.has_any_row_format(*row, layout.max_col))
             .unwrap_or(layout.data_start_row)
     }
-    fn update(
-        &mut self,
-        today: &str,
-        changes: &[ChangeRow],
-        added: &[StoreRow],
-        deleted: &[StoreRow],
-    ) -> Result<()> {
-        let date_text = format!("현행화 일자: {today}");
+    fn update(&mut self) -> Result<()> {
+        let date_text = format!("현행화 일자: {}", self.today);
         self.worksheet.set_string_at(1, 2, &date_text);
         let layout = self.find_layout()?;
         let style_template_row = self.select_style_template_row(&layout);
         self.clear_existing_rows(&layout)?;
-        let entries = self.build_entries(changes, added, deleted)?;
+        let entries = self.build_entries()?;
         self.write_entries(&layout, style_template_row, &entries)?;
         self.worksheet.update_dimension()?;
         Ok(())

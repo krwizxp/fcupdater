@@ -153,11 +153,33 @@ impl HeaderList {
         self.0 = Some(updated);
         Ok(())
     }
-    fn as_ptr(&self) -> *mut CurlSlist {
-        match self.0 {
-            Some(list) => list.as_ptr(),
-            None => null_mut(),
+    const fn as_ptr(&self) -> *mut CurlSlist {
+        let Some(list) = self.0 else {
+            return null_mut();
+        };
+        list.as_ptr()
+    }
+}
+impl TryFrom<&[(&str, &str)]> for HeaderList {
+    type Error = String;
+    fn try_from(request_headers: &[(&str, &str)]) -> Result<Self, Self::Error> {
+        let mut header_list = Self(None);
+        for &(name, value) in request_headers {
+            let header_capacity = name
+                .len()
+                .saturating_add(": ".len())
+                .saturating_add(value.len());
+            let mut header = String::new();
+            header
+                .try_reserve(header_capacity)
+                .map_err(|source| format!("HTTP header 메모리 확보 실패: {source}"))?;
+            header.push_str(name);
+            header.push_str(": ");
+            header.push_str(value);
+            let header_c = cstring("HTTP header", &header)?;
+            header_list.append(header_c.as_c_str())?;
         }
+        Ok(header_list)
     }
 }
 impl Client {
@@ -194,22 +216,7 @@ impl Client {
         raw_url.push_str(host);
         raw_url.push_str(path);
         let url = cstring("URL", &raw_url)?;
-        let mut header_list = HeaderList(None);
-        for &(name, value) in request_headers {
-            let header_capacity = name
-                .len()
-                .saturating_add(": ".len())
-                .saturating_add(value.len());
-            let mut header = String::new();
-            header
-                .try_reserve(header_capacity)
-                .map_err(|source| format!("HTTP header 메모리 확보 실패: {source}"))?;
-            header.push_str(name);
-            header.push_str(": ");
-            header.push_str(value);
-            let header_c = cstring("HTTP header", &header)?;
-            header_list.append(header_c.as_c_str())?;
-        }
+        let header_list = HeaderList::try_from(request_headers)?;
         let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
         let mut response_buffers = ResponseBuffers {
             body: BoundedResponseBuffer::new("본문", HTTP_MAX_BODY_BYTES),
@@ -335,11 +342,11 @@ impl ResponseBuffers {
             if line.starts_with("HTTP/") {
                 continue;
             }
-            let Some((name, value)) = line.split_once(':') else {
+            let Some((raw_name, raw_value)) = line.split_once(':') else {
                 continue;
             };
-            let name = name.trim_ascii();
-            let value = value.trim_ascii();
+            let name = raw_name.trim_ascii();
+            let value = raw_value.trim_ascii();
             let mut header_name = String::new();
             header_name
                 .try_reserve(name.len())
@@ -387,27 +394,19 @@ unsafe extern "C" fn write_vec_callback(
     if len == 0 {
         return 0;
     }
-    // SAFETY: libcurl invokes this callback with a readable payload pointer and
-    // the userdata pointer configured for the active response buffer.
-    let Some((bytes, target)) = (unsafe { callback_payload(ptr, len, userdata) }) else {
+    let Some(payload_head) = NonNull::new(ptr.cast::<u8>()) else {
         return 0;
     };
+    let Some(mut target_ptr) = NonNull::new(userdata.cast::<BoundedResponseBuffer>()) else {
+        return 0;
+    };
+    let payload_ptr = NonNull::slice_from_raw_parts(payload_head, len);
+    // SAFETY: libcurl passes a readable buffer with len bytes for this callback.
+    let bytes = unsafe { payload_ptr.as_ref() };
+    // SAFETY: userdata is the response buffer pointer configured before curl_easy_perform.
+    let target = unsafe { target_ptr.as_mut() };
     if !target.append(bytes) {
         return 0;
     }
     len
-}
-unsafe fn callback_payload<'a>(
-    ptr: *mut c_char,
-    len: usize,
-    userdata: *mut c_void,
-) -> Option<(&'a [u8], &'a mut BoundedResponseBuffer)> {
-    let bytes_ptr = NonNull::new(ptr.cast::<u8>())?;
-    let mut target_ptr = NonNull::new(userdata.cast::<BoundedResponseBuffer>())?;
-    let bytes_ptr = NonNull::slice_from_raw_parts(bytes_ptr, len);
-    // SAFETY: libcurl passes a valid buffer with len bytes for the duration of this callback.
-    let bytes = unsafe { bytes_ptr.as_ref() };
-    // SAFETY: userdata is the target buffer pointer set before curl_easy_perform.
-    let target = unsafe { target_ptr.as_mut() };
-    Some((bytes, target))
 }

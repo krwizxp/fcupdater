@@ -1,4 +1,4 @@
-use core::{fmt::Display, time::Duration};
+use core::time::Duration;
 const DAYS_PER_100_YEARS_I64: i64 = 36_524;
 const DAYS_PER_400_YEARS_I64: i64 = 146_097;
 const DAYS_PER_4_YEARS_I64: i64 = 1_460;
@@ -15,18 +15,12 @@ const MONTH_TERM_MULTIPLIER_I64: i64 = 153;
 const MONTH_TERM_OFFSET_I64: i64 = 2;
 const PRE_MARCH_MONTH_OFFSET_I64: i64 = 9;
 pub const SECS_PER_DAY_U64: u64 = 86_400;
-pub struct KstDateCalculator;
-pub trait KstDateCalculatorExt {
-    fn civil_from_days(&self, z: i32) -> Option<(i32, u32, u32)>;
-    fn format_ymd<Y, M, D>(&self, prefix: &str, year: Y, month: M, day: D) -> String
-    where
-        Y: Display,
-        M: Display,
-        D: Display;
+pub struct KstDateCalculator {
+    pub day_index: i32,
 }
-impl KstDateCalculatorExt for KstDateCalculator {
-    fn civil_from_days(&self, z: i32) -> Option<(i32, u32, u32)> {
-        let shifted_days = i64::from(z).checked_add(DAYS_UNTIL_UNIX_EPOCH_I64)?;
+impl KstDateCalculator {
+    pub fn civil_from_days(&self) -> Option<(i32, u32, u32)> {
+        let shifted_days = i64::from(self.day_index).checked_add(DAYS_UNTIL_UNIX_EPOCH_I64)?;
         let era = shifted_days.div_euclid(DAYS_PER_400_YEARS_I64);
         let doe = shifted_days.rem_euclid(DAYS_PER_400_YEARS_I64);
         let yoe_after_first = doe.checked_sub(doe.checked_div(DAYS_PER_4_YEARS_I64)?)?;
@@ -62,13 +56,5 @@ impl KstDateCalculatorExt for KstDateCalculator {
         let year_adjust = i64::from(month <= MARCH_MONTH_THRESHOLD);
         let year = i32::try_from(y.checked_add(year_adjust)?).ok()?;
         Some((year, month, day))
-    }
-    fn format_ymd<Y, M, D>(&self, prefix: &str, year: Y, month: M, day: D) -> String
-    where
-        Y: Display,
-        M: Display,
-        D: Display,
-    {
-        format!("{prefix}{year:04}-{month:02}-{day:02}")
     }
 }

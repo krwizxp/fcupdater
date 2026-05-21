@@ -2,51 +2,50 @@ use super::{
     CURRENT_PRICE_PAGE_DIV, DEFAULT_REGION_LABEL, GAS_STATION_API_GBN, GAS_STATION_LPG_CODE,
     NETFUNNEL_DOWNLOAD_ACTION_ID, NETFUNNEL_ENTRY_ACTION_ID, OIL_PRICE_DOWNLOAD_TAR_URL,
     OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH, OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST,
-    OPINET_KEY, SourceDownloadOps, http_client, lossy_prefix,
+    OPINET_KEY, SourceDownload, http_client, lossy_prefix,
 };
-use crate::{
-    Result, SourceRecord, err, err_with_source, normalize_address_key, path_source_message,
-    prefixed_message,
-};
-use alloc::{string::String, vec::Vec};
+use crate::{Result, err, path_source_message, prefixed_message};
+use alloc::string::String;
 use core::result::Result as StdResult;
 use std::{
     fs,
     io::{ErrorKind, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
-const TARGET_REGION_KEYS: [&str; 11] = [
-    "대전대덕구",
-    "대전동구",
-    "대전서구",
-    "대전유성구",
-    "대전중구",
-    "세종시",
-    "충북청주시",
-    "충남공주시",
-    "충남보령시",
-    "충남아산시",
-    "충남천안시",
-];
 const AUTO_SOURCE_FILE_NAME: &str = "fcupdater-opinet-source.xls";
 const AUTO_SOURCE_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
-pub(super) trait SourceDownloadOpsExt {
-    fn filter_target_region_records_impl(
-        &self,
-        records: Vec<SourceRecord>,
-    ) -> Result<Vec<SourceRecord>>;
-    fn refresh_source_impl(&self, dir: &Path, out: &mut dyn Write) -> Result<PathBuf>;
+struct SourceDownloadWorkflow<'out> {
+    canonical_dir: PathBuf,
+    out: &'out mut dyn Write,
 }
-trait SourceDownloadWorkflowExt {
-    fn cleanup_auto_source_files(&self, dir: &Path) -> StdResult<usize, String>;
-    fn download_nationwide_source_http(&self, dir: &Path) -> StdResult<PathBuf, String>;
-    fn record_matches_target_region(&self, record: &SourceRecord) -> bool;
+impl SourceDownload<'_, '_> {
+    pub fn refresh_source(&mut self) -> Result<PathBuf> {
+        fs::create_dir_all(self.dir).map_err(|source_err| {
+            err(path_source_message(
+                "소스 폴더 생성 실패",
+                self.dir,
+                source_err,
+            ))
+        })?;
+        let canonical_dir = self.dir.canonicalize().map_err(|source_err| {
+            err(path_source_message(
+                "소스 폴더 경로 확인 실패",
+                self.dir,
+                source_err,
+            ))
+        })?;
+        SourceDownloadWorkflow {
+            canonical_dir,
+            out: &mut *self.out,
+        }
+        .refresh_source()
+    }
 }
-impl SourceDownloadWorkflowExt for SourceDownloadOps {
-    fn cleanup_auto_source_files(&self, dir: &Path) -> StdResult<usize, String> {
+impl SourceDownloadWorkflow<'_> {
+    fn cleanup_auto_source_files(&self) -> StdResult<usize, String> {
         let mut removed = 0_usize;
         for file_name in [AUTO_SOURCE_FILE_NAME, AUTO_SOURCE_TEMP_FILE_NAME] {
-            let path = dir.join(file_name);
+            let path = self.canonical_dir.join(file_name);
             match fs::remove_file(&path) {
                 Ok(()) => {
                     removed = removed.saturating_add(1);
@@ -63,7 +62,7 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
         }
         Ok(removed)
     }
-    fn download_nationwide_source_http(&self, dir: &Path) -> StdResult<PathBuf, String> {
+    fn download_nationwide_source_http(&self) -> StdResult<PathBuf, String> {
         let mut client = http_client::HttpClient::default();
         let _gate_html = client.get_text(OPINET_HOST, OPDOWNLOAD_PATH, None)?;
         let entry_key = client.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
@@ -110,8 +109,8 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
                 preview,
             ));
         }
-        let target = dir.join(AUTO_SOURCE_FILE_NAME);
-        let temp = dir.join(AUTO_SOURCE_TEMP_FILE_NAME);
+        let target = self.canonical_dir.join(AUTO_SOURCE_FILE_NAME);
+        let temp = self.canonical_dir.join(AUTO_SOURCE_TEMP_FILE_NAME);
         fs::write(&temp, &response.body)
             .map_err(|error| path_source_message("다운로드 파일 쓰기 실패", &temp, error))?;
         match fs::rename(&temp, &target) {
@@ -127,53 +126,14 @@ impl SourceDownloadWorkflowExt for SourceDownloadOps {
         }
         Ok(target)
     }
-    fn record_matches_target_region(&self, record: &SourceRecord) -> bool {
-        let region_key = normalize_address_key(&record.region);
-        TARGET_REGION_KEYS.contains(&region_key.as_str())
-    }
-}
-impl SourceDownloadOpsExt for SourceDownloadOps {
-    fn filter_target_region_records_impl(
-        &self,
-        records: Vec<SourceRecord>,
-    ) -> Result<Vec<SourceRecord>> {
-        let mut filtered = Vec::new();
-        filtered
-            .try_reserve_exact(records.len())
-            .map_err(|source| {
-                let record_count = records.len();
-                err_with_source(
-                    format!("필터링 소스 레코드 목록 메모리 확보 실패: {record_count} records"),
-                    source,
-                )
-            })?;
-        for record in records {
-            if self.record_matches_target_region(&record) {
-                filtered.push(record);
-            }
-        }
-        Ok(filtered)
-    }
-    fn refresh_source_impl(&self, dir: &Path, out: &mut dyn Write) -> Result<PathBuf> {
-        fs::create_dir_all(dir).map_err(|source_err| {
-            err(path_source_message("소스 폴더 생성 실패", dir, source_err))
+    fn refresh_source(&mut self) -> Result<PathBuf> {
+        let removed = self.cleanup_auto_source_files().map_err(|error_text| {
+            err(prefixed_message("기존 자동 소스 정리 실패: ", error_text))
         })?;
-        let canonical_dir = dir.canonicalize().map_err(|source_err| {
-            err(path_source_message(
-                "소스 폴더 경로 확인 실패",
-                dir,
-                source_err,
-            ))
-        })?;
-        let removed = self
-            .cleanup_auto_source_files(&canonical_dir)
-            .map_err(|error_text| {
-                err(prefixed_message("기존 자동 소스 정리 실패: ", error_text))
-            })?;
         if removed > 0 {
-            let _write_result = writeln!(out, "이전 임시 소스 파일 {removed}개 정리");
+            let _write_result = writeln!(self.out, "이전 임시 소스 파일 {removed}개 정리");
         }
-        self.download_nationwide_source_http(&canonical_dir)
+        self.download_nationwide_source_http()
             .map_err(|error_text| err(prefixed_message("Opinet 자동 다운로드 실패: ", error_text)))
     }
 }

@@ -2,7 +2,7 @@ extern crate alloc;
 use cli::ParseAction;
 use core::{error::Error, fmt::Display, result::Result as StdResult};
 use io_util::write_line_ignored;
-pub(crate) use region::{display_region_label_from_source, normalize_address_key};
+pub(crate) use region::{normalize_address_key, parse_region_label};
 pub(crate) use rows::{ChangeRow, SourceRecord, StoreRow};
 pub(crate) use sheet_util::{
     add_row_offset, canon_header, parse_i32_str, same_trimmed, shift_row, usize_to_u32,
@@ -12,7 +12,7 @@ use std::{
     io::{Error as IoError, stdout},
     path::Path,
 };
-use update_run::{UpdateRunContext, UpdateRunContextExt as _};
+use update_run::UpdateRunContext;
 mod change_log;
 mod cli;
 mod excel;

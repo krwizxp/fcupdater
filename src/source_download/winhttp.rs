@@ -7,7 +7,8 @@ use core::{
     ffi::c_void,
     ptr::{NonNull, null, null_mut},
 };
-use std::{ffi::OsStr, os::windows::ffi::OsStrExt as _};
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt as WindowsOsStrExt;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
 const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
@@ -168,8 +169,8 @@ impl Client {
                 WINHTTP_CONNECT_TIMEOUT_MS,
                 WINHTTP_SEND_TIMEOUT_MS,
                 WINHTTP_RECEIVE_TIMEOUT_MS,
-            )
-        };
+            );
+        }
         Ok(session)
     }
     fn query_data_available(&self, request: &Handle) -> Result<u32, String> {
@@ -371,10 +372,7 @@ impl Client {
             headers_text.push_str("\r\n");
         }
         let headers_wide = wide(&headers_text)?;
-        let body_slice = match request_body {
-            Some(body) => body,
-            None => &[],
-        };
+        let body_slice = request_body.unwrap_or_default();
         let body_len = u32::try_from(body_slice.len())
             .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?;
         self.send_request(&request, &headers_wide, body_slice, body_len)?;
@@ -430,7 +428,7 @@ fn wide(value: &str) -> Result<Vec<u16>, String> {
     let mut out = Vec::new();
     out.try_reserve(capacity)
         .map_err(|source| format!("wide 문자열 메모리 확보 실패: {source}"))?;
-    out.extend(OsStr::new(value).encode_wide());
+    out.extend(<OsStr as WindowsOsStrExt>::encode_wide(OsStr::new(value)));
     out.push(0);
     Ok(out)
 }

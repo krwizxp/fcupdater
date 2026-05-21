@@ -1,6 +1,6 @@
 use super::{
     path_util::path_from_slashes,
-    zip_archive::{self, ZipArchiveOpsExt as _, is_safe_archive_entry_path},
+    zip_archive::{self, is_safe_archive_entry_path},
 };
 use crate::{Result, err, path_pair_source_message, path_source_message, prefixed_message};
 use core::{mem, time::Duration};
@@ -13,10 +13,10 @@ use std::{
 };
 cfg_select! {
     windows => {
-        use std::os::windows::ffi::OsStrExt as _;
+        use std::{ffi::OsStr, os::windows::ffi::OsStrExt as WindowsOsStrExt};
     }
     _ => {
-        use std::io::{stderr, Write as _};
+        use std::io::{Write as IoWrite, stderr};
     }
 }
 #[derive(Debug)]
@@ -30,12 +30,6 @@ struct WorkDirCleanup {
     keep: bool,
     path: PathBuf,
 }
-struct ArchiveOps;
-trait ArchiveOpsExt {
-    fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()>;
-    fn promote_temp_archive(&self, temp_archive: &Path, target_xlsx: &Path) -> Result<()>;
-    fn verify_saved_archive(&self, saved_archive: &Path) -> Result<()>;
-}
 impl Drop for WorkDirCleanup {
     fn drop(&mut self) {
         if !self.keep && !self.path.as_os_str().is_empty() {
@@ -45,87 +39,19 @@ impl Drop for WorkDirCleanup {
         }
     }
 }
-impl ArchiveOpsExt for ArchiveOps {
-    fn create_archive(&self, unpack_dir: &Path, archive_path: &Path) -> Result<()> {
-        zip_archive::ZipArchiveOps.create_from_directory(unpack_dir, archive_path)
-    }
-    fn promote_temp_archive(&self, temp_archive: &Path, target_xlsx: &Path) -> Result<()> {
-        cfg_select! {
-            windows => {
-                let replacement_w = encode_path_wide(temp_archive)?;
-                let destination_w = encode_path_wide(target_xlsx)?;
-                if target_xlsx.try_exists().map_err(|source_err| {
-                    err(path_source_message(
-                        "대상 파일 경로 확인 실패",
-                        target_xlsx,
-                        source_err,
-                    ))
-                })? {
-                    if super::windows_api::WindowsFileApi::run(
-                        super::windows_api::WindowsFileOperation::ReplaceWriteThrough,
-                        &destination_w,
-                        &replacement_w,
-                    ) {
-                        return Ok(());
-                    }
-                    let code = super::windows_api::WindowsFileApi::last_error();
-                    return Err(err(windows_file_op_error_message(
-                        "파일 교체 실패(ReplaceFileW): ",
-                        target_xlsx,
-                        Some(temp_archive),
-                        " <- ",
-                        code,
-                    )));
-                }
-                if super::windows_api::WindowsFileApi::run(
-                    super::windows_api::WindowsFileOperation::MoveReplaceWriteThrough,
-                    &replacement_w,
-                    &destination_w,
-                ) {
-                    return Ok(());
-                }
-                let code = super::windows_api::WindowsFileApi::last_error();
-                Err(err(windows_file_op_error_message(
-                    "파일 이동 실패(MoveFileExW): ",
-                    temp_archive,
-                    Some(target_xlsx),
-                    " -> ",
-                    code,
-                )))
-            }
-            _ => {
-                fs::rename(temp_archive, target_xlsx).map_err(|source_err| {
-                    err(path_pair_source_message(
-                        "xlsx 저장 실패",
-                        temp_archive,
-                        target_xlsx,
-                        source_err,
-                    ))
-                })?;
-                if let Err(source_err) = fs::OpenOptions::new()
-                    .read(true)
-                    .open(target_xlsx)
-                    .and_then(|file| file.sync_all())
-                {
-                    let target_path = target_xlsx.display().to_string();
-                    write_durability_warning("파일", &target_path, &source_err);
-                }
-                if let Some(parent) = target_xlsx.parent()
-                    && let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all())
-                {
-                    let parent_path = parent.display().to_string();
-                    write_durability_warning("폴더", &parent_path, &source_err);
-                }
-                Ok(())
-            }
-        }
-    }
-    fn verify_saved_archive(&self, saved_archive: &Path) -> Result<()> {
+struct SavedArchiveVerifier<'path> {
+    saved_archive: &'path Path,
+}
+impl SavedArchiveVerifier<'_> {
+    fn verify(&self) -> Result<()> {
         let verify_work = create_unique_work_dir()?;
         let verify_unpacked = verify_work.join("verify_unpacked");
         create_dir_all_checked(&verify_unpacked, "저장 검증용 임시 폴더 생성 실패")?;
         let verify_result = (|| -> Result<()> {
-            for entry_name in Self::list_archive_entries(saved_archive)? {
+            let archive_entries = zip_archive::ZipArchiveEntries {
+                archive_path: self.saved_archive,
+            };
+            for entry_name in archive_entries.list()? {
                 if !is_safe_archive_entry_path(&entry_name) {
                     return Err(err(prefixed_message(
                         "허용되지 않은 압축 경로가 포함되어 있습니다: ",
@@ -133,7 +59,11 @@ impl ArchiveOpsExt for ArchiveOps {
                     )));
                 }
             }
-            extract_archive(saved_archive, &verify_unpacked)?;
+            zip_archive::ZipArchiveExtractor {
+                archive_path: self.saved_archive,
+                unpack_dir: &verify_unpacked,
+            }
+            .extract()?;
             for rel in [
                 "[Content_Types].xml",
                 "xl/workbook.xml",
@@ -147,10 +77,10 @@ impl ArchiveOpsExt for ArchiveOps {
                     )));
                 }
             }
-            super::writer::Workbook::open(saved_archive).map_err(|source_err| {
+            super::writer::Workbook::open(self.saved_archive).map_err(|source_err| {
                 err(path_source_message(
                     "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
-                    saved_archive,
+                    self.saved_archive,
                     source_err,
                 ))
             })?;
@@ -162,9 +92,79 @@ impl ArchiveOpsExt for ArchiveOps {
         verify_result
     }
 }
-impl ArchiveOps {
-    fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>> {
-        zip_archive::ZipArchiveOps.list_entries(archive_path)
+struct TempArchivePromotion<'path> {
+    target_xlsx: &'path Path,
+    temp_archive: &'path Path,
+}
+impl TempArchivePromotion<'_> {
+    fn promote(&self) -> Result<()> {
+        cfg_select! {
+            windows => {
+                let replacement_w = encode_path_wide(self.temp_archive)?;
+                let destination_w = encode_path_wide(self.target_xlsx)?;
+                if self.target_xlsx.try_exists().map_err(|source_err| {
+                    err(path_source_message(
+                        "대상 파일 경로 확인 실패",
+                        self.target_xlsx,
+                        source_err,
+                    ))
+                })? {
+                    if let Some(code) = super::windows_api::WindowsFileApi::run_with_retry(
+                        super::windows_api::WindowsFileOperation::ReplaceWriteThrough,
+                        &destination_w,
+                        &replacement_w,
+                    ) {
+                        return Err(err(windows_file_op_error_message(
+                            "파일 교체 실패(ReplaceFileW): ",
+                            self.target_xlsx,
+                            Some(self.temp_archive),
+                            " <- ",
+                            code,
+                        )));
+                    }
+                    return Ok(());
+                }
+                if let Some(code) = super::windows_api::WindowsFileApi::run_with_retry(
+                    super::windows_api::WindowsFileOperation::MoveReplaceWriteThrough,
+                    &replacement_w,
+                    &destination_w,
+                ) {
+                    return Err(err(windows_file_op_error_message(
+                        "파일 이동 실패(MoveFileExW): ",
+                        self.temp_archive,
+                        Some(self.target_xlsx),
+                        " -> ",
+                        code,
+                    )));
+                }
+                Ok(())
+            }
+            _ => {
+                fs::rename(self.temp_archive, self.target_xlsx).map_err(|source_err| {
+                    err(path_pair_source_message(
+                        "xlsx 저장 실패",
+                        self.temp_archive,
+                        self.target_xlsx,
+                        source_err,
+                    ))
+                })?;
+                if let Err(source_err) = fs::OpenOptions::new()
+                    .read(true)
+                    .open(self.target_xlsx)
+                    .and_then(|file| file.sync_all())
+                {
+                    let target_path = self.target_xlsx.display().to_string();
+                    write_durability_warning("파일", &target_path, &source_err);
+                }
+                if let Some(parent) = self.target_xlsx.parent()
+                    && let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all())
+                {
+                    let parent_path = parent.display().to_string();
+                    write_durability_warning("폴더", &parent_path, &source_err);
+                }
+                Ok(())
+            }
+        }
     }
 }
 impl TryFrom<&Path> for XlsxContainer {
@@ -197,7 +197,11 @@ impl TryFrom<&Path> for XlsxContainer {
                 source_err,
             ))
         })?;
-        for entry_name in ArchiveOps::list_archive_entries(&archive_path)? {
+        for entry_name in (zip_archive::ZipArchiveEntries {
+            archive_path: &archive_path,
+        })
+        .list()?
+        {
             if !is_safe_archive_entry_path(&entry_name) {
                 return Err(err(prefixed_message(
                     "허용되지 않은 압축 경로가 포함되어 있습니다: ",
@@ -205,7 +209,11 @@ impl TryFrom<&Path> for XlsxContainer {
                 )));
             }
         }
-        extract_archive(&archive_path, &unpack_dir)?;
+        zip_archive::ZipArchiveExtractor {
+            archive_path: &archive_path,
+            unpack_dir: &unpack_dir,
+        }
+        .extract()?;
         cleanup.keep = true;
         let work_dir = mem::take(&mut cleanup.path);
         Ok(Self {
@@ -258,7 +266,6 @@ impl XlsxContainer {
         Ok(self.unpack_dir.join(path))
     }
     pub fn save(&self, target_xlsx: &Path) -> Result<()> {
-        let archive_ops = ArchiveOps;
         if self.archive_path.try_exists().map_err(|source_err| {
             err(path_source_message(
                 "archive 경로 확인 실패",
@@ -274,7 +281,11 @@ impl XlsxContainer {
                 ))
             })?;
         }
-        archive_ops.create_archive(&self.unpack_dir, &self.archive_path)?;
+        zip_archive::ZipArchiveBuilder {
+            archive_path: &self.archive_path,
+            root: &self.unpack_dir,
+        }
+        .create()?;
         let parent = if let Some(parent) = target_xlsx.parent() {
             create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
             parent
@@ -300,8 +311,15 @@ impl XlsxContainer {
                     source_err,
                 ))
             })?;
-            archive_ops.verify_saved_archive(&tmp_archive)?;
-            archive_ops.promote_temp_archive(&tmp_archive, target_xlsx)?;
+            SavedArchiveVerifier {
+                saved_archive: &tmp_archive,
+            }
+            .verify()?;
+            TempArchivePromotion {
+                target_xlsx,
+                temp_archive: &tmp_archive,
+            }
+            .promote()?;
             Ok(())
         })();
         result.inspect_err(|_| match fs::remove_file(&tmp_archive) {
@@ -327,14 +345,18 @@ impl Drop for XlsxContainer {
         }
     }
 }
-#[cfg(not(windows))]
-fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::Error) {
-    let mut err = stderr().lock();
-    match writeln!(
-        err,
-        "경고: 저장 내구성 동기화 실패({path_kind}): {path_text} ({source_err})",
-    ) {
-        Ok(()) | Err(_) => {}
+cfg_select! {
+    windows => {}
+    _ => {
+        fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::Error) {
+            let mut err = stderr().lock();
+            match IoWrite::write_fmt(
+                &mut err,
+                format_args!("경고: 저장 내구성 동기화 실패({path_kind}): {path_text} ({source_err})\n"),
+            ) {
+                Ok(()) | Err(_) => {}
+            }
+        }
     }
 }
 fn create_unique_work_dir() -> Result<PathBuf> {
@@ -383,43 +405,43 @@ where
     }
     Err(err(exhausted_message))
 }
-fn extract_archive(archive_path: &Path, unpack_dir: &Path) -> Result<()> {
-    zip_archive::ZipArchiveOps.extract_to_directory(archive_path, unpack_dir)
-}
-#[cfg(windows)]
-fn encode_path_wide(path: &Path) -> Result<Vec<u16>> {
-    let unit_count = path.as_os_str().encode_wide().count();
-    let capacity = unit_count
-        .checked_add(1)
-        .ok_or_else(|| err("Windows path wide 문자열 용량 계산 실패"))?;
-    let mut out = Vec::new();
-    out.try_reserve(capacity).map_err(|source| {
-        crate::err_with_source("Windows path wide 문자열 메모리 확보 실패", source)
-    })?;
-    out.extend(path.as_os_str().encode_wide());
-    out.push(0);
-    Ok(out)
-}
 fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
     format!("{prefix}{relative_path}")
 }
-#[cfg(windows)]
-fn windows_file_op_error_message(
-    prefix: &str,
-    from: &Path,
-    to: Option<&Path>,
-    arrow: &str,
-    code: u32,
-) -> String {
-    to.map_or_else(
-        || format!("{prefix}{} (GetLastError={code})", from.display()),
-        |target| {
-            format!(
-                "{prefix}{}{}{} (GetLastError={code})",
-                from.display(),
-                arrow,
-                target.display()
+cfg_select! {
+    windows => {
+        fn encode_path_wide(path: &Path) -> Result<Vec<u16>> {
+            let unit_count = <OsStr as WindowsOsStrExt>::encode_wide(path.as_os_str()).count();
+            let capacity = unit_count
+                .checked_add(1)
+                .ok_or_else(|| err("Windows path wide 문자열 용량 계산 실패"))?;
+            let mut out = Vec::new();
+            out.try_reserve(capacity).map_err(|source| {
+                crate::err_with_source("Windows path wide 문자열 메모리 확보 실패", source)
+            })?;
+            out.extend(<OsStr as WindowsOsStrExt>::encode_wide(path.as_os_str()));
+            out.push(0);
+            Ok(out)
+        }
+        fn windows_file_op_error_message(
+            prefix: &str,
+            from: &Path,
+            to: Option<&Path>,
+            arrow: &str,
+            code: u32,
+        ) -> String {
+            to.map_or_else(
+                || format!("{prefix}{} (GetLastError={code})", from.display()),
+                |target| {
+                    format!(
+                        "{prefix}{}{}{} (GetLastError={code})",
+                        from.display(),
+                        arrow,
+                        target.display()
+                    )
+                },
             )
-        },
-    )
+        }
+    }
+    _ => {}
 }

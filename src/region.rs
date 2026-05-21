@@ -35,16 +35,7 @@ pub fn normalize_address_key(addr: &str) -> String {
     }
     out
 }
-pub fn display_region_label_from_source(region: &str, address: &str) -> String {
-    if let Some(label) = parse_region_label(region) {
-        return label;
-    }
-    if let Some(label) = parse_region_label(address) {
-        return label;
-    }
-    region.trim().to_owned()
-}
-fn parse_region_label(text: &str) -> Option<String> {
+pub fn parse_region_label(text: &str) -> Option<String> {
     let mut tokens = text.split_whitespace();
     let first = tokens.next()?;
     let second = tokens.next();
@@ -61,9 +52,7 @@ fn parse_region_label(text: &str) -> Option<String> {
             "충남" | "충북" | "경기" | "강원" | "전북" | "전남" | "경북" | "경남" | "제주"
         )
     {
-        return second.map(|token| {
-            strip_basic_region_suffix(token).map_or_else(|| token.to_owned(), str::to_owned)
-        });
+        return second.map(|token| strip_basic_region_suffix(token).unwrap_or(token).to_owned());
     }
     if matches!(
         first,

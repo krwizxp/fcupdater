@@ -4,7 +4,7 @@ use super::{
 };
 use crate::prefixed_message;
 use alloc::{string::String, vec::Vec};
-use core::{fmt::Write as _, result::Result as StdResult, time::Duration};
+use core::{fmt::Write as FmtWrite, result::Result as StdResult, time::Duration};
 use std::{
     thread::sleep,
     time::{SystemTime, UNIX_EPOCH},
@@ -307,8 +307,8 @@ impl HttpClient {
                     prefixed_message("NetFunnel ttl fragment 메모리 확보 실패: ", source)
                 })?;
                 fragment.push_str("&ttl=");
-                write!(&mut fragment, "{ttl_value}")
-                    .map_err(|_| "NetFunnel ttl fragment 작성 실패".to_owned())?;
+                FmtWrite::write_fmt(&mut fragment, format_args!("{ttl_value}"))
+                    .map_err(|error| format!("NetFunnel ttl fragment 작성 실패: {error}"))?;
                 fragment
             }
             None => String::new(),
@@ -342,8 +342,8 @@ impl HttpClient {
         path.push_str("&aid=");
         path.push_str(action_id);
         path.push_str("&js=yes&");
-        write!(&mut path, "{timestamp}")
-            .map_err(|_| "NetFunnel timestamp fragment 작성 실패".to_owned())?;
+        FmtWrite::write_fmt(&mut path, format_args!("{timestamp}"))
+            .map_err(|error| format!("NetFunnel timestamp fragment 작성 실패: {error}"))?;
         let response = self.request(
             "GET",
             NETFUNNEL_HOST,
@@ -383,8 +383,5 @@ impl HttpClient {
     }
 }
 fn split_head_or_all(value: &str, separator: char) -> &str {
-    match value.split_once(separator) {
-        Some((head, _)) => head,
-        None => value,
-    }
+    value.split_once(separator).map_or(value, |(head, _)| head)
 }

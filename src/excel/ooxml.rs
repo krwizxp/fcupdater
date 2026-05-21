@@ -17,14 +17,13 @@ pub struct SheetCatalog {
     pub sheet_name_to_path: HashMap<String, String>,
     pub sheet_order: Vec<String>,
 }
-pub trait XlsxOoxmlExt {
-    fn load_shared_strings(&self) -> Result<Vec<String>>;
-    fn load_sheet_catalog(&self) -> Result<SheetCatalog>;
-    fn load_sheet_xml(&self, catalog: &SheetCatalog, sheet_name: &str) -> Result<String>;
+pub(super) struct XlsxOoxml<'container> {
+    pub container: &'container XlsxContainer,
 }
-impl XlsxOoxmlExt for XlsxContainer {
-    fn load_shared_strings(&self) -> Result<Vec<String>> {
+impl XlsxOoxml<'_> {
+    pub fn load_shared_strings(&self) -> Result<Vec<String>> {
         let path = self
+            .container
             .unpack_dir()
             .join(path_from_slashes("xl/sharedStrings.xml"));
         if !(path.try_exists().map_err(|source_err| {
@@ -35,7 +34,7 @@ impl XlsxOoxmlExt for XlsxContainer {
         }))? {
             return Ok(Vec::new());
         }
-        let xml = self.read_text("xl/sharedStrings.xml")?;
+        let xml = self.container.read_text("xl/sharedStrings.xml")?;
         let shared_string_count = xml.matches("<si").count();
         let mut out: Vec<String> = Vec::new();
         out.try_reserve_exact(shared_string_count)
@@ -70,9 +69,9 @@ impl XlsxOoxmlExt for XlsxContainer {
         }
         Ok(out)
     }
-    fn load_sheet_catalog(&self) -> Result<SheetCatalog> {
-        let workbook_xml = self.read_text("xl/workbook.xml")?;
-        let rels_xml = self.read_text("xl/_rels/workbook.xml.rels")?;
+    pub fn load_sheet_catalog(&self) -> Result<SheetCatalog> {
+        let workbook_xml = self.container.read_text("xl/workbook.xml")?;
+        let rels_xml = self.container.read_text("xl/_rels/workbook.xml.rels")?;
         let relationship_count = rels_xml.matches("<Relationship").count();
         let mut rid_to_target: HashMap<String, String> = HashMap::new();
         rid_to_target
@@ -164,12 +163,6 @@ impl XlsxOoxmlExt for XlsxContainer {
             sheet_name_to_path,
             sheet_order,
         })
-    }
-    fn load_sheet_xml(&self, catalog: &SheetCatalog, sheet_name: &str) -> Result<String> {
-        let Some(path) = catalog.sheet_name_to_path.get(sheet_name) else {
-            return Err(err(format!("시트를 찾지 못했습니다: {sheet_name}")));
-        };
-        self.read_text(path)
     }
 }
 fn iter_start_tags<'xml, 'tag>(
