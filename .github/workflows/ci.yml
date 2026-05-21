@@ -28,6 +28,10 @@ jobs:
             binary_name: fcupdater-windows-x64
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
       - name: Install Rust
