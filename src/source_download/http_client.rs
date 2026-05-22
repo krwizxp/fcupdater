@@ -1,11 +1,14 @@
 use super::{
-    HTTP_MAX_BODY_BYTES, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, USER_AGENT,
-    enforce_http_content_length_limit, lossy_prefix,
+    HTTP_MAX_BODY_BYTES, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
+    StreamedBodySummary, USER_AGENT, enforce_http_content_length_limit, lossy_prefix,
 };
-use crate::prefixed_message;
+use crate::{path_source_message, prefixed_message};
 use alloc::{string::String, vec::Vec};
 use core::{fmt::Write as FmtWrite, result::Result as StdResult, time::Duration};
 use std::{
+    fs::{self, File},
+    io::Write as IoWrite,
+    path::Path,
     thread::sleep,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,6 +17,12 @@ const U128_DECIMAL_MAX_LEN: usize = 39;
 #[derive(Debug)]
 pub(super) struct HttpResponse {
     pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+    pub status: u32,
+}
+#[derive(Debug)]
+pub(super) struct HttpStreamResponse {
+    pub body: StreamedBodySummary,
     pub headers: Vec<(String, String)>,
     pub status: u32,
 }
@@ -81,6 +90,35 @@ impl HttpClient {
             out.push_str(&cookie.value);
         }
         Ok(Some(out))
+    }
+    fn encoded_form_body(form: &[(&str, &str)]) -> StdResult<String, String> {
+        let body_capacity = form.iter().try_fold(0_usize, |sum, &(name, value)| {
+            let encoded_capacity = name
+                .len()
+                .checked_add(value.len())?
+                .checked_mul(3)?
+                .checked_add(1)?;
+            let separated_capacity = if sum == 0 {
+                encoded_capacity
+            } else {
+                encoded_capacity.checked_add(1)?
+            };
+            sum.checked_add(separated_capacity)
+        });
+        let mut body = String::new();
+        body.try_reserve(
+            body_capacity.ok_or_else(|| String::from("HTTP form body 메모리 용량 계산 실패"))?,
+        )
+        .map_err(|source| prefixed_message("HTTP form body 메모리 확보 실패: ", source))?;
+        for &(name, value) in form {
+            if !body.is_empty() {
+                body.push('&');
+            }
+            Self::push_percent_encoded(&mut body, name.as_bytes());
+            body.push('=');
+            Self::push_percent_encoded(&mut body, value.as_bytes());
+        }
+        Ok(body)
     }
     fn extract_netfunnel_key(result: &str) -> StdResult<String, String> {
         let Some((_, tail)) = result.split_once("key=") else {
@@ -152,32 +190,45 @@ impl HttpClient {
         referer: Option<&str>,
         ajax: bool,
     ) -> StdResult<HttpResponse, String> {
-        let body_capacity = form.iter().try_fold(0_usize, |sum, &(name, value)| {
-            let encoded_capacity = name
-                .len()
-                .checked_add(value.len())?
-                .checked_mul(3)?
-                .checked_add(1)?;
-            let separated_capacity = if sum == 0 {
-                encoded_capacity
-            } else {
-                encoded_capacity.checked_add(1)?
-            };
-            sum.checked_add(separated_capacity)
-        });
-        let mut body = String::new();
-        body.try_reserve(
-            body_capacity.ok_or_else(|| String::from("HTTP form body 메모리 용량 계산 실패"))?,
-        )
-        .map_err(|source| prefixed_message("HTTP form body 메모리 확보 실패: ", source))?;
-        for &(name, value) in form {
-            if !body.is_empty() {
-                body.push('&');
+        let body = Self::encoded_form_body(form)?;
+        let headers = Self::post_headers(referer, ajax)?;
+        self.request("POST", host, path, Some(body.as_bytes()), &headers)
+    }
+    pub(super) fn post_form_to_file(
+        &mut self,
+        host: &str,
+        path: &str,
+        form: &[(&str, &str)],
+        referer: Option<&str>,
+        ajax: bool,
+        target: &Path,
+    ) -> StdResult<HttpStreamResponse, String> {
+        let body = Self::encoded_form_body(form)?;
+        let headers = Self::post_headers(referer, ajax)?;
+        let mut file = File::create(target).map_err(|source| {
+            path_source_message("다운로드 임시 파일 생성 실패", target, source)
+        })?;
+        let response = match self.request_to_writer(
+            "POST",
+            host,
+            path,
+            Some(body.as_bytes()),
+            &headers,
+            &mut file,
+        ) {
+            Ok(response) => response,
+            Err(error_text) => {
+                drop(file);
+                let _cleanup_result = fs::remove_file(target);
+                return Err(error_text);
             }
-            Self::push_percent_encoded(&mut body, name.as_bytes());
-            body.push('=');
-            Self::push_percent_encoded(&mut body, value.as_bytes());
-        }
+        };
+        IoWrite::flush(&mut file).map_err(|source| {
+            path_source_message("다운로드 임시 파일 flush 실패", target, source)
+        })?;
+        Ok(response)
+    }
+    fn post_headers(referer: Option<&str>, ajax: bool) -> StdResult<Vec<(&str, &str)>, String> {
         let mut headers = Vec::new();
         headers
             .try_reserve(6)
@@ -193,7 +244,7 @@ impl HttpClient {
         if let Some(referer_value) = referer {
             headers.push(("Referer", referer_value));
         }
-        self.request("POST", host, path, Some(body.as_bytes()), &headers)
+        Ok(headers)
     }
     fn push_percent_encoded(out: &mut String, bytes: &[u8]) {
         for byte in bytes {
@@ -366,8 +417,74 @@ impl HttpClient {
         out.push_str(value);
         Ok(out)
     }
+    fn request_to_writer(
+        &mut self,
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+        writer: &mut dyn IoWrite,
+    ) -> StdResult<HttpStreamResponse, String> {
+        let mut merged_headers = Vec::new();
+        let merged_header_capacity = headers.len().saturating_add(3);
+        merged_headers
+            .try_reserve(merged_header_capacity)
+            .map_err(|source| prefixed_message("HTTP request header 메모리 확보 실패: ", source))?;
+        merged_headers.push(("User-Agent", USER_AGENT));
+        merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
+        for header in headers {
+            merged_headers.push(*header);
+        }
+        let cookie_header = self.cookie_header()?;
+        if let Some(cookie_text) = cookie_header.as_deref() {
+            merged_headers.push(("Cookie", cookie_text));
+        }
+        let response = {
+            cfg_select! {
+                windows => {
+                    super::winhttp::CLIENT.request_to_writer(
+                        method,
+                        host,
+                        path,
+                        body,
+                        &merged_headers,
+                        writer,
+                    )
+                }
+                any(target_os = "linux", target_os = "macos") => {
+                    super::libcurl::CLIENT.request_to_writer(
+                        method,
+                        host,
+                        path,
+                        body,
+                        &merged_headers,
+                        writer,
+                    )
+                }
+                _ => {
+                    let _ = (method, host, path, body, headers, &merged_headers, writer);
+                    Err("외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.".to_owned())
+                }
+            }
+        }?;
+        enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
+        self.store_response_cookies_from_headers(&response.headers)?;
+        if !(200..300).contains(&response.status) {
+            let body_preview = response.body.preview_lossy();
+            let status = response.status;
+            return Err(format!("HTTP {status}: {body_preview}"));
+        }
+        Ok(response)
+    }
     fn store_response_cookies(&mut self, response: &HttpResponse) -> StdResult<(), String> {
-        for header in &response.headers {
+        self.store_response_cookies_from_headers(&response.headers)
+    }
+    fn store_response_cookies_from_headers(
+        &mut self,
+        headers: &[(String, String)],
+    ) -> StdResult<(), String> {
+        for header in headers {
             let name = &header.0;
             let value = &header.1;
             if !name.eq_ignore_ascii_case("set-cookie") {

@@ -1,8 +1,8 @@
 use super::{
     CURRENT_PRICE_PAGE_DIV, DEFAULT_REGION_LABEL, GAS_STATION_API_GBN, GAS_STATION_LPG_CODE,
     NETFUNNEL_DOWNLOAD_ACTION_ID, NETFUNNEL_ENTRY_ACTION_ID, OIL_PRICE_DOWNLOAD_TAR_URL,
-    OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH, OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST,
-    OPINET_KEY, SourceDownload, http_client, lossy_prefix,
+    OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH, OPDOWNLOAD_PATH, OPDOWNLOAD_URL,
+    OPINET_HOST, OPINET_KEY, SourceDownload, http_client,
 };
 use crate::{Result, err, path_source_message, prefixed_message};
 use alloc::string::String;
@@ -84,7 +84,9 @@ impl SourceDownloadWorkflow<'_> {
             true,
         )?;
         let download_key = client.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
-        let response = client.post_form(
+        let target = self.canonical_dir.join(AUTO_SOURCE_FILE_NAME);
+        let temp = self.canonical_dir.join(AUTO_SOURCE_TEMP_FILE_NAME);
+        let response = match client.post_form_to_file(
             OPINET_HOST,
             OPDOWNLOAD_EXCEL_PATH,
             &[
@@ -98,21 +100,22 @@ impl SourceDownloadWorkflow<'_> {
             ],
             Some(OPDOWNLOAD_URL),
             false,
-        )?;
-        if !response
-            .body
-            .starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
-        {
-            let preview = lossy_prefix(&response.body, 512);
+            &temp,
+        ) {
+            Ok(response) => response,
+            Err(error_text) => {
+                let _cleanup_result = fs::remove_file(&temp);
+                return Err(error_text);
+            }
+        };
+        if !response.body.starts_with(&OLE2_SIGNATURE) {
+            let preview = response.body.preview_lossy();
+            let _cleanup_result = fs::remove_file(&temp);
             return Err(prefixed_message(
                 "다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: ",
                 preview,
             ));
         }
-        let target = self.canonical_dir.join(AUTO_SOURCE_FILE_NAME);
-        let temp = self.canonical_dir.join(AUTO_SOURCE_TEMP_FILE_NAME);
-        fs::write(&temp, &response.body)
-            .map_err(|error| path_source_message("다운로드 파일 쓰기 실패", &temp, error))?;
         match fs::rename(&temp, &target) {
             Ok(()) => {}
             Err(error) => {

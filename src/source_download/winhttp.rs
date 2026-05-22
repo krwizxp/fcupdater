@@ -1,6 +1,8 @@
 use super::{
     HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, checked_http_buffer_len,
-    enforce_http_content_length_limit, http_client::HttpResponse,
+    enforce_http_content_length_limit,
+    http_client::{HttpResponse, HttpStreamResponse},
+    StreamedBodySummary, StreamingBodySink,
 };
 use alloc::{string::String, vec::Vec};
 use core::{
@@ -8,6 +10,7 @@ use core::{
     ptr::{NonNull, null, null_mut},
 };
 use std::ffi::OsStr;
+use std::io::Write as IoWrite;
 use std::os::windows::ffi::OsStrExt as WindowsOsStrExt;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
@@ -308,6 +311,52 @@ impl Client {
         }
         Ok(body)
     }
+    fn read_body_to_writer(
+        &self,
+        request: &Handle,
+        writer: &mut dyn IoWrite,
+    ) -> Result<StreamedBodySummary, String> {
+        let mut sink = StreamingBodySink {
+            error: None,
+            limit: HTTP_MAX_BODY_BYTES,
+            summary: StreamedBodySummary {
+                bytes_seen: 0,
+                prefix: Vec::new(),
+                preview: Vec::new(),
+            },
+            writer,
+        };
+        let mut chunk_buffer = Vec::new();
+        loop {
+            let available = self.query_data_available(request)?;
+            if available == 0 {
+                break;
+            }
+            let chunk_len = usize::try_from(available)
+                .map_err(|source| format!("응답 chunk 길이 변환 실패: {source}"))?;
+            checked_http_buffer_len("본문", 0, chunk_len, HTTP_MAX_BODY_BYTES)?;
+            chunk_buffer.clear();
+            chunk_buffer
+                .try_reserve(chunk_len)
+                .map_err(|source| format!("응답 본문 chunk 메모리 확보 실패: {source}"))?;
+            chunk_buffer.resize(chunk_len, 0);
+            let read = self.read_chunk(request, &mut chunk_buffer, available)?;
+            let read_len = usize::try_from(read)
+                .map_err(|source| format!("응답 read 길이 변환 실패: {source}"))?;
+            checked_http_buffer_len("본문", 0, read_len, HTTP_MAX_BODY_BYTES)?;
+            chunk_buffer.truncate(read_len);
+            if !sink.append(&chunk_buffer) {
+                return Err(sink
+                    .error
+                    .take()
+                    .unwrap_or_else(|| "응답 본문 파일 쓰기 실패".to_owned()));
+            }
+            if read == 0 {
+                break;
+            }
+        }
+        Ok(sink.summary)
+    }
     fn read_chunk(
         &self,
         request: &Handle,
@@ -382,6 +431,55 @@ impl Client {
         enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
         let response_body = self.read_body(&request)?;
         Ok(HttpResponse {
+            body: response_body,
+            headers: response_headers,
+            status,
+        })
+    }
+    pub(super) fn request_to_writer(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        request_body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+        writer: &mut dyn IoWrite,
+    ) -> Result<HttpStreamResponse, String> {
+        let user_agent = wide(super::USER_AGENT)?;
+        let host_wide = wide(host)?;
+        let method_wide = wide(method)?;
+        let path_wide = wide(path)?;
+        let session = self.open_session(&user_agent)?;
+        let connect = self.connect(&session, &host_wide)?;
+        let request = self.open_request(&connect, &method_wide, &path_wide)?;
+        let header_capacity = headers.iter().fold(0_usize, |acc, &(name, value)| {
+            acc.saturating_add(name.len())
+                .saturating_add(value.len())
+                .saturating_add(4)
+        });
+        let mut headers_text = String::new();
+        headers_text
+            .try_reserve(header_capacity)
+            .map_err(|source| format!("요청 헤더 메모리 확보 실패: {source}"))?;
+        for header in headers {
+            let name = header.0;
+            let value = header.1;
+            headers_text.push_str(name);
+            headers_text.push_str(": ");
+            headers_text.push_str(value);
+            headers_text.push_str("\r\n");
+        }
+        let headers_wide = wide(&headers_text)?;
+        let body_slice = request_body.unwrap_or_default();
+        let body_len = u32::try_from(body_slice.len())
+            .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?;
+        self.send_request(&request, &headers_wide, body_slice, body_len)?;
+        self.receive_response(&request)?;
+        let status = self.query_status(&request)?;
+        let response_headers = self.query_headers(&request)?;
+        enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
+        let response_body = self.read_body_to_writer(&request, writer)?;
+        Ok(HttpStreamResponse {
             body: response_body,
             headers: response_headers,
             status,

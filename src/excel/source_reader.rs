@@ -549,31 +549,24 @@ impl SstChunkReader<'_, '_> {
         }
         Ok(out)
     }
-    fn remaining_bytes(&self) -> usize {
-        let mut total = 0_usize;
-        for (idx, chunk) in self.chunks.iter().enumerate().skip(self.chunk_index) {
-            let consumed = if idx == self.chunk_index {
-                self.offset_in_chunk.min(chunk.len())
-            } else {
-                0
-            };
-            total = total.saturating_add(chunk.len().saturating_sub(consumed));
-        }
-        total
-    }
     fn skip_bytes(&mut self, len: usize) -> Result<()> {
-        if len > self.remaining_bytes() {
-            return Err(err(format!(
-                "SST data가 예상보다 짧습니다. (요청 {len} bytes)"
-            )));
-        }
         let mut remaining = len;
         while remaining > 0 {
-            self.ensure_available()?;
-            let chunk = *self
-                .chunks
-                .get(self.chunk_index)
-                .ok_or_else(|| err("SST chunk 접근 범위 오류"))?;
+            while let Some(chunk) = self.chunks.get(self.chunk_index) {
+                if self.offset_in_chunk < chunk.len() {
+                    break;
+                }
+                self.chunk_index = self
+                    .chunk_index
+                    .checked_add(1)
+                    .ok_or_else(|| err("SST chunk index overflow가 발생했습니다."))?;
+                self.offset_in_chunk = 0;
+            }
+            let Some(chunk) = self.chunks.get(self.chunk_index).copied() else {
+                return Err(err(format!(
+                    "SST data가 예상보다 짧습니다. (요청 {len} bytes)"
+                )));
+            };
             let remain = chunk
                 .len()
                 .checked_sub(self.offset_in_chunk)

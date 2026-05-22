@@ -1,13 +1,14 @@
 use super::{
     HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, enforce_http_content_length_limit,
-    http_client::HttpResponse,
+    http_client::{HttpResponse, HttpStreamResponse},
+    StreamedBodySummary, StreamingBodySink,
 };
 use alloc::{ffi::CString, string::String};
 use core::{
     ffi::{CStr, c_char, c_int, c_long, c_void},
     ptr::{NonNull, null_mut},
 };
-use std::sync::OnceLock;
+use std::{io::Write as IoWrite, sync::OnceLock};
 const CURLE_OK: CurlCode = 0;
 const CURL_ERROR_SIZE: usize = 256;
 const CURL_GLOBAL_DEFAULT: c_long = 3;
@@ -55,6 +56,10 @@ struct BoundedResponseBuffer {
 struct ResponseBuffers {
     body: BoundedResponseBuffer,
     headers: BoundedResponseBuffer,
+}
+enum CurlWriteTarget<'target, 'writer> {
+    Buffer(&'target mut BoundedResponseBuffer),
+    Stream(&'target mut StreamingBodySink<'writer>),
 }
 #[link(name = "curl")]
 unsafe extern "C" {
@@ -225,8 +230,8 @@ impl Client {
         handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
         handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
         handle.setopt_ptr(CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
-        handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_vec_callback)?;
-        handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_vec_callback)?;
+        handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
+        handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
         for (option, value) in [
             (CURLOPT_CONNECTTIMEOUT, 30),
             (
@@ -239,10 +244,6 @@ impl Client {
         ] {
             handle.setopt_long(option, value)?;
         }
-        let body_data = (&raw mut response_buffers.body).cast::<c_void>();
-        let header_data = (&raw mut response_buffers.headers).cast::<c_void>();
-        handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
-        handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
         if let Some(body_bytes) = body {
             handle.setopt_long(CURLOPT_POST, 1)?;
             let post_fields = body_bytes.as_ptr().cast::<c_char>();
@@ -255,7 +256,15 @@ impl Client {
             let custom_method = cstring("HTTP method", method)?;
             handle.setopt_str(CURLOPT_CUSTOMREQUEST, custom_method.as_ptr())?;
         }
-        let perform_code = handle.perform();
+        let perform_code = {
+            let mut body_target = CurlWriteTarget::Buffer(&mut response_buffers.body);
+            let mut header_target = CurlWriteTarget::Buffer(&mut response_buffers.headers);
+            let body_data = (&raw mut body_target).cast::<c_void>();
+            let header_data = (&raw mut header_target).cast::<c_void>();
+            handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
+            handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
+            handle.perform()
+        };
         if let Some(callback_error) = response_buffers.take_error() {
             return Err(callback_error);
         }
@@ -278,6 +287,117 @@ impl Client {
         enforce_http_content_length_limit(&headers, HTTP_MAX_BODY_BYTES)?;
         Ok(HttpResponse {
             body: response_buffers.body.bytes,
+            headers,
+            status,
+        })
+    }
+    pub(super) fn request_to_writer(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        request_headers: &[(&str, &str)],
+        writer: &mut dyn IoWrite,
+    ) -> Result<HttpStreamResponse, String> {
+        static INIT: OnceLock<CurlCode> = OnceLock::new();
+        // SAFETY: curl_global_init may be called once here before any easy handles are used.
+        let init_code = *INIT.get_or_init(|| unsafe { curl_global_init(CURL_GLOBAL_DEFAULT) });
+        if init_code != CURLE_OK {
+            return Err(curl_error("curl_global_init", init_code));
+        }
+        // SAFETY: curl_easy_init has no preconditions.
+        let raw_handle_ptr = unsafe { curl_easy_init() };
+        let Some(raw_handle) = NonNull::new(raw_handle_ptr) else {
+            return Err("curl_easy_init 실패".to_owned());
+        };
+        let handle = EasyHandle(raw_handle);
+        let url_capacity = self
+            .scheme_prefix
+            .len()
+            .saturating_add(host.len())
+            .saturating_add(path.len());
+        let mut raw_url = String::new();
+        raw_url
+            .try_reserve(url_capacity)
+            .map_err(|source| format!("URL 메모리 확보 실패: {source}"))?;
+        raw_url.push_str(self.scheme_prefix);
+        raw_url.push_str(host);
+        raw_url.push_str(path);
+        let url = cstring("URL", &raw_url)?;
+        let header_list = HeaderList::try_from(request_headers)?;
+        let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
+        let mut body_sink = StreamingBodySink {
+            error: None,
+            limit: HTTP_MAX_BODY_BYTES,
+            summary: StreamedBodySummary {
+                bytes_seen: 0,
+                prefix: Vec::new(),
+                preview: Vec::new(),
+            },
+            writer,
+        };
+        let mut header_buffer = BoundedResponseBuffer::new("헤더", HTTP_MAX_HEADER_BYTES);
+        handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
+        handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
+        handle.setopt_ptr(CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
+        handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
+        handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
+        for (option, value) in [
+            (CURLOPT_CONNECTTIMEOUT, 30),
+            (
+                CURLOPT_MAXFILESIZE_LARGE,
+                c_long::try_from(HTTP_MAX_BODY_BYTES)
+                    .map_err(|source| format!("HTTP 본문 한도 변환 실패: {source}"))?,
+            ),
+            (CURLOPT_TIMEOUT, 60),
+            (CURLOPT_NOSIGNAL, 1),
+        ] {
+            handle.setopt_long(option, value)?;
+        }
+        if let Some(body_bytes) = body {
+            handle.setopt_long(CURLOPT_POST, 1)?;
+            let post_fields = body_bytes.as_ptr().cast::<c_char>();
+            handle.setopt_ptr(CURLOPT_POSTFIELDS, post_fields)?;
+            let body_len = c_long::try_from(body_bytes.len())
+                .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?;
+            handle.setopt_long(CURLOPT_POSTFIELDSIZE, body_len)?;
+        }
+        if method != "GET" && method != "POST" {
+            let custom_method = cstring("HTTP method", method)?;
+            handle.setopt_str(CURLOPT_CUSTOMREQUEST, custom_method.as_ptr())?;
+        }
+        let perform_code = {
+            let mut body_target = CurlWriteTarget::Stream(&mut body_sink);
+            let mut header_target = CurlWriteTarget::Buffer(&mut header_buffer);
+            let body_data = (&raw mut body_target).cast::<c_void>();
+            let header_data = (&raw mut header_target).cast::<c_void>();
+            handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
+            handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
+            handle.perform()
+        };
+        if let Some(callback_error) = body_sink.error.take().or_else(|| header_buffer.error.take()) {
+            return Err(callback_error);
+        }
+        if perform_code != CURLE_OK {
+            let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
+            if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
+                && !message_cstr.to_bytes().is_empty()
+            {
+                let message = message_cstr.to_string_lossy();
+                return Err(format!(
+                    "curl_easy_perform 실패: {message} ({perform_code})"
+                ));
+            }
+            return Err(curl_error("curl_easy_perform", perform_code));
+        }
+        let raw_status = handle.response_code()?;
+        let status = u32::try_from(raw_status)
+            .map_err(|source| format!("HTTP 상태 코드 변환 실패: {source}"))?;
+        let headers = parsed_headers_from_bytes(&header_buffer.bytes)?;
+        enforce_http_content_length_limit(&headers, HTTP_MAX_BODY_BYTES)?;
+        Ok(HttpStreamResponse {
+            body: body_sink.summary,
             headers,
             status,
         })
@@ -317,7 +437,14 @@ impl BoundedResponseBuffer {
 }
 impl ResponseBuffers {
     fn parsed_headers(&self) -> Result<Vec<(String, String)>, String> {
-        let text = String::from_utf8_lossy(&self.headers.bytes);
+        parsed_headers_from_bytes(&self.headers.bytes)
+    }
+    fn take_error(&mut self) -> Option<String> {
+        self.body.error.take().or_else(|| self.headers.error.take())
+    }
+}
+fn parsed_headers_from_bytes(header_bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+        let text = String::from_utf8_lossy(header_bytes);
         let separator = if text.contains("\r\n\r\n") {
             "\r\n\r\n"
         } else {
@@ -360,10 +487,6 @@ impl ResponseBuffers {
             headers.push((header_name, header_value));
         }
         Ok(headers)
-    }
-    fn take_error(&mut self) -> Option<String> {
-        self.body.error.take().or_else(|| self.headers.error.take())
-    }
 }
 fn cstring(label: &str, value: &str) -> Result<CString, String> {
     CString::new(value)
@@ -382,7 +505,7 @@ fn curl_error(context: &str, code: CurlCode) -> String {
     };
     format!("{context} 실패: {message} ({code})")
 }
-unsafe extern "C" fn write_vec_callback(
+unsafe extern "C" fn write_callback(
     ptr: *mut c_char,
     size: usize,
     nmemb: usize,
@@ -397,15 +520,19 @@ unsafe extern "C" fn write_vec_callback(
     let Some(payload_head) = NonNull::new(ptr.cast::<u8>()) else {
         return 0;
     };
-    let Some(mut target_ptr) = NonNull::new(userdata.cast::<BoundedResponseBuffer>()) else {
+    let Some(mut target_ptr) = NonNull::new(userdata.cast::<CurlWriteTarget<'_, '_>>()) else {
         return 0;
     };
     let payload_ptr = NonNull::slice_from_raw_parts(payload_head, len);
     // SAFETY: libcurl passes a readable buffer with len bytes for this callback.
     let bytes = unsafe { payload_ptr.as_ref() };
-    // SAFETY: userdata is the response buffer pointer configured before curl_easy_perform.
+    // SAFETY: userdata is the write target pointer configured before curl_easy_perform.
     let target = unsafe { target_ptr.as_mut() };
-    if !target.append(bytes) {
+    let appended = match *target {
+        CurlWriteTarget::Buffer(ref mut buffer) => buffer.append(bytes),
+        CurlWriteTarget::Stream(ref mut stream) => stream.append(bytes),
+    };
+    if !appended {
         return 0;
     }
     len

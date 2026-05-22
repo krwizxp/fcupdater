@@ -70,31 +70,19 @@ impl StreamingZipWriter<'_> {
                 source,
             ))
         })?;
-        let Some(central_dir_capacity) =
+        let Some((central_dir_size_usize, max_header_capacity)) =
             self.entries
                 .iter()
-                .try_fold(END_OF_CENTRAL_DIRECTORY_LEN, |acc, entry| {
-                    let len = acc.checked_add(CENTRAL_FILE_HEADER_BASE_LEN)?;
-                    len.checked_add(entry.name.len())
+                .try_fold((0_usize, 0_usize), |(size, max_capacity), entry| {
+                    let header_len = CENTRAL_FILE_HEADER_BASE_LEN.checked_add(entry.name.len())?;
+                    Some((size.checked_add(header_len)?, max_capacity.max(header_len)))
                 })
         else {
             return Err(err(
                 "ZIP 중앙 디렉터리 크기 계산 중 overflow가 발생했습니다.",
             ));
         };
-        let mut central_dir = Vec::new();
-        central_dir
-            .try_reserve(central_dir_capacity)
-            .map_err(|source| {
-                err(prefixed_message(
-                    "ZIP 중앙 디렉터리 메모리 확보 실패: ",
-                    source,
-                ))
-            })?;
-        for entry in &self.entries {
-            write_file_header(&mut central_dir, ZipFileHeader::Central(entry))?;
-        }
-        let central_dir_size = u32::try_from(central_dir.len()).map_err(|source| {
+        let central_dir_size = u32::try_from(central_dir_size_usize).map_err(|source| {
             err(prefixed_message(
                 "ZIP 중앙 디렉터리 크기 변환 실패: ",
                 source,
@@ -102,15 +90,43 @@ impl StreamingZipWriter<'_> {
         })?;
         let entry_count_u16 = u16::try_from(self.entries.len())
             .map_err(|source| err(prefixed_message("ZIP entry 수 변환 실패: ", source)))?;
-        write_u32(&mut central_dir, END_OF_CENTRAL_DIRECTORY_SIGNATURE);
-        write_u16(&mut central_dir, 0);
-        write_u16(&mut central_dir, 0);
-        write_u16(&mut central_dir, entry_count_u16);
-        write_u16(&mut central_dir, entry_count_u16);
-        write_u32(&mut central_dir, central_dir_size);
-        write_u32(&mut central_dir, central_dir_offset);
-        write_u16(&mut central_dir, 0);
-        self.write_all(&central_dir, "xlsx 압축 중앙 디렉터리 쓰기 실패")
+        let mut central_header = Vec::new();
+        central_header
+            .try_reserve(max_header_capacity)
+            .map_err(|source| {
+                err(prefixed_message(
+                    "ZIP 중앙 header 메모리 확보 실패: ",
+                    source,
+                ))
+            })?;
+        for index in 0..self.entries.len() {
+            central_header.clear();
+            {
+                let entry = self
+                    .entries
+                    .get(index)
+                    .ok_or_else(|| err("ZIP entry 접근 범위 오류"))?;
+                write_file_header(&mut central_header, ZipFileHeader::Central(entry))?;
+            }
+            self.write_all(&central_header, "xlsx 압축 중앙 디렉터리 쓰기 실패")?;
+        }
+        let mut eocd = Vec::new();
+        eocd.try_reserve(END_OF_CENTRAL_DIRECTORY_LEN)
+            .map_err(|source| {
+                err(prefixed_message(
+                    "ZIP 중앙 디렉터리 footer 메모리 확보 실패: ",
+                    source,
+                ))
+            })?;
+        write_u32(&mut eocd, END_OF_CENTRAL_DIRECTORY_SIGNATURE);
+        write_u16(&mut eocd, 0);
+        write_u16(&mut eocd, 0);
+        write_u16(&mut eocd, entry_count_u16);
+        write_u16(&mut eocd, entry_count_u16);
+        write_u32(&mut eocd, central_dir_size);
+        write_u32(&mut eocd, central_dir_offset);
+        write_u16(&mut eocd, 0);
+        self.write_all(&eocd, "xlsx 압축 중앙 디렉터리 쓰기 실패")
     }
     fn append_file(&mut self, file: PendingFile) -> Result<()> {
         let data = fs::read(&file.path).map_err(|source_err| {
@@ -129,6 +145,7 @@ impl StreamingZipWriter<'_> {
             drop(data);
             (METHOD_DEFLATE, deflated)
         } else {
+            drop(deflated);
             (METHOD_STORE, data)
         };
         let local_header_offset = u32::try_from(self.bytes_written)
