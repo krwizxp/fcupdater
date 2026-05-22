@@ -968,7 +968,7 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
             adjusted_premium: prices.premium,
             fuel_total_text: self.fuel_total_text(prices),
             rank_total,
-            region_rate: total_price.map(|_| region_rate),
+            region_rate: total_price.is_some().then_some(region_rate),
             regional_discount,
             smart_discount,
             total_price,
@@ -1006,9 +1006,11 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
             .currency_apply
             .map(|col| self.ws.get_display_at(col, self.row, self.shared_strings))
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("Y"));
-        if currency_apply {
-            total_price
-                .and_then(|_| self.sort_context.region_rates.get(region.trim()).copied())
+        if currency_apply && total_price.is_some() {
+            self.sort_context
+                .region_rates
+                .get(region.trim())
+                .copied()
                 .unwrap_or_default()
         } else {
             0
@@ -1418,18 +1420,17 @@ impl RankSortKeyBuilder<'_, '_, '_> {
         let regional_adjusted_diesel = adjusted_diesel
             .and_then(|value| i128::from(value).checked_mul(i128::from(region_multiplier)));
         let rank_total = self.sort_context.total_qty.and_then(|total_qty| {
-            (!MasterSheetOps::is_zero(total_qty))
-                .then_some(total_qty)
-                .and_then(|_| {
-                    MasterSheetOps::compute_total_price(
-                        self.sort_context.gasoline_qty,
-                        adjusted_gasoline,
-                        self.sort_context.premium_qty,
-                        adjusted_premium,
-                        self.sort_context.diesel_qty,
-                        adjusted_diesel,
-                    )
-                })
+            if MasterSheetOps::is_zero(total_qty) {
+                None
+            } else {
+                MasterSheetOps::compute_total_price(
+                    self.sort_context.gasoline_qty,
+                    adjusted_gasoline,
+                    self.sort_context.premium_qty,
+                    adjusted_premium,
+                    self.sort_context.diesel_qty,
+                    adjusted_diesel,
+                )
                 .and_then(|total_price| {
                     let discount_numerator = total_price.checked_mul(i128::from(region_rate))?;
                     let discount_floor = discount_numerator.checked_div(DECIMAL_SCALE_CUBED)?;
@@ -1437,6 +1438,7 @@ impl RankSortKeyBuilder<'_, '_, '_> {
                     total_price.checked_sub(discount_value)
                 })
                 .filter(|value| *value != 0)
+            }
         });
         RankSortKey {
             has_rank_total: rank_total.is_some(),

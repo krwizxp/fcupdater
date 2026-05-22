@@ -283,7 +283,7 @@ impl XlsxContainer {
             .unwrap_or("workbook.xlsx");
         let tmp_archive = reserve_unique_temp_entry(
             |pid, nanos, seq| parent.join(format!(".{file_name}.tmp_{pid}_{nanos}_{seq}")),
-            |path| fs::File::create_new(path).map(|_| ()),
+            |path| fs::File::create_new(path).map(drop),
             "임시 저장 파일 생성 실패",
             prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
