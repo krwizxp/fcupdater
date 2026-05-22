@@ -246,7 +246,8 @@ impl Huffman {
             };
             *next_slot = code;
         }
-        let mut codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1] = from_fn(|_| Vec::new());
+        let mut codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1] =
+            [const { Vec::new() }; DEFLATE_MAX_BITS + 1];
         for (symbol, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;

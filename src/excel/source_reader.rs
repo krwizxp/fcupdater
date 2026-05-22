@@ -4,7 +4,6 @@ use crate::{
 };
 use alloc::collections::BTreeMap;
 use core::{
-    array::from_fn,
     char::{REPLACEMENT_CHARACTER, decode_utf16},
     fmt::Display,
 };
@@ -915,7 +914,7 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
         self.rows_map
             .entry(row)
             .or_insert_with(|| SourceRow {
-                cells: from_fn(|_| String::new()),
+                cells: [const { String::new() }; SOURCE_COLUMN_COUNT],
             })
             .set(col, value)?;
         Ok(())

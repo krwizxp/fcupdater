@@ -283,7 +283,10 @@ impl XlsxContainer {
             .unwrap_or("workbook.xlsx");
         let tmp_archive = reserve_unique_temp_entry(
             |pid, nanos, seq| parent.join(format!(".{file_name}.tmp_{pid}_{nanos}_{seq}")),
-            |path| fs::File::create_new(path).map(drop),
+            |path| {
+                fs::File::create_new(path)?;
+                Ok(())
+            },
             "임시 저장 파일 생성 실패",
             prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
@@ -307,9 +310,12 @@ impl XlsxContainer {
             .promote()?;
             Ok(())
         })();
-        result.inspect_err(|_| match fs::remove_file(&tmp_archive) {
-            Ok(()) | Err(_) => {}
-        })
+        if result.is_err() {
+            match fs::remove_file(&tmp_archive) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        result
     }
     pub fn unpack_dir(&self) -> &Path {
         &self.unpack_dir

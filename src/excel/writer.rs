@@ -12,7 +12,10 @@ use super::{
 };
 use crate::{Result, err, err_with_source, parse_i32_str};
 use alloc::collections::BTreeMap;
-use core::fmt::{Display, Write as FmtWrite};
+use core::{
+    convert::identity,
+    fmt::{Display, Write as FmtWrite},
+};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 mod cell_ref;
@@ -61,6 +64,14 @@ struct SharedFormulaHead {
 struct SharedFormulaSpec {
     formula_text: Option<String>,
     si: String,
+}
+#[derive(Clone, Copy)]
+enum TagRemovalRule<'rule> {
+    All,
+    AttrEquals {
+        attr_name: &'rule str,
+        expected_value: &'rule str,
+    },
 }
 impl Workbook {
     pub fn open(path: &Path) -> Result<Self> {
@@ -187,7 +198,8 @@ impl Workbook {
         self.update_shared_strings_xml_text(existing_total, existing_unique)
     }
     fn remove_excel_recovery_artifacts(&mut self) -> Result<()> {
-        self.xml_text = remove_tags_matching(&self.xml_text, "fileRecoveryPr", |_| true)?;
+        self.xml_text =
+            remove_tags_matching(&self.xml_text, "fileRecoveryPr", TagRemovalRule::All)?;
         let workbook_rels_path = "xl/_rels/workbook.xml.rels";
         let workbook_rels_xml = self.container.read_text(workbook_rels_path)?;
         let updated_workbook_rels = remove_tags_matching_attr(
@@ -877,7 +889,7 @@ impl Worksheet {
             }
         } else if let Some(inner) = cell.inner_xml.as_mut() {
             *inner = replace_formula_tag_with_plain_formula(inner, formula)
-                .unwrap_or_else(|_| build_formula_with_empty_value(&formula_text));
+                .map_or_else(|_| build_formula_with_empty_value(&formula_text), identity);
             if !inner.contains("<v") {
                 inner.push_str("<v></v>");
             }
@@ -1081,7 +1093,7 @@ pub fn remap_row_numbers(row: &mut Row, new_row: u32, resolver: &dyn Fn(u32) -> 
         if let Some(inner) = cell.inner_xml.as_mut()
             && let Some(text) = extract_first_tag_text(inner, "f")
         {
-            let rewritten =
+            let rewrite_result =
                 rewrite_formula_cell_refs(&decode_xml_entities(&text), |chars, start| {
                     try_parse_and_rewrite_cell_ref(
                         chars,
@@ -1095,8 +1107,8 @@ pub fn remap_row_numbers(row: &mut Row, new_row: u32, resolver: &dyn Fn(u32) -> 
                             Ok((base_col, updated_row))
                         },
                     )
-                })
-                .unwrap_or_else(|_| decode_xml_entities(&text));
+                });
+            let rewritten = rewrite_result.map_or_else(|_| decode_xml_entities(&text), identity);
             let encoded = xml_escape_text(&rewritten);
             replace_first_tag_text(inner, "f", &encoded);
         }
@@ -1344,14 +1356,16 @@ fn remove_tags_matching_attr(
     attr_name: &str,
     expected_value: &str,
 ) -> Result<String> {
-    remove_tags_matching(xml, tag_name, |attrs| {
-        get_attr(attrs, attr_name).is_some_and(|value| value == expected_value)
-    })
+    remove_tags_matching(
+        xml,
+        tag_name,
+        TagRemovalRule::AttrEquals {
+            attr_name,
+            expected_value,
+        },
+    )
 }
-fn remove_tags_matching<F>(xml: &str, tag_name: &str, mut should_remove: F) -> Result<String>
-where
-    F: FnMut(&[(String, String)]) -> bool,
-{
+fn remove_tags_matching(xml: &str, tag_name: &str, rule: TagRemovalRule<'_>) -> Result<String> {
     let mut out = xml.to_owned();
     let mut cursor = 0_usize;
     while let Some(tag_start) = find_start_tag(&out, tag_name, cursor) {
@@ -1364,7 +1378,14 @@ where
             .to_owned();
         let attrs = parse_tag_attrs(&tag_xml)?;
         let next_cursor = checked_usize_add(tag_end, 1, "XML 태그 다음 cursor")?;
-        if should_remove(&attrs) {
+        let remove_tag = match rule {
+            TagRemovalRule::All => true,
+            TagRemovalRule::AttrEquals {
+                attr_name,
+                expected_value,
+            } => get_attr(&attrs, attr_name).is_some_and(|value| value == expected_value),
+        };
+        if remove_tag {
             let tag_end_exclusive = if tag_xml.trim_ascii_end().ends_with("/>") {
                 checked_usize_add(tag_end, 1, "XML self-closing 태그 끝")?
             } else {
