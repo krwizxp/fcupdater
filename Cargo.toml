@@ -1,6 +1,6 @@
 [package]
 name = "fcupdater"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2024"
 rust-version = "1.95"
 description = "CLI tool to update fuel_cost_chungcheong.xlsx from the Opinet current-price .xls source."

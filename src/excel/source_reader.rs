@@ -252,7 +252,6 @@ impl CfbDirectoryParser<'_> {
             let stream_size = u64::from_le_bytes(read_le_array::<8>(
                 entry,
                 0x78,
-                "u64 read",
                 "u64 read out of range at ",
             )?) & 0xFFFF_FFFF;
             let name = if (2..=64).contains(&name_len) {
@@ -1158,30 +1157,25 @@ fn read_stream_from_fat_chain(
     Ok(out)
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
-    let arr = read_le_array::<2>(bytes, offset, "u16 read", "u16 read out of range at ")?;
+    let arr = read_le_array::<2>(bytes, offset, "u16 read out of range at ")?;
     Ok(u16::from_le_bytes(arr))
 }
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
-    let arr = read_le_array::<4>(bytes, offset, "u32 read", "u32 read out of range at ")?;
+    let arr = read_le_array::<4>(bytes, offset, "u32 read out of range at ")?;
     Ok(u32::from_le_bytes(arr))
 }
 fn read_le_array<const N: usize>(
     bytes: &[u8],
     offset: usize,
-    label: &str,
     out_of_range_prefix: &str,
 ) -> Result<[u8; N]> {
-    let end = offset.checked_add(N).ok_or_else(|| {
-        err(format!(
-            "{label} 오프셋 계산 중 overflow가 발생했습니다. (offset={offset}, add={N})"
-        ))
-    })?;
-    let arr = bytes
-        .get(offset..end)
-        .and_then(|slice| slice.as_array::<N>())
-        .copied()
-        .ok_or_else(|| err(prefixed_display_message(out_of_range_prefix, offset)))?;
-    Ok(arr)
+    let Some((_, tail)) = bytes.split_at_checked(offset) else {
+        return Err(err(prefixed_display_message(out_of_range_prefix, offset)));
+    };
+    let Some(raw_bytes) = tail.first_chunk::<N>() else {
+        return Err(err(prefixed_display_message(out_of_range_prefix, offset)));
+    };
+    Ok(*raw_bytes)
 }
 fn prefixed_display_message(prefix: &str, value: impl Display) -> String {
     format!("{prefix}{value}")

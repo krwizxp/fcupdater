@@ -1,12 +1,12 @@
 # fcupdater
 `fuel_cost_chungcheong.xlsx`를 Opinet 전국 현재 판매가격(주유소) `.xls` 소스로 현행화하는 CLI 도구입니다.
-- Excel 미설치 환경에서 동작
+- Excel 독립 실행 지원
 - Opinet 전국 단일 `.xls` 소스 자동 다운로드
 - 마스터 파일은 `fuel_cost_chungcheong.xlsx` 하나로 직접 현행화
 - `.xlsx` 읽기/저장은 내장 Rust ZIP/deflate 처리 사용
 - 주소 기반 매칭으로 기존 행 갱신
 - 소스 기준 신규 업체 자동 추가
-- 소스 미존재 업체는 폐업으로 삭제
+- 소스 기준 업체 영업 상태 정리
 - `변경내역` 시트 항상 갱신
 - 저장 후 OOXML 필수 파트 무결성 검증
 ## 요구사항
@@ -28,23 +28,29 @@ cargo build --release --locked
 ```bash
 fcupdater
 ```
-3. 프로그램이 Opinet에서 현재 판매가격 `.xls`를 다운로드하고 11개 대상 지역만 반영합니다.
+3. 프로그램이 Opinet에서 현재 판매가격 `.xls`를 다운로드하고 11개 대상 지역을 반영합니다.
 4. `fuel_cost_chungcheong.xlsx`가 직접 현행화됩니다.
 ## CLI
-지원 옵션은 아래뿐입니다.
+지원 옵션은 아래와 같습니다.
 - `-h`, `--help`: 도움말
 - `--version`: 버전 표시
 ## GitHub Actions
 `.github/workflows/ci.yml`은 `ubuntu-latest`, `macos-latest`, `windows-latest`에서 `cargo build --release --locked`를 수행하고 실행 파일을 Artifact로 업로드합니다.
+- Linux Artifact 파일: `fcupdater-linux-x64.tar.gz`
+  - 내부 실행 파일: `fcupdater-linux-x64`
+- macOS Artifact 파일: `fcupdater-macos.tar.gz`
+  - 내부 실행 파일: `fcupdater-macos`
+- Windows Artifact 파일: `fcupdater-windows-x64.exe`
+Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어 업로드합니다. Windows는 빌드 결과를 `fcupdater-windows-x64.exe`로 이름만 바꿔 그대로 업로드합니다.
 `.github/workflows/update_master.yml`은 `ubuntu-latest`에서 고정 워크플로를 실행합니다.
 - 마스터: `fuel_cost_chungcheong.xlsx`
 - 업로드: `artifacts/fcupdater-result.xlsx`
 ## 동작 기준
 - Opinet 자동 다운로드는 항상 수행합니다.
-- 소스는 OLE2/BIFF `.xls`만 허용합니다.
-- BIFF `CODEPAGE = 1200`만 허용합니다.
-- 소스 worksheet는 1개만 허용합니다.
-- 소스 cell record는 `LABELSST` 기반 문자열 셀만 허용합니다.
+- 소스 형식은 OLE2/BIFF `.xls` 기준입니다.
+- BIFF `CODEPAGE = 1200` 기준으로 읽습니다.
+- 소스 worksheet는 1개 구조를 기준으로 읽습니다.
+- 소스 cell record는 `LABELSST` 기반 문자열 셀 구조를 기준으로 읽습니다.
 - 소스 데이터는 고정 열 구조를 사용합니다.
 - 마스터 파일을 직접 저장하고 저장 검증은 항상 수행합니다.
 - 변경내역 시트는 항상 갱신합니다.
