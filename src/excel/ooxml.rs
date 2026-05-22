@@ -2,8 +2,8 @@ use super::{
     path_util::path_from_slashes,
     xlsx_container::XlsxContainer,
     xml::{
-        decode_xml_entities, extract_all_tag_text, extract_attr, find_end_tag, find_start_tag,
-        find_tag_end,
+        XmlScanner, decode_xml_entities, extract_all_tag_text, extract_attr, find_end_tag,
+        find_start_tag, find_tag_end,
     },
 };
 use crate::{Result, err, err_with_source};
@@ -174,10 +174,9 @@ where
 {
     let mut cursor = 0_usize;
     iter::from_fn(move || {
-        let start = find_start_tag(xml, tag_name, cursor)?;
-        let end = find_tag_end(xml, start)?;
-        let tag = xml.get(start..=end)?;
-        cursor = end.checked_add(1)?;
-        Some(tag)
+        let mut scanner = XmlScanner::from(xml, cursor);
+        let tag = scanner.next_start_named(tag_name)?;
+        cursor = tag.end().checked_add(1)?;
+        Some(tag.tag())
     })
 }

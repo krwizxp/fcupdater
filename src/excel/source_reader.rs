@@ -4,6 +4,7 @@ use crate::{
 };
 use alloc::collections::BTreeMap;
 use core::{
+    array::from_fn,
     char::{REPLACEMENT_CHARACTER, decode_utf16},
     fmt::Display,
 };
@@ -27,6 +28,7 @@ const COL_SELF_YN: usize = 5;
 const COL_PREMIUM: usize = 6;
 const COL_GASOLINE: usize = 7;
 const COL_DIESEL: usize = 8;
+const SOURCE_COLUMN_COUNT: usize = COL_DIESEL + 1;
 pub struct SourceReader<'path> {
     pub path: &'path Path,
 }
@@ -75,7 +77,10 @@ struct CfbFileOpener<'path> {
     path: &'path Path,
 }
 struct SourceHeaderValidator<'rows> {
-    rows: &'rows [(usize, Vec<String>)],
+    rows: &'rows [(usize, SourceRow)],
+}
+struct SourceRow {
+    cells: [String; SOURCE_COLUMN_COUNT],
 }
 struct SstParser<'chunks, 'chunk> {
     chunks: &'chunks [&'chunk [u8]],
@@ -87,9 +92,24 @@ struct SstChunkReader<'chunks, 'chunk> {
 }
 struct WorksheetCellsParser<'workbook, 'strings> {
     pos: usize,
-    rows_map: BTreeMap<usize, BTreeMap<usize, String>>,
+    rows_map: BTreeMap<usize, SourceRow>,
     shared_strings: &'strings [String],
     workbook_stream: &'workbook [u8],
+}
+impl SourceRow {
+    fn set(&mut self, col: usize, value: String) -> Result<()> {
+        let Some(cell) = self.cells.get_mut(col) else {
+            return Err(err(prefixed_display_message(
+                "Opinet 고정 소스 열 범위 오류: ",
+                col.saturating_add(1),
+            )));
+        };
+        *cell = value;
+        Ok(())
+    }
+    fn text(&self, idx: usize) -> Option<&str> {
+        self.cells.get(idx).map(String::as_str)
+    }
 }
 impl CfbDataParser<'_, '_> {
     fn build_fat_table(&self, sector_size: usize, fat_sector_ids: &[u32]) -> Result<Vec<u32>> {
@@ -236,8 +256,8 @@ impl CfbDirectoryParser<'_> {
                 "u64 read out of range at ",
             )?) & 0xFFFF_FFFF;
             let name = if (2..=64).contains(&name_len) {
-                let bytes = entry
-                    .get(0..name_len.saturating_sub(2))
+                let (bytes, _) = entry
+                    .split_at_checked(name_len.saturating_sub(2))
                     .ok_or_else(|| err("CFB 디렉터리 이름 범위 오류"))?;
                 let (name_units, remainder) = bytes.as_chunks::<2>();
                 if !remainder.is_empty() {
@@ -321,8 +341,8 @@ impl CfbFileOpener<'_> {
                 "CFB FAT 엔트리가 부족합니다: 필요 {declared_fat_sectors}, 실제 {difat_entry_count}"
             )));
         }
-        let fat_sector_ids = difat_entries
-            .get(..declared_fat_sectors)
+        let (fat_sector_ids, _) = difat_entries
+            .split_at_checked(declared_fat_sectors)
             .ok_or_else(|| err("CFB FAT entry 범위가 손상되었습니다."))?;
         let fat = parser.build_fat_table(header.sector_size, fat_sector_ids)?;
         let dir_stream = read_stream_from_fat_chain(
@@ -519,9 +539,12 @@ impl SstChunkReader<'_, '_> {
             let byte_len = chars_here
                 .checked_mul(bytes_per_char)
                 .ok_or_else(|| err("SST 문자열 길이 계산 중 overflow가 발생했습니다."))?;
-            let bytes = chunk
-                .get(self.offset_in_chunk..self.offset_in_chunk.saturating_add(byte_len))
-                .ok_or_else(|| err("SST 문자열 slice 범위 오류"))?;
+            let (_, tail) = chunk
+                .split_at_checked(self.offset_in_chunk)
+                .ok_or_else(|| err("SST 문자열 slice 시작 범위 오류"))?;
+            let (bytes, _) = tail
+                .split_at_checked(byte_len)
+                .ok_or_else(|| err("SST 문자열 slice 길이 오류"))?;
             if high_byte {
                 let (chunks, _) = bytes.as_chunks::<2>();
                 out.extend(
@@ -712,7 +735,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         &self,
         sheet_offset: usize,
         shared_strings: &[String],
-    ) -> Result<Vec<(usize, Vec<String>)>> {
+    ) -> Result<Vec<(usize, SourceRow)>> {
         if sheet_offset >= self.workbook_stream.len() {
             return Err(err(prefixed_display_message(
                 "worksheet offset이 workbook stream 범위를 벗어났습니다: ",
@@ -775,7 +798,7 @@ impl SstParser<'_, '_> {
             chunks: self.chunks,
             offset_in_chunk: 0,
         };
-        let _total_count = reader.read_u32()?;
+        reader.read_u32()?;
         let unique_count = usize::try_from(reader.read_u32()?)
             .map_err(|source| err_with_source("SST unique count 변환에 실패했습니다.", source))?;
         let Some(max_unique_count) = total_chunk_bytes.saturating_sub(8).checked_div(3) else {
@@ -830,11 +853,11 @@ impl SstParser<'_, '_> {
     }
 }
 impl<'workbook> WorksheetCellsParser<'workbook, '_> {
-    fn finalize_sparse_rows(self) -> Result<Vec<(usize, Vec<String>)>> {
+    fn finalize_source_rows(self) -> Result<Vec<(usize, SourceRow)>> {
         if self.rows_map.is_empty() {
             return Ok(Vec::new());
         }
-        let mut rows: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut rows: Vec<(usize, SourceRow)> = Vec::new();
         rows.try_reserve_exact(self.rows_map.len())
             .map_err(|source| {
                 let row_count = self.rows_map.len();
@@ -843,28 +866,8 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
                     source,
                 )
             })?;
-        for (row_num, cells) in self.rows_map {
-            let Some((&max_col, _)) = cells.last_key_value() else {
-                rows.push((row_num, Vec::new()));
-                continue;
-            };
-            let row_len = max_col
-                .checked_add(1)
-                .ok_or_else(|| err("worksheet row 길이 계산 중 overflow가 발생했습니다."))?;
-            let mut row_values: Vec<String> = Vec::new();
-            row_values.try_reserve_exact(row_len).map_err(|source| {
-                err_with_source(
-                    format!("BIFF worksheet 셀 메모리 확보 실패: {row_len} cells"),
-                    source,
-                )
-            })?;
-            row_values.resize(row_len, String::new());
-            for (col, value) in cells {
-                if let Some(slot) = row_values.get_mut(col) {
-                    *slot = value;
-                }
-            }
-            rows.push((row_num, row_values));
+        for row_entry in self.rows_map {
+            rows.push(row_entry);
         }
         Ok(rows)
     }
@@ -899,6 +902,9 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
                 col.saturating_add(1),
             )));
         }
+        if row < SOURCE_HEADER_ROW || col >= SOURCE_COLUMN_COUNT {
+            return Ok(());
+        }
         let idx_u32 = read_u32_le(header, 6)?;
         let idx = usize::try_from(idx_u32)
             .map_err(|source| err_with_source("SST index 변환에 실패했습니다.", source))?;
@@ -907,7 +913,12 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
                 "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
             ))
         })?;
-        self.rows_map.entry(row).or_default().insert(col, value);
+        self.rows_map
+            .entry(row)
+            .or_insert_with(|| SourceRow {
+                cells: from_fn(|_| String::new()),
+            })
+            .set(col, value)?;
         Ok(())
     }
     fn handle_record(&mut self, record_id: u16, data: &[u8]) -> Result<bool> {
@@ -923,13 +934,13 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
         }
         Ok(false)
     }
-    fn parse(mut self) -> Result<Vec<(usize, Vec<String>)>> {
+    fn parse(mut self) -> Result<Vec<(usize, SourceRow)>> {
         while let Some((record_id, data)) = self.read_record()? {
             if self.handle_record(record_id, data)? {
                 break;
             }
         }
-        self.finalize_sparse_rows()
+        self.finalize_source_rows()
     }
     fn read_record(&mut self) -> Result<Option<(u16, &'workbook [u8])>> {
         if self
@@ -989,11 +1000,11 @@ fn reserve_seen_set(
 fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
     value.filter(|fuel_price| *fuel_price > 0_i32)
 }
-fn row_i32(row: &[String], idx: usize) -> Option<i32> {
-    parse_i32_str(row.get(idx)?)
+fn row_i32(row: &SourceRow, idx: usize) -> Option<i32> {
+    parse_i32_str(row.text(idx)?)
 }
-fn row_text(row: &[String], idx: usize) -> String {
-    row.get(idx)
+fn row_text(row: &SourceRow, idx: usize) -> String {
+    row.text(idx)
         .map(|cell| cell.trim().to_owned())
         .unwrap_or_default()
 }
@@ -1110,11 +1121,10 @@ fn read_stream_from_fat_chain(
         let sector = get_sector_slice(data, sector_size, sid)?;
         if let Some(remain) = remaining.as_mut() {
             let take = (*remain).min(sector.len());
-            out.extend_from_slice(
-                sector
-                    .get(..take)
-                    .ok_or_else(|| err("sector 슬라이스 범위 오류"))?,
-            );
+            let (prefix, _) = sector
+                .split_at_checked(take)
+                .ok_or_else(|| err("sector 슬라이스 범위 오류"))?;
+            out.extend_from_slice(prefix);
             *remain = remain.saturating_sub(take);
         } else {
             out.try_reserve(sector.len()).map_err(|source| {

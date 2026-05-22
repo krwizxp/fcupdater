@@ -41,6 +41,8 @@ jobs:
       - name: Install Linux native dependencies
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build Release Binary
         run: cargo build --release --locked
       - name: Prepare Unix artifact

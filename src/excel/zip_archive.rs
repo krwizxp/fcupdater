@@ -631,9 +631,10 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
     let eocd_signature = END_OF_CENTRAL_DIRECTORY_SIGNATURE.to_le_bytes();
     let mut search_len = search_bytes.len();
     let eocd_offset = loop {
-        let Some(relative_offset) = search_bytes
-            .get(..search_len)
-            .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 오류"))?
+        let (search_prefix, _) = search_bytes
+            .split_at_checked(search_len)
+            .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 오류"))?;
+        let Some(relative_offset) = search_prefix
             .array_windows::<4>()
             .rposition(|window| *window == eocd_signature)
         else {
@@ -742,10 +743,10 @@ fn read_array<const N: usize>(
     offset: usize,
     error_message: &'static str,
 ) -> ZipResult<[u8; N]> {
-    let Some(end) = offset.checked_add(N) else {
+    let Some((_, tail)) = bytes.split_at_checked(offset) else {
         return Err(zip_static(error_message));
     };
-    let Some(raw_bytes) = bytes.get(offset..end).and_then(<[u8]>::as_array::<N>) else {
+    let Some(raw_bytes) = tail.first_chunk::<N>() else {
         return Err(zip_static(error_message));
     };
     Ok(*raw_bytes)

@@ -1,7 +1,4 @@
-use super::{
-    path_util::path_from_slashes,
-    zip_archive::{self, is_safe_archive_entry_path},
-};
+use super::zip_archive::{self, is_safe_archive_entry_path};
 use crate::{Result, err, path_pair_source_message, path_source_message, prefixed_message};
 use core::{mem, time::Duration};
 use std::{
@@ -44,52 +41,34 @@ struct SavedArchiveVerifier<'path> {
 }
 impl SavedArchiveVerifier<'_> {
     fn verify(&self) -> Result<()> {
-        let verify_work = create_unique_work_dir()?;
-        let verify_unpacked = verify_work.join("verify_unpacked");
-        create_dir_all_checked(&verify_unpacked, "저장 검증용 임시 폴더 생성 실패")?;
-        let verify_result = (|| -> Result<()> {
-            let archive_entries = zip_archive::ZipArchiveEntries {
-                archive_path: self.saved_archive,
-            };
-            for entry_name in archive_entries.list()? {
-                if !is_safe_archive_entry_path(&entry_name) {
-                    return Err(err(prefixed_message(
-                        "허용되지 않은 압축 경로가 포함되어 있습니다: ",
-                        entry_name,
-                    )));
-                }
-            }
-            zip_archive::ZipArchiveExtractor {
-                archive_path: self.saved_archive,
-                unpack_dir: &verify_unpacked,
-            }
-            .extract()?;
-            for rel in [
-                "[Content_Types].xml",
-                "xl/workbook.xml",
-                "xl/_rels/workbook.xml.rels",
-            ] {
-                let path = verify_unpacked.join(path_from_slashes(rel));
-                if !path.is_file() {
-                    return Err(err(prefixed_message(
-                        "저장 검증 실패: 필수 OOXML 파트가 없습니다: ",
-                        path.display(),
-                    )));
-                }
-            }
-            super::writer::Workbook::open(self.saved_archive).map_err(|source_err| {
+        let container = XlsxContainer::open(self.saved_archive).map_err(|source_err| {
+            err(path_source_message(
+                "저장 검증 실패: 저장 직후 압축 해제 점검에 실패했습니다",
+                self.saved_archive,
+                source_err,
+            ))
+        })?;
+        for rel in [
+            "[Content_Types].xml",
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+        ] {
+            container.read_text(rel).map_err(|source_err| {
                 err(path_source_message(
-                    "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
+                    "저장 검증 실패: 필수 OOXML 파트 읽기 실패",
                     self.saved_archive,
                     source_err,
                 ))
             })?;
-            Ok(())
-        })();
-        match fs::remove_dir_all(&verify_work) {
-            Ok(()) | Err(_) => {}
         }
-        verify_result
+        super::writer::Workbook::open(self.saved_archive).map_err(|source_err| {
+            err(path_source_message(
+                "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
+                self.saved_archive,
+                source_err,
+            ))
+        })?;
+        Ok(())
     }
 }
 struct TempArchivePromotion<'path> {
@@ -170,9 +149,8 @@ impl TempArchivePromotion<'_> {
         }
     }
 }
-impl TryFrom<&Path> for XlsxContainer {
-    type Error = crate::BoxError;
-    fn try_from(source_xlsx: &Path) -> Result<Self> {
+impl XlsxContainer {
+    pub(super) fn open(source_xlsx: &Path) -> Result<Self> {
         if !source_xlsx.try_exists().map_err(|source_err| {
             err(path_source_message(
                 "xlsx 파일 경로 확인 실패",
@@ -185,8 +163,14 @@ impl TryFrom<&Path> for XlsxContainer {
                 source_xlsx.display(),
             )));
         }
+        let base = env::temp_dir();
         let mut cleanup = WorkDirCleanup {
-            path: (create_unique_work_dir())?,
+            path: reserve_unique_temp_entry(
+                |pid, nanos, seq| base.join(format!("fcupdater_{pid}_{nanos}_{seq}")),
+                |path| fs::create_dir_all(path),
+                "임시 작업 폴더 생성 실패",
+                "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
+            )?,
             keep: false,
         };
         let unpack_dir = cleanup.path.join("unzipped");
@@ -225,8 +209,6 @@ impl TryFrom<&Path> for XlsxContainer {
             work_dir,
         })
     }
-}
-impl XlsxContainer {
     pub fn read_text(&self, relative_path: &str) -> Result<String> {
         let path = self.resolve_relative_path(relative_path)?;
         fs::read_to_string(&path)
@@ -361,15 +343,6 @@ cfg_select! {
             }
         }
     }
-}
-fn create_unique_work_dir() -> Result<PathBuf> {
-    let base = env::temp_dir();
-    reserve_unique_temp_entry(
-        |pid, nanos, seq| base.join(format!("fcupdater_{pid}_{nanos}_{seq}")),
-        |path| fs::create_dir_all(path),
-        "임시 작업 폴더 생성 실패",
-        "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
-    )
 }
 fn create_dir_all_checked(path: &Path, failure_label: &str) -> Result<()> {
     fs::create_dir_all(path)

@@ -6,12 +6,15 @@ use super::{
 };
 use alloc::{string::String, vec::Vec};
 use core::{
+    cell::RefCell,
     ffi::c_void,
     ptr::{NonNull, null, null_mut},
 };
-use std::ffi::OsStr;
-use std::io::Write as IoWrite;
-use std::os::windows::ffi::OsStrExt as WindowsOsStrExt;
+use std::{
+    ffi::OsStr,
+    io::Write as IoWrite,
+    os::windows::ffi::OsStrExt as WindowsOsStrExt,
+};
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
 const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
@@ -20,6 +23,7 @@ const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_CONNECT_TIMEOUT_MS: i32 = 30_000;
+const WINHTTP_CONNECT_CACHE_LIMIT: usize = 4;
 const WINHTTP_RECEIVE_TIMEOUT_MS: i32 = 60_000;
 const WINHTTP_RESOLVE_TIMEOUT_MS: i32 = 30_000;
 const WINHTTP_SEND_TIMEOUT_MS: i32 = 60_000;
@@ -93,6 +97,18 @@ unsafe extern "system" {
     fn GetLastError() -> u32;
 }
 struct Handle(NonNull<c_void>);
+struct CachedConnect {
+    handle: Handle,
+    host: String,
+    port: u16,
+}
+struct SessionCache {
+    connects: Vec<CachedConnect>,
+    session: Handle,
+}
+std::thread_local! {
+    static SESSION_CACHE: RefCell<Option<SessionCache>> = const { RefCell::new(None) };
+}
 impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: self.0 is a WinHTTP handle returned by WinHTTP and is closed exactly once here.
@@ -107,16 +123,47 @@ impl Handle {
     }
 }
 impl Client {
-    fn connect(&self, session: &Handle, host: &[u16]) -> Result<Handle, String> {
+    fn cached_connect<'cache>(
+        &self,
+        cache: &'cache mut SessionCache,
+        host: &str,
+        host_wide: &[u16],
+        port: u16,
+    ) -> Result<&'cache Handle, String> {
+        if let Some(index) = cache
+            .connects
+            .iter()
+            .position(|entry| entry.port == port && entry.host.as_str() == host)
+        {
+            return cache
+                .connects
+                .get(index)
+                .map(|entry| &entry.handle)
+                .ok_or_else(|| "WinHTTP connect cache 범위 오류".to_owned());
+        }
+        let handle = self.connect(&cache.session, host_wide, port)?;
+        let mut host_key = String::new();
+        host_key
+            .try_reserve(host.len())
+            .map_err(|source| format!("WinHTTP connect host key 메모리 확보 실패: {source}"))?;
+        host_key.push_str(host);
+        if cache.connects.len() >= WINHTTP_CONNECT_CACHE_LIMIT {
+            cache.connects.remove(0);
+        }
+        cache
+            .connects
+            .try_reserve(1)
+            .map_err(|source| format!("WinHTTP connect cache 메모리 확보 실패: {source}"))?;
+        let entry = cache.connects.push_mut(CachedConnect {
+            handle,
+            host: host_key,
+            port,
+        });
+        Ok(&entry.handle)
+    }
+    fn connect(&self, session: &Handle, host: &[u16], port: u16) -> Result<Handle, String> {
         // SAFETY: host is NUL-terminated and session is a valid session handle.
-        let raw_connect = unsafe {
-            WinHttpConnect(
-                session.as_ptr(),
-                host.as_ptr(),
-                INTERNET_DEFAULT_HTTPS_PORT,
-                0,
-            )
-        };
+        let raw_connect = unsafe { WinHttpConnect(session.as_ptr(), host.as_ptr(), port, 0) };
         self.non_null_handle(raw_connect, "WinHttpConnect")
     }
     fn last_error_code(&self) -> u32 {
@@ -134,14 +181,14 @@ impl Client {
     }
     fn open_request(
         &self,
-        connect: &Handle,
+        connect: HInternet,
         method: &[u16],
         path: &[u16],
     ) -> Result<Handle, String> {
         // SAFETY: method and path are NUL-terminated and connect is valid.
         let raw_request = unsafe {
             WinHttpOpenRequest(
-                connect.as_ptr(),
+                connect,
                 method.as_ptr(),
                 path.as_ptr(),
                 null(),
@@ -321,7 +368,6 @@ impl Client {
             limit: HTTP_MAX_BODY_BYTES,
             summary: StreamedBodySummary {
                 bytes_seen: 0,
-                prefix: Vec::new(),
                 preview: Vec::new(),
             },
             writer,
@@ -400,9 +446,6 @@ impl Client {
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
         let path_wide = wide(path)?;
-        let session = self.open_session(&user_agent)?;
-        let connect = self.connect(&session, &host_wide)?;
-        let request = self.open_request(&connect, &method_wide, &path_wide)?;
         let header_capacity = headers.iter().fold(0_usize, |acc, &(name, value)| {
             acc.saturating_add(name.len())
                 .saturating_add(value.len())
@@ -424,17 +467,26 @@ impl Client {
         let body_slice = request_body.unwrap_or_default();
         let body_len = u32::try_from(body_slice.len())
             .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?;
-        self.send_request(&request, &headers_wide, body_slice, body_len)?;
-        self.receive_response(&request)?;
-        let status = self.query_status(&request)?;
-        let response_headers = self.query_headers(&request)?;
-        enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
-        let response_body = self.read_body(&request)?;
-        Ok(HttpResponse {
-            body: response_body,
-            headers: response_headers,
-            status,
-        })
+        self.with_cached_connect(
+            &user_agent,
+            host,
+            &host_wide,
+            INTERNET_DEFAULT_HTTPS_PORT,
+            |connect| {
+                let request = self.open_request(connect, &method_wide, &path_wide)?;
+                self.send_request(&request, &headers_wide, body_slice, body_len)?;
+                self.receive_response(&request)?;
+                let status = self.query_status(&request)?;
+                let response_headers = self.query_headers(&request)?;
+                enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
+                let response_body = self.read_body(&request)?;
+                Ok(HttpResponse {
+                    body: response_body,
+                    headers: response_headers,
+                    status,
+                })
+            },
+        )
     }
     pub(super) fn request_to_writer(
         &self,
@@ -449,9 +501,6 @@ impl Client {
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
         let path_wide = wide(path)?;
-        let session = self.open_session(&user_agent)?;
-        let connect = self.connect(&session, &host_wide)?;
-        let request = self.open_request(&connect, &method_wide, &path_wide)?;
         let header_capacity = headers.iter().fold(0_usize, |acc, &(name, value)| {
             acc.saturating_add(name.len())
                 .saturating_add(value.len())
@@ -473,17 +522,26 @@ impl Client {
         let body_slice = request_body.unwrap_or_default();
         let body_len = u32::try_from(body_slice.len())
             .map_err(|source| format!("요청 본문 길이 변환 실패: {source}"))?;
-        self.send_request(&request, &headers_wide, body_slice, body_len)?;
-        self.receive_response(&request)?;
-        let status = self.query_status(&request)?;
-        let response_headers = self.query_headers(&request)?;
-        enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
-        let response_body = self.read_body_to_writer(&request, writer)?;
-        Ok(HttpStreamResponse {
-            body: response_body,
-            headers: response_headers,
-            status,
-        })
+        self.with_cached_connect(
+            &user_agent,
+            host,
+            &host_wide,
+            INTERNET_DEFAULT_HTTPS_PORT,
+            |connect| {
+                let request = self.open_request(connect, &method_wide, &path_wide)?;
+                self.send_request(&request, &headers_wide, body_slice, body_len)?;
+                self.receive_response(&request)?;
+                let status = self.query_status(&request)?;
+                let response_headers = self.query_headers(&request)?;
+                enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
+                let response_body = self.read_body_to_writer(&request, writer)?;
+                Ok(HttpStreamResponse {
+                    body: response_body,
+                    headers: response_headers,
+                    status,
+                })
+            },
+        )
     }
     fn send_request(
         &self,
@@ -515,6 +573,51 @@ impl Client {
             Err(self.last_error_message("WinHttpSendRequest"))
         } else {
             Ok(())
+        }
+    }
+    fn with_cached_connect<R>(
+        &self,
+        user_agent: &[u16],
+        host: &str,
+        host_wide: &[u16],
+        port: u16,
+        action: impl FnOnce(HInternet) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let connect_ptr = SESSION_CACHE
+            .try_with(|cell| {
+                let mut session_cache = cell
+                    .try_borrow_mut()
+                    .map_err(|source| format!("WinHTTP session cache borrow 실패: {source}"))?;
+                if session_cache.is_none() {
+                    *session_cache = Some(SessionCache {
+                        connects: Vec::new(),
+                        session: self.open_session(user_agent)?,
+                    });
+                }
+                let Some(cache) = session_cache.as_mut() else {
+                    return Err("WinHTTP session cache가 비어 있습니다.".to_owned());
+                };
+                let connect = self.cached_connect(cache, host, host_wide, port)?;
+                Ok(connect.as_ptr())
+            })
+            .map_err(|source| format!("WinHTTP session cache 접근 실패: {source}"))??;
+        match action(connect_ptr) {
+            Ok(value) => Ok(value),
+            Err(action_error) => match SESSION_CACHE.try_with(|cell| {
+                let mut session_cache = cell
+                    .try_borrow_mut()
+                    .map_err(|source| format!("WinHTTP session cache borrow 실패: {source}"))?;
+                *session_cache = None;
+                Ok::<(), String>(())
+            }) {
+                Ok(Ok(())) => Err(action_error),
+                Ok(Err(cache_error)) => Err(format!(
+                    "{action_error}; WinHTTP session cache 정리 실패: {cache_error}"
+                )),
+                Err(access_error) => Err(format!(
+                    "{action_error}; WinHTTP session cache 접근 실패: {access_error}"
+                )),
+            },
         }
     }
 }

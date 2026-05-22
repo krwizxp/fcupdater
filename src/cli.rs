@@ -1,40 +1,13 @@
-use crate::{Result, err};
-use std::{
-    env,
-    ffi::{OsStr, OsString},
-};
-const APP_NAME: &str = "fcupdater";
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+use std::env;
+pub const APP_NAME: &str = "fcupdater";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone)]
 pub enum ParseAction {
     Help(String),
     Run,
     Version(String),
 }
-impl TryFrom<(Option<OsString>, bool)> for ParseAction {
-    type Error = crate::BoxError;
-    fn try_from(raw_args: (Option<OsString>, bool)) -> Result<Self> {
-        let (first_arg, has_extra) = raw_args;
-        let Some(token) = first_arg else {
-            return Ok(Self::Run);
-        };
-        if has_extra {
-            return Err(err(unknown_option_message(&token.to_string_lossy())));
-        }
-        if token == OsStr::new("-h") || token == OsStr::new("--help") {
-            return Ok(Self::Help(usage_text()));
-        }
-        if token == OsStr::new("--version") {
-            return Ok(Self::Version(format!("{APP_NAME} {APP_VERSION}")));
-        }
-        Err(err(unknown_option_message(&token.to_string_lossy())))
-    }
-}
-fn unknown_option_message(token: &str) -> String {
-    let usage = usage_text();
-    format!("알 수 없는 옵션: {token}\n\n{usage}")
-}
-fn usage_text() -> String {
+pub fn usage_text() -> String {
     format!(
         "{APP_NAME} {APP_VERSION}\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n\
 사용법:\n  {APP_NAME}\n\n\

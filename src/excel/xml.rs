@@ -1,3 +1,126 @@
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::excel) enum XmlTagKind {
+    End,
+    Start,
+}
+#[derive(Clone, Copy)]
+pub(in crate::excel) struct XmlTag<'xml> {
+    end: usize,
+    kind: XmlTagKind,
+    name: &'xml str,
+    self_closing: bool,
+    start: usize,
+    tag: &'xml str,
+}
+pub(in crate::excel) struct XmlScanner<'xml> {
+    cursor: usize,
+    xml: &'xml str,
+}
+impl XmlScanner<'_> {
+    pub(in crate::excel) fn skip_to(&mut self, cursor: usize) {
+        self.cursor = cursor.min(self.xml.len());
+    }
+}
+impl<'xml> XmlScanner<'xml> {
+    fn find_tag_matching<F>(&mut self, mut predicate: F) -> Option<XmlTag<'xml>>
+    where
+        F: FnMut(&XmlTag<'xml>) -> bool,
+    {
+        while let Some(tag) = self.next_tag() {
+            if predicate(&tag) {
+                return Some(tag);
+            }
+        }
+        None
+    }
+    pub(in crate::excel) const fn from(xml: &'xml str, cursor: usize) -> Self {
+        Self { cursor, xml }
+    }
+    pub(in crate::excel) const fn new(xml: &'xml str) -> Self {
+        Self { cursor: 0, xml }
+    }
+    pub(in crate::excel) fn next_start_named(&mut self, tag_name: &str) -> Option<XmlTag<'xml>> {
+        let wanted = local_tag_name(tag_name);
+        self.find_tag_matching(|tag| tag.is_start() && tag.local_name() == wanted)
+    }
+    fn next_tag(&mut self) -> Option<XmlTag<'xml>> {
+        while let Some(rel) = self.xml.get(self.cursor..)?.find('<') {
+            let start = checked_offset_add(self.cursor, rel)?;
+            let end = find_tag_end(self.xml, start)?;
+            self.cursor = checked_offset_add(end, 1)?;
+            let inner_start = checked_offset_add(start, 1)?;
+            let mut name_start = inner_start;
+            let bytes = self.xml.as_bytes();
+            let first = *bytes.get(name_start)?;
+            let kind = if first == b'/' {
+                name_start = checked_offset_add(name_start, 1)?;
+                XmlTagKind::End
+            } else if matches!(first, b'!' | b'?') {
+                continue;
+            } else {
+                XmlTagKind::Start
+            };
+            while bytes.get(name_start).is_some_and(u8::is_ascii_whitespace) {
+                name_start = checked_offset_add(name_start, 1)?;
+            }
+            let mut name_end = name_start;
+            while bytes
+                .get(name_end)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b'/' | b'>'))
+            {
+                name_end = checked_offset_add(name_end, 1)?;
+            }
+            let name = self.xml.get(name_start..name_end)?;
+            if name.is_empty() {
+                continue;
+            }
+            let tag = self.xml.get(start..=end)?;
+            let mut self_close_cursor = end;
+            let mut self_closing = false;
+            while self_close_cursor > start {
+                let previous = self_close_cursor.saturating_sub(1);
+                let Some(&byte) = bytes.get(previous) else {
+                    break;
+                };
+                if byte.is_ascii_whitespace() {
+                    self_close_cursor = previous;
+                    continue;
+                }
+                self_closing = byte == b'/';
+                break;
+            }
+            return Some(XmlTag {
+                end,
+                kind,
+                name,
+                self_closing,
+                start,
+                tag,
+            });
+        }
+        None
+    }
+}
+impl<'xml> XmlTag<'xml> {
+    pub(in crate::excel) const fn end(&self) -> usize {
+        self.end
+    }
+    pub(in crate::excel) const fn is_self_closing(&self) -> bool {
+        self.self_closing
+    }
+    pub(in crate::excel) const fn is_start(&self) -> bool {
+        matches!(self.kind, XmlTagKind::Start)
+    }
+    pub(in crate::excel) fn local_name(&self) -> &str {
+        local_tag_name(self.name)
+    }
+    pub(in crate::excel) const fn start(&self) -> usize {
+        self.start
+    }
+    pub(in crate::excel) const fn tag(&self) -> &'xml str {
+        self.tag
+    }
+}
 const fn checked_offset_add(base: usize, add: usize) -> Option<usize> {
     base.checked_add(add)
 }
@@ -34,46 +157,30 @@ pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<Strin
     None
 }
 pub(in crate::excel) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
-    let mut cursor = from.min(xml.len());
-    let wanted = local_tag_name(tag_name);
-    while let Some(rel) = xml.get(cursor..)?.find('<') {
-        let start = checked_offset_add(cursor, rel)?;
-        let rest = xml.get(checked_offset_add(start, 1)?..)?;
-        if rest.starts_with(['/', '!', '?']) {
-            cursor = checked_offset_add(start, 1)?;
-            continue;
-        }
-        let name_end_rel = rest
-            .find(|ch: char| ch.is_ascii_whitespace() || ch == '/' || ch == '>')
-            .unwrap_or(rest.len());
-        let raw_name = rest.get(..name_end_rel)?;
-        if !raw_name.is_empty() && local_tag_name(raw_name) == wanted {
-            return Some(start);
-        }
-        cursor = checked_offset_add(start, 1)?;
-    }
-    None
+    XmlScanner::from(xml, from)
+        .next_start_named(tag_name)
+        .map(|tag| tag.start())
 }
 pub(in crate::excel) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
-    let mut cursor = from.min(xml.len());
     let wanted = local_tag_name(tag_name);
-    while let Some(rel) = xml.get(cursor..)?.find("</") {
-        let start = checked_offset_add(cursor, rel)?;
-        let rest = xml.get(checked_offset_add(start, 2)?..)?;
-        let name_end_rel = rest
-            .find(|ch: char| ch.is_ascii_whitespace() || ch == '>')
-            .unwrap_or(rest.len());
-        let raw_name = rest.get(..name_end_rel)?;
-        if !raw_name.is_empty() && local_tag_name(raw_name) == wanted {
-            return Some(start);
-        }
-        cursor = checked_offset_add(start, 2)?;
-    }
-    None
+    XmlScanner::from(xml, from)
+        .find_tag_matching(|tag| !tag.is_start() && tag.local_name() == wanted)
+        .map(|tag| tag.start())
 }
 pub(in crate::excel) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
-    let rel = xml.get(tag_start..)?.find('>')?;
-    checked_offset_add(tag_start, rel)
+    let bytes = xml.as_bytes();
+    let mut cursor = tag_start;
+    let mut quote = None;
+    while let Some(&byte) = bytes.get(cursor) {
+        match quote {
+            Some(active_quote) if byte == active_quote => quote = None,
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if byte == b'>' => return Some(cursor),
+            Some(_) | None => {}
+        }
+        cursor = checked_offset_add(cursor, 1)?;
+    }
+    None
 }
 pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     let open_start = find_start_tag(xml, tag_name, 0)?;

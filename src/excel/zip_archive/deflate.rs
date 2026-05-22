@@ -64,6 +64,17 @@ pub(in crate::excel::zip_archive) mod token {
     }
 }
 const TOO_FAR_MATCH_DISTANCE: usize = 4096;
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+const XML_NICE_MATCH_LEN: usize = 128;
+const XLSX_XML_NEEDLES: [&[u8]; 7] = [
+    b"<worksheet",
+    b"<sst",
+    b"<workbook",
+    b"<styleSheet",
+    b"<Relationships",
+    b"<Types",
+    b"schemas.openxmlformats.org",
+];
 pub(super) struct DeflateInflater<'bytes> {
     pub bytes: &'bytes [u8],
     pub expected_len: usize,
@@ -91,6 +102,11 @@ struct DynamicTokenWriter<'writer, 'huffman> {
     distance_huffman: &'huffman WriteHuffman,
     literal_huffman: &'huffman WriteHuffman,
     writer: &'writer mut BitWriter,
+}
+#[derive(Clone, Copy)]
+struct DeflateProfile {
+    max_chain: usize,
+    nice_match_len: usize,
 }
 struct FixedDeflateWriter<'tokens> {
     byte_len: usize,
@@ -136,14 +152,16 @@ impl BitReader<'_> {
     }
     fn read_stored_bytes(&mut self, len: usize) -> ZipResult<&[u8]> {
         self.align_to_byte();
-        let end = self
+        let Some((_, remaining)) = self.bytes.split_at_checked(self.cursor) else {
+            return Err(zip_static("deflate 저장 블록 시작 위치가 입력보다 깁니다."));
+        };
+        let Some((bytes, _)) = remaining.split_at_checked(len) else {
+            return Err(zip_static("deflate 저장 블록이 입력보다 깁니다."));
+        };
+        self.cursor = self
             .cursor
             .checked_add(len)
             .ok_or_else(|| zip_static("deflate 저장 블록 크기 계산 실패"))?;
-        let Some(bytes) = self.bytes.get(self.cursor..end) else {
-            return Err(zip_static("deflate 저장 블록이 입력보다 깁니다."));
-        };
-        self.cursor = end;
         Ok(bytes)
     }
 }
@@ -439,12 +457,10 @@ impl InflateState<'_> {
                 }
             }
         }
-        let literal_lengths = lengths
-            .get(..literal_count)
-            .ok_or_else(|| zip_static("deflate literal length 범위 오류"))?;
-        let distance_lengths = lengths
-            .get(literal_count..)
-            .ok_or_else(|| zip_static("deflate distance length 범위 오류"))?;
+        let Some((literal_lengths, distance_lengths)) = lengths.split_at_checked(literal_count)
+        else {
+            return Err(zip_static("deflate literal/distance length 범위 오류"));
+        };
         let literal = Huffman::from_lengths(literal_lengths)?
             .ok_or_else(|| zip_static("deflate literal Huffman tree가 비어 있습니다."))?;
         let distance = Huffman::from_lengths(distance_lengths)?;
@@ -667,16 +683,14 @@ impl DynamicDeflateWriter<'_> {
         combined_lengths
             .try_reserve(literal_count.saturating_add(distance_count))
             .map_err(|source| format!("deflate combined length 메모리 확보 실패: {source}"))?;
-        combined_lengths.extend_from_slice(
-            literal_lengths
-                .get(..literal_count)
-                .ok_or_else(|| zip_static("deflate literal length 범위 오류"))?,
-        );
-        combined_lengths.extend_from_slice(
-            distance_lengths
-                .get(..distance_count)
-                .ok_or_else(|| zip_static("deflate distance length 범위 오류"))?,
-        );
+        let Some((literal_prefix, _)) = literal_lengths.split_at_checked(literal_count) else {
+            return Err(zip_static("deflate literal length 범위 오류"));
+        };
+        let Some((distance_prefix, _)) = distance_lengths.split_at_checked(distance_count) else {
+            return Err(zip_static("deflate distance length 범위 오류"));
+        };
+        combined_lengths.extend_from_slice(literal_prefix);
+        combined_lengths.extend_from_slice(distance_prefix);
         let code_length_tokens = CodeLengthTokenizer {
             lengths: &combined_lengths,
         }
@@ -1083,6 +1097,7 @@ impl DeflateWriter<'_> {
         position: usize,
         head: &[usize],
         previous: &[usize],
+        profile: DeflateProfile,
     ) -> Option<(usize, usize)> {
         let hash = hash3(bytes, position)?;
         let mut candidate = *head.get(hash)?;
@@ -1094,7 +1109,7 @@ impl DeflateWriter<'_> {
         while candidate != usize::MAX
             && candidate >= min_candidate
             && candidate < position
-            && chain_len < MAX_CHAIN
+            && chain_len < profile.max_chain
         {
             let mut len = 0_usize;
             while len < max_len {
@@ -1112,7 +1127,7 @@ impl DeflateWriter<'_> {
             if len > best_len && len >= MIN_MATCH {
                 best_len = len;
                 best_distance = position.saturating_sub(candidate);
-                if len == MAX_MATCH {
+                if len >= profile.nice_match_len {
                     break;
                 }
             }
@@ -1174,6 +1189,30 @@ impl DeflateWriter<'_> {
         None
     }
     fn tokens(&self) -> ZipResult<Vec<DeflateToken>> {
+        let has_bom = self.bytes.starts_with(UTF8_BOM);
+        let mut xml_cursor = if has_bom { UTF8_BOM.len() } else { 0 };
+        while self
+            .bytes
+            .get(xml_cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            xml_cursor = xml_cursor.saturating_add(1);
+        }
+        let looks_like_xlsx_xml = self.bytes.get(xml_cursor..).is_some_and(|tail| {
+            (tail.starts_with(b"<?xml") || tail.starts_with(b"<"))
+                && XLSX_XML_NEEDLES
+                    .iter()
+                    .any(|needle| tail.windows(needle.len()).any(|window| window == *needle))
+        });
+        let nice_match_len = if looks_like_xlsx_xml {
+            XML_NICE_MATCH_LEN
+        } else {
+            MAX_MATCH
+        };
+        let profile = DeflateProfile {
+            max_chain: MAX_CHAIN,
+            nice_match_len,
+        };
         let mut tokens = Vec::new();
         tokens
             .try_reserve(self.bytes.len())
@@ -1190,7 +1229,7 @@ impl DeflateWriter<'_> {
         let mut position = 0_usize;
         while position < self.bytes.len() {
             if let Some((length, distance)) =
-                Self::best_match(self.bytes, position, &head, &previous)
+                Self::best_match(self.bytes, position, &head, &previous, profile)
             {
                 if length == MIN_MATCH && distance > TOO_FAR_MATCH_DISTANCE {
                     let Some(&byte) = self.bytes.get(position) else {
@@ -1210,7 +1249,7 @@ impl DeflateWriter<'_> {
                 {
                     Self::insert_position(self.bytes, position, &mut head, &mut previous);
                     inserted_current = true;
-                    Self::best_match(self.bytes, next_position, &head, &previous)
+                    Self::best_match(self.bytes, next_position, &head, &previous, profile)
                         .is_some_and(|(next_length, _)| next_length > length)
                 } else {
                     false

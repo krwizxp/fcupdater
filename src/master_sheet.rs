@@ -665,10 +665,10 @@ impl RankFormulaRangeRewriter<'_> {
         let Some(end_digits_end) = end_digits_start.checked_add(end_digits_len) else {
             return self.formula.to_owned();
         };
-        let Some(prefix) = self.formula.get(..first_col_pos) else {
+        let Some((prefix, _range_start)) = self.formula.split_at_checked(first_col_pos) else {
             return self.formula.to_owned();
         };
-        let Some(suffix) = self.formula.get(end_digits_end..) else {
+        let Some((_formula_head, suffix)) = self.formula.split_at_checked(end_digits_end) else {
             return self.formula.to_owned();
         };
         let data_start_row = self.data_start_row;

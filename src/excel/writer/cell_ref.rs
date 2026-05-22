@@ -46,8 +46,7 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, b
     if col_end == 0 {
         return None;
     }
-    let col_s = after_col_lock.get(..col_end)?;
-    let after_col = after_col_lock.get(col_end..)?;
+    let (col_s, after_col) = after_col_lock.split_at_checked(col_end)?;
     let (row_lock, row_part) = strip_ref_lock_prefix(after_col);
     let row_end = row_part
         .find(|ch: char| !ch.is_ascii_digit())

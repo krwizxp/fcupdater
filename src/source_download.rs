@@ -16,7 +16,6 @@ const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
 const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
 const OLE2_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-const STREAM_PREFIX_BYTES: usize = 8;
 const OPINET_HOST: &str = "www.opinet.co.kr";
 const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
 const OPDOWNLOAD_PATH: &str = "/user/opdown/opDownload.do";
@@ -54,7 +53,6 @@ pub struct SourceDownload<'dir, 'out> {
 #[derive(Debug)]
 struct StreamedBodySummary {
     bytes_seen: usize,
-    prefix: Vec<u8>,
     preview: Vec<u8>,
 }
 struct StreamingBodySink<'writer> {
@@ -68,7 +66,7 @@ impl StreamedBodySummary {
         lossy_prefix(&self.preview, self.preview.len())
     }
     fn starts_with(&self, prefix: &[u8]) -> bool {
-        self.prefix.as_slice() == prefix && self.bytes_seen >= prefix.len()
+        self.bytes_seen >= prefix.len() && self.preview.starts_with(prefix)
     }
 }
 impl StreamingBodySink<'_> {
@@ -84,7 +82,7 @@ impl StreamingBodySink<'_> {
             ));
             return false;
         }
-        if !self.capture_prefix(bytes) || !self.capture_preview(bytes) {
+        if !self.capture_preview(bytes) {
             return false;
         }
         if let Err(source) = self.writer.write_all(bytes) {
@@ -92,24 +90,6 @@ impl StreamingBodySink<'_> {
             return false;
         }
         self.summary.bytes_seen = next_len;
-        true
-    }
-    fn capture_prefix(&mut self, bytes: &[u8]) -> bool {
-        let take = STREAM_PREFIX_BYTES
-            .saturating_sub(self.summary.prefix.len())
-            .min(bytes.len());
-        if take == 0 {
-            return true;
-        }
-        if let Err(source) = self.summary.prefix.try_reserve(take) {
-            self.error = Some(format!("HTTP 응답 본문 prefix 메모리 확보 실패: {source}"));
-            return false;
-        }
-        let Some(prefix) = bytes.get(..take) else {
-            self.error = Some("HTTP 응답 본문 prefix 범위 계산 실패".to_owned());
-            return false;
-        };
-        self.summary.prefix.extend_from_slice(prefix);
         true
     }
     fn capture_preview(&mut self, bytes: &[u8]) -> bool {
@@ -123,7 +103,7 @@ impl StreamingBodySink<'_> {
             self.error = Some(format!("HTTP 응답 본문 preview 메모리 확보 실패: {source}"));
             return false;
         }
-        let Some(preview) = bytes.get(..take) else {
+        let Some((preview, _)) = bytes.split_at_checked(take) else {
             self.error = Some("HTTP 응답 본문 preview 범위 계산 실패".to_owned());
             return false;
         };

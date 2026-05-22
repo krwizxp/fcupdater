@@ -1,5 +1,5 @@
 extern crate alloc;
-use cli::ParseAction;
+use cli::{APP_NAME, APP_VERSION, ParseAction, usage_text};
 use core::{error::Error, fmt::Display, result::Result as StdResult};
 use io_util::write_line_ignored;
 pub(crate) use region::{normalize_address_key, parse_region_label};
@@ -9,6 +9,7 @@ pub(crate) use sheet_util::{
 };
 use std::{
     env,
+    ffi::OsStr,
     io::{Error as IoError, stdout},
     path::Path,
 };
@@ -108,7 +109,29 @@ fn main() -> Result<()> {
     let mut raw_args = env::args_os().skip(1);
     let first_arg = raw_args.next();
     let has_extra = raw_args.next().is_some();
-    let action = ParseAction::try_from((first_arg, has_extra))?;
+    let action = match first_arg {
+        None => ParseAction::Run,
+        Some(token) => {
+            if has_extra {
+                let usage = usage_text();
+                return Err(err(format!(
+                    "알 수 없는 옵션: {}\n\n{usage}",
+                    token.to_string_lossy()
+                )));
+            }
+            if token == OsStr::new("-h") || token == OsStr::new("--help") {
+                ParseAction::Help(usage_text())
+            } else if token == OsStr::new("--version") {
+                ParseAction::Version(format!("{APP_NAME} {APP_VERSION}"))
+            } else {
+                let usage = usage_text();
+                return Err(err(format!(
+                    "알 수 없는 옵션: {}\n\n{usage}",
+                    token.to_string_lossy()
+                )));
+            }
+        }
+    };
     match action {
         ParseAction::Run => {
             let mut context = UpdateRunContext { out: &mut out };

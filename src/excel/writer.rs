@@ -6,8 +6,8 @@ use super::{
     ooxml::{self, SheetCatalog},
     xlsx_container::XlsxContainer,
     xml::{
-        decode_xml_entities, extract_all_tag_text, extract_first_tag_text, find_end_tag,
-        find_start_tag, find_tag_end,
+        XmlScanner, decode_xml_entities, extract_all_tag_text, extract_first_tag_text,
+        find_end_tag, find_start_tag, find_tag_end,
     },
 };
 use crate::{Result, err, err_with_source, parse_i32_str};
@@ -64,7 +64,7 @@ struct SharedFormulaSpec {
 }
 impl Workbook {
     pub fn open(path: &Path) -> Result<Self> {
-        let container = XlsxContainer::try_from(path)?;
+        let container = XlsxContainer::open(path)?;
         let ooxml = ooxml::XlsxOoxml {
             container: &container,
         };
@@ -373,30 +373,11 @@ impl Workbook {
 }
 impl WorksheetRowParser<'_> {
     fn parse_into(&self, row: &mut Row) -> Result<()> {
-        let mut cursor = 0_usize;
+        let mut scanner = XmlScanner::new(self.row_body);
         let mut next_col = 1_u32;
-        while let Some(cell_open_rel) = self.row_body.get(cursor..).and_then(|tail| tail.find("<c"))
-        {
-            let cell_open = checked_usize_add(cursor, cell_open_rel, "row cell 시작")?;
-            let Some(cell_tag_end_rel) = self
-                .row_body
-                .get(cell_open..)
-                .and_then(|tail| tail.find('>'))
-            else {
-                return Err(err(row_offset_error(
-                    "row 내 cell 시작 태그가 손상되었습니다. (row=",
-                    self.row_num,
-                    cell_open,
-                )));
-            };
-            let cell_tag_end = checked_usize_add(cell_open, cell_tag_end_rel, "row cell 태그 끝")?;
-            let cell_tag = self.row_body.get(cell_open..=cell_tag_end).ok_or_else(|| {
-                err(row_offset_error(
-                    "row 내 cell 태그 범위가 손상되었습니다. (row=",
-                    self.row_num,
-                    cell_open,
-                ))
-            })?;
+        while let Some(cell_info) = scanner.next_start_named("c") {
+            let cell_tag_end = cell_info.end();
+            let cell_tag = cell_info.tag();
             let mut attrs = parse_tag_attrs(cell_tag)?;
             let col = if let Some((col_num, _, _, _)) =
                 get_attr(&attrs, "r").and_then(parse_ref_with_locks)
@@ -411,7 +392,7 @@ impl WorksheetRowParser<'_> {
                 "r",
                 ref_with_locks(col, self.row_num, false, false),
             );
-            if cell_tag.ends_with("/>") {
+            if cell_info.is_self_closing() {
                 row.cells.insert(
                     col,
                     Cell {
@@ -420,7 +401,6 @@ impl WorksheetRowParser<'_> {
                     },
                 );
                 next_col = col.saturating_add(1);
-                cursor = cell_tag_end.saturating_add(1);
                 continue;
             }
             let cell_body_start = checked_usize_add(cell_tag_end, 1, "row cell 본문 시작")?;
@@ -456,7 +436,11 @@ impl WorksheetRowParser<'_> {
                 },
             );
             next_col = col.saturating_add(1);
-            cursor = checked_usize_add(cell_body_end, "</c>".len(), "row cell 다음 cursor")?;
+            scanner.skip_to(checked_usize_add(
+                cell_body_end,
+                "</c>".len(),
+                "row cell 다음 cursor",
+            )?);
         }
         Ok(())
     }
@@ -464,24 +448,10 @@ impl WorksheetRowParser<'_> {
 impl WorksheetRowsParser<'_> {
     fn parse(&self) -> Result<BTreeMap<u32, Row>> {
         let mut rows = BTreeMap::new();
-        let mut cursor = 0_usize;
-        while let Some(row_open_rel) = self.body.get(cursor..).and_then(|tail| tail.find("<row")) {
-            let row_open = checked_usize_add(cursor, row_open_rel, "sheetData row 시작")?;
-            let Some(row_tag_end_rel) = self.body.get(row_open..).and_then(|tail| tail.find('>'))
-            else {
-                return Err(err(offset_only_error(
-                    "sheetData row 시작 태그가 손상되었습니다. (offset=",
-                    row_open,
-                )));
-            };
-            let row_tag_end =
-                checked_usize_add(row_open, row_tag_end_rel, "sheetData row 태그 끝")?;
-            let row_tag = self.body.get(row_open..=row_tag_end).ok_or_else(|| {
-                err(offset_only_error(
-                    "sheetData row 태그 범위가 손상되었습니다. (offset=",
-                    row_open,
-                ))
-            })?;
+        let mut scanner = XmlScanner::new(self.body);
+        while let Some(row_info) = scanner.next_start_named("row") {
+            let row_tag_end = row_info.end();
+            let row_tag = row_info.tag();
             let mut row_attrs = parse_tag_attrs(row_tag)?;
             let row_num = get_attr(&row_attrs, "r")
                 .and_then(|value| value.parse::<u32>().ok())
@@ -497,7 +467,7 @@ impl WorksheetRowsParser<'_> {
                 false,
             )?;
             set_attr(&mut row_attrs, "r", display_string(row_num));
-            if row_tag.ends_with("/>") {
+            if row_info.is_self_closing() {
                 rows.insert(
                     row_num,
                     Row {
@@ -505,7 +475,6 @@ impl WorksheetRowsParser<'_> {
                         cells: BTreeMap::new(),
                     },
                 );
-                cursor = row_tag_end.saturating_add(1);
                 continue;
             }
             let row_body_start = checked_usize_add(row_tag_end, 1, "sheetData row 본문 시작")?;
@@ -533,7 +502,11 @@ impl WorksheetRowsParser<'_> {
             };
             WorksheetRowParser { row_body, row_num }.parse_into(&mut row)?;
             rows.insert(row_num, row);
-            cursor = checked_usize_add(row_body_end, "</row>".len(), "sheetData row 다음 cursor")?;
+            scanner.skip_to(checked_usize_add(
+                row_body_end,
+                "</row>".len(),
+                "sheetData row 다음 cursor",
+            )?);
         }
         Ok(rows)
     }
@@ -554,20 +527,18 @@ impl WorksheetXmlParser<'_> {
         else {
             return Err(err("worksheet XML에 </sheetData>가 없습니다."));
         };
-        let prefix = self
+        let (prefix_raw, body_and_suffix) = self
             .xml
-            .get(..sheet_data_body_start)
-            .ok_or_else(|| err("worksheet XML prefix 범위가 손상되었습니다."))?
-            .to_owned();
-        let body = self
-            .xml
-            .get(sheet_data_body_start..sheet_data_close)
+            .split_at_checked(sheet_data_body_start)
+            .ok_or_else(|| err("worksheet XML prefix 범위가 손상되었습니다."))?;
+        let body_len = sheet_data_close
+            .checked_sub(sheet_data_body_start)
             .ok_or_else(|| err("worksheet XML body 범위가 손상되었습니다."))?;
-        let suffix = self
-            .xml
-            .get(sheet_data_close..)
-            .ok_or_else(|| err("worksheet XML suffix 범위가 손상되었습니다."))?
-            .to_owned();
+        let (body, suffix_raw) = body_and_suffix
+            .split_at_checked(body_len)
+            .ok_or_else(|| err("worksheet XML body 범위가 손상되었습니다."))?;
+        let prefix = prefix_raw.to_owned();
+        let suffix = suffix_raw.to_owned();
         let rows = WorksheetRowsParser { body }.parse()?;
         Ok(Worksheet {
             prefix,
@@ -1031,13 +1002,14 @@ impl Worksheet {
                     .get(auto_filter_start..auto_filter_end)
                     .ok_or_else(|| err("worksheet XML의 autoFilter 태그 범위가 손상되었습니다."))?;
                 let mut attrs = parse_tag_attrs(tag)?;
-                let mut end_col = 1_u32;
-                if let Some(existing_ref) = get_attr(&attrs, "ref") {
-                    let (_, end_ref) = parse_range_token(existing_ref);
-                    if let Some((parsed_end_col, _, _, _)) = parse_ref_with_locks(end_ref) {
-                        end_col = parsed_end_col;
-                    }
-                }
+                let end_col = if let Some(existing_ref) = get_attr(&attrs, "ref")
+                    && let Some((parsed_end_col, _, _, _)) =
+                        parse_ref_with_locks(parse_range_token(existing_ref).1)
+                {
+                    parsed_end_col
+                } else {
+                    1_u32
+                };
                 let new_ref = build_ref_range("A", header_row, end_col, target_last_row);
                 reserve_xml_attrs(
                     &mut attrs,
@@ -1325,20 +1297,28 @@ fn replace_formula_tag_with_plain_formula(inner_xml: &str, formula: &str) -> Res
     let open_tag = inner_xml
         .get(f_start..=f_end)
         .ok_or_else(|| err("cell formula 시작 태그 범위가 손상되었습니다."))?;
-    let prefix = inner_xml
-        .get(..f_start)
+    let (prefix, formula_and_suffix) = inner_xml
+        .split_at_checked(f_start)
         .ok_or_else(|| err("cell formula prefix 범위가 손상되었습니다."))?;
     let suffix = if open_tag.trim_ascii_end().ends_with("/>") {
+        let suffix_start = checked_usize_add(f_end, 1, "cell formula suffix 시작")?;
         inner_xml
-            .get(checked_usize_add(f_end, 1, "cell formula suffix 시작")?..)
+            .split_at_checked(suffix_start)
+            .map(|(_, suffix)| suffix)
             .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?
     } else {
         let close_search_from = checked_usize_add(f_end, 1, "cell formula 종료 태그 검색 시작")?;
         let Some(close_start) = find_end_tag(inner_xml, "f", close_search_from) else {
             return Err(err("cell formula 종료 태그를 찾지 못했습니다."));
         };
-        inner_xml
-            .get(checked_usize_add(close_start, "</f>".len(), "cell formula suffix 시작")?..)
+        let suffix_start =
+            checked_usize_add(close_start, "</f>".len(), "cell formula suffix 시작")?;
+        let relative_suffix_start = suffix_start
+            .checked_sub(f_start)
+            .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?;
+        formula_and_suffix
+            .split_at_checked(relative_suffix_start)
+            .map(|(_, suffix)| suffix)
             .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?
     };
     let escaped_formula = xml_escape_text(formula);
@@ -1541,21 +1521,6 @@ fn build_ref_range(start_col_text: &str, start_row: u32, end_col: u32, end_row: 
 fn display_string(value: impl Display) -> String {
     value.to_string()
 }
-fn offset_only_error(prefix: &str, offset: usize) -> String {
-    let offset_text = offset.to_string();
-    let capacity = prefix
-        .len()
-        .saturating_add(offset_text.len())
-        .saturating_add(1);
-    let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("{prefix}{offset_text})");
-    }
-    out.push_str(prefix);
-    out.push_str(&offset_text);
-    out.push(')');
-    out
-}
 fn row_only_error(prefix: &str, row_num: u32) -> String {
     let row_text = row_num.to_string();
     let capacity = prefix
@@ -1568,26 +1533,6 @@ fn row_only_error(prefix: &str, row_num: u32) -> String {
     }
     out.push_str(prefix);
     out.push_str(&row_text);
-    out.push(')');
-    out
-}
-fn row_offset_error(prefix: &str, row_num: u32, offset: usize) -> String {
-    let row_text = row_num.to_string();
-    let offset_text = offset.to_string();
-    let capacity = prefix
-        .len()
-        .saturating_add(row_text.len())
-        .saturating_add(", offset=".len())
-        .saturating_add(offset_text.len())
-        .saturating_add(1);
-    let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("{prefix}{row_text}, offset={offset_text})");
-    }
-    out.push_str(prefix);
-    out.push_str(&row_text);
-    out.push_str(", offset=");
-    out.push_str(&offset_text);
     out.push(')');
     out
 }

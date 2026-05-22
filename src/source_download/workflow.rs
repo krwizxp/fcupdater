@@ -10,7 +10,7 @@ use core::result::Result as StdResult;
 use std::{
     fs,
     io::{ErrorKind, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 const AUTO_SOURCE_FILE_NAME: &str = "fcupdater-opinet-source.xls";
 const AUTO_SOURCE_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
@@ -64,9 +64,9 @@ impl SourceDownloadWorkflow<'_> {
     }
     fn download_nationwide_source_http(&self) -> StdResult<PathBuf, String> {
         let mut client = http_client::HttpClient::default();
-        let _gate_html = client.get_text(OPINET_HOST, OPDOWNLOAD_PATH, None)?;
+        client.get_text(OPINET_HOST, OPDOWNLOAD_PATH, None)?;
         let entry_key = client.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
-        let _entry_page = client.post_form(
+        client.post_form(
             OPINET_HOST,
             OPDOWNLOAD_PATH,
             &[
@@ -76,7 +76,7 @@ impl SourceDownloadWorkflow<'_> {
             Some(OPDOWNLOAD_URL),
             false,
         )?;
-        let _layout = client.post_form(
+        client.post_form(
             OPINET_HOST,
             OPDOWNLOAD_LAYOUT_PATH,
             &[("tarUrl", OIL_PRICE_DOWNLOAD_TAR_URL)],
@@ -104,13 +104,13 @@ impl SourceDownloadWorkflow<'_> {
         ) {
             Ok(response) => response,
             Err(error_text) => {
-                let _cleanup_result = fs::remove_file(&temp);
+                remove_file_best_effort(&temp);
                 return Err(error_text);
             }
         };
         if !response.body.starts_with(&OLE2_SIGNATURE) {
             let preview = response.body.preview_lossy();
-            let _cleanup_result = fs::remove_file(&temp);
+            remove_file_best_effort(&temp);
             return Err(prefixed_message(
                 "다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: ",
                 preview,
@@ -119,7 +119,7 @@ impl SourceDownloadWorkflow<'_> {
         match fs::rename(&temp, &target) {
             Ok(()) => {}
             Err(error) => {
-                let _cleanup_result = fs::remove_file(&temp);
+                remove_file_best_effort(&temp);
                 return Err(path_source_message(
                     "다운로드 파일 이름 변경 실패",
                     &target,
@@ -134,9 +134,16 @@ impl SourceDownloadWorkflow<'_> {
             err(prefixed_message("기존 자동 소스 정리 실패: ", error_text))
         })?;
         if removed > 0 {
-            let _write_result = writeln!(self.out, "이전 임시 소스 파일 {removed}개 정리");
+            match writeln!(self.out, "이전 임시 소스 파일 {removed}개 정리") {
+                Ok(()) | Err(_) => {}
+            }
         }
         self.download_nationwide_source_http()
             .map_err(|error_text| err(prefixed_message("Opinet 자동 다운로드 실패: ", error_text)))
+    }
+}
+fn remove_file_best_effort(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) | Err(_) => {}
     }
 }

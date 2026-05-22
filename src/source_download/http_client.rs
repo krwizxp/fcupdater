@@ -136,7 +136,9 @@ impl HttpClient {
             let result = self.request_netfunnel(action_id, current_key.as_deref(), None)?;
             self.add_cookie("NetFunnel_ID", &result)?;
             let mut parts = result.split(':');
-            let _opcode = parts.next();
+            if parts.next().is_none() {
+                return Err(prefixed_message("NetFunnel opcode 없음: ", result));
+            }
             let Some(code_text) = parts.next() else {
                 return Err(prefixed_message("NetFunnel 코드 없음: ", result));
             };
@@ -219,13 +221,19 @@ impl HttpClient {
             Ok(response) => response,
             Err(error_text) => {
                 drop(file);
-                let _cleanup_result = fs::remove_file(target);
+                remove_file_best_effort(target);
                 return Err(error_text);
             }
         };
-        IoWrite::flush(&mut file).map_err(|source| {
-            path_source_message("다운로드 임시 파일 flush 실패", target, source)
-        })?;
+        if let Err(source) = IoWrite::flush(&mut file) {
+            drop(file);
+            remove_file_best_effort(target);
+            return Err(path_source_message(
+                "다운로드 임시 파일 flush 실패",
+                target,
+                source,
+            ));
+        }
         Ok(response)
     }
     fn post_headers(referer: Option<&str>, ajax: bool) -> StdResult<Vec<(&str, &str)>, String> {
@@ -305,8 +313,12 @@ impl HttpClient {
                     super::libcurl::CLIENT.request(method, host, path, body, &merged_headers)
                 }
                 _ => {
-                    let _ = (method, host, path, body, headers, &merged_headers);
-                    Err("외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.".to_owned())
+                    let body_len = body.map_or(0, <[u8]>::len);
+                    let header_count = headers.len();
+                    let merged_header_count = merged_headers.len();
+                    Err(format!(
+                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
+                    ))
                 }
             }
         }?;
@@ -463,8 +475,13 @@ impl HttpClient {
                     )
                 }
                 _ => {
-                    let _ = (method, host, path, body, headers, &merged_headers, writer);
-                    Err("외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다.".to_owned())
+                    let body_len = body.map_or(0, <[u8]>::len);
+                    let header_count = headers.len();
+                    let merged_header_count = merged_headers.len();
+                    let writer_type = core::any::type_name_of_val(writer);
+                    Err(format!(
+                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}, writer={writer_type}"
+                    ))
                 }
             }
         }?;
@@ -501,4 +518,9 @@ impl HttpClient {
 }
 fn split_head_or_all(value: &str, separator: char) -> &str {
     value.split_once(separator).map_or(value, |(head, _)| head)
+}
+fn remove_file_best_effort(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) | Err(_) => {}
+    }
 }
