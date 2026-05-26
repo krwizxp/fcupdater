@@ -11,13 +11,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 cfg_select! {
-    windows => {
-        use std::{ffi::OsStr, os::windows::ffi::OsStrExt as WindowsOsStrExt};
-    }
-    _ => {
+    any(target_os = "linux", target_os = "macos") => {
         use std::io::{Write as IoWrite, stderr};
     }
+    _ => {}
 }
+const TEMP_ARCHIVE_PROMOTION_ATTEMPTS: u32 = 5;
+const TEMP_ARCHIVE_PROMOTION_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 #[derive(Debug)]
 pub struct XlsxContainer {
     archive_path: PathBuf,
@@ -79,76 +80,53 @@ struct TempArchivePromotion<'path> {
 }
 impl TempArchivePromotion<'_> {
     fn promote(&self) -> Result<()> {
-        cfg_select! {
-            windows => {
-                let replacement_w = encode_path_wide(self.temp_archive)?;
-                let destination_w = encode_path_wide(self.target_xlsx)?;
-                if self.target_xlsx.try_exists().map_err(|source_err| {
-                    err(path_source_message(
-                        "대상 파일 경로 확인 실패",
-                        self.target_xlsx,
-                        source_err,
-                    ))
-                })? {
-                    if let Some(code) = super::windows_api::WindowsFileApi::run_with_retry(
-                        super::windows_api::WindowsFileOperation::ReplaceWriteThrough,
-                        &destination_w,
-                        &replacement_w,
-                    ) {
-                        return Err(err(windows_file_op_error_message(
-                            "파일 교체 실패(ReplaceFileW): ",
-                            self.target_xlsx,
-                            Some(self.temp_archive),
-                            " <- ",
-                            code,
-                        )));
+        let mut last_error = None;
+        for attempt in 1..=TEMP_ARCHIVE_PROMOTION_ATTEMPTS {
+            match fs::rename(self.temp_archive, self.target_xlsx) {
+                Ok(()) => {
+                    cfg_select! {
+                        any(target_os = "linux", target_os = "macos") => {
+                            if let Err(source_err) = fs::OpenOptions::new()
+                                .read(true)
+                                .open(self.target_xlsx)
+                                .and_then(|file| file.sync_all())
+                            {
+                                let target_path = self.target_xlsx.display().to_string();
+                                write_durability_warning("파일", &target_path, &source_err);
+                            }
+                            let parent = self
+                                .target_xlsx
+                                .parent()
+                                .filter(|path| !path.as_os_str().is_empty())
+                                .unwrap_or_else(|| Path::new("."));
+                            if let Err(source_err) =
+                                fs::File::open(parent).and_then(|dir| dir.sync_all())
+                            {
+                                let parent_path = parent.display().to_string();
+                                write_durability_warning("폴더", &parent_path, &source_err);
+                            }
+                        }
+                        _ => {}
                     }
                     return Ok(());
                 }
-                if let Some(code) = super::windows_api::WindowsFileApi::run_with_retry(
-                    super::windows_api::WindowsFileOperation::MoveReplaceWriteThrough,
-                    &replacement_w,
-                    &destination_w,
-                ) {
-                    return Err(err(windows_file_op_error_message(
-                        "파일 이동 실패(MoveFileExW): ",
-                        self.temp_archive,
-                        Some(self.target_xlsx),
-                        " -> ",
-                        code,
-                    )));
+                Err(source_err) => {
+                    last_error = Some(source_err);
+                    if attempt < TEMP_ARCHIVE_PROMOTION_ATTEMPTS {
+                        thread::sleep(TEMP_ARCHIVE_PROMOTION_RETRY_DELAY);
+                    }
                 }
-                Ok(())
-            }
-            _ => {
-                fs::rename(self.temp_archive, self.target_xlsx).map_err(|source_err| {
-                    err(path_pair_source_message(
-                        "xlsx 저장 실패",
-                        self.temp_archive,
-                        self.target_xlsx,
-                        source_err,
-                    ))
-                })?;
-                if let Err(source_err) = fs::OpenOptions::new()
-                    .read(true)
-                    .open(self.target_xlsx)
-                    .and_then(|file| file.sync_all())
-                {
-                    let target_path = self.target_xlsx.display().to_string();
-                    write_durability_warning("파일", &target_path, &source_err);
-                }
-                let parent = self
-                    .target_xlsx
-                    .parent()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                if let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
-                    let parent_path = parent.display().to_string();
-                    write_durability_warning("폴더", &parent_path, &source_err);
-                }
-                Ok(())
             }
         }
+        let Some(source_err) = last_error else {
+            return Err(err("xlsx 저장 시도 횟수가 비정상적으로 비어 있습니다."));
+        };
+        Err(err(path_pair_source_message(
+            "xlsx 저장 실패",
+            self.temp_archive,
+            self.target_xlsx,
+            source_err,
+        )))
     }
 }
 impl XlsxContainer {
@@ -346,8 +324,7 @@ impl Drop for XlsxContainer {
     }
 }
 cfg_select! {
-    windows => {}
-    _ => {
+    any(target_os = "linux", target_os = "macos") => {
         fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::Error) {
             let mut err = stderr().lock();
             match IoWrite::write_fmt(
@@ -358,6 +335,7 @@ cfg_select! {
             }
         }
     }
+    _ => {}
 }
 fn create_dir_all_checked(path: &Path, failure_label: &str) -> Result<()> {
     fs::create_dir_all(path)
@@ -398,41 +376,4 @@ where
 }
 fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
     format!("{prefix}{relative_path}")
-}
-cfg_select! {
-    windows => {
-        fn encode_path_wide(path: &Path) -> Result<Vec<u16>> {
-            let unit_count = <OsStr as WindowsOsStrExt>::encode_wide(path.as_os_str()).count();
-            let capacity = unit_count
-                .checked_add(1)
-                .ok_or_else(|| err("Windows path wide 문자열 용량 계산 실패"))?;
-            let mut out = Vec::new();
-            out.try_reserve(capacity).map_err(|source| {
-                crate::err_with_source("Windows path wide 문자열 메모리 확보 실패", source)
-            })?;
-            out.extend(<OsStr as WindowsOsStrExt>::encode_wide(path.as_os_str()));
-            out.push(0);
-            Ok(out)
-        }
-        fn windows_file_op_error_message(
-            prefix: &str,
-            from: &Path,
-            to: Option<&Path>,
-            arrow: &str,
-            code: u32,
-        ) -> String {
-            to.map_or_else(
-                || format!("{prefix}{} (GetLastError={code})", from.display()),
-                |target| {
-                    format!(
-                        "{prefix}{}{}{} (GetLastError={code})",
-                        from.display(),
-                        arrow,
-                        target.display()
-                    )
-                },
-            )
-        }
-    }
-    _ => {}
 }
