@@ -1,6 +1,6 @@
 extern crate alloc;
 use cli::{APP_NAME, APP_VERSION, ParseAction, usage_text};
-use core::{error::Error, fmt::Display, result::Result as StdResult};
+use core::{error::Error, fmt::Display, result::Result as CoreResult};
 use io_util::write_line_ignored;
 pub(crate) use region::{normalize_address_key, parse_region_label};
 pub(crate) use rows::{ChangeRow, SourceRecord, StoreRow};
@@ -26,7 +26,7 @@ mod sheet_util;
 mod source_download;
 mod update_run;
 type BoxError = Box<dyn Error + Send + Sync>;
-type Result<T> = StdResult<T, BoxError>;
+type Result<T> = CoreResult<T, BoxError>;
 fn err(msg: impl Into<BoxError>) -> BoxError {
     IoError::other(msg).into()
 }
@@ -55,6 +55,20 @@ fn prefixed_message(prefix: &str, detail: impl Display) -> String {
     }
     out.push_str(prefix);
     out.push_str(&detail_text);
+    out
+}
+fn append_error_text(error_text: &str, detail_text: &str) -> String {
+    let capacity = error_text
+        .len()
+        .saturating_add("; ".len())
+        .saturating_add(detail_text.len());
+    let mut out = String::new();
+    if out.try_reserve(capacity).is_err() {
+        return format!("{error_text}; {detail_text}");
+    }
+    out.push_str(error_text);
+    out.push_str("; ");
+    out.push_str(detail_text);
     out
 }
 fn path_source_message(label: &str, path: &Path, source: impl Display) -> String {

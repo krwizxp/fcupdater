@@ -1,6 +1,11 @@
+use crate::{append_error_text, path_source_message};
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use core::result::Result as StdResult;
-use std::{io::Write, path::Path};
+use core::result::Result as CoreResult;
+use std::{
+    fs,
+    io::{ErrorKind, Write},
+    path::Path,
+};
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         mod libcurl;
@@ -125,7 +130,7 @@ cfg_select! {
             current_len: usize,
             additional_len: usize,
             limit: usize,
-        ) -> StdResult<usize, String> {
+        ) -> CoreResult<usize, String> {
             let next_len = current_len
                 .checked_add(additional_len)
                 .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
@@ -143,7 +148,7 @@ cfg_select! {
 fn enforce_http_content_length_limit(
     headers: &[(String, String)],
     limit: usize,
-) -> StdResult<(), String> {
+) -> CoreResult<(), String> {
     for header in headers {
         let name = &header.0;
         let value = &header.1;
@@ -161,4 +166,14 @@ fn enforce_http_content_length_limit(
         }
     }
     Ok(())
+}
+fn attach_remove_file_error(error_text: String, path: &Path) -> String {
+    match fs::remove_file(path) {
+        Ok(()) => error_text,
+        Err(error) if error.kind() == ErrorKind::NotFound => error_text,
+        Err(error) => {
+            let cleanup_text = path_source_message("다운로드 임시 파일 삭제 실패", path, error);
+            append_error_text(&error_text, &cleanup_text)
+        }
+    }
 }

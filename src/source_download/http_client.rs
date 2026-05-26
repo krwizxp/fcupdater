@@ -1,12 +1,13 @@
 use super::{
     HTTP_MAX_BODY_BYTES, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
-    StreamedBodySummary, USER_AGENT, enforce_http_content_length_limit, lossy_prefix,
+    StreamedBodySummary, USER_AGENT, attach_remove_file_error, enforce_http_content_length_limit,
+    lossy_prefix,
 };
 use crate::{path_source_message, prefixed_message};
 use alloc::{string::String, vec::Vec};
-use core::{fmt::Write as FmtWrite, result::Result as StdResult, time::Duration};
+use core::{fmt::Write as FmtWrite, result::Result as CoreResult, time::Duration};
 use std::{
-    fs::{self, File},
+    fs::File,
     io::Write as IoWrite,
     path::Path,
     thread::sleep,
@@ -36,7 +37,7 @@ struct Cookie {
     value: String,
 }
 impl HttpClient {
-    fn add_cookie(&mut self, name: &str, value: &str) -> StdResult<(), String> {
+    fn add_cookie(&mut self, name: &str, value: &str) -> CoreResult<(), String> {
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
             cookie.value.clear();
             cookie
@@ -66,7 +67,7 @@ impl HttpClient {
         self.cookies.push(cookie);
         Ok(())
     }
-    fn cookie_header(&self) -> StdResult<Option<String>, String> {
+    fn cookie_header(&self) -> CoreResult<Option<String>, String> {
         if self.cookies.is_empty() {
             return Ok(None);
         }
@@ -91,7 +92,7 @@ impl HttpClient {
         }
         Ok(Some(out))
     }
-    fn encoded_form_body(form: &[(&str, &str)]) -> StdResult<String, String> {
+    fn encoded_form_body(form: &[(&str, &str)]) -> CoreResult<String, String> {
         let body_capacity = form.iter().try_fold(0_usize, |sum, &(name, value)| {
             let encoded_capacity = name
                 .len()
@@ -120,7 +121,7 @@ impl HttpClient {
         }
         Ok(body)
     }
-    fn extract_netfunnel_key(result: &str) -> StdResult<String, String> {
+    fn extract_netfunnel_key(result: &str) -> CoreResult<String, String> {
         let Some((_, tail)) = result.split_once("key=") else {
             return Err(prefixed_message("NetFunnel key 없음: ", result));
         };
@@ -130,7 +131,7 @@ impl HttpClient {
         }
         Ok(value.to_owned())
     }
-    pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> StdResult<String, String> {
+    pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> CoreResult<String, String> {
         let mut current_key: Option<String> = None;
         for _ in 0..NETFUNNEL_POLL_LIMIT {
             let result = self.request_netfunnel(action_id, current_key.as_deref(), None)?;
@@ -168,7 +169,7 @@ impl HttpClient {
         host: &str,
         path: &str,
         referer: Option<&str>,
-    ) -> StdResult<String, String> {
+    ) -> CoreResult<String, String> {
         let mut headers = Vec::new();
         headers
             .try_reserve(3)
@@ -191,7 +192,7 @@ impl HttpClient {
         form: &[(&str, &str)],
         referer: Option<&str>,
         ajax: bool,
-    ) -> StdResult<HttpResponse, String> {
+    ) -> CoreResult<HttpResponse, String> {
         let body = Self::encoded_form_body(form)?;
         let headers = Self::post_headers(referer, ajax)?;
         self.request("POST", host, path, Some(body.as_bytes()), &headers)
@@ -204,7 +205,7 @@ impl HttpClient {
         referer: Option<&str>,
         ajax: bool,
         target: &Path,
-    ) -> StdResult<HttpStreamResponse, String> {
+    ) -> CoreResult<HttpStreamResponse, String> {
         let body = Self::encoded_form_body(form)?;
         let headers = Self::post_headers(referer, ajax)?;
         let mut file = File::create(target).map_err(|source| {
@@ -221,22 +222,17 @@ impl HttpClient {
             Ok(response) => response,
             Err(error_text) => {
                 drop(file);
-                remove_file_best_effort(target);
-                return Err(error_text);
+                return Err(attach_remove_file_error(error_text, target));
             }
         };
         if let Err(source) = IoWrite::flush(&mut file) {
             drop(file);
-            remove_file_best_effort(target);
-            return Err(path_source_message(
-                "다운로드 임시 파일 flush 실패",
-                target,
-                source,
-            ));
+            let error_text = path_source_message("다운로드 임시 파일 flush 실패", target, source);
+            return Err(attach_remove_file_error(error_text, target));
         }
         Ok(response)
     }
-    fn post_headers(referer: Option<&str>, ajax: bool) -> StdResult<Vec<(&str, &str)>, String> {
+    fn post_headers(referer: Option<&str>, ajax: bool) -> CoreResult<Vec<(&str, &str)>, String> {
         let mut headers = Vec::new();
         headers
             .try_reserve(6)
@@ -289,7 +285,7 @@ impl HttpClient {
         path: &str,
         body: Option<&[u8]>,
         headers: &[(&str, &str)],
-    ) -> StdResult<HttpResponse, String> {
+    ) -> CoreResult<HttpResponse, String> {
         let mut merged_headers = Vec::new();
         let merged_header_capacity = headers.len().saturating_add(3);
         merged_headers
@@ -336,7 +332,7 @@ impl HttpClient {
         action_id: &str,
         key: Option<&str>,
         ttl: Option<u32>,
-    ) -> StdResult<String, String> {
+    ) -> CoreResult<String, String> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
@@ -437,7 +433,7 @@ impl HttpClient {
         body: Option<&[u8]>,
         headers: &[(&str, &str)],
         writer: &mut dyn IoWrite,
-    ) -> StdResult<HttpStreamResponse, String> {
+    ) -> CoreResult<HttpStreamResponse, String> {
         let mut merged_headers = Vec::new();
         let merged_header_capacity = headers.len().saturating_add(3);
         merged_headers
@@ -494,13 +490,13 @@ impl HttpClient {
         }
         Ok(response)
     }
-    fn store_response_cookies(&mut self, response: &HttpResponse) -> StdResult<(), String> {
+    fn store_response_cookies(&mut self, response: &HttpResponse) -> CoreResult<(), String> {
         self.store_response_cookies_from_headers(&response.headers)
     }
     fn store_response_cookies_from_headers(
         &mut self,
         headers: &[(String, String)],
-    ) -> StdResult<(), String> {
+    ) -> CoreResult<(), String> {
         for header in headers {
             let name = &header.0;
             let value = &header.1;
@@ -518,9 +514,4 @@ impl HttpClient {
 }
 fn split_head_or_all(value: &str, separator: char) -> &str {
     value.split_once(separator).map_or(value, |(head, _)| head)
-}
-fn remove_file_best_effort(path: &Path) {
-    match fs::remove_file(path) {
-        Ok(()) | Err(_) => {}
-    }
 }

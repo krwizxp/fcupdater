@@ -2,7 +2,7 @@ use crate::{
     Result, err, err_with_source, path_pair_source_message, path_source_message, prefixed_message,
 };
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use core::{result::Result as StdResult, str};
+use core::{result::Result as CoreResult, str};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -338,7 +338,7 @@ const _: () = assert!(
     ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES >= ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
     "ZIP total limit must cover at least one entry"
 );
-type ZipResult<T> = StdResult<T, Cow<'static, str>>;
+type ZipResult<T> = CoreResult<T, Cow<'static, str>>;
 #[derive(Clone)]
 struct ZipEntry {
     compressed_size: u32,

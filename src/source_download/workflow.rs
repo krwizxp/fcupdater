@@ -2,15 +2,14 @@ use super::{
     CURRENT_PRICE_PAGE_DIV, DEFAULT_REGION_LABEL, GAS_STATION_API_GBN, GAS_STATION_LPG_CODE,
     NETFUNNEL_DOWNLOAD_ACTION_ID, NETFUNNEL_ENTRY_ACTION_ID, OIL_PRICE_DOWNLOAD_TAR_URL,
     OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH, OPDOWNLOAD_PATH, OPDOWNLOAD_URL,
-    OPINET_HOST, OPINET_KEY, SourceDownload, http_client,
+    OPINET_HOST, OPINET_KEY, SourceDownload, attach_remove_file_error, http_client,
 };
 use crate::{Result, err, path_source_message, prefixed_message};
-use alloc::string::String;
-use core::result::Result as StdResult;
+use core::result::Result as CoreResult;
 use std::{
     fs,
     io::{ErrorKind, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 const AUTO_SOURCE_FILE_NAME: &str = "fcupdater-opinet-source.xls";
 const AUTO_SOURCE_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
@@ -42,7 +41,7 @@ impl SourceDownload<'_, '_> {
     }
 }
 impl SourceDownloadWorkflow<'_> {
-    fn cleanup_auto_source_files(&self) -> StdResult<usize, String> {
+    fn cleanup_auto_source_files(&self) -> CoreResult<usize, String> {
         let mut removed = 0_usize;
         for file_name in [AUTO_SOURCE_FILE_NAME, AUTO_SOURCE_TEMP_FILE_NAME] {
             let path = self.canonical_dir.join(file_name);
@@ -62,7 +61,7 @@ impl SourceDownloadWorkflow<'_> {
         }
         Ok(removed)
     }
-    fn download_nationwide_source_http(&self) -> StdResult<PathBuf, String> {
+    fn download_nationwide_source_http(&self) -> CoreResult<PathBuf, String> {
         let mut client = http_client::HttpClient::default();
         client.get_text(OPINET_HOST, OPDOWNLOAD_PATH, None)?;
         let entry_key = client.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
@@ -86,7 +85,7 @@ impl SourceDownloadWorkflow<'_> {
         let download_key = client.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
         let target = self.canonical_dir.join(AUTO_SOURCE_FILE_NAME);
         let temp = self.canonical_dir.join(AUTO_SOURCE_TEMP_FILE_NAME);
-        let response = match client.post_form_to_file(
+        let response = client.post_form_to_file(
             OPINET_HOST,
             OPDOWNLOAD_EXCEL_PATH,
             &[
@@ -101,30 +100,21 @@ impl SourceDownloadWorkflow<'_> {
             Some(OPDOWNLOAD_URL),
             false,
             &temp,
-        ) {
-            Ok(response) => response,
-            Err(error_text) => {
-                remove_file_best_effort(&temp);
-                return Err(error_text);
-            }
-        };
+        )?;
         if !response.body.starts_with(&OLE2_SIGNATURE) {
             let preview = response.body.preview_lossy();
-            remove_file_best_effort(&temp);
-            return Err(prefixed_message(
+            let error_text = prefixed_message(
                 "다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: ",
                 preview,
-            ));
+            );
+            return Err(attach_remove_file_error(error_text, &temp));
         }
         match fs::rename(&temp, &target) {
             Ok(()) => {}
             Err(error) => {
-                remove_file_best_effort(&temp);
-                return Err(path_source_message(
-                    "다운로드 파일 이름 변경 실패",
-                    &target,
-                    error,
-                ));
+                let error_text =
+                    path_source_message("다운로드 파일 이름 변경 실패", &target, error);
+                return Err(attach_remove_file_error(error_text, &temp));
             }
         }
         Ok(target)
@@ -140,10 +130,5 @@ impl SourceDownloadWorkflow<'_> {
         }
         self.download_nationwide_source_http()
             .map_err(|error_text| err(prefixed_message("Opinet 자동 다운로드 실패: ", error_text)))
-    }
-}
-fn remove_file_best_effort(path: &Path) {
-    match fs::remove_file(path) {
-        Ok(()) | Err(_) => {}
     }
 }

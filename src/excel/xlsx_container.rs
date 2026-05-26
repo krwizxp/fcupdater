@@ -1,5 +1,7 @@
 use super::zip_archive::{self, is_safe_archive_entry_path};
-use crate::{Result, err, path_pair_source_message, path_source_message, prefixed_message};
+use crate::{
+    Result, append_error_text, err, path_pair_source_message, path_source_message, prefixed_message,
+};
 use core::{mem, time::Duration};
 use std::{
     env, fs,
@@ -167,7 +169,7 @@ impl XlsxContainer {
         let mut cleanup = WorkDirCleanup {
             path: reserve_unique_temp_entry(
                 |pid, nanos, seq| base.join(format!("fcupdater_{pid}_{nanos}_{seq}")),
-                |path| fs::create_dir_all(path),
+                |path| fs::DirBuilder::new().create(path),
                 "임시 작업 폴더 생성 실패",
                 "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
             )?,
@@ -310,12 +312,19 @@ impl XlsxContainer {
             .promote()?;
             Ok(())
         })();
-        if result.is_err() {
-            match fs::remove_file(&tmp_archive) {
-                Ok(()) | Err(_) => {}
-            }
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) => match fs::remove_file(&tmp_archive) {
+                Ok(()) => Err(source),
+                Err(error) if error.kind() == ErrorKind::NotFound => Err(source),
+                Err(error) => {
+                    let error_text = source.to_string();
+                    let cleanup_text =
+                        path_source_message("xlsx 임시 저장 파일 삭제 실패", &tmp_archive, error);
+                    Err(err(append_error_text(&error_text, &cleanup_text)))
+                }
+            },
         }
-        result
     }
     pub fn unpack_dir(&self) -> &Path {
         &self.unpack_dir
