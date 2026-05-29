@@ -2,6 +2,7 @@ use crate::{
     ChangeRow, Result, StoreRow, add_row_offset, err, err_with_source,
     excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
 };
+use core::range::RangeInclusive;
 const CHANGELOG_HEADER_ROW: u32 = 3;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
 const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
@@ -355,9 +356,11 @@ impl ChangeLogUpdater<'_, '_, '_> {
             layout.col_delta_diesel,
         ];
         self.worksheet.extend_conditional_formats(
-            last_change_row,
+            RangeInclusive {
+                start: layout.data_start_row,
+                last: last_change_row,
+            },
             &target_cols,
-            layout.data_start_row,
         )
     }
 }

@@ -287,10 +287,7 @@ impl Client {
         parsed
             .try_reserve(raw.lines().count().saturating_sub(1))
             .map_err(|source| format!("응답 header 목록 메모리 확보 실패: {source}"))?;
-        for line in raw.lines().skip(1) {
-            let Some((raw_name, raw_value)) = line.split_once(':') else {
-                continue;
-            };
+        for (raw_name, raw_value) in raw.lines().skip(1).filter_map(|line| line.split_once(':')) {
             let name = raw_name.trim_ascii();
             let value = raw_value.trim_ascii();
             let mut header_name = String::new();
@@ -588,17 +585,16 @@ impl Client {
                 let mut session_cache = cell
                     .try_borrow_mut()
                     .map_err(|source| format!("WinHTTP session cache borrow 실패: {source}"))?;
-                if session_cache.is_none() {
-                    *session_cache = Some(SessionCache {
+                let cache = if let Some(ref mut cache) = *session_cache {
+                    cache
+                } else {
+                    session_cache.insert(SessionCache {
                         connects: Vec::new(),
                         session: self.open_session(user_agent)?,
-                    });
-                }
-                let Some(cache) = session_cache.as_mut() else {
-                    return Err("WinHTTP session cache가 비어 있습니다.".to_owned());
+                    })
                 };
                 let connect = self.cached_connect(cache, host, host_wide, port)?;
-                Ok(connect.as_ptr())
+                Ok::<HInternet, String>(connect.as_ptr())
             })
             .map_err(|source| format!("WinHTTP session cache 접근 실패: {source}"))??;
         match action(connect_ptr) {

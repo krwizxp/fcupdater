@@ -10,7 +10,7 @@ use super::{
     MIN_MATCH, ZipResult, read_u16, zip_static,
 };
 use alloc::vec::Vec;
-use core::{array::from_fn, cmp::Ordering, iter::repeat_n};
+use core::{array::from_fn, cmp::Ordering, iter::repeat_n, range::Range};
 pub(in crate::excel::zip_archive) mod bit_io {
     use alloc::vec::Vec;
     pub(in crate::excel::zip_archive) struct BitReader<'bytes> {
@@ -152,16 +152,17 @@ impl BitReader<'_> {
     }
     fn read_stored_bytes(&mut self, len: usize) -> ZipResult<&[u8]> {
         self.align_to_byte();
-        let Some((_, remaining)) = self.bytes.split_at_checked(self.cursor) else {
+        let start = self.cursor;
+        if start > self.bytes.len() {
             return Err(zip_static("deflate 저장 블록 시작 위치가 입력보다 깁니다."));
-        };
-        let Some((bytes, _)) = remaining.split_at_checked(len) else {
-            return Err(zip_static("deflate 저장 블록이 입력보다 깁니다."));
-        };
-        self.cursor = self
-            .cursor
+        }
+        let end = start
             .checked_add(len)
             .ok_or_else(|| zip_static("deflate 저장 블록 크기 계산 실패"))?;
+        let Some(bytes) = self.bytes.get(Range { start, end }) else {
+            return Err(zip_static("deflate 저장 블록이 입력보다 깁니다."));
+        };
+        self.cursor = end;
         Ok(bytes)
     }
 }
@@ -570,11 +571,7 @@ impl CodeLengthTokenizer<'_> {
             };
             if value == 0 {
                 let mut run = 1_usize;
-                while self
-                    .lengths
-                    .get(index.saturating_add(run))
-                    .is_some_and(|&candidate| candidate == 0)
-                {
+                while self.lengths.get(index.saturating_add(run)) == Some(&0) {
                     run = run.saturating_add(1);
                 }
                 let mut remaining = run;
@@ -619,7 +616,7 @@ impl CodeLengthTokenizer<'_> {
                 while self
                     .lengths
                     .get(index.saturating_add(1).saturating_add(run))
-                    .is_some_and(|&candidate| candidate == value)
+                    == Some(&value)
                 {
                     run = run.saturating_add(1);
                 }
@@ -684,10 +681,10 @@ impl DynamicDeflateWriter<'_> {
         combined_lengths
             .try_reserve(literal_count.saturating_add(distance_count))
             .map_err(|source| format!("deflate combined length 메모리 확보 실패: {source}"))?;
-        let Some((literal_prefix, _)) = literal_lengths.split_at_checked(literal_count) else {
+        let Some(literal_prefix) = literal_lengths.get(..literal_count) else {
             return Err(zip_static("deflate literal length 범위 오류"));
         };
-        let Some((distance_prefix, _)) = distance_lengths.split_at_checked(distance_count) else {
+        let Some(distance_prefix) = distance_lengths.get(..distance_count) else {
             return Err(zip_static("deflate distance length 범위 오류"));
         };
         combined_lengths.extend_from_slice(literal_prefix);
@@ -1190,21 +1187,17 @@ impl DeflateWriter<'_> {
         None
     }
     fn tokens(&self) -> ZipResult<Vec<DeflateToken>> {
-        let has_bom = self.bytes.starts_with(UTF8_BOM);
-        let mut xml_cursor = if has_bom { UTF8_BOM.len() } else { 0 };
-        while self
+        let xml_probe = self
             .bytes
-            .get(xml_cursor)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            xml_cursor = xml_cursor.saturating_add(1);
-        }
-        let looks_like_xlsx_xml = self.bytes.get(xml_cursor..).is_some_and(|tail| {
-            (tail.starts_with(b"<?xml") || tail.starts_with(b"<"))
-                && XLSX_XML_NEEDLES
-                    .iter()
-                    .any(|needle| tail.windows(needle.len()).any(|window| window == *needle))
-        });
+            .strip_prefix(UTF8_BOM)
+            .unwrap_or(self.bytes)
+            .trim_ascii_start();
+        let looks_like_xlsx_xml = (xml_probe.starts_with(b"<?xml") || xml_probe.starts_with(b"<"))
+            && XLSX_XML_NEEDLES.iter().any(|needle| {
+                xml_probe
+                    .windows(needle.len())
+                    .any(|window| window == *needle)
+            });
         let nice_match_len = if looks_like_xlsx_xml {
             XML_NICE_MATCH_LEN
         } else {

@@ -7,7 +7,7 @@ use super::{
     },
 };
 use crate::{Result, err, err_with_source};
-use core::iter;
+use core::{iter, range::Range};
 use std::{
     collections::HashMap,
     path::{Component, PathBuf},
@@ -55,7 +55,11 @@ impl XlsxOoxml<'_> {
             let Some(si_end) = find_end_tag(&xml, "si", body_start) else {
                 break;
             };
-            let Some(si_body) = xml.get(body_start..si_end) else {
+            let si_body_span = Range {
+                start: body_start,
+                end: si_end,
+            };
+            let Some(si_body) = xml.get(si_body_span) else {
                 break;
             };
             let text = extract_all_tag_text(si_body, "t")
@@ -172,11 +176,6 @@ fn iter_start_tags<'xml, 'tag>(
 where
     'xml: 'tag,
 {
-    let mut cursor = 0_usize;
-    iter::from_fn(move || {
-        let mut scanner = XmlScanner::from(xml, cursor);
-        let tag = scanner.next_start_named(tag_name)?;
-        cursor = tag.end().checked_add(1)?;
-        Some(tag.tag())
-    })
+    let mut scanner = XmlScanner::new(xml);
+    iter::from_fn(move || scanner.next_start_named(tag_name).map(|tag| tag.tag()))
 }

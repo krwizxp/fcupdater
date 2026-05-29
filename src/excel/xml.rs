@@ -1,3 +1,8 @@
+use core::{
+    iter,
+    range::{Range, RangeInclusive},
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::excel) enum XmlTagKind {
     End,
@@ -5,11 +10,10 @@ pub(in crate::excel) enum XmlTagKind {
 }
 #[derive(Clone, Copy)]
 pub(in crate::excel) struct XmlTag<'xml> {
-    end: usize,
     kind: XmlTagKind,
     name: &'xml str,
     self_closing: bool,
-    start: usize,
+    span: RangeInclusive<usize>,
     tag: &'xml str,
 }
 pub(in crate::excel) struct XmlScanner<'xml> {
@@ -22,16 +26,11 @@ impl XmlScanner<'_> {
     }
 }
 impl<'xml> XmlScanner<'xml> {
-    fn find_tag_matching<F>(&mut self, mut predicate: F) -> Option<XmlTag<'xml>>
+    fn find_tag_matching<F>(&mut self, predicate: F) -> Option<XmlTag<'xml>>
     where
         F: FnMut(&XmlTag<'xml>) -> bool,
     {
-        while let Some(tag) = self.next_tag() {
-            if predicate(&tag) {
-                return Some(tag);
-            }
-        }
-        None
+        iter::from_fn(|| self.next_tag()).find(predicate)
     }
     pub(in crate::excel) const fn from(xml: &'xml str, cursor: usize) -> Self {
         Self { cursor, xml }
@@ -74,7 +73,8 @@ impl<'xml> XmlScanner<'xml> {
             if name.is_empty() {
                 continue;
             }
-            let tag = self.xml.get(start..=end)?;
+            let span = RangeInclusive { start, last: end };
+            let tag = self.xml.get(span)?;
             let mut self_close_cursor = end;
             let mut self_closing = false;
             while self_close_cursor > start {
@@ -90,11 +90,10 @@ impl<'xml> XmlScanner<'xml> {
                 break;
             }
             return Some(XmlTag {
-                end,
                 kind,
                 name,
                 self_closing,
-                start,
+                span,
                 tag,
             });
         }
@@ -103,7 +102,7 @@ impl<'xml> XmlScanner<'xml> {
 }
 impl<'xml> XmlTag<'xml> {
     pub(in crate::excel) const fn end(&self) -> usize {
-        self.end
+        self.span.last
     }
     pub(in crate::excel) const fn is_self_closing(&self) -> bool {
         self.self_closing
@@ -115,7 +114,7 @@ impl<'xml> XmlTag<'xml> {
         local_tag_name(self.name)
     }
     pub(in crate::excel) const fn start(&self) -> usize {
-        self.start
+        self.span.start
     }
     pub(in crate::excel) const fn tag(&self) -> &'xml str {
         self.tag
@@ -187,7 +186,11 @@ pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Opt
     let open_end = find_tag_end(xml, open_start)?;
     let body_start = checked_offset_add(open_end, 1)?;
     let body_end = find_end_tag(xml, tag_name, body_start)?;
-    let text = xml.get(body_start..body_end)?;
+    let body_span = Range {
+        start: body_start,
+        end: body_end,
+    };
+    let text = xml.get(body_span)?;
     let mut out = String::new();
     out.try_reserve(text.len()).ok()?;
     out.push_str(text);
@@ -202,7 +205,11 @@ pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Optio
         let open_end = find_tag_end(xml, open_start)?;
         let body_start = checked_offset_add(open_end, 1)?;
         let body_end = find_end_tag(xml, tag_name, body_start)?;
-        out.push_str(xml.get(body_start..body_end)?);
+        let body_span = Range {
+            start: body_start,
+            end: body_end,
+        };
+        out.push_str(xml.get(body_span)?);
         let close_tag_len = checked_offset_add(tag_name.len(), 3)?;
         cursor = checked_offset_add(body_end, close_tag_len)?;
     }
@@ -219,41 +226,35 @@ pub(in crate::excel) fn decode_xml_entities(text: &str) -> String {
         let Some(rest) = text.get(i..) else {
             break;
         };
-        if rest.starts_with('&')
-            && let Some(end_rel) = rest.find(';')
+        if let Some(after_amp) = rest.strip_prefix('&')
+            && let Some((entity, _after_semi)) = after_amp.split_once(';')
+            && !entity.is_empty()
         {
-            let Some(end) = checked_offset_add(i, end_rel) else {
-                break;
-            };
-            let Some(entity_start) = checked_offset_add(i, 1) else {
-                break;
-            };
-            if end > entity_start
-                && let Some(entity) = text.get(entity_start..end)
-            {
-                let decoded = match entity {
-                    "lt" => Some('<'),
-                    "gt" => Some('>'),
-                    "quot" => Some('"'),
-                    "apos" => Some('\''),
-                    "amp" => Some('&'),
-                    _ => entity.strip_prefix('#').and_then(|body| {
-                        let value = if let Some(hex) = body.strip_prefix(['x', 'X']) {
-                            u32::from_str_radix(hex, 16).ok()?
-                        } else {
-                            body.parse::<u32>().ok()?
-                        };
-                        char::from_u32(value)
-                    }),
-                };
-                if let Some(decoded_char) = decoded {
-                    out.push(decoded_char);
-                    let Some(next_i) = checked_offset_add(end, 1) else {
-                        break;
+            let decoded = match entity {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "amp" => Some('&'),
+                _ => entity.strip_prefix('#').and_then(|body| {
+                    let value = if let Some(hex) = body.strip_prefix(['x', 'X']) {
+                        u32::from_str_radix(hex, 16).ok()?
+                    } else {
+                        body.parse::<u32>().ok()?
                     };
-                    i = next_i;
-                    continue;
-                }
+                    char::from_u32(value)
+                }),
+            };
+            if let Some(decoded_char) = decoded {
+                out.push(decoded_char);
+                let Some(consumed) = entity.len().checked_add(2) else {
+                    break;
+                };
+                let Some(next_i) = checked_offset_add(i, consumed) else {
+                    break;
+                };
+                i = next_i;
+                continue;
             }
         }
         let mut chars = rest.chars();

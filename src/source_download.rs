@@ -108,7 +108,7 @@ impl StreamingBodySink<'_> {
             self.error = Some(format!("HTTP 응답 본문 preview 메모리 확보 실패: {source}"));
             return false;
         }
-        let Some((preview, _)) = bytes.split_at_checked(take) else {
+        let Some(preview) = bytes.get(..take) else {
             self.error = Some("HTTP 응답 본문 preview 범위 계산 실패".to_owned());
             return false;
         };
@@ -118,7 +118,7 @@ impl StreamingBodySink<'_> {
 }
 fn lossy_prefix(bytes: &[u8], max_len: usize) -> Cow<'_, str> {
     let prefix_len = bytes.len().min(max_len);
-    let Some((prefix, _)) = bytes.split_at_checked(prefix_len) else {
+    let Some(prefix) = bytes.get(..prefix_len) else {
         return String::from_utf8_lossy(bytes);
     };
     String::from_utf8_lossy(prefix)

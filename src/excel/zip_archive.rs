@@ -2,7 +2,7 @@ use crate::{
     Result, err, err_with_source, path_pair_source_message, path_source_message, prefixed_message,
 };
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use core::{result::Result as CoreResult, str};
+use core::{range::Range, result::Result as CoreResult, str};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -293,9 +293,14 @@ const METHOD_STORE: u16 = 0;
 const VERSION_NEEDED: u16 = 20;
 const ZIP_COMMENT_MAX_LEN: usize = 0xffff;
 const ZIP_BAD_CRC_MESSAGE: &str = "ZIP CRC가 일치하지 않습니다";
+const ZIP_BAD_CENTRAL_SIGNATURE_MESSAGE: &str = "ZIP 중앙 디렉터리 signature가 올바르지 않습니다.";
 const ZIP_BAD_LOCAL_HEADER_MESSAGE: &str = "ZIP local header signature가 올바르지 않습니다";
 const ZIP_BAD_SIZE_MESSAGE: &str = "ZIP 해제 크기가 일치하지 않습니다";
+const ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE: &str =
+    "ZIP 중앙 디렉터리 크기가 entry 목록과 일치하지 않습니다.";
+const ZIP_CENTRAL_HEADER_RANGE: &str = "ZIP 중앙 디렉터리 header 범위 오류";
 const ZIP_DATA_RANGE_MESSAGE: &str = "ZIP entry 데이터가 파일 범위를 벗어났습니다";
+const ZIP_EOCD_HEADER_RANGE: &str = "ZIP EOCD header 범위 오류";
 const ZIP_MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
@@ -359,9 +364,7 @@ impl ZipArchiveEntries<'_> {
         names
             .try_reserve(entries.len())
             .map_err(|source| err_with_source("ZIP entry 이름 목록 메모리 확보 실패", source))?;
-        for entry in entries {
-            names.push(entry.name);
-        }
+        names.extend(entries.into_iter().map(|entry| entry.name));
         Ok(names)
     }
 }
@@ -408,22 +411,29 @@ impl ZipArchiveExtractor<'_> {
             let data = (|| -> ZipResult<Cow<'_, [u8]>> {
                 let local_offset = usize::try_from(entry.local_header_offset)
                     .map_err(|source| format!("ZIP local header offset 변환 실패: {source}"))?;
-                if read_u32(&bytes, local_offset)? != LOCAL_FILE_HEADER_SIGNATURE {
+                let (local_header, local_tail) = split_header_at::<LOCAL_FILE_HEADER_LEN>(
+                    &bytes,
+                    local_offset,
+                    ZIP_BAD_LOCAL_HEADER_MESSAGE,
+                )
+                .map_err(|source| zip_entry_message(source.as_ref(), entry_name))?;
+                if read_u32(local_header, 0)? != LOCAL_FILE_HEADER_SIGNATURE {
                     return Err(zip_entry_message(ZIP_BAD_LOCAL_HEADER_MESSAGE, entry_name).into());
                 }
-                let name_len = usize::from(read_u16(&bytes, local_offset.saturating_add(26))?);
-                let extra_len = usize::from(read_u16(&bytes, local_offset.saturating_add(28))?);
-                let data_start = local_offset
-                    .checked_add(LOCAL_FILE_HEADER_LEN)
-                    .and_then(|value| value.checked_add(name_len))
-                    .and_then(|value| value.checked_add(extra_len))
+                let name_len = usize::from(read_u16(local_header, 26)?);
+                let extra_len = usize::from(read_u16(local_header, 28)?);
+                let data_start = name_len
+                    .checked_add(extra_len)
                     .ok_or_else(|| zip_static("ZIP data offset 계산 실패"))?;
                 let compressed_len = usize::try_from(entry.compressed_size)
                     .map_err(|source| format!("ZIP 압축 크기 변환 실패: {source}"))?;
-                let data_end = data_start
-                    .checked_add(compressed_len)
-                    .ok_or_else(|| zip_static("ZIP data end 계산 실패"))?;
-                let Some(compressed) = bytes.get(data_start..data_end) else {
+                let compressed_span = Range {
+                    start: data_start,
+                    end: data_start
+                        .checked_add(compressed_len)
+                        .ok_or_else(|| zip_static("ZIP data end 계산 실패"))?,
+                };
+                let Some(compressed) = local_tail.get(compressed_span) else {
                     return Err(zip_entry_message(ZIP_DATA_RANGE_MESSAGE, entry_name).into());
                 };
                 let output = match entry.method {
@@ -630,9 +640,9 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
         .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 오류"))?;
     let eocd_signature = END_OF_CENTRAL_DIRECTORY_SIGNATURE.to_le_bytes();
     let mut search_len = search_bytes.len();
-    let eocd_offset = loop {
-        let (search_prefix, _) = search_bytes
-            .split_at_checked(search_len)
+    let (eocd_offset, eocd) = loop {
+        let search_prefix = search_bytes
+            .get(..search_len)
             .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 오류"))?;
         let Some(relative_offset) = search_prefix
             .array_windows::<4>()
@@ -641,20 +651,22 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
             return Err(zip_static("ZIP EOCD를 찾지 못했습니다."));
         };
         let offset = min_offset.saturating_add(relative_offset);
-        let comment_len = usize::from(read_u16(bytes, offset.saturating_add(20))?);
+        let (eocd, _) =
+            split_header_at::<END_OF_CENTRAL_DIRECTORY_LEN>(bytes, offset, ZIP_EOCD_HEADER_RANGE)?;
+        let comment_len = usize::from(read_u16(eocd, 20)?);
         if offset
             .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
             .and_then(|value| value.checked_add(comment_len))
-            .is_some_and(|end| end == bytes.len())
+            == Some(bytes.len())
         {
-            break offset;
+            break (offset, eocd);
         }
         search_len = relative_offset;
     };
-    let total_entries = usize::from(read_u16(bytes, eocd_offset.saturating_add(10))?);
-    let central_dir_size = usize::try_from(read_u32(bytes, eocd_offset.saturating_add(12))?)
+    let total_entries = usize::from(read_u16(eocd, 10)?);
+    let central_dir_size = usize::try_from(read_u32(eocd, 12)?)
         .map_err(|source| format!("ZIP 중앙 디렉터리 크기 변환 실패: {source}"))?;
-    let central_dir_offset = usize::try_from(read_u32(bytes, eocd_offset.saturating_add(16))?)
+    let central_dir_offset = usize::try_from(read_u32(eocd, 16)?)
         .map_err(|source| format!("ZIP 중앙 디렉터리 offset 변환 실패: {source}"))?;
     let central_dir_end = central_dir_offset
         .checked_add(central_dir_size)
@@ -668,28 +680,26 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
         .map_err(|source| format!("ZIP 중앙 디렉터리 entry 목록 메모리 확보 실패: {source}"))?;
     let mut cursor = central_dir_offset;
     for _ in 0..total_entries {
-        if read_u32(bytes, cursor)? != CENTRAL_DIRECTORY_SIGNATURE {
-            return Err(zip_static(
-                "ZIP 중앙 디렉터리 signature가 올바르지 않습니다.",
-            ));
+        let (header, tail) = split_header_at::<CENTRAL_DIRECTORY_HEADER_LEN>(
+            bytes,
+            cursor,
+            ZIP_CENTRAL_HEADER_RANGE,
+        )?;
+        if read_u32(header, 0)? != CENTRAL_DIRECTORY_SIGNATURE {
+            return Err(zip_static(ZIP_BAD_CENTRAL_SIGNATURE_MESSAGE));
         }
-        let flags = read_u16(bytes, cursor.saturating_add(8))?;
-        if flags & ENCRYPTED_FLAG != 0 {
+        if read_u16(header, 8)? & ENCRYPTED_FLAG != 0 {
             return Err(zip_static("암호화된 ZIP entry는 지원하지 않습니다."));
         }
-        let method = read_u16(bytes, cursor.saturating_add(10))?;
-        let crc32 = read_u32(bytes, cursor.saturating_add(16))?;
-        let compressed_size = read_u32(bytes, cursor.saturating_add(20))?;
-        let uncompressed_size = read_u32(bytes, cursor.saturating_add(24))?;
-        let name_len = usize::from(read_u16(bytes, cursor.saturating_add(28))?);
-        let extra_len = usize::from(read_u16(bytes, cursor.saturating_add(30))?);
-        let comment_len = usize::from(read_u16(bytes, cursor.saturating_add(32))?);
-        let local_header_offset = read_u32(bytes, cursor.saturating_add(42))?;
-        let name_start = cursor.saturating_add(CENTRAL_DIRECTORY_HEADER_LEN);
-        let name_end = name_start
-            .checked_add(name_len)
-            .ok_or_else(|| zip_static("ZIP entry 이름 범위 계산 실패"))?;
-        let Some(name_bytes) = bytes.get(name_start..name_end) else {
+        let method = read_u16(header, 10)?;
+        let crc32 = read_u32(header, 16)?;
+        let compressed_size = read_u32(header, 20)?;
+        let uncompressed_size = read_u32(header, 24)?;
+        let name_len = usize::from(read_u16(header, 28)?);
+        let extra_len = usize::from(read_u16(header, 30)?);
+        let comment_len = usize::from(read_u16(header, 32)?);
+        let local_header_offset = read_u32(header, 42)?;
+        let Some(name_bytes) = tail.get(..name_len) else {
             return Err(zip_static("ZIP entry 이름이 파일 범위를 벗어났습니다."));
         };
         let name = str::from_utf8(name_bytes)
@@ -703,17 +713,29 @@ fn parse_entries(bytes: &[u8]) -> ZipResult<Vec<ZipEntry>> {
             name,
             uncompressed_size,
         });
-        cursor = name_end
-            .checked_add(extra_len)
+        let entry_len = CENTRAL_DIRECTORY_HEADER_LEN
+            .checked_add(name_len)
+            .and_then(|value| value.checked_add(extra_len))
             .and_then(|value| value.checked_add(comment_len))
+            .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 entry 길이 계산 실패"))?;
+        cursor = cursor
+            .checked_add(entry_len)
             .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 다음 entry 위치 계산 실패"))?;
     }
     if cursor != central_dir_end {
-        return Err(zip_static(
-            "ZIP 중앙 디렉터리 크기가 entry 목록과 일치하지 않습니다.",
-        ));
+        return Err(zip_static(ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE));
     }
     Ok(entries)
+}
+fn split_header_at<'bytes, const LEN: usize>(
+    bytes: &'bytes [u8],
+    offset: usize,
+    context: &'static str,
+) -> ZipResult<(&'bytes [u8; LEN], &'bytes [u8])> {
+    bytes
+        .get(offset..)
+        .and_then(|tail| tail.split_first_chunk::<LEN>())
+        .ok_or_else(|| zip_static(context))
 }
 fn path_from_safe_entry_name(entry_name: &str) -> PathBuf {
     let mut path = PathBuf::new();
@@ -743,10 +765,7 @@ fn read_array<const N: usize>(
     offset: usize,
     error_message: &'static str,
 ) -> ZipResult<[u8; N]> {
-    let Some((_, tail)) = bytes.split_at_checked(offset) else {
-        return Err(zip_static(error_message));
-    };
-    let Some(raw_bytes) = tail.first_chunk::<N>() else {
+    let Some(raw_bytes) = bytes.get(offset..).and_then(|tail| tail.first_chunk::<N>()) else {
         return Err(zip_static(error_message));
     };
     Ok(*raw_bytes)

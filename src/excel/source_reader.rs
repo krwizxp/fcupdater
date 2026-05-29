@@ -4,8 +4,10 @@ use crate::{
 };
 use alloc::collections::BTreeMap;
 use core::{
+    array,
     char::{REPLACEMENT_CHARACTER, decode_utf16},
     fmt::Display,
+    range::Range,
 };
 use std::{collections::HashSet, fs, path::Path};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -131,10 +133,15 @@ impl CfbDataParser<'_, '_> {
         })?;
         for sid in fat_sector_ids {
             let sector = get_sector_slice(self.data, sector_size, *sid)?;
-            let (chunks, _) = sector.as_chunks::<4>();
-            for chunk in chunks.iter().take(entries_per_sector) {
-                fat.push(u32::from_le_bytes(*chunk));
-            }
+            let (chunks, &[]) = sector.as_chunks::<4>() else {
+                return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
+            };
+            fat.extend(
+                chunks
+                    .iter()
+                    .take(entries_per_sector)
+                    .map(|chunk| u32::from_le_bytes(*chunk)),
+            );
         }
         Ok(fat)
     }
@@ -155,13 +162,15 @@ impl CfbDataParser<'_, '_> {
             .data
             .get(0x4C..header_difat_end)
             .ok_or_else(|| err("CFB DIFAT 헤더 범위가 손상되었습니다."))?;
-        let (header_difat_chunks, _) = header_difat.as_chunks::<4>();
-        for chunk in header_difat_chunks {
-            let sid = u32::from_le_bytes(*chunk);
-            if is_regular_sector_id(sid) {
-                difat_entries.push(sid);
-            }
-        }
+        let (header_difat_chunks, &[]) = header_difat.as_chunks::<4>() else {
+            return Err(err("CFB DIFAT 헤더 길이가 4바이트 단위가 아닙니다."));
+        };
+        difat_entries.extend(
+            header_difat_chunks
+                .iter()
+                .map(|chunk| u32::from_le_bytes(*chunk))
+                .filter(|&sid| is_regular_sector_id(sid)),
+        );
         Ok(difat_entries)
     }
     const fn max_regular_sector_count(&self, sector_size: usize) -> usize {
@@ -254,13 +263,12 @@ impl CfbDirectoryParser<'_> {
                 "u64 read out of range at ",
             )?) & 0xFFFF_FFFF;
             let name = if (2..=64).contains(&name_len) {
-                let (bytes, _) = entry
-                    .split_at_checked(name_len.saturating_sub(2))
+                let bytes = entry
+                    .get(..name_len.saturating_sub(2))
                     .ok_or_else(|| err("CFB 디렉터리 이름 범위 오류"))?;
-                let (name_units, remainder) = bytes.as_chunks::<2>();
-                if !remainder.is_empty() {
+                let (name_units, &[]) = bytes.as_chunks::<2>() else {
                     return Err(err("UTF-16 문자열 길이가 홀수입니다."));
-                }
+                };
                 let capacity = name_units
                     .len()
                     .checked_mul(3)
@@ -275,10 +283,10 @@ impl CfbDirectoryParser<'_> {
                         source,
                     )
                 })?;
-                for item in decode_utf16(name_units.iter().map(|chunk| u16::from_le_bytes(*chunk)))
-                {
-                    decoded.push(item.unwrap_or(REPLACEMENT_CHARACTER));
-                }
+                decoded.extend(
+                    decode_utf16(name_units.iter().map(|chunk| u16::from_le_bytes(*chunk)))
+                        .map(|item| item.unwrap_or(REPLACEMENT_CHARACTER)),
+                );
                 decoded
             } else {
                 String::new()
@@ -339,8 +347,8 @@ impl CfbFileOpener<'_> {
                 "CFB FAT 엔트리가 부족합니다: 필요 {declared_fat_sectors}, 실제 {difat_entry_count}"
             )));
         }
-        let (fat_sector_ids, _) = difat_entries
-            .split_at_checked(declared_fat_sectors)
+        let fat_sector_ids = difat_entries
+            .get(..declared_fat_sectors)
             .ok_or_else(|| err("CFB FAT entry 범위가 손상되었습니다."))?;
         let fat = parser.build_fat_table(header.sector_size, fat_sector_ids)?;
         let dir_stream = read_stream_from_fat_chain(
@@ -537,14 +545,20 @@ impl SstChunkReader<'_, '_> {
             let byte_len = chars_here
                 .checked_mul(bytes_per_char)
                 .ok_or_else(|| err("SST 문자열 길이 계산 중 overflow가 발생했습니다."))?;
-            let (_, tail) = chunk
-                .split_at_checked(self.offset_in_chunk)
-                .ok_or_else(|| err("SST 문자열 slice 시작 범위 오류"))?;
-            let (bytes, _) = tail
-                .split_at_checked(byte_len)
-                .ok_or_else(|| err("SST 문자열 slice 길이 오류"))?;
+            let start = self.offset_in_chunk;
+            if start > chunk.len() {
+                return Err(err("SST 문자열 slice 시작 범위 오류"));
+            }
+            let end = start
+                .checked_add(byte_len)
+                .ok_or_else(|| err("SST chunk offset overflow가 발생했습니다."))?;
+            let Some(bytes) = chunk.get(Range { start, end }) else {
+                return Err(err("SST 문자열 slice 길이 오류"));
+            };
             if high_byte {
-                let (chunks, _) = bytes.as_chunks::<2>();
+                let (chunks, &[]) = bytes.as_chunks::<2>() else {
+                    return Err(err("SST UTF-16 문자열 길이가 홀수입니다."));
+                };
                 out.extend(
                     decode_utf16(chunks.iter().map(|unit| u16::from_le_bytes(*unit)))
                         .map(|decoded| decoded.unwrap_or(REPLACEMENT_CHARACTER)),
@@ -552,10 +566,7 @@ impl SstChunkReader<'_, '_> {
             } else {
                 out.extend(bytes.iter().copied().map(char::from));
             }
-            self.offset_in_chunk = self
-                .offset_in_chunk
-                .checked_add(byte_len)
-                .ok_or_else(|| err("SST chunk offset overflow가 발생했습니다."))?;
+            self.offset_in_chunk = end;
             remaining = remaining.saturating_sub(chars_here);
             if remaining > 0 && self.offset_in_chunk >= chunk.len() {
                 self.chunk_index = self
@@ -612,38 +623,37 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         reserve_vec_entries_exact(&mut chunks, 8, "xls SST chunk 목록 메모리 확보 실패")?;
         chunks.push(first_chunk);
         let mut next = first_chunk_end;
-        while next
-            .checked_add(4)
-            .is_some_and(|next_record| next_record <= self.workbook_stream.len())
+        while let Some((record_header, record_tail)) = self
+            .workbook_stream
+            .get(next..)
+            .and_then(|tail| tail.split_first_chunk::<4>())
         {
-            let next_id = read_u16_le(self.workbook_stream, next)?;
-            let next_len = usize::from(read_u16_le(
-                self.workbook_stream,
-                next.checked_add(2).ok_or_else(|| {
-                    err("xls SST Continue 레코드 길이 offset 계산에 실패했습니다.")
-                })?,
-            )?);
+            let next_id = read_u16_le(record_header, 0)?;
+            let next_len = usize::from(read_u16_le(record_header, 2)?);
             let next_data_start = next
                 .checked_add(4)
                 .ok_or_else(|| err("xls SST Continue 데이터 시작 offset 계산에 실패했습니다."))?;
             let Some(next_data_end) = next_data_start.checked_add(next_len) else {
                 break;
             };
-            if next_data_end > self.workbook_stream.len() || next_id != 0x003C {
+            let next_data = Range {
+                start: next_data_start,
+                end: next_data_end,
+            };
+            if next_id != 0x003C {
                 break;
             }
-            if let Some(chunk) = self.workbook_stream.get(next_data_start..next_data_end) {
-                chunks.try_reserve(1).map_err(|source| {
-                    err_with_source(
-                        "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
-                        source,
-                    )
-                })?;
-                chunks.push(chunk);
-            } else {
+            let Some(chunk) = record_tail.get(..next_len) else {
                 break;
-            }
-            next = next_data_end;
+            };
+            chunks.try_reserve(1).map_err(|source| {
+                err_with_source(
+                    "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
+                    source,
+                )
+            })?;
+            chunks.push(chunk);
+            next = next_data.end;
         }
         Ok((chunks, next))
     }
@@ -652,29 +662,25 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         let mut boundsheet: Option<BiffBoundSheet> = None;
         let mut code_page: Option<u16> = None;
         let mut shared_strings: Vec<String> = Vec::new();
-        while pos
-            .checked_add(4)
-            .is_some_and(|next_pos| next_pos <= self.workbook_stream.len())
+        while let Some((record_header, record_tail)) = self
+            .workbook_stream
+            .get(pos..)
+            .and_then(|tail| tail.split_first_chunk::<4>())
         {
-            let record_id = read_u16_le(self.workbook_stream, pos)?;
-            let record_len = usize::from(read_u16_le(
-                self.workbook_stream,
-                pos.checked_add(2).ok_or_else(|| {
-                    err("xls BIFF globals 레코드 길이 offset 계산에 실패했습니다.")
-                })?,
-            )?);
+            let record_id = read_u16_le(record_header, 0)?;
+            let record_len = usize::from(read_u16_le(record_header, 2)?);
             let data_start = pos
                 .checked_add(4)
                 .ok_or_else(|| err("xls BIFF globals 데이터 시작 offset 계산에 실패했습니다."))?;
             let data_end = data_start.checked_add(record_len).ok_or_else(|| {
                 err("xls BIFF globals 레코드 길이 계산 중 overflow가 발생했습니다.")
             })?;
-            if data_end > self.workbook_stream.len() {
-                return Err(err("xls BIFF globals 레코드가 손상되었습니다."));
-            }
-            let data = self
-                .workbook_stream
-                .get(data_start..data_end)
+            let record_data = Range {
+                start: data_start,
+                end: data_end,
+            };
+            let data = record_tail
+                .get(..record_len)
                 .ok_or_else(|| err("xls BIFF globals 레코드 범위 오류"))?;
             match record_id {
                 0x0085 if let Some(header) = data.first_chunk::<8>() => {
@@ -689,7 +695,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 }
                 0x0042 if let Some(header) = data.first_chunk::<2>() => {
                     code_page = Some(read_u16_le(header, 0)?);
-                    if code_page.is_none_or(|page| page != EXPECTED_BIFF_CODE_PAGE) {
+                    if code_page != Some(EXPECTED_BIFF_CODE_PAGE) {
                         return Err(err(format!(
                             "Opinet 고정 소스의 BIFF code page가 예상과 다릅니다: {code_page:?}"
                         )));
@@ -697,7 +703,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 }
                 0x00FC => {
                     let (chunks, next) = self.collect_sst_chunks(data, data_end)?;
-                    if code_page.is_none_or(|page| page != EXPECTED_BIFF_CODE_PAGE) {
+                    if code_page != Some(EXPECTED_BIFF_CODE_PAGE) {
                         return Err(err(format!(
                             "Opinet 고정 소스의 BIFF code page가 예상과 다릅니다: {code_page:?}"
                         )));
@@ -708,7 +714,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 }
                 _ => {}
             }
-            pos = data_end;
+            pos = record_data.end;
             if record_id == 0x000A && boundsheet.is_some() {
                 break;
             }
@@ -716,7 +722,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         let Some(parsed_boundsheet) = boundsheet else {
             return Err(err("xls에서 BoundSheet를 찾지 못했습니다."));
         };
-        if code_page.is_none_or(|page| page != EXPECTED_BIFF_CODE_PAGE) {
+        if code_page != Some(EXPECTED_BIFF_CODE_PAGE) {
             return Err(err(format!(
                 "Opinet 고정 소스의 BIFF code page가 예상과 다릅니다: {code_page:?}"
             )));
@@ -751,13 +757,14 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
 }
 impl SourceHeaderValidator<'_> {
     fn validate(&self) -> Result<()> {
-        let Some(header) = self
+        let Some(header_entry) = self
             .rows
             .iter()
-            .find_map(|row_entry| (row_entry.0 == SOURCE_HEADER_ROW).then_some(&row_entry.1))
+            .find(|row_entry| row_entry.0 == SOURCE_HEADER_ROW)
         else {
             return Err(err("Opinet 소스 헤더 행을 찾지 못했습니다."));
         };
+        let header = &header_entry.1;
         for (col, expected) in [
             (COL_REGION, "지역"),
             (COL_NAME, "상호"),
@@ -864,9 +871,7 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
                     source,
                 )
             })?;
-        for row_entry in self.rows_map {
-            rows.push(row_entry);
-        }
+        rows.extend(self.rows_map);
         Ok(rows)
     }
     fn handle_label_sst_record(&mut self, data: &[u8]) -> Result<()> {
@@ -914,7 +919,7 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
         self.rows_map
             .entry(row)
             .or_insert_with(|| SourceRow {
-                cells: [const { String::new() }; SOURCE_COLUMN_COUNT],
+                cells: array::repeat(String::new()),
             })
             .set(col, value)?;
         Ok(())
@@ -941,20 +946,15 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
         self.finalize_source_rows()
     }
     fn read_record(&mut self) -> Result<Option<(u16, &'workbook [u8])>> {
-        if self
-            .pos
-            .checked_add(4)
-            .is_none_or(|next_pos| next_pos > self.workbook_stream.len())
-        {
+        let Some((record_header, record_tail)) = self
+            .workbook_stream
+            .get(self.pos..)
+            .and_then(|tail| tail.split_first_chunk::<4>())
+        else {
             return Ok(None);
-        }
-        let record_id = read_u16_le(self.workbook_stream, self.pos)?;
-        let record_len = usize::from(read_u16_le(
-            self.workbook_stream,
-            self.pos
-                .checked_add(2)
-                .ok_or_else(|| err("xls worksheet 레코드 길이 offset 계산에 실패했습니다."))?,
-        )?);
+        };
+        let record_id = read_u16_le(record_header, 0)?;
+        let record_len = usize::from(read_u16_le(record_header, 2)?);
         let data_start = self
             .pos
             .checked_add(4)
@@ -962,13 +962,13 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
         let data_end = data_start
             .checked_add(record_len)
             .ok_or_else(|| err("xls worksheet 레코드 길이 계산 중 overflow가 발생했습니다."))?;
-        if data_end > self.workbook_stream.len() {
-            return Err(err("xls worksheet 레코드가 손상되었습니다."));
-        }
-        self.pos = data_end;
-        let data = self
-            .workbook_stream
-            .get(data_start..data_end)
+        let record_data = Range {
+            start: data_start,
+            end: data_end,
+        };
+        self.pos = record_data.end;
+        let data = record_tail
+            .get(..record_len)
             .ok_or_else(|| err("xls worksheet 레코드 범위 오류"))?;
         Ok(Some((record_id, data)))
     }
@@ -1048,7 +1048,8 @@ fn get_sector_slice(data: &[u8], sector_size: usize, sector_id: u32) -> Result<&
             sector_size,
         ))
     })?;
-    data.get(start..end).ok_or_else(|| {
+    let sector_span = Range { start, end };
+    data.get(sector_span).ok_or_else(|| {
         err(sector_size_message(
             "CFB sector 범위를 벗어났습니다: sector=",
             sector_id,
@@ -1095,7 +1096,7 @@ fn read_stream_from_fat_chain(
         stream_name,
     )?;
     while sid != CFB_END_OF_CHAIN {
-        if remaining.is_some_and(|remaining_len| remaining_len == 0) {
+        if remaining == Some(0) {
             break;
         }
         if !is_regular_sector_id(sid) {
@@ -1119,8 +1120,8 @@ fn read_stream_from_fat_chain(
         let sector = get_sector_slice(data, sector_size, sid)?;
         if let Some(remain) = remaining.as_mut() {
             let take = (*remain).min(sector.len());
-            let (prefix, _) = sector
-                .split_at_checked(take)
+            let prefix = sector
+                .get(..take)
                 .ok_or_else(|| err("sector 슬라이스 범위 오류"))?;
             out.extend_from_slice(prefix);
             *remain = remain.saturating_sub(take);
@@ -1168,10 +1169,7 @@ fn read_le_array<const N: usize>(
     offset: usize,
     out_of_range_prefix: &str,
 ) -> Result<[u8; N]> {
-    let Some((_, tail)) = bytes.split_at_checked(offset) else {
-        return Err(err(prefixed_display_message(out_of_range_prefix, offset)));
-    };
-    let Some(raw_bytes) = tail.first_chunk::<N>() else {
+    let Some(raw_bytes) = bytes.get(offset..).and_then(|tail| tail.first_chunk::<N>()) else {
         return Err(err(prefixed_display_message(out_of_range_prefix, offset)));
     };
     Ok(*raw_bytes)

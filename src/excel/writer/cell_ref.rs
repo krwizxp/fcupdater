@@ -105,9 +105,7 @@ where
             source,
         )
     })?;
-    for ch in formula.chars() {
-        chars.push(ch);
-    }
+    chars.extend(formula.chars());
     let mut i = 0_usize;
     let capacity = formula.len();
     let mut out = String::new();
@@ -121,10 +119,7 @@ where
                 let escaped_quote_idx = i
                     .checked_add(1)
                     .ok_or_else(|| err("formula 문자열 quote index 계산에 실패했습니다."))?;
-                if chars
-                    .get(escaped_quote_idx)
-                    .is_some_and(|candidate| *candidate == '"')
-                {
+                if chars.get(escaped_quote_idx) == Some(&'"') {
                     out.push('"');
                     i = i
                         .checked_add(2)
@@ -149,17 +144,11 @@ where
             while let Some(&quoted_char) = chars.get(quoted_index) {
                 if quoted_char == '\'' {
                     let next_idx = quoted_index.saturating_add(1);
-                    if chars
-                        .get(next_idx)
-                        .is_some_and(|candidate| *candidate == '\'')
-                    {
+                    if chars.get(next_idx) == Some(&'\'') {
                         quoted_index = quoted_index.saturating_add(2);
                         continue;
                     }
-                    if chars
-                        .get(next_idx)
-                        .is_some_and(|candidate| *candidate == '!')
-                    {
+                    if chars.get(next_idx) == Some(&'!') {
                         quoted_end = Some(quoted_index.saturating_add(2));
                     }
                     break;
@@ -167,14 +156,10 @@ where
                 quoted_index = quoted_index.saturating_add(1);
             }
             if let Some(next_idx) = quoted_end {
-                for quoted in chars
-                    .iter()
-                    .skip(i)
-                    .take(next_idx.saturating_sub(i))
-                    .copied()
-                {
-                    out.push(quoted);
-                }
+                let quoted = chars
+                    .get(i..next_idx)
+                    .ok_or_else(|| err("formula quoted sheet 범위가 손상되었습니다."))?;
+                out.extend(quoted.iter().copied());
                 i = next_idx;
                 continue;
             }
@@ -215,7 +200,7 @@ where
 {
     let mut index = start;
     let mut col_lock = false;
-    if chars.get(index).is_some_and(|ch| *ch == '$') {
+    if chars.get(index) == Some(&'$') {
         col_lock = true;
         index = index.saturating_add(1);
     }
@@ -256,7 +241,7 @@ where
         return Ok(None);
     }
     let mut row_lock = false;
-    if chars.get(index).is_some_and(|ch| *ch == '$') {
+    if chars.get(index) == Some(&'$') {
         row_lock = true;
         index = index.saturating_add(1);
     }

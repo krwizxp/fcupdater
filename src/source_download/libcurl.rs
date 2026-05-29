@@ -279,11 +279,9 @@ impl Client {
         raw_url.push_str(path);
         let url = cstring("URL", &raw_url)?;
         let header_list = HeaderList::from_headers(request_headers)?;
-        let custom_method = if method != "GET" && method != "POST" {
-            Some(cstring("HTTP method", method)?)
-        } else {
-            None
-        };
+        let custom_method = (method != "GET" && method != "POST")
+            .then(|| cstring("HTTP method", method))
+            .transpose()?;
         let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
         let mut response_buffers = ResponseBuffers {
             body: BoundedResponseBuffer::new("본문", HTTP_MAX_BODY_BYTES),
@@ -365,11 +363,9 @@ impl Client {
         raw_url.push_str(path);
         let url = cstring("URL", &raw_url)?;
         let header_list = HeaderList::from_headers(request_headers)?;
-        let custom_method = if method != "GET" && method != "POST" {
-            Some(cstring("HTTP method", method)?)
-        } else {
-            None
-        };
+        let custom_method = (method != "GET" && method != "POST")
+            .then(|| cstring("HTTP method", method))
+            .transpose()?;
         let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
         let mut body_sink = StreamingBodySink {
             error: None,
@@ -450,16 +446,15 @@ impl Client {
                 let mut cached = cell
                     .try_borrow_mut()
                     .map_err(|source| format!("curl easy handle cache borrow 실패: {source}"))?;
-                if cached.is_none() {
+                let handle = if let Some(ref mut handle) = *cached {
+                    handle
+                } else {
                     // SAFETY: curl_easy_init has no preconditions after global init.
                     let raw_handle_ptr = unsafe { curl_easy_init() };
                     let Some(raw_handle) = NonNull::new(raw_handle_ptr) else {
                         return Err("curl_easy_init 실패".to_owned());
                     };
-                    *cached = Some(EasyHandle(raw_handle));
-                }
-                let Some(handle) = cached.as_ref() else {
-                    return Err("curl easy handle cache가 비어 있습니다.".to_owned());
+                    cached.insert(EasyHandle(raw_handle))
                 };
                 handle.reset();
                 action(handle)
@@ -529,13 +524,11 @@ fn parsed_headers_from_bytes(header_bytes: &[u8]) -> Result<Vec<(String, String)
     headers
         .try_reserve(header_count)
         .map_err(|source| format!("HTTP header 목록 메모리 확보 실패: {source}"))?;
-    for line in selected.lines() {
-        if line.starts_with("HTTP/") {
-            continue;
-        }
-        let Some((raw_name, raw_value)) = line.split_once(':') else {
-            continue;
-        };
+    for (raw_name, raw_value) in selected
+        .lines()
+        .filter(|line| !line.starts_with("HTTP/"))
+        .filter_map(|line| line.split_once(':'))
+    {
         let name = raw_name.trim_ascii();
         let value = raw_value.trim_ascii();
         let mut header_name = String::new();

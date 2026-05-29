@@ -10,7 +10,7 @@ use crate::{
     normalize_address_key, parse_region_label, same_trimmed, shift_row, usize_to_u32,
 };
 use alloc::collections::BTreeMap;
-use core::mem;
+use core::{mem, range::RangeInclusive};
 use std::collections::{HashMap, HashSet};
 mod filter;
 mod format;
@@ -20,6 +20,7 @@ const DECIMAL_SCALE_SQUARED: ScaledSortKey = 1_000_000_000_000;
 const DECIMAL_SCALE_CUBED: ScaledSortKey = 1_000_000_000_000_000_000;
 type ScaledDecimal = i64;
 type ScaledSortKey = i128;
+type RowRange = RangeInclusive<u32>;
 struct MasterRowDecision {
     change: Option<ChangeRow>,
     deleted: Option<StoreRow>,
@@ -77,21 +78,18 @@ struct RankFormulaCacheWriter<'sheet, 'cache> {
     ws: &'sheet mut excel::writer::Worksheet,
 }
 struct RankFormulaRangeRewriter<'formula> {
-    data_end_row: u32,
-    data_start_row: u32,
+    data_rows: RowRange,
     formula: &'formula str,
     sort_key_col: u32,
 }
 struct RankFormulaRefresher<'sheet, 'strings> {
-    data_end_row: u32,
-    data_start_row: u32,
+    data_rows: RowRange,
     layout: MasterSheetLayout,
     shared_strings: &'strings [String],
     ws: &'sheet mut excel::writer::Worksheet,
 }
 struct RankRowsSorter<'sheet, 'strings> {
-    data_end_row: u32,
-    data_start_row: u32,
+    data_rows: RowRange,
     layout: MasterSheetLayout,
     shared_strings: &'strings [String],
     ws: &'sheet mut excel::writer::Worksheet,
@@ -104,15 +102,13 @@ struct RankSortKeyBuilder<'sheet, 'strings, 'context> {
     ws: &'sheet excel::writer::Worksheet,
 }
 struct RankSortRefresher<'sheet, 'strings> {
-    data_end_row: u32,
-    data_start_row: u32,
+    data_rows: RowRange,
     layout: MasterSheetLayout,
     shared_strings: &'strings [String],
     ws: &'sheet mut excel::writer::Worksheet,
 }
 struct RebasedNonDataRowsBuilder<'rows, 'mapper> {
-    data_start_row: u32,
-    old_end_row: u32,
+    old_data_rows: RowRange,
     original_rows: &'rows BTreeMap<u32, StdRow>,
     row_mapper: &'mapper RowMapper,
 }
@@ -240,20 +236,15 @@ struct MasterRowEvaluation {
     matched_source_keys: HashSet<String>,
 }
 struct RowMapper {
-    data_start_row: u32,
     decrease: u32,
     deleted_rows: Vec<u32>,
-    has_old_rows: bool,
     increase: u32,
     old_count_u32: u32,
-    old_end_row: u32,
+    old_data_rows: RowRange,
 }
 impl RowMapper {
     fn map(&self, old_ref_row: u32) -> u32 {
-        if self.has_old_rows
-            && old_ref_row >= self.data_start_row
-            && old_ref_row <= self.old_end_row
-        {
+        if self.old_data_rows.contains(&old_ref_row) {
             let deleted_le = u32::try_from(
                 self.deleted_rows
                     .partition_point(|deleted_row| *deleted_row <= old_ref_row),
@@ -261,7 +252,7 @@ impl RowMapper {
             .unwrap_or(self.old_count_u32);
             return old_ref_row.saturating_sub(deleted_le);
         }
-        if old_ref_row > self.old_end_row {
+        if old_ref_row > self.old_data_rows.last {
             return shift_row(old_ref_row, self.increase, self.decrease);
         }
         old_ref_row
@@ -342,15 +333,8 @@ impl DeletedRowsBuilder<'_, '_> {
             })?;
         let mut kept_iter = self.kept_source_rows.iter().map(|entry| entry.0).peekable();
         for row_num in self.old_rows.iter().copied() {
-            while kept_iter.peek().is_some_and(|kept_row| *kept_row < row_num) {
-                kept_iter.next();
-            }
-            if kept_iter
-                .peek()
-                .is_some_and(|kept_row| *kept_row == row_num)
-            {
-                kept_iter.next();
-            } else {
+            while kept_iter.next_if(|kept_row| *kept_row < row_num).is_some() {}
+            if kept_iter.next_if_eq(&row_num).is_none() {
                 deleted_rows.push(row_num);
             }
         }
@@ -492,14 +476,11 @@ impl RebasedNonDataRowsBuilder<'_, '_> {
         let mut new_rows_map = BTreeMap::new();
         for (row_ref, row_obj) in self.original_rows {
             let row_num = *row_ref;
-            if self.row_mapper.has_old_rows
-                && row_num >= self.data_start_row
-                && row_num <= self.old_end_row
-            {
+            if self.old_data_rows.contains(&row_num) {
                 continue;
             }
             let mut cloned_row = row_obj.clone();
-            if row_num < self.data_start_row {
+            if row_num < self.old_data_rows.start {
                 remap_row_numbers(&mut cloned_row, row_num, &|old_ref_row| {
                     self.row_mapper.map(old_ref_row)
                 });
@@ -642,17 +623,13 @@ impl RankFormulaRangeRewriter<'_> {
         else {
             return self.formula.to_owned();
         };
-        if !self
-            .formula
-            .get(second_col_pos..)
-            .is_some_and(|tail| tail.starts_with(&range_marker))
-        {
+        let Some(second_tail) = self.formula.get(second_col_pos..) else {
             return self.formula.to_owned();
-        }
+        };
         let Some(end_digits_start) = second_col_pos.checked_add(range_marker.len()) else {
             return self.formula.to_owned();
         };
-        let Some(end_digits_tail) = self.formula.get(end_digits_start..) else {
+        let Some(end_digits_tail) = second_tail.strip_prefix(range_marker.as_str()) else {
             return self.formula.to_owned();
         };
         let end_digits_len = end_digits_tail
@@ -665,14 +642,14 @@ impl RankFormulaRangeRewriter<'_> {
         let Some(end_digits_end) = end_digits_start.checked_add(end_digits_len) else {
             return self.formula.to_owned();
         };
-        let Some((prefix, _range_start)) = self.formula.split_at_checked(first_col_pos) else {
+        let Some(prefix) = self.formula.get(..first_col_pos) else {
             return self.formula.to_owned();
         };
-        let Some((_formula_head, suffix)) = self.formula.split_at_checked(end_digits_end) else {
+        let Some(suffix) = self.formula.get(end_digits_end..) else {
             return self.formula.to_owned();
         };
-        let data_start_row = self.data_start_row;
-        let data_end_row = self.data_end_row;
+        let data_start_row = self.data_rows.start;
+        let data_end_row = self.data_rows.last;
         format!(
             "{prefix}${sort_key_col_name}${data_start_row}:${sort_key_col_name}${data_end_row}{suffix}"
         )
@@ -776,7 +753,10 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, 'sources, 'source> {
         filter_end_row: u32,
         original_rows: BTreeMap<u32, StdRow>,
     ) -> Result<(u32, u32)> {
-        if let Err(error) = self.ws.update_auto_filter_ref(header_row, filter_end_row) {
+        if let Err(error) = self.ws.update_auto_filter_ref(RowRange {
+            start: header_row,
+            last: filter_end_row,
+        }) {
             self.ws.rows = original_rows;
             return Err(error);
         }
@@ -805,13 +785,17 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, 'sources, 'source> {
             .last()
             .copied()
             .unwrap_or_else(|| data_start_row.saturating_sub(1));
+        let old_data_rows = RowRange {
+            start: data_start_row,
+            last: old_end_row,
+        };
         let original_rows = mem::take(&mut self.ws.rows);
         let final_count = self
             .kept_source_rows
             .len()
             .saturating_add(self.new_sources.len());
-        let row_mapper = self.row_mapper(old_count, old_end_row, final_count)?;
-        let rebuilt = self.rebuild_rows(&original_rows, &row_mapper, old_end_row);
+        let row_mapper = self.row_mapper(old_count, old_data_rows, final_count)?;
+        let rebuilt = self.rebuild_rows(&original_rows, &row_mapper, old_data_rows);
         let (new_rows_map, kept_rows, new_rows_from_sources) = match rebuilt {
             Ok(values) => values,
             Err(error) => {
@@ -831,8 +815,10 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, 'sources, 'source> {
         let filter_end_row = self.filter_end_row(final_count, final_count_u32)?;
         if final_count > 0 {
             RankSortRefresher {
-                data_start_row,
-                data_end_row: filter_end_row,
+                data_rows: RowRange {
+                    start: data_start_row,
+                    last: filter_end_row,
+                },
                 layout,
                 shared_strings: self.shared_strings,
                 ws: self.ws,
@@ -845,7 +831,7 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, 'sources, 'source> {
         &self,
         original_rows: &BTreeMap<u32, StdRow>,
         row_mapper: &RowMapper,
-        old_end_row: u32,
+        old_data_rows: RowRange,
     ) -> Result<RebuiltMasterRows<'sources, 'source>> {
         let data_start_row = self.plan.data_start_row;
         let template_row_num = self.old_rows.last().copied().unwrap_or(data_start_row);
@@ -854,8 +840,7 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, 'sources, 'source> {
             .cloned()
             .unwrap_or_else(|| MasterSheetOps::default_row(template_row_num));
         let mut new_rows_map = RebasedNonDataRowsBuilder {
-            data_start_row,
-            old_end_row,
+            old_data_rows,
             original_rows,
             row_mapper,
         }
@@ -883,15 +868,13 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, 'sources, 'source> {
     fn row_mapper(
         &self,
         old_count: usize,
-        old_end_row: u32,
+        old_data_rows: RowRange,
         final_count: usize,
     ) -> Result<RowMapper> {
         let old_count_u32 = usize_to_u32(old_count, "기존 유류비 행 수")?;
         let final_count_u32 = usize_to_u32(final_count, "최종 유류비 행 수")?;
         Ok(RowMapper {
-            has_old_rows: old_count > 0,
-            data_start_row: self.plan.data_start_row,
-            old_end_row,
+            old_data_rows,
             deleted_rows: DeletedRowsBuilder {
                 kept_source_rows: self.kept_source_rows,
                 old_rows: self.old_rows,
@@ -1001,11 +984,12 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
         Some(parts)
     }
     fn region_rate(&self, region: &str, total_price: Option<ScaledSortKey>) -> ScaledDecimal {
-        let currency_apply = self
-            .layout
-            .currency_apply
-            .map(|col| self.ws.get_display_at(col, self.row, self.shared_strings))
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("Y"));
+        let currency_apply = self.layout.currency_apply.is_some_and(|col| {
+            self.ws
+                .get_display_at(col, self.row, self.shared_strings)
+                .trim()
+                .eq_ignore_ascii_case("Y")
+        });
         if currency_apply && total_price.is_some() {
             self.sort_context
                 .region_rates
@@ -1126,8 +1110,9 @@ impl RankFormulaRefresher<'_, '_> {
         sort_context: &RankSortContext,
     ) -> Result<Vec<(u32, Option<ScaledSortKey>)>> {
         let capacity = usize::try_from(
-            self.data_end_row
-                .saturating_sub(self.data_start_row)
+            self.data_rows
+                .last
+                .saturating_sub(self.data_rows.start)
                 .saturating_add(1),
         )
         .unwrap_or_default();
@@ -1138,7 +1123,7 @@ impl RankFormulaRefresher<'_, '_> {
                 source,
             )
         })?;
-        for row in self.data_start_row..=self.data_end_row {
+        for row in self.data_rows {
             let cache = {
                 let ws = &*self.ws;
                 RankFormulaCacheBuilder {
@@ -1166,8 +1151,7 @@ impl RankFormulaRefresher<'_, '_> {
         let display_total_qty = MasterSheetOps::get_f64_at(self.ws, 2, 10, self.shared_strings)
             .filter(|value| !MasterSheetOps::is_zero(*value));
         let sort_context = MasterSheetOps::build_rank_sort_context(self.ws, self.shared_strings)?;
-        self.ws
-            .clear_formula_cached_values_in_range(self.data_start_row, self.data_end_row);
+        self.ws.clear_formula_cached_values_in_range(self.data_rows);
         let rank_totals = self.collect_rank_totals(display_total_qty, &sort_context)?;
         let mut visible_rank_totals: Vec<ScaledSortKey> = Vec::new();
         visible_rank_totals
@@ -1197,15 +1181,14 @@ impl RankFormulaRefresher<'_, '_> {
         let Some(sort_key_col) = self.layout.sort_key else {
             return;
         };
-        for row in self.data_start_row..=self.data_end_row {
+        for row in self.data_rows {
             let Some(formula) = self.ws.get_formula_at(self.layout.rank, row) else {
                 continue;
             };
             let updated = RankFormulaRangeRewriter {
                 formula: &formula,
                 sort_key_col,
-                data_start_row: self.data_start_row,
-                data_end_row: self.data_end_row,
+                data_rows: self.data_rows,
             }
             .rewrite();
             if updated != formula {
@@ -1230,7 +1213,7 @@ impl RankRowsSorter<'_, '_> {
                     source,
                 )
             })?;
-        for old_row in self.data_start_row..=self.data_end_row {
+        for old_row in self.data_rows {
             let row = self
                 .ws
                 .rows
@@ -1239,12 +1222,12 @@ impl RankRowsSorter<'_, '_> {
             detached_rows.push(Some(row));
         }
         for (old_row, _) in data_rows {
-            let Some(new_row) = mapped_contiguous_row(row_mapping, self.data_start_row, old_row)
+            let Some(new_row) = mapped_contiguous_row(row_mapping, self.data_rows.start, old_row)
             else {
                 return Err(err(format!("정렬 후 행 매핑을 찾지 못했습니다: {old_row}")));
             };
             let row_offset = old_row
-                .checked_sub(self.data_start_row)
+                .checked_sub(self.data_rows.start)
                 .ok_or_else(|| err(format!("정렬 분리 행 offset 계산 실패: {old_row}")))?;
             let index = usize::try_from(row_offset)
                 .map_err(|source| err_with_source("정렬 분리 행 index 변환 실패", source))?;
@@ -1253,7 +1236,7 @@ impl RankRowsSorter<'_, '_> {
                 .and_then(Option::take)
                 .ok_or_else(|| missing_sort_target_row_error(old_row))?;
             remap_row_numbers(&mut row, new_row, &|old_ref_row| {
-                mapped_contiguous_row(row_mapping, self.data_start_row, old_ref_row)
+                mapped_contiguous_row(row_mapping, self.data_rows.start, old_ref_row)
                     .unwrap_or(old_ref_row)
             });
             self.ws.rows.insert(new_row, row);
@@ -1274,9 +1257,9 @@ impl RankRowsSorter<'_, '_> {
         row_mapping.resize(data_rows.len(), None);
         for (index, data_row) in data_rows.iter().enumerate() {
             let old_row = data_row.0;
-            let new_row = add_row_offset(self.data_start_row, index, "유류비 정렬 재배치")?;
+            let new_row = add_row_offset(self.data_rows.start, index, "유류비 정렬 재배치")?;
             let row_offset = old_row
-                .checked_sub(self.data_start_row)
+                .checked_sub(self.data_rows.start)
                 .ok_or_else(|| err(format!("정렬 행 매핑 offset 계산 실패: {old_row}")))?;
             let mapping_index = usize::try_from(row_offset)
                 .map_err(|source| err_with_source("정렬 행 매핑 index 변환 실패", source))?;
@@ -1285,7 +1268,7 @@ impl RankRowsSorter<'_, '_> {
             };
             *slot = Some(new_row);
         }
-        if row_mapping.iter().any(Option::is_none) {
+        if row_mapping.contains(&None) {
             let data_row_count = data_rows.len();
             return Err(err(format!(
                 "정렬 행 매핑에 누락된 항목이 있습니다: {data_row_count} entries"
@@ -1294,7 +1277,7 @@ impl RankRowsSorter<'_, '_> {
         Ok(row_mapping)
     }
     fn sort(&mut self) -> Result<()> {
-        if self.data_end_row <= self.data_start_row {
+        if self.data_rows.start >= self.data_rows.last {
             return Ok(());
         }
         let sort_context = MasterSheetOps::build_rank_sort_context(self.ws, self.shared_strings)?;
@@ -1304,8 +1287,9 @@ impl RankRowsSorter<'_, '_> {
     }
     fn sorted_data_rows(&self, sort_context: &RankSortContext) -> Result<Vec<(u32, RankSortKey)>> {
         let row_count = usize::try_from(
-            self.data_end_row
-                .saturating_sub(self.data_start_row)
+            self.data_rows
+                .last
+                .saturating_sub(self.data_rows.start)
                 .saturating_add(1),
         )
         .unwrap_or_default();
@@ -1316,7 +1300,7 @@ impl RankRowsSorter<'_, '_> {
                 source,
             )
         })?;
-        for row_num in self.data_start_row..=self.data_end_row {
+        for row_num in self.data_rows {
             if !self.ws.rows.contains_key(&row_num) {
                 return Err(missing_sort_target_row_error(row_num));
             }
@@ -1398,11 +1382,12 @@ impl RankSortKeyBuilder<'_, '_, '_> {
                 .checked_mul(DECIMAL_SCALE)?
                 .checked_add(discount)
         });
-        let currency_apply = self
-            .layout
-            .currency_apply
-            .map(|col| self.ws.get_display_at(col, self.row, self.shared_strings))
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("Y"));
+        let currency_apply = self.layout.currency_apply.is_some_and(|col| {
+            self.ws
+                .get_display_at(col, self.row, self.shared_strings)
+                .trim()
+                .eq_ignore_ascii_case("Y")
+        });
         let region_rate = if currency_apply {
             self.sort_context
                 .region_rates
@@ -1455,16 +1440,14 @@ impl RankSortKeyBuilder<'_, '_, '_> {
 impl RankSortRefresher<'_, '_> {
     fn refresh(&mut self) -> Result<()> {
         RankRowsSorter {
-            data_start_row: self.data_start_row,
-            data_end_row: self.data_end_row,
+            data_rows: self.data_rows,
             layout: self.layout,
             shared_strings: self.shared_strings,
             ws: self.ws,
         }
         .sort()?;
         let mut formula_refresher = RankFormulaRefresher {
-            data_start_row: self.data_start_row,
-            data_end_row: self.data_end_row,
+            data_rows: self.data_rows,
             layout: self.layout,
             shared_strings: self.shared_strings,
             ws: self.ws,
@@ -1766,8 +1749,10 @@ impl MasterSheetOps<'_> {
         if filter_start_row > 0 && filter_end_row > 0 && filter_end_col > 0 {
             FilterDatabaseDefinedNameUpdater {
                 workbook_xml: book.workbook_xml_mut(),
-                data_start_row: filter_start_row,
-                data_end_row: filter_end_row,
+                data_rows: RowRange {
+                    start: filter_start_row,
+                    last: filter_end_row,
+                },
                 data_end_col: filter_end_col,
             }
             .update();

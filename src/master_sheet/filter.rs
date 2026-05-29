@@ -1,8 +1,9 @@
+use super::RowRange;
 use crate::excel;
+use core::range::Range;
 pub(super) struct FilterDatabaseDefinedNameUpdater<'xml> {
     pub data_end_col: u32,
-    pub data_end_row: u32,
-    pub data_start_row: u32,
+    pub data_rows: RowRange,
     pub workbook_xml: &'xml mut String,
 }
 impl FilterDatabaseDefinedNameUpdater<'_> {
@@ -10,7 +11,7 @@ impl FilterDatabaseDefinedNameUpdater<'_> {
         let end_col = excel::writer::col_to_name(self.data_end_col.max(1));
         let replacement = format!(
             "유류비!$A${}:{end_col}${}",
-            self.data_start_row, self.data_end_row
+            self.data_rows.start, self.data_rows.last
         );
         let marker = "_xlnm._FilterDatabase";
         let marker_attr_double = format!("name=\"{marker}\"");
@@ -48,12 +49,15 @@ impl FilterDatabaseDefinedNameUpdater<'_> {
                 break;
             };
             let content_end = content_start.saturating_add(close_rel);
-            let Some(content) = self.workbook_xml.get(content_start..content_end) else {
+            let content_span = Range {
+                start: content_start,
+                end: content_end,
+            };
+            let Some(content) = self.workbook_xml.get(content_span) else {
                 break;
             };
             if content.contains(sheet_ref_plain) || content.contains(sheet_ref_quoted) {
-                self.workbook_xml
-                    .replace_range(content_start..content_end, &replacement);
+                self.workbook_xml.replace_range(content_span, &replacement);
                 return;
             }
             cursor = content_end.saturating_add("</definedName>".len());

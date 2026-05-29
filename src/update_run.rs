@@ -40,7 +40,7 @@ impl UpdateRunContext<'_> {
             .and_then(|name| name.to_str())
             .map_or_else(|| source_path.display().to_string(), str::to_owned);
         let result = (|| -> Result<HashMap<String, SourceRecord>> {
-            let raw_records = source_reader::SourceReader { path: &source_path }
+            let mut records = source_reader::SourceReader { path: &source_path }
                 .read_xls_source()
                 .map_err(|source_err| {
                     err(path_source_message(
@@ -49,22 +49,10 @@ impl UpdateRunContext<'_> {
                         source_err,
                     ))
                 })?;
-            let mut records = Vec::new();
-            records
-                .try_reserve_exact(raw_records.len())
-                .map_err(|source| {
-                    let record_count = raw_records.len();
-                    err_with_source(
-                        format!("필터링 소스 레코드 목록 메모리 확보 실패: {record_count} records"),
-                        source,
-                    )
-                })?;
-            for record in raw_records {
+            records.retain(|record| {
                 let region_key = normalize_address_key(&record.region);
-                if source_download::TARGET_REGION_KEYS.contains(&region_key.as_str()) {
-                    records.push(record);
-                }
-            }
+                source_download::TARGET_REGION_KEYS.contains(&region_key.as_str())
+            });
             if records.is_empty() {
                 return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
             }

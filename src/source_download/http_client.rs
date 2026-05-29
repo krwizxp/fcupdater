@@ -136,13 +136,10 @@ impl HttpClient {
         for _ in 0..NETFUNNEL_POLL_LIMIT {
             let result = self.request_netfunnel(action_id, current_key.as_deref(), None)?;
             self.add_cookie("NetFunnel_ID", &result)?;
-            let mut parts = result.split(':');
-            if parts.next().is_none() {
-                return Err(prefixed_message("NetFunnel opcode 없음: ", result));
-            }
-            let Some(code_text) = parts.next() else {
+            let Some((_opcode, code_tail)) = result.split_once(':') else {
                 return Err(prefixed_message("NetFunnel 코드 없음: ", result));
             };
+            let code_text = split_head_or_all(code_tail, ':');
             let code = code_text
                 .parse::<u32>()
                 .map_err(|source| prefixed_message("NetFunnel 코드 파싱 실패: ", source))?;
@@ -293,9 +290,7 @@ impl HttpClient {
             .map_err(|source| prefixed_message("HTTP request header 메모리 확보 실패: ", source))?;
         merged_headers.push(("User-Agent", USER_AGENT));
         merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
-        for header in headers {
-            merged_headers.push(*header);
-        }
+        merged_headers.extend_from_slice(headers);
         let cookie_header = self.cookie_header()?;
         if let Some(cookie_text) = cookie_header.as_deref() {
             merged_headers.push(("Cookie", cookie_text));
@@ -441,9 +436,7 @@ impl HttpClient {
             .map_err(|source| prefixed_message("HTTP request header 메모리 확보 실패: ", source))?;
         merged_headers.push(("User-Agent", USER_AGENT));
         merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
-        for header in headers {
-            merged_headers.push(*header);
-        }
+        merged_headers.extend_from_slice(headers);
         let cookie_header = self.cookie_header()?;
         if let Some(cookie_text) = cookie_header.as_deref() {
             merged_headers.push(("Cookie", cookie_text));

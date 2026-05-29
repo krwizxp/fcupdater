@@ -10,7 +10,7 @@
 - `변경내역` 시트 항상 갱신
 - 저장 후 OOXML 필수 파트 무결성 검증
 ## 요구사항
-- MSRV: Rust 1.95
+- MSRV: Rust 1.96
 - 자동 다운로드: Windows는 WinHTTP, Linux/macOS는 native libcurl 사용
 - Linux 빌드 환경: `libcurl4-openssl-dev`
 - Linux 실행 환경: `libcurl4`
