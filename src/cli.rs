@@ -1,7 +1,7 @@
 use std::env;
 pub const APP_NAME: &str = "fcupdater";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ParseAction {
     Help(String),
     Run,

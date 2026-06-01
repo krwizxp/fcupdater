@@ -1,6 +1,6 @@
 use crate::{append_error_text, path_source_message};
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use core::result::Result as CoreResult;
+use core::{fmt, fmt::Display, result::Result as CoreResult};
 use std::{
     fs,
     io::{ErrorKind, Write},
@@ -51,17 +51,16 @@ pub const TARGET_REGION_KEYS: [&str; 11] = [
     "충남아산시",
     "충남천안시",
 ];
-pub struct SourceDownload<'dir, 'out> {
-    pub dir: &'dir Path,
-    pub out: &'out mut dyn Write,
-}
+#[derive(Debug)]
+struct DownloadError(Cow<'static, str>);
+type DownloadResult<T> = CoreResult<T, DownloadError>;
 #[derive(Debug)]
 struct StreamedBodySummary {
     bytes_seen: usize,
     preview: Vec<u8>,
 }
 struct StreamingBodySink<'writer> {
-    error: Option<String>,
+    error: Option<Cow<'static, str>>,
     limit: usize,
     summary: StreamedBodySummary,
     writer: &'writer mut dyn Write,
@@ -74,24 +73,46 @@ impl StreamedBodySummary {
         self.bytes_seen >= prefix.len() && self.preview.starts_with(prefix)
     }
 }
+impl Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.as_ref())
+    }
+}
+impl From<Cow<'static, str>> for DownloadError {
+    fn from(value: Cow<'static, str>) -> Self {
+        Self(value)
+    }
+}
+impl From<String> for DownloadError {
+    fn from(value: String) -> Self {
+        Self(Cow::Owned(value))
+    }
+}
+impl From<&'static str> for DownloadError {
+    fn from(value: &'static str) -> Self {
+        Self(Cow::Borrowed(value))
+    }
+}
 impl StreamingBodySink<'_> {
     fn append(&mut self, bytes: &[u8]) -> bool {
         let Some(next_len) = self.summary.bytes_seen.checked_add(bytes.len()) else {
-            self.error = Some("HTTP 응답 본문 크기 계산 실패".to_owned());
+            self.error = Some(Cow::Borrowed("HTTP 응답 본문 크기 계산 실패"));
             return false;
         };
         if next_len > self.limit {
-            self.error = Some(format!(
+            self.error = Some(Cow::Owned(format!(
                 "HTTP 응답 본문 크기가 허용 한도({} bytes)를 초과했습니다.",
                 self.limit
-            ));
+            )));
             return false;
         }
         if !self.capture_preview(bytes) {
             return false;
         }
         if let Err(source) = self.writer.write_all(bytes) {
-            self.error = Some(format!("HTTP 응답 본문 파일 쓰기 실패: {source}"));
+            self.error = Some(Cow::Owned(format!(
+                "HTTP 응답 본문 파일 쓰기 실패: {source}"
+            )));
             return false;
         }
         self.summary.bytes_seen = next_len;
@@ -105,11 +126,13 @@ impl StreamingBodySink<'_> {
             return true;
         }
         if let Err(source) = self.summary.preview.try_reserve(take) {
-            self.error = Some(format!("HTTP 응답 본문 preview 메모리 확보 실패: {source}"));
+            self.error = Some(Cow::Owned(format!(
+                "HTTP 응답 본문 preview 메모리 확보 실패: {source}"
+            )));
             return false;
         }
         let Some(preview) = bytes.get(..take) else {
-            self.error = Some("HTTP 응답 본문 preview 범위 계산 실패".to_owned());
+            self.error = Some(Cow::Borrowed("HTTP 응답 본문 preview 범위 계산 실패"));
             return false;
         };
         self.summary.preview.extend_from_slice(preview);
@@ -130,14 +153,15 @@ cfg_select! {
             current_len: usize,
             additional_len: usize,
             limit: usize,
-        ) -> CoreResult<usize, String> {
+        ) -> DownloadResult<usize> {
             let next_len = current_len
                 .checked_add(additional_len)
                 .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
             if next_len > limit {
                 Err(format!(
                     "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
-                ))
+                )
+                .into())
             } else {
                 Ok(next_len)
             }
@@ -148,21 +172,20 @@ cfg_select! {
 fn enforce_http_content_length_limit(
     headers: &[(String, String)],
     limit: usize,
-) -> CoreResult<(), String> {
-    for header in headers {
-        let name = &header.0;
-        let value = &header.1;
-        if !name.eq_ignore_ascii_case("Content-Length") {
-            continue;
-        }
+) -> DownloadResult<()> {
+    for value in headers
+        .iter()
+        .filter(|header| header.0.eq_ignore_ascii_case("Content-Length"))
+        .map(|header| &header.1)
+    {
         let parsed = value
             .trim_ascii()
             .parse::<usize>()
             .map_err(|source| format!("HTTP Content-Length 해석 실패: {source}"))?;
         if parsed > limit {
-            return Err(format!(
-                "HTTP Content-Length가 허용 한도({limit} bytes)를 초과했습니다."
-            ));
+            return Err(
+                format!("HTTP Content-Length가 허용 한도({limit} bytes)를 초과했습니다.").into(),
+            );
         }
     }
     Ok(())

@@ -1,3 +1,4 @@
+use super::super::ZipArchiveBuilder;
 use super::{
     CENTRAL_DIRECTORY_SIGNATURE, DOS_DATE_1980_01_01, END_OF_CENTRAL_DIRECTORY_LEN,
     END_OF_CENTRAL_DIRECTORY_SIGNATURE, GENERAL_PURPOSE_UTF8_FLAG, LOCAL_FILE_HEADER_LEN,
@@ -11,7 +12,6 @@ use std::{
     path::Path,
 };
 const CENTRAL_FILE_HEADER_BASE_LEN: usize = 46;
-#[derive(Clone)]
 struct WriteEntry {
     compressed_size: usize,
     crc32: u32,
@@ -31,10 +31,6 @@ enum ZipFileHeader<'entry> {
         uncompressed_len: usize,
     },
 }
-pub(in crate::excel) struct ZipArchiveBuilder<'path> {
-    pub archive_path: &'path Path,
-    pub root: &'path Path,
-}
 struct StreamingZipWriter<'path> {
     archive_path: &'path Path,
     bytes_written: u64,
@@ -42,7 +38,7 @@ struct StreamingZipWriter<'path> {
     file: File,
 }
 impl ZipArchiveBuilder<'_> {
-    pub fn create(&self) -> Result<()> {
+    pub(in crate::excel) fn create(&self) -> Result<()> {
         let mut files = Vec::new();
         collect_files(self.root, self.root, &mut files)?;
         files.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -138,14 +134,10 @@ impl StreamingZipWriter<'_> {
         })?;
         let crc32 = crc32(&data);
         let uncompressed_size = data.len();
-        let deflated = deflate::DeflateWriter { bytes: &data }
-            .deflate()
-            .map_err(err)?;
+        let deflated = deflate::DeflateWriter { bytes: &data }.deflate()?;
         let (method, compressed_data) = if deflated.len() < uncompressed_size {
-            drop(data);
             (METHOD_DEFLATE, deflated)
         } else {
-            drop(deflated);
             (METHOD_STORE, data)
         };
         let local_header_offset = u32::try_from(self.bytes_written)

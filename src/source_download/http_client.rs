@@ -1,11 +1,11 @@
 use super::{
-    HTTP_MAX_BODY_BYTES, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
-    StreamedBodySummary, USER_AGENT, attach_remove_file_error, enforce_http_content_length_limit,
-    lossy_prefix,
+    DownloadResult, HTTP_MAX_BODY_BYTES, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT,
+    NETFUNNEL_SERVICE_ID, StreamedBodySummary, USER_AGENT, attach_remove_file_error,
+    enforce_http_content_length_limit, lossy_prefix,
 };
 use crate::{path_source_message, prefixed_message};
 use alloc::{string::String, vec::Vec};
-use core::{fmt::Write as FmtWrite, result::Result as CoreResult, time::Duration};
+use core::{fmt::Write as FmtWrite, time::Duration};
 use std::{
     fs::File,
     io::Write as IoWrite,
@@ -31,13 +31,17 @@ pub(super) struct HttpStreamResponse {
 pub(super) struct HttpClient {
     cookies: Vec<Cookie>,
 }
-#[derive(Clone)]
+#[derive(Clone, Copy)]
+pub(super) enum PostHeaderProfile {
+    Ajax,
+    Standard,
+}
 struct Cookie {
     name: String,
     value: String,
 }
 impl HttpClient {
-    fn add_cookie(&mut self, name: &str, value: &str) -> CoreResult<(), String> {
+    fn add_cookie(&mut self, name: &str, value: &str) -> DownloadResult<()> {
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
             cookie.value.clear();
             cookie
@@ -47,6 +51,9 @@ impl HttpClient {
             cookie.value.push_str(value);
             return Ok(());
         }
+        self.cookies
+            .try_reserve(1)
+            .map_err(|source| prefixed_message("Cookie 목록 메모리 확보 실패: ", source))?;
         let mut cookie = Cookie {
             name: String::new(),
             value: String::new(),
@@ -61,13 +68,10 @@ impl HttpClient {
             .map_err(|source| prefixed_message("Cookie 값 메모리 확보 실패: ", source))?;
         cookie.name.push_str(name);
         cookie.value.push_str(value);
-        self.cookies
-            .try_reserve(1)
-            .map_err(|source| prefixed_message("Cookie 목록 메모리 확보 실패: ", source))?;
         self.cookies.push(cookie);
         Ok(())
     }
-    fn cookie_header(&self) -> CoreResult<Option<String>, String> {
+    fn cookie_header(&self) -> DownloadResult<Option<String>> {
         if self.cookies.is_empty() {
             return Ok(None);
         }
@@ -82,8 +86,8 @@ impl HttpClient {
         let mut out = String::new();
         out.try_reserve(capacity)
             .map_err(|source| prefixed_message("Cookie header 메모리 확보 실패: ", source))?;
-        for cookie in &self.cookies {
-            if !out.is_empty() {
+        for (index, cookie) in self.cookies.iter().enumerate() {
+            if index != 0 {
                 out.push_str("; ");
             }
             out.push_str(&cookie.name);
@@ -92,7 +96,7 @@ impl HttpClient {
         }
         Ok(Some(out))
     }
-    fn encoded_form_body(form: &[(&str, &str)]) -> CoreResult<String, String> {
+    fn encoded_form_body(form: &[(&str, &str)]) -> DownloadResult<String> {
         let body_capacity = form.iter().try_fold(0_usize, |sum, &(name, value)| {
             let encoded_capacity = name
                 .len()
@@ -107,12 +111,10 @@ impl HttpClient {
             sum.checked_add(separated_capacity)
         });
         let mut body = String::new();
-        body.try_reserve(
-            body_capacity.ok_or_else(|| String::from("HTTP form body 메모리 용량 계산 실패"))?,
-        )
-        .map_err(|source| prefixed_message("HTTP form body 메모리 확보 실패: ", source))?;
-        for &(name, value) in form {
-            if !body.is_empty() {
+        body.try_reserve(body_capacity.ok_or("HTTP form body 메모리 용량 계산 실패")?)
+            .map_err(|source| prefixed_message("HTTP form body 메모리 확보 실패: ", source))?;
+        for (index, &(name, value)) in form.iter().enumerate() {
+            if index != 0 {
                 body.push('&');
             }
             Self::push_percent_encoded(&mut body, name.as_bytes());
@@ -121,52 +123,51 @@ impl HttpClient {
         }
         Ok(body)
     }
-    fn extract_netfunnel_key(result: &str) -> CoreResult<String, String> {
+    fn extract_netfunnel_key(result: &str) -> DownloadResult<String> {
         let Some((_, tail)) = result.split_once("key=") else {
-            return Err(prefixed_message("NetFunnel key 없음: ", result));
+            return Err(prefixed_message("NetFunnel key 없음: ", result).into());
         };
         let value = split_head_or_all(tail, '&');
         if value.is_empty() {
-            return Err(prefixed_message("NetFunnel key 비어 있음: ", result));
+            return Err(prefixed_message("NetFunnel key 비어 있음: ", result).into());
         }
         Ok(value.to_owned())
     }
-    pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> CoreResult<String, String> {
+    pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> DownloadResult<String> {
         let mut current_key: Option<String> = None;
         for _ in 0..NETFUNNEL_POLL_LIMIT {
             let result = self.request_netfunnel(action_id, current_key.as_deref(), None)?;
             self.add_cookie("NetFunnel_ID", &result)?;
             let Some((_opcode, code_tail)) = result.split_once(':') else {
-                return Err(prefixed_message("NetFunnel 코드 없음: ", result));
+                return Err(prefixed_message("NetFunnel 코드 없음: ", result).into());
             };
             let code_text = split_head_or_all(code_tail, ':');
             let code = code_text
                 .parse::<u32>()
                 .map_err(|source| prefixed_message("NetFunnel 코드 파싱 실패: ", source))?;
-            if matches!(code, 200 | 300 | 303) {
-                return Self::extract_netfunnel_key(&result);
+            match code {
+                200 | 300 | 303 => return Self::extract_netfunnel_key(&result),
+                201 | 202 | 302 => {
+                    current_key = Some(Self::extract_netfunnel_key(&result)?);
+                    let wait_secs = result
+                        .split_once("ttl=")
+                        .map(|(_, tail)| split_head_or_all(tail, '&'))
+                        .and_then(|ttl_text| ttl_text.parse::<u32>().ok())
+                        .unwrap_or(1)
+                        .clamp(1, 30);
+                    sleep(Duration::from_secs(u64::from(wait_secs)));
+                }
+                _ => return Err(prefixed_message("NetFunnel 응답 오류: ", result).into()),
             }
-            if matches!(code, 201 | 202 | 302) {
-                current_key = Some(Self::extract_netfunnel_key(&result)?);
-                let wait_secs = result
-                    .split_once("ttl=")
-                    .map(|(_, tail)| split_head_or_all(tail, '&'))
-                    .and_then(|ttl_text| ttl_text.parse::<u32>().ok())
-                    .unwrap_or(1)
-                    .clamp(1, 30);
-                sleep(Duration::from_secs(u64::from(wait_secs)));
-                continue;
-            }
-            return Err(prefixed_message("NetFunnel 응답 오류: ", result));
         }
-        Err("NetFunnel 대기 횟수를 초과했습니다.".to_owned())
+        Err("NetFunnel 대기 횟수를 초과했습니다.".into())
     }
     pub(super) fn get_text(
         &mut self,
         host: &str,
         path: &str,
         referer: Option<&str>,
-    ) -> CoreResult<String, String> {
+    ) -> DownloadResult<String> {
         let mut headers = Vec::new();
         headers
             .try_reserve(3)
@@ -179,8 +180,8 @@ impl HttpClient {
             headers.push(("Referer", referer_value));
         }
         let response = self.request("GET", host, path, None, &headers)?;
-        String::from_utf8(response.body)
-            .map_err(|source| prefixed_message("HTTP 응답 UTF-8 변환 실패: ", source))
+        Ok(String::from_utf8(response.body)
+            .map_err(|source| prefixed_message("HTTP 응답 UTF-8 변환 실패: ", source))?)
     }
     pub(super) fn post_form(
         &mut self,
@@ -188,10 +189,10 @@ impl HttpClient {
         path: &str,
         form: &[(&str, &str)],
         referer: Option<&str>,
-        ajax: bool,
-    ) -> CoreResult<HttpResponse, String> {
+        profile: PostHeaderProfile,
+    ) -> DownloadResult<HttpResponse> {
         let body = Self::encoded_form_body(form)?;
-        let headers = Self::post_headers(referer, ajax)?;
+        let headers = Self::post_headers(referer, profile)?;
         self.request("POST", host, path, Some(body.as_bytes()), &headers)
     }
     pub(super) fn post_form_to_file(
@@ -200,11 +201,11 @@ impl HttpClient {
         path: &str,
         form: &[(&str, &str)],
         referer: Option<&str>,
-        ajax: bool,
+        profile: PostHeaderProfile,
         target: &Path,
-    ) -> CoreResult<HttpStreamResponse, String> {
+    ) -> DownloadResult<HttpStreamResponse> {
         let body = Self::encoded_form_body(form)?;
-        let headers = Self::post_headers(referer, ajax)?;
+        let headers = Self::post_headers(referer, profile)?;
         let mut file = File::create(target).map_err(|source| {
             path_source_message("다운로드 임시 파일 생성 실패", target, source)
         })?;
@@ -219,27 +220,32 @@ impl HttpClient {
             Ok(response) => response,
             Err(error_text) => {
                 drop(file);
-                return Err(attach_remove_file_error(error_text, target));
+                return Err(attach_remove_file_error(error_text.to_string(), target).into());
             }
         };
         if let Err(source) = IoWrite::flush(&mut file) {
             drop(file);
             let error_text = path_source_message("다운로드 임시 파일 flush 실패", target, source);
-            return Err(attach_remove_file_error(error_text, target));
+            return Err(attach_remove_file_error(error_text, target).into());
         }
         Ok(response)
     }
-    fn post_headers(referer: Option<&str>, ajax: bool) -> CoreResult<Vec<(&str, &str)>, String> {
+    fn post_headers(
+        referer: Option<&str>,
+        profile: PostHeaderProfile,
+    ) -> DownloadResult<Vec<(&str, &str)>> {
         let mut headers = Vec::new();
         headers
             .try_reserve(6)
             .map_err(|source| prefixed_message("HTTP POST header 메모리 확보 실패: ", source))?;
-        headers.push((
-            "Content-Type",
-            "application/x-www-form-urlencoded; charset=UTF-8",
-        ));
-        headers.push(("Accept", "text/html, */*; q=0.01"));
-        if ajax {
+        headers.extend_from_slice(&[
+            (
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            ),
+            ("Accept", "text/html, */*; q=0.01"),
+        ]);
+        if matches!(profile, PostHeaderProfile::Ajax) {
             headers.push(("X-Requested-With", "XMLHttpRequest"));
         }
         if let Some(referer_value) = referer {
@@ -282,7 +288,7 @@ impl HttpClient {
         path: &str,
         body: Option<&[u8]>,
         headers: &[(&str, &str)],
-    ) -> CoreResult<HttpResponse, String> {
+    ) -> DownloadResult<HttpResponse> {
         let mut merged_headers = Vec::new();
         let merged_header_capacity = headers.len().saturating_add(3);
         merged_headers
@@ -309,16 +315,17 @@ impl HttpClient {
                     let merged_header_count = merged_headers.len();
                     Err(format!(
                         "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
-                    ))
+                    )
+                    .into())
                 }
             }
         }?;
         enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
-        self.store_response_cookies(&response)?;
+        self.store_response_cookies_from_headers(&response.headers)?;
         if !(200..300).contains(&response.status) {
             let body_preview = lossy_prefix(&response.body, 512);
             let status = response.status;
-            return Err(format!("HTTP {status}: {body_preview}"));
+            return Err(format!("HTTP {status}: {body_preview}").into());
         }
         Ok(response)
     }
@@ -327,7 +334,7 @@ impl HttpClient {
         action_id: &str,
         key: Option<&str>,
         ttl: Option<u32>,
-    ) -> CoreResult<String, String> {
+    ) -> DownloadResult<String> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
@@ -337,10 +344,10 @@ impl HttpClient {
             let encoded_capacity = key_value
                 .len()
                 .checked_mul(3)
-                .ok_or_else(|| "NetFunnel key 인코딩 용량 계산 실패".to_owned())?;
+                .ok_or("NetFunnel key 인코딩 용량 계산 실패")?;
             let capacity = encoded_capacity
                 .checked_add("&key=".len())
-                .ok_or_else(|| "NetFunnel key fragment 용량 계산 실패".to_owned())?;
+                .ok_or("NetFunnel key fragment 용량 계산 실패")?;
             let mut fragment = String::new();
             fragment.try_reserve(capacity).map_err(|source| {
                 prefixed_message("NetFunnel key fragment 메모리 확보 실패: ", source)
@@ -355,7 +362,7 @@ impl HttpClient {
             Some(ttl_value) => {
                 let capacity = U32_DECIMAL_MAX_LEN
                     .checked_add("&ttl=".len())
-                    .ok_or_else(|| "NetFunnel ttl fragment 용량 계산 실패".to_owned())?;
+                    .ok_or("NetFunnel ttl fragment 용량 계산 실패")?;
                 let mut fragment = String::new();
                 fragment.try_reserve(capacity).map_err(|source| {
                     prefixed_message("NetFunnel ttl fragment 메모리 확보 실패: ", source)
@@ -412,7 +419,7 @@ impl HttpClient {
             .and_then(|(_, rest)| rest.split_once('\''))
             .map(|(value, _)| value);
         let Some(value) = result else {
-            return Err(prefixed_message("NetFunnel result 파싱 실패: ", text));
+            return Err(prefixed_message("NetFunnel result 파싱 실패: ", text).into());
         };
         let mut out = String::new();
         out.try_reserve(value.len())
@@ -428,7 +435,7 @@ impl HttpClient {
         body: Option<&[u8]>,
         headers: &[(&str, &str)],
         writer: &mut dyn IoWrite,
-    ) -> CoreResult<HttpStreamResponse, String> {
+    ) -> DownloadResult<HttpStreamResponse> {
         let mut merged_headers = Vec::new();
         let merged_header_capacity = headers.len().saturating_add(3);
         merged_headers
@@ -470,7 +477,8 @@ impl HttpClient {
                     let writer_type = core::any::type_name_of_val(writer);
                     Err(format!(
                         "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}, writer={writer_type}"
-                    ))
+                    )
+                    .into())
                 }
             }
         }?;
@@ -479,27 +487,19 @@ impl HttpClient {
         if !(200..300).contains(&response.status) {
             let body_preview = response.body.preview_lossy();
             let status = response.status;
-            return Err(format!("HTTP {status}: {body_preview}"));
+            return Err(format!("HTTP {status}: {body_preview}").into());
         }
         Ok(response)
-    }
-    fn store_response_cookies(&mut self, response: &HttpResponse) -> CoreResult<(), String> {
-        self.store_response_cookies_from_headers(&response.headers)
     }
     fn store_response_cookies_from_headers(
         &mut self,
         headers: &[(String, String)],
-    ) -> CoreResult<(), String> {
-        for header in headers {
-            let name = &header.0;
-            let value = &header.1;
-            if !name.eq_ignore_ascii_case("set-cookie") {
-                continue;
-            }
-            let cookie_pair = split_head_or_all(value, ';');
-            let Some((cookie_name, cookie_value)) = cookie_pair.split_once('=') else {
-                continue;
-            };
+    ) -> DownloadResult<()> {
+        for (cookie_name, cookie_value) in headers
+            .iter()
+            .filter(|header| header.0.eq_ignore_ascii_case("set-cookie"))
+            .filter_map(|header| split_head_or_all(&header.1, ';').split_once('='))
+        {
             self.add_cookie(cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
         }
         Ok(())

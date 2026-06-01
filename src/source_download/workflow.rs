@@ -1,11 +1,11 @@
 use super::{
-    CURRENT_PRICE_PAGE_DIV, DEFAULT_REGION_LABEL, GAS_STATION_API_GBN, GAS_STATION_LPG_CODE,
-    NETFUNNEL_DOWNLOAD_ACTION_ID, NETFUNNEL_ENTRY_ACTION_ID, OIL_PRICE_DOWNLOAD_TAR_URL,
-    OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH, OPDOWNLOAD_PATH, OPDOWNLOAD_URL,
-    OPINET_HOST, OPINET_KEY, SourceDownload, attach_remove_file_error, http_client,
+    CURRENT_PRICE_PAGE_DIV, DEFAULT_REGION_LABEL, DownloadResult, GAS_STATION_API_GBN,
+    GAS_STATION_LPG_CODE, NETFUNNEL_DOWNLOAD_ACTION_ID, NETFUNNEL_ENTRY_ACTION_ID,
+    OIL_PRICE_DOWNLOAD_TAR_URL, OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH,
+    OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, OPINET_KEY, attach_remove_file_error,
+    http_client::{self, PostHeaderProfile},
 };
-use crate::{Result, err, path_source_message, prefixed_message};
-use core::result::Result as CoreResult;
+use crate::{Result, SourceDownload, err, path_source_message, prefixed_message};
 use std::{
     fs,
     io::{ErrorKind, Write},
@@ -13,11 +13,14 @@ use std::{
 };
 const AUTO_SOURCE_FILE_NAME: &str = "fcupdater-opinet-source.xls";
 const AUTO_SOURCE_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
-struct SourceDownloadWorkflow<'out> {
+struct SourceDownloadWorkflow<'out, W: Write + ?Sized> {
     canonical_dir: PathBuf,
-    out: &'out mut dyn Write,
+    out: &'out mut W,
 }
-impl SourceDownload<'_, '_> {
+impl<W> SourceDownload<'_, '_, W>
+where
+    W: Write + ?Sized,
+{
     pub fn refresh_source(&mut self) -> Result<PathBuf> {
         fs::create_dir_all(self.dir).map_err(|source_err| {
             err(path_source_message(
@@ -40,8 +43,11 @@ impl SourceDownload<'_, '_> {
         .refresh_source()
     }
 }
-impl SourceDownloadWorkflow<'_> {
-    fn cleanup_auto_source_files(&self) -> CoreResult<usize, String> {
+impl<W> SourceDownloadWorkflow<'_, W>
+where
+    W: Write + ?Sized,
+{
+    fn cleanup_auto_source_files(&self) -> DownloadResult<usize> {
         let mut removed = 0_usize;
         for file_name in [AUTO_SOURCE_FILE_NAME, AUTO_SOURCE_TEMP_FILE_NAME] {
             let path = self.canonical_dir.join(file_name);
@@ -51,17 +57,15 @@ impl SourceDownloadWorkflow<'_> {
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(path_source_message(
-                        "자동 소스 파일 삭제 실패",
-                        &path,
-                        error,
-                    ));
+                    return Err(
+                        path_source_message("자동 소스 파일 삭제 실패", &path, error).into(),
+                    );
                 }
             }
         }
         Ok(removed)
     }
-    fn download_nationwide_source_http(&self) -> CoreResult<PathBuf, String> {
+    fn download_nationwide_source_http(&self) -> DownloadResult<PathBuf> {
         let mut client = http_client::HttpClient::default();
         client.get_text(OPINET_HOST, OPDOWNLOAD_PATH, None)?;
         let entry_key = client.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
@@ -73,14 +77,14 @@ impl SourceDownloadWorkflow<'_> {
                 ("opinet_key", OPINET_KEY),
             ],
             Some(OPDOWNLOAD_URL),
-            false,
+            PostHeaderProfile::Standard,
         )?;
         client.post_form(
             OPINET_HOST,
             OPDOWNLOAD_LAYOUT_PATH,
             &[("tarUrl", OIL_PRICE_DOWNLOAD_TAR_URL)],
             Some(OPDOWNLOAD_URL),
-            true,
+            PostHeaderProfile::Ajax,
         )?;
         let download_key = client.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
         let target = self.canonical_dir.join(AUTO_SOURCE_FILE_NAME);
@@ -98,7 +102,7 @@ impl SourceDownloadWorkflow<'_> {
                 ("netfunnel_key", download_key.as_str()),
             ],
             Some(OPDOWNLOAD_URL),
-            false,
+            PostHeaderProfile::Standard,
             &temp,
         )?;
         if !response.body.starts_with(&OLE2_SIGNATURE) {
@@ -107,14 +111,14 @@ impl SourceDownloadWorkflow<'_> {
                 "다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: ",
                 preview,
             );
-            return Err(attach_remove_file_error(error_text, &temp));
+            return Err(attach_remove_file_error(error_text, &temp).into());
         }
         match fs::rename(&temp, &target) {
             Ok(()) => {}
             Err(error) => {
                 let error_text =
                     path_source_message("다운로드 파일 이름 변경 실패", &target, error);
-                return Err(attach_remove_file_error(error_text, &temp));
+                return Err(attach_remove_file_error(error_text, &temp).into());
             }
         }
         Ok(target)

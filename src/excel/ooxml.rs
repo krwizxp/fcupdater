@@ -2,8 +2,7 @@ use super::{
     path_util::path_from_slashes,
     xlsx_container::XlsxContainer,
     xml::{
-        XmlScanner, decode_xml_entities, extract_all_tag_text, extract_attr, find_end_tag,
-        find_start_tag, find_tag_end,
+        XmlScanner, extract_all_tag_text, extract_attr, find_end_tag, find_start_tag, find_tag_end,
     },
 };
 use crate::{Result, err, err_with_source};
@@ -12,16 +11,16 @@ use std::{
     collections::HashMap,
     path::{Component, PathBuf},
 };
-#[derive(Debug, Clone, Default)]
-pub struct SheetCatalog {
-    pub sheet_name_to_path: HashMap<String, String>,
-    pub sheet_order: Vec<String>,
+pub(super) type SheetCatalog = Vec<SheetInfo>;
+pub(in crate::excel) struct SheetInfo {
+    pub name: String,
+    pub path: String,
 }
 pub(super) struct XlsxOoxml<'container> {
     pub container: &'container XlsxContainer,
 }
 impl XlsxOoxml<'_> {
-    pub fn load_shared_strings(&self) -> Result<Vec<String>> {
+    pub(super) fn load_shared_strings(&self) -> Result<Vec<String>> {
         let path = self
             .container
             .unpack_dir()
@@ -62,9 +61,7 @@ impl XlsxOoxml<'_> {
             let Some(si_body) = xml.get(si_body_span) else {
                 break;
             };
-            let text = extract_all_tag_text(si_body, "t")
-                .map(|text_value| decode_xml_entities(&text_value))
-                .unwrap_or_default();
+            let text = extract_all_tag_text(si_body, "t").unwrap_or_default();
             out.push(text);
             let Some(next_cursor) = si_end.checked_add("</si>".len()) else {
                 break;
@@ -73,7 +70,7 @@ impl XlsxOoxml<'_> {
         }
         Ok(out)
     }
-    pub fn load_sheet_catalog(&self) -> Result<SheetCatalog> {
+    pub(super) fn load_sheet_catalog(&self) -> Result<SheetCatalog> {
         let workbook_xml = self.container.read_text("xl/workbook.xml")?;
         let rels_xml = self.container.read_text("xl/_rels/workbook.xml.rels")?;
         let relationship_count = rels_xml.matches("<Relationship").count();
@@ -86,34 +83,18 @@ impl XlsxOoxml<'_> {
                     source,
                 )
             })?;
-        for tag in iter_start_tags(&rels_xml, "Relationship") {
-            let Some(id) = extract_attr(tag, "Id") else {
-                continue;
-            };
-            let Some(target) = extract_attr(tag, "Target") else {
-                continue;
-            };
-            rid_to_target.insert(id, target);
-        }
+        rid_to_target.extend(
+            iter_start_tags(&rels_xml, "Relationship")
+                .filter_map(|tag| Some((extract_attr(tag, "Id")?, extract_attr(tag, "Target")?))),
+        );
         let sheet_count = workbook_xml.matches("<sheet").count();
-        let mut sheet_name_to_path: HashMap<String, String> = HashMap::new();
-        sheet_name_to_path
-            .try_reserve(sheet_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("시트 경로 맵 메모리 확보 실패: {sheet_count} entries"),
-                    source,
-                )
-            })?;
-        let mut sheet_order: Vec<String> = Vec::new();
-        sheet_order
-            .try_reserve_exact(sheet_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("시트 순서 목록 메모리 확보 실패: {sheet_count} sheets"),
-                    source,
-                )
-            })?;
+        let mut sheets: SheetCatalog = Vec::new();
+        sheets.try_reserve_exact(sheet_count).map_err(|source| {
+            err_with_source(
+                format!("시트 순서 목록 메모리 확보 실패: {sheet_count} sheets"),
+                source,
+            )
+        })?;
         for tag in iter_start_tags(&workbook_xml, "sheet") {
             let Some(name) = extract_attr(tag, "name") else {
                 continue;
@@ -157,16 +138,15 @@ impl XlsxOoxml<'_> {
                 }
                 resolved_path
             };
-            sheet_name_to_path.insert(name.clone(), resolved);
-            sheet_order.push(name);
+            sheets.push(SheetInfo {
+                name,
+                path: resolved,
+            });
         }
-        if sheet_name_to_path.is_empty() {
+        if sheets.is_empty() {
             return Err(err("workbook에서 시트 정보를 찾지 못했습니다."));
         }
-        Ok(SheetCatalog {
-            sheet_name_to_path,
-            sheet_order,
-        })
+        Ok(sheets)
     }
 }
 fn iter_start_tags<'xml, 'tag>(

@@ -1,6 +1,5 @@
 use crate::{
-    ChangeRow, Result, StoreRow, add_row_offset, err, err_with_source,
-    excel::writer::{Workbook as StdWorkbook, Worksheet, col_to_name},
+    ChangeLogUpdater, Result, add_row_offset, err, err_with_source, excel::writer::col_to_name,
 };
 use core::range::RangeInclusive;
 const CHANGELOG_HEADER_ROW: u32 = 3;
@@ -36,112 +35,21 @@ struct ChangeLogLayout {
     data_start_row: u32,
     max_col: u32,
 }
-#[derive(Debug, Clone)]
-struct ChangeLogEntry {
-    address: String,
-    name: String,
+#[derive(Debug)]
+struct ChangeLogEntry<'row> {
+    address: &'row str,
+    name: &'row str,
     new_diesel: Option<i32>,
     new_gasoline: Option<i32>,
     new_premium: Option<i32>,
     old_diesel: Option<i32>,
     old_gasoline: Option<i32>,
     old_premium: Option<i32>,
-    reason: String,
-    region: String,
+    reason: &'row str,
+    region: &'row str,
 }
-struct ChangeLogUpdater<'sheet, 'shared, 'data> {
-    added: &'data [StoreRow],
-    changes: &'data [ChangeRow],
-    deleted: &'data [StoreRow],
-    shared_string_table: &'shared [String],
-    today: &'data str,
-    worksheet: &'sheet mut Worksheet,
-}
-pub struct ChangeLogSheetService<'book, 'data> {
-    pub added: &'data [StoreRow],
-    pub book: &'book mut StdWorkbook,
-    pub changes: &'data [ChangeRow],
-    pub deleted: &'data [StoreRow],
-    pub today: &'data str,
-}
-impl ChangeLogSheetService<'_, '_> {
-    pub fn update(&mut self) -> Result<()> {
-        self.book
-            .with_sheet_mut("변경내역", |ws, shared_strings| -> Result<()> {
-                let mut updater = ChangeLogUpdater {
-                    added: self.added,
-                    changes: self.changes,
-                    deleted: self.deleted,
-                    shared_string_table: shared_strings,
-                    today: self.today,
-                    worksheet: ws,
-                };
-                updater.update()
-            })
-            .ok_or_else(|| err("마스터 파일에 '변경내역' 시트가 없습니다"))?
-    }
-}
-impl ChangeLogUpdater<'_, '_, '_> {
-    fn build_entries(&self) -> Result<Vec<ChangeLogEntry>> {
-        let entry_capacity = self
-            .changes
-            .len()
-            .saturating_add(self.added.len())
-            .saturating_add(self.deleted.len());
-        let mut entries: Vec<ChangeLogEntry> = Vec::new();
-        entries
-            .try_reserve_exact(entry_capacity)
-            .map_err(|source| {
-                err_with_source(
-                    format!("변경내역 entry 메모리 확보 실패: {entry_capacity} entries"),
-                    source,
-                )
-            })?;
-        for change in self.changes {
-            entries.push(ChangeLogEntry {
-                reason: change.reason.clone(),
-                region: change.region.clone(),
-                name: change.name.clone(),
-                address: change.address.clone(),
-                old_gasoline: change.old_gasoline,
-                new_gasoline: change.new_gasoline,
-                old_premium: change.old_premium,
-                new_premium: change.new_premium,
-                old_diesel: change.old_diesel,
-                new_diesel: change.new_diesel,
-            });
-        }
-        for item in self.added {
-            entries.push(ChangeLogEntry {
-                reason: "신규".to_owned(),
-                region: item.region.clone(),
-                name: item.name.clone(),
-                address: item.address.clone(),
-                old_gasoline: None,
-                new_gasoline: item.gasoline,
-                old_premium: None,
-                new_premium: item.premium,
-                old_diesel: None,
-                new_diesel: item.diesel,
-            });
-        }
-        for item in self.deleted {
-            entries.push(ChangeLogEntry {
-                reason: "폐업".to_owned(),
-                region: item.region.clone(),
-                name: item.name.clone(),
-                address: item.address.clone(),
-                old_gasoline: item.gasoline,
-                new_gasoline: None,
-                old_premium: item.premium,
-                new_premium: None,
-                old_diesel: item.diesel,
-                new_diesel: None,
-            });
-        }
-        Ok(entries)
-    }
-    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<()> {
+impl ChangeLogUpdater<'_, '_, '_, '_> {
+    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) {
         let cols = [
             layout.col_region,
             layout.col_name,
@@ -156,51 +64,21 @@ impl ChangeLogUpdater<'_, '_, '_> {
         ];
         let last_row = self
             .worksheet
-            .rows
-            .range(layout.data_start_row..)
+            .row_numbers_from(layout.data_start_row)
             .rev()
-            .map(|(row, _)| *row)
             .find(|&row| {
                 self.worksheet
                     .row_has_any_data(row, &cols, self.shared_string_table)
             });
         if let Some(last_data_row) = last_row {
-            let estimated_rows = last_data_row
-                .saturating_sub(layout.data_start_row)
-                .saturating_add(1);
-            let estimated_rows_usize = usize::try_from(estimated_rows)
-                .map_err(|source| err_with_source("변경내역 clear 행 수 변환 실패", source))?;
-            let max_col_usize = usize::try_from(layout.max_col)
-                .map_err(|source| err_with_source("변경내역 clear 열 수 변환 실패", source))?;
-            let cell_capacity =
-                estimated_rows_usize
-                    .checked_mul(max_col_usize)
-                    .ok_or_else(|| {
-                        err("변경내역 clear 대상 cell 수 계산 중 overflow가 발생했습니다.")
-                    })?;
-            let mut cells_to_clear: Vec<(u32, u32)> = Vec::new();
-            cells_to_clear
-                .try_reserve_exact(cell_capacity)
-                .map_err(|source| {
-                    err_with_source(
-                        format!("변경내역 clear 대상 메모리 확보 실패: {cell_capacity} cells"),
-                        source,
-                    )
-                })?;
-            for (row, row_obj) in self
-                .worksheet
-                .rows
-                .range(layout.data_start_row..=last_data_row)
-            {
-                for (&col, _) in row_obj.cells.range(..=layout.max_col) {
-                    cells_to_clear.push((col, *row));
-                }
-            }
-            for (col, row) in cells_to_clear {
-                self.worksheet.clear_cell_if_exists(col, row);
-            }
+            self.worksheet.clear_cells_in_rows_through_col(
+                RangeInclusive {
+                    start: layout.data_start_row,
+                    last: last_data_row,
+                },
+                layout.max_col,
+            );
         }
-        Ok(())
     }
     fn find_layout(&self) -> Result<ChangeLogLayout> {
         self.validate_fixed_header()?;
@@ -240,13 +118,62 @@ impl ChangeLogUpdater<'_, '_, '_> {
             .find(|row| self.worksheet.has_any_row_format(*row, layout.max_col))
             .unwrap_or(layout.data_start_row)
     }
-    fn update(&mut self) -> Result<()> {
+    pub(crate) fn update(&mut self) -> Result<()> {
         let date_text = format!("현행화 일자: {}", self.today);
         self.worksheet.set_string_at(1, 2, &date_text);
         let layout = self.find_layout()?;
         let style_template_row = self.select_style_template_row(&layout);
-        self.clear_existing_rows(&layout)?;
-        let entries = self.build_entries()?;
+        self.clear_existing_rows(&layout);
+        let entry_capacity = self
+            .changes
+            .len()
+            .saturating_add(self.added.len())
+            .saturating_add(self.deleted.len());
+        let mut entries: Vec<ChangeLogEntry<'_>> = Vec::new();
+        entries
+            .try_reserve_exact(entry_capacity)
+            .map_err(|source| {
+                err_with_source(
+                    format!("변경내역 entry 메모리 확보 실패: {entry_capacity} entries"),
+                    source,
+                )
+            })?;
+        entries.extend(self.changes.iter().map(|change| ChangeLogEntry {
+            address: change.address,
+            name: change.name,
+            new_diesel: change.new_diesel,
+            new_gasoline: change.new_gasoline,
+            new_premium: change.new_premium,
+            old_diesel: change.old_diesel,
+            old_gasoline: change.old_gasoline,
+            old_premium: change.old_premium,
+            reason: &change.reason,
+            region: &change.region,
+        }));
+        entries.extend(self.added.iter().map(|item| ChangeLogEntry {
+            address: &item.record.address,
+            name: &item.record.name,
+            new_diesel: item.record.diesel,
+            new_gasoline: item.record.gasoline,
+            new_premium: item.record.premium,
+            old_diesel: None,
+            old_gasoline: None,
+            old_premium: None,
+            reason: "신규",
+            region: item.region,
+        }));
+        entries.extend(self.deleted.iter().map(|item| ChangeLogEntry {
+            address: &item.address,
+            name: &item.name,
+            new_diesel: None,
+            new_gasoline: None,
+            new_premium: None,
+            old_diesel: item.diesel,
+            old_gasoline: item.gasoline,
+            old_premium: item.premium,
+            reason: "폐업",
+            region: &item.region,
+        }));
         self.write_entries(&layout, style_template_row, &entries)?;
         self.worksheet.update_dimension()?;
         Ok(())
@@ -284,7 +211,7 @@ impl ChangeLogUpdater<'_, '_, '_> {
         &mut self,
         layout: &ChangeLogLayout,
         style_template_row: u32,
-        entries: &[ChangeLogEntry],
+        entries: &[ChangeLogEntry<'_>],
     ) -> Result<()> {
         let old_gas_col = col_to_name(layout.col_old_gas);
         let new_gas_col = col_to_name(layout.col_new_gas);
@@ -313,16 +240,16 @@ impl ChangeLogUpdater<'_, '_, '_> {
             let row = add_row_offset(layout.data_start_row, index, "변경내역 데이터 쓰기")?;
             if row > style_template_row {
                 self.worksheet
-                    .clone_row_style(style_template_row, row, layout.max_col);
+                    .clone_row_style(style_template_row, row, layout.max_col)?;
             }
             self.worksheet
-                .set_string_at(layout.col_region, row, &entry.region);
+                .set_string_at(layout.col_region, row, entry.region);
             self.worksheet
-                .set_string_at(layout.col_name, row, &entry.name);
+                .set_string_at(layout.col_name, row, entry.name);
             self.worksheet
-                .set_string_at(layout.col_address, row, &entry.address);
+                .set_string_at(layout.col_address, row, entry.address);
             self.worksheet
-                .set_string_at(layout.col_reason, row, &entry.reason);
+                .set_string_at(layout.col_reason, row, entry.reason);
             self.worksheet
                 .set_i32_at(layout.col_old_gas, row, entry.old_gasoline);
             self.worksheet
@@ -339,7 +266,7 @@ impl ChangeLogUpdater<'_, '_, '_> {
                 let formula = format!(
                     "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
                 );
-                self.worksheet.set_formula_at(delta_col, row, &formula);
+                self.worksheet.set_formula_at(delta_col, row, &formula)?;
             }
         }
         if entries.is_empty() {

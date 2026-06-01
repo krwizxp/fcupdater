@@ -7,6 +7,26 @@ const COL_NAME_CHARS: [char; 26] = [
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
 pub(super) const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CellReference {
+    pub col: u32,
+    pub col_locked: bool,
+    pub row: u32,
+    pub row_locked: bool,
+}
+impl CellReference {
+    pub const fn unlocked(col: u32, row: u32) -> Self {
+        Self {
+            col,
+            col_locked: false,
+            row,
+            row_locked: false,
+        }
+    }
+    pub(super) const fn with_row(self, row: u32) -> Self {
+        Self { row, ..self }
+    }
+}
 pub(super) fn col_to_name(mut col: u32) -> String {
     if col == 0 {
         return "A".into();
@@ -38,7 +58,7 @@ pub(super) fn col_to_name(mut col: u32) -> String {
 pub(super) fn parse_range_token(token: &str) -> (&str, &str) {
     token.split_once(':').unwrap_or((token, token))
 }
-pub(super) fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, bool)> {
+pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     let (col_lock, after_col_lock) = strip_ref_lock_prefix(reference);
     let col_end = after_col_lock
         .find(|ch: char| !ch.is_ascii_alphabetic())
@@ -68,13 +88,18 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool, b
         return None;
     }
     let row = row_part.parse::<u32>().ok()?;
-    Some((col, row, col_lock, row_lock))
+    Some(CellReference {
+        col,
+        col_locked: col_lock,
+        row,
+        row_locked: row_lock,
+    })
 }
-pub(super) fn ref_with_locks(col: u32, row: u32, col_lock: bool, row_lock: bool) -> String {
-    let col_name = col_to_name(col);
-    let col_prefix = if col_lock { "$" } else { "" };
-    let row_prefix = if row_lock { "$" } else { "" };
-    let row_text = row.to_string();
+pub(super) fn ref_with_locks(reference: CellReference) -> String {
+    let col_name = col_to_name(reference.col);
+    let col_prefix = if reference.col_locked { "$" } else { "" };
+    let row_prefix = if reference.row_locked { "$" } else { "" };
+    let row_text = reference.row.to_string();
     let capacity = col_prefix
         .len()
         .saturating_add(col_name.len())
@@ -287,7 +312,12 @@ where
         return Ok(None);
     }
     let (new_col, new_row) = rewrite_ref(base_col, base_row, col_lock, row_lock)?;
-    let replaced = ref_with_locks(new_col, new_row, col_lock, row_lock);
+    let replaced = ref_with_locks(CellReference {
+        col: new_col,
+        col_locked: col_lock,
+        row: new_row,
+        row_locked: row_lock,
+    });
     Ok(Some((index, replaced)))
 }
 const fn is_ref_neighbor_identifier(ch: char) -> bool {

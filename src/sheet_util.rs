@@ -7,13 +7,7 @@ const I32_MIN_F64: f64 = -2_147_483_648.0;
 const I32_MAX_F64: f64 = 2_147_483_647.0;
 const SIGNIFICAND_HIDDEN_BIT: u64 = 1_u64 << FRACTION_BITS;
 pub fn canon_header(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if !ch.is_whitespace() {
-            out.push(ch);
-        }
-    }
-    out
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 pub fn same_trimmed(left: &str, right: &str) -> bool {
     left.trim() == right.trim()

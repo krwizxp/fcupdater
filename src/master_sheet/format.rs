@@ -1,12 +1,13 @@
 use super::{DECIMAL_SCALE, DECIMAL_SCALE_SQUARED, ScaledDecimal, ScaledSortKey};
-use crate::err;
+use crate::{AppError, err};
 use alloc::string::String;
-use core::error::Error;
 pub(super) fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> String {
+    let half_scale = ScaledSortKey(DECIMAL_SCALE_SQUARED.as_i128().div_euclid(2));
     let rounded = total
-        .checked_add(DECIMAL_SCALE_SQUARED.div_euclid(2))
+        .checked_add(half_scale)
         .unwrap_or(total)
-        .div_euclid(DECIMAL_SCALE_SQUARED);
+        .as_i128()
+        .div_euclid(DECIMAL_SCALE_SQUARED.as_i128());
     let raw = rounded.to_string();
     let (sign, digits) = split_negative_prefix(raw.as_str(), "", "-");
     let groups = digits.len().saturating_sub(1).div_euclid(3);
@@ -52,12 +53,12 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
     format!("{sign}{whole_text}.{frac_text}")
 }
 pub(super) fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -> Option<String> {
-    if qty == 0 {
+    if qty.is_zero() {
         return None;
     }
-    let denominator_raw = i128::from(qty).checked_mul(i128::from(DECIMAL_SCALE))?;
-    let sign = if total < 0 { "-" } else { "" };
-    let abs = total.unsigned_abs();
+    let denominator_raw = qty.as_i128().checked_mul(DECIMAL_SCALE.as_i128())?;
+    let sign = if total.as_i128() < 0 { "-" } else { "" };
+    let abs = total.as_i128().unsigned_abs();
     let denominator = denominator_raw.unsigned_abs();
     let whole = abs.div_euclid(denominator);
     let mut remainder = abs.rem_euclid(denominator);
@@ -78,6 +79,6 @@ pub(super) fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -
     frac_text.truncate(trimmed_frac_len);
     Some(format!("{sign}{whole_text}.{frac_text}"))
 }
-pub(super) fn missing_sort_target_row_error(row_num: u32) -> Box<dyn Error + Send + Sync> {
+pub(super) fn missing_sort_target_row_error(row_num: u32) -> AppError {
     err(format!("정렬 대상 행을 찾지 못했습니다: {row_num}"))
 }

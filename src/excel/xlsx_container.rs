@@ -1,4 +1,4 @@
-use super::zip_archive::{self, is_safe_archive_entry_path};
+use super::{ZipArchiveBuilder, ZipArchiveExtractor};
 use crate::{
     Result, append_error_text, err, path_pair_source_message, path_source_message, prefixed_message,
 };
@@ -164,21 +164,9 @@ impl XlsxContainer {
                 source_err,
             ))
         })?;
-        for entry_name in (zip_archive::ZipArchiveEntries {
-            archive_path: &archive_path,
-        })
-        .list()?
-        {
-            if !is_safe_archive_entry_path(&entry_name) {
-                return Err(err(prefixed_message(
-                    "허용되지 않은 압축 경로가 포함되어 있습니다: ",
-                    entry_name,
-                )));
-            }
-        }
-        zip_archive::ZipArchiveExtractor {
-            archive_path: &archive_path,
-            unpack_dir: &unpack_dir,
+        ZipArchiveExtractor {
+            archive_path: archive_path.as_path(),
+            unpack_dir: unpack_dir.as_path(),
         }
         .extract()?;
         cleanup.keep = true;
@@ -246,9 +234,9 @@ impl XlsxContainer {
                 ))
             })?;
         }
-        zip_archive::ZipArchiveBuilder {
-            archive_path: &self.archive_path,
-            root: &self.unpack_dir,
+        ZipArchiveBuilder {
+            archive_path: self.archive_path.as_path(),
+            root: self.unpack_dir.as_path(),
         }
         .create()?;
         let parent = if let Some(parent) = target_xlsx.parent() {

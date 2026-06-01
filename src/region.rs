@@ -35,16 +35,16 @@ pub fn normalize_address_key(addr: &str) -> String {
     }
     out
 }
-pub fn parse_region_label(text: &str) -> Option<String> {
+pub fn parse_region_label(text: &str) -> Option<&str> {
     let mut tokens = text.split_whitespace();
     let first = tokens.next()?;
     let second = tokens.next();
-    for suffix in REGION_LABEL_SUFFIXES {
-        if let Some(label) = first.strip_suffix(suffix)
-            && !label.is_empty()
-        {
-            return Some(label.to_owned());
-        }
+    if let Some(label) = REGION_LABEL_SUFFIXES
+        .iter()
+        .filter_map(|suffix| first.strip_suffix(suffix))
+        .find(|label| !label.is_empty())
+    {
+        return Some(label);
     }
     if first.ends_with('도')
         || matches!(
@@ -52,17 +52,17 @@ pub fn parse_region_label(text: &str) -> Option<String> {
             "충남" | "충북" | "경기" | "강원" | "전북" | "전남" | "경북" | "경남" | "제주"
         )
     {
-        return second.map(|token| strip_basic_region_suffix(token).unwrap_or(token).to_owned());
+        return second.map(|token| strip_basic_region_suffix(token).unwrap_or(token));
     }
     if matches!(
         first,
         "서울" | "부산" | "대구" | "인천" | "광주" | "대전" | "울산" | "세종"
     ) {
-        return Some(first.to_owned());
+        return Some(first);
     }
     match strip_basic_region_suffix(first) {
-        Some(label) => Some(label.to_owned()),
-        None if second.is_none() => Some(first.to_owned()),
+        Some(label) => Some(label),
+        None if second.is_none() => Some(first),
         None => None,
     }
 }

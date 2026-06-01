@@ -1,10 +1,11 @@
 use super::{
-    HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, checked_http_buffer_len,
+    DownloadError, DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES,
+    checked_http_buffer_len,
     enforce_http_content_length_limit,
     http_client::{HttpResponse, HttpStreamResponse},
     StreamedBodySummary, StreamingBodySink,
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{
     cell::RefCell,
     ffi::c_void,
@@ -129,17 +130,17 @@ impl Client {
         host: &str,
         host_wide: &[u16],
         port: u16,
-    ) -> Result<&'cache Handle, String> {
+    ) -> DownloadResult<&'cache Handle> {
         if let Some(index) = cache
             .connects
             .iter()
             .position(|entry| entry.port == port && entry.host.as_str() == host)
         {
-            return cache
+            return Ok(cache
                 .connects
                 .get(index)
                 .map(|entry| &entry.handle)
-                .ok_or_else(|| "WinHTTP connect cache 범위 오류".to_owned());
+                .ok_or("WinHTTP connect cache 범위 오류")?);
         }
         let handle = self.connect(&cache.session, host_wide, port)?;
         let mut host_key = String::new();
@@ -161,7 +162,7 @@ impl Client {
         });
         Ok(&entry.handle)
     }
-    fn connect(&self, session: &Handle, host: &[u16], port: u16) -> Result<Handle, String> {
+    fn connect(&self, session: &Handle, host: &[u16], port: u16) -> DownloadResult<Handle> {
         // SAFETY: host is NUL-terminated and session is a valid session handle.
         let raw_connect = unsafe { WinHttpConnect(session.as_ptr(), host.as_ptr(), port, 0) };
         self.non_null_handle(raw_connect, "WinHttpConnect")
@@ -174,17 +175,17 @@ impl Client {
         let code = self.last_error_code();
         format!("{context} 실패: Windows error {code}")
     }
-    fn non_null_handle(&self, handle: HInternet, context: &str) -> Result<Handle, String> {
-        NonNull::new(handle)
+    fn non_null_handle(&self, handle: HInternet, context: &str) -> DownloadResult<Handle> {
+        Ok(NonNull::new(handle)
             .map(Handle)
-            .ok_or_else(|| self.last_error_message(context))
+            .ok_or_else(|| self.last_error_message(context))?)
     }
     fn open_request(
         &self,
         connect: HInternet,
         method: &[u16],
         path: &[u16],
-    ) -> Result<Handle, String> {
+    ) -> DownloadResult<Handle> {
         // SAFETY: method and path are NUL-terminated and connect is valid.
         let raw_request = unsafe {
             WinHttpOpenRequest(
@@ -199,7 +200,7 @@ impl Client {
         };
         self.non_null_handle(raw_request, "WinHttpOpenRequest")
     }
-    fn open_session(&self, user_agent: &[u16]) -> Result<Handle, String> {
+    fn open_session(&self, user_agent: &[u16]) -> DownloadResult<Handle> {
         // SAFETY: user_agent is NUL-terminated and optional proxy pointers are intentionally null.
         let raw_session = unsafe {
             WinHttpOpen(
@@ -223,18 +224,18 @@ impl Client {
         }
         Ok(session)
     }
-    fn query_data_available(&self, request: &Handle) -> Result<u32, String> {
+    fn query_data_available(&self, request: &Handle) -> DownloadResult<u32> {
         let mut available = 0_u32;
         // SAFETY: available is a valid output buffer and request is a valid request handle.
         let available_ok =
             unsafe { WinHttpQueryDataAvailable(request.as_ptr(), &raw mut available) };
         if available_ok == 0_i32 {
-            Err(self.last_error_message("WinHttpQueryDataAvailable"))
+            Err(self.last_error_message("WinHttpQueryDataAvailable").into())
         } else {
             Ok(available)
         }
     }
-    fn query_headers(&self, request: &Handle) -> Result<Vec<(String, String)>, String> {
+    fn query_headers(&self, request: &Handle) -> DownloadResult<Vec<(String, String)>> {
         let mut bytes = 0_u32;
         let mut index = 0_u32;
         // SAFETY: request is valid; this first call probes the required buffer size.
@@ -253,14 +254,14 @@ impl Client {
         }
         let last_error = self.last_error_code();
         if last_error != ERROR_INSUFFICIENT_BUFFER {
-            return Err(self.last_error_message("WinHttpQueryHeaders"));
+            return Err(self.last_error_message("WinHttpQueryHeaders").into());
         }
         let header_bytes = usize::try_from(bytes)
             .map_err(|source| format!("응답 헤더 길이 변환 실패: {source}"))?;
         checked_http_buffer_len("헤더", 0, header_bytes, HTTP_MAX_HEADER_BYTES)?;
         let units = header_bytes
             .checked_div(2)
-            .ok_or_else(|| "응답 헤더 길이 계산 실패".to_owned())?;
+            .ok_or("응답 헤더 길이 계산 실패")?;
         let mut buffer = Vec::new();
         buffer
             .try_reserve(units)
@@ -279,7 +280,7 @@ impl Client {
             )
         };
         if fetch_ok == 0_i32 {
-            return Err(self.last_error_message("WinHttpQueryHeaders"));
+            return Err(self.last_error_message("WinHttpQueryHeaders").into());
         }
         while buffer.pop_if(|value| *value == 0).is_some() {}
         let raw = String::from_utf16_lossy(&buffer);
@@ -304,7 +305,7 @@ impl Client {
         }
         Ok(parsed)
     }
-    fn query_status(&self, request: &Handle) -> Result<u32, String> {
+    fn query_status(&self, request: &Handle) -> DownloadResult<u32> {
         let mut status = 0_u32;
         let mut bytes = u32::try_from(size_of::<u32>())
             .map_err(|source| format!("상태 코드 버퍼 길이 변환 실패: {source}"))?;
@@ -320,12 +321,12 @@ impl Client {
             )
         };
         if ok == 0_i32 {
-            Err(self.last_error_message("WinHttpQueryHeaders status"))
+            Err(self.last_error_message("WinHttpQueryHeaders status").into())
         } else {
             Ok(status)
         }
     }
-    fn read_body(&self, request: &Handle) -> Result<Vec<u8>, String> {
+    fn read_body(&self, request: &Handle) -> DownloadResult<Vec<u8>> {
         let mut body = Vec::new();
         loop {
             let available = self.query_data_available(request)?;
@@ -342,7 +343,7 @@ impl Client {
             body.resize(buffered_len, 0);
             let chunk = body
                 .get_mut(old_len..buffered_len)
-                .ok_or_else(|| "응답 본문 chunk 범위 계산 실패".to_owned())?;
+                .ok_or("응답 본문 chunk 범위 계산 실패")?;
             let read = self.read_chunk(request, chunk, available)?;
             let read_len = usize::try_from(read)
                 .map_err(|source| format!("응답 read 길이 변환 실패: {source}"))?;
@@ -359,7 +360,7 @@ impl Client {
         &self,
         request: &Handle,
         writer: &mut dyn IoWrite,
-    ) -> Result<StreamedBodySummary, String> {
+    ) -> DownloadResult<StreamedBodySummary> {
         let mut sink = StreamingBodySink {
             error: None,
             limit: HTTP_MAX_BODY_BYTES,
@@ -392,7 +393,8 @@ impl Client {
                 return Err(sink
                     .error
                     .take()
-                    .unwrap_or_else(|| "응답 본문 파일 쓰기 실패".to_owned()));
+                    .unwrap_or(Cow::Borrowed("응답 본문 파일 쓰기 실패"))
+                    .into());
             }
             if read == 0 {
                 break;
@@ -405,7 +407,7 @@ impl Client {
         request: &Handle,
         chunk: &mut [u8],
         available: u32,
-    ) -> Result<u32, String> {
+    ) -> DownloadResult<u32> {
         let mut read = 0_u32;
         // SAFETY: chunk is a valid writable buffer and read is a valid output buffer.
         let read_ok = unsafe {
@@ -417,16 +419,16 @@ impl Client {
             )
         };
         if read_ok == 0_i32 {
-            Err(self.last_error_message("WinHttpReadData"))
+            Err(self.last_error_message("WinHttpReadData").into())
         } else {
             Ok(read)
         }
     }
-    fn receive_response(&self, request: &Handle) -> Result<(), String> {
+    fn receive_response(&self, request: &Handle) -> DownloadResult<()> {
         // SAFETY: request is a valid request handle and no reserved pointer is required.
         let received = unsafe { WinHttpReceiveResponse(request.as_ptr(), null_mut()) };
         if received == 0_i32 {
-            Err(self.last_error_message("WinHttpReceiveResponse"))
+            Err(self.last_error_message("WinHttpReceiveResponse").into())
         } else {
             Ok(())
         }
@@ -438,7 +440,7 @@ impl Client {
         path: &str,
         request_body: Option<&[u8]>,
         headers: &[(&str, &str)],
-    ) -> Result<HttpResponse, String> {
+    ) -> DownloadResult<HttpResponse> {
         let user_agent = wide(super::USER_AGENT)?;
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
@@ -452,9 +454,7 @@ impl Client {
         headers_text
             .try_reserve(header_capacity)
             .map_err(|source| format!("요청 헤더 메모리 확보 실패: {source}"))?;
-        for header in headers {
-            let name = header.0;
-            let value = header.1;
+        for &(name, value) in headers {
             headers_text.push_str(name);
             headers_text.push_str(": ");
             headers_text.push_str(value);
@@ -493,7 +493,7 @@ impl Client {
         request_body: Option<&[u8]>,
         headers: &[(&str, &str)],
         writer: &mut dyn IoWrite,
-    ) -> Result<HttpStreamResponse, String> {
+    ) -> DownloadResult<HttpStreamResponse> {
         let user_agent = wide(super::USER_AGENT)?;
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
@@ -507,9 +507,7 @@ impl Client {
         headers_text
             .try_reserve(header_capacity)
             .map_err(|source| format!("요청 헤더 메모리 확보 실패: {source}"))?;
-        for header in headers {
-            let name = header.0;
-            let value = header.1;
+        for &(name, value) in headers {
             headers_text.push_str(name);
             headers_text.push_str(": ");
             headers_text.push_str(value);
@@ -546,7 +544,7 @@ impl Client {
         headers: &[u16],
         body: &[u8],
         body_len: u32,
-    ) -> Result<(), String> {
+    ) -> DownloadResult<()> {
         let header_len = u32::try_from(headers.len().saturating_sub(1))
             .map_err(|source| format!("요청 헤더 길이 변환 실패: {source}"))?;
         let body_ptr = if body.is_empty() {
@@ -567,7 +565,7 @@ impl Client {
             )
         };
         if sent == 0_i32 {
-            Err(self.last_error_message("WinHttpSendRequest"))
+            Err(self.last_error_message("WinHttpSendRequest").into())
         } else {
             Ok(())
         }
@@ -578,8 +576,8 @@ impl Client {
         host: &str,
         host_wide: &[u16],
         port: u16,
-        action: impl FnOnce(HInternet) -> Result<R, String>,
-    ) -> Result<R, String> {
+        action: impl FnOnce(HInternet) -> DownloadResult<R>,
+    ) -> DownloadResult<R> {
         let connect_ptr = SESSION_CACHE
             .try_with(|cell| {
                 let mut session_cache = cell
@@ -594,7 +592,7 @@ impl Client {
                     })
                 };
                 let connect = self.cached_connect(cache, host, host_wide, port)?;
-                Ok::<HInternet, String>(connect.as_ptr())
+                Ok::<HInternet, DownloadError>(connect.as_ptr())
             })
             .map_err(|source| format!("WinHTTP session cache 접근 실패: {source}"))??;
         match action(connect_ptr) {
@@ -604,24 +602,26 @@ impl Client {
                     .try_borrow_mut()
                     .map_err(|source| format!("WinHTTP session cache borrow 실패: {source}"))?;
                 *session_cache = None;
-                Ok::<(), String>(())
+                Ok::<(), DownloadError>(())
             }) {
                 Ok(Ok(())) => Err(action_error),
                 Ok(Err(cache_error)) => Err(format!(
                     "{action_error}; WinHTTP session cache 정리 실패: {cache_error}"
-                )),
+                )
+                .into()),
                 Err(access_error) => Err(format!(
                     "{action_error}; WinHTTP session cache 접근 실패: {access_error}"
-                )),
+                )
+                .into()),
             },
         }
     }
 }
-fn wide(value: &str) -> Result<Vec<u16>, String> {
+fn wide(value: &str) -> DownloadResult<Vec<u16>> {
     let capacity = value
         .len()
         .checked_add(1)
-        .ok_or_else(|| "wide 문자열 용량 계산 실패".to_owned())?;
+        .ok_or("wide 문자열 용량 계산 실패")?;
     let mut out = Vec::new();
     out.try_reserve(capacity)
         .map_err(|source| format!("wide 문자열 메모리 확보 실패: {source}"))?;

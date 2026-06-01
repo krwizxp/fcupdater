@@ -1,50 +1,149 @@
 extern crate alloc;
+use alloc::borrow::Cow;
 use cli::{APP_NAME, APP_VERSION, ParseAction, usage_text};
-use core::{error::Error, fmt::Display, result::Result as CoreResult};
+use core::{error::Error, fmt, fmt::Display, result::Result as CoreResult};
 use io_util::write_line_ignored;
 pub(crate) use region::{normalize_address_key, parse_region_label};
-pub(crate) use rows::{ChangeRow, SourceRecord, StoreRow};
 pub(crate) use sheet_util::{
     add_row_offset, canon_header, parse_i32_str, same_trimmed, shift_row, usize_to_u32,
 };
 use std::{
+    collections::HashMap,
     env,
     ffi::OsStr,
-    io::{Error as IoError, stdout},
+    io::{Error as IoError, Write, stdout},
     path::Path,
 };
-use update_run::UpdateRunContext;
 mod change_log;
 mod cli;
 mod excel;
 mod io_util;
-mod kst_date;
 mod master_sheet;
 mod region;
-mod rows;
 mod sheet_util;
 mod source_download;
 mod update_run;
-type BoxError = Box<dyn Error + Send + Sync>;
-type Result<T> = CoreResult<T, BoxError>;
-fn err(msg: impl Into<BoxError>) -> BoxError {
-    IoError::other(msg).into()
+pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
+type Result<T> = CoreResult<T, AppError>;
+#[derive(Debug)]
+struct SourceRecord {
+    address: String,
+    brand: String,
+    diesel: Option<i32>,
+    gasoline: Option<i32>,
+    name: String,
+    premium: Option<i32>,
+    region: String,
+    self_yn: String,
 }
-fn err_with_source(context: impl Display, source: impl Display) -> BoxError {
-    let context_text = context.to_string();
-    let source_text = source.to_string();
-    let capacity = context_text
-        .len()
-        .saturating_add(": ".len())
-        .saturating_add(source_text.len());
-    let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return IoError::other(format!("{context_text}: {source_text}")).into();
+#[derive(Debug)]
+struct AddedStoreRow<'source> {
+    record: &'source SourceRecord,
+    region: &'source str,
+}
+#[derive(Debug)]
+struct ChangeRow<'source> {
+    address: &'source str,
+    name: &'source str,
+    new_diesel: Option<i32>,
+    new_gasoline: Option<i32>,
+    new_premium: Option<i32>,
+    old_diesel: Option<i32>,
+    old_gasoline: Option<i32>,
+    old_premium: Option<i32>,
+    reason: String,
+    region: String,
+}
+#[derive(Debug)]
+struct StoreRow {
+    address: String,
+    diesel: Option<i32>,
+    gasoline: Option<i32>,
+    name: String,
+    premium: Option<i32>,
+    region: String,
+}
+pub(crate) struct AppError {
+    message: Cow<'static, str>,
+    source: Option<BoxError>,
+}
+struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
+    added: &'data [AddedStoreRow<'source>],
+    changes: &'data [ChangeRow<'source>],
+    deleted: &'data [StoreRow],
+    shared_string_table: &'shared [String],
+    today: &'data str,
+    worksheet: &'sheet mut excel::writer::Worksheet,
+}
+struct MasterSheetUpdater<'source> {
+    source_index: &'source HashMap<String, SourceRecord>,
+}
+struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
+    dir: &'dir Path,
+    out: &'out mut W,
+}
+struct UpdateRunContext<'out> {
+    out: &'out mut dyn Write,
+}
+impl AppError {
+    fn context(
+        context: impl Into<Cow<'static, str>>,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: context.into(),
+            source: Some(Box::new(source)),
+        }
     }
-    out.push_str(&context_text);
-    out.push_str(": ");
-    out.push_str(&source_text);
-    IoError::other(out).into()
+    fn message(message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+}
+impl Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(source) = self.source.as_ref() {
+            write!(f, "{}: {source}", self.message)
+        } else {
+            f.write_str(self.message.as_ref())
+        }
+    }
+}
+impl fmt::Debug for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+impl From<Cow<'static, str>> for AppError {
+    fn from(value: Cow<'static, str>) -> Self {
+        Self::message(value)
+    }
+}
+impl From<String> for AppError {
+    fn from(value: String) -> Self {
+        Self::message(value)
+    }
+}
+impl From<&'static str> for AppError {
+    fn from(value: &'static str) -> Self {
+        Self::message(value)
+    }
+}
+impl From<IoError> for AppError {
+    fn from(value: IoError) -> Self {
+        Self::context("I/O 오류", value)
+    }
+}
+fn err(msg: impl Into<Cow<'static, str>>) -> AppError {
+    AppError::message(msg)
+}
+fn err_with_source(
+    context: impl Into<Cow<'static, str>>,
+    source: impl Error + Send + Sync + 'static,
+) -> AppError {
+    AppError::context(context, source)
 }
 fn prefixed_message(prefix: &str, detail: impl Display) -> String {
     let detail_text = detail.to_string();

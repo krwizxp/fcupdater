@@ -11,53 +11,52 @@ use super::{
 };
 use alloc::vec::Vec;
 use core::{array::from_fn, cmp::Ordering, iter::repeat_n, range::Range};
-pub(in crate::excel::zip_archive) mod bit_io {
+mod bit_io {
     use alloc::vec::Vec;
-    pub(in crate::excel::zip_archive) struct BitReader<'bytes> {
+    pub(super) struct BitReader<'bytes> {
         pub bit_buffer: u32,
         pub bit_count: u8,
         pub bytes: &'bytes [u8],
         pub cursor: usize,
     }
-    pub(in crate::excel::zip_archive) struct BitWriter {
+    pub(super) struct BitWriter {
         pub bit_buffer: u8,
         pub bit_count: u8,
         pub bytes: Vec<u8>,
     }
 }
-pub(in crate::excel::zip_archive) mod huffman {
+mod huffman {
     use super::DEFLATE_MAX_BITS;
     use alloc::vec::Vec;
-    pub(in crate::excel::zip_archive) struct Huffman {
+    pub(super) struct Huffman {
         pub codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1],
     }
-    pub(in crate::excel::zip_archive) struct WriteHuffman {
+    pub(super) struct WriteHuffman {
         pub codes: Vec<u16>,
         pub lengths: Vec<u8>,
     }
-    #[derive(Clone)]
-    pub(in crate::excel::zip_archive) struct HuffmanCode {
+    pub(super) struct HuffmanCode {
         pub code: u16,
         pub symbol: u16,
     }
 }
-pub(in crate::excel::zip_archive) mod token {
+mod token {
     #[derive(Clone, Copy)]
-    pub(in crate::excel::zip_archive) enum DeflateToken {
+    pub(super) enum DeflateToken {
         Literal(u8),
         Match { distance: usize, length: usize },
     }
     #[derive(Clone, Copy)]
-    pub(in crate::excel::zip_archive) struct CodeLengthToken {
+    pub(super) struct CodeLengthToken {
         pub extra: u16,
         pub extra_bits: u8,
         pub symbol: u8,
     }
-    pub(in crate::excel::zip_archive) struct HuffmanBuildNode {
+    pub(super) struct HuffmanBuildNode {
         pub freq: u64,
         pub parent: Option<usize>,
     }
-    pub(in crate::excel::zip_archive) struct HuffmanLeafLength {
+    pub(super) struct HuffmanLeafLength {
         pub freq: u32,
         pub len: usize,
         pub symbol: usize,

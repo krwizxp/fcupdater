@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use core::{
     iter,
     range::{Range, RangeInclusive},
@@ -151,7 +152,7 @@ pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<Strin
         let value_start = checked_offset_add(quote_idx, 1)?;
         let value_end_rel = tag.get(value_start..)?.find(char::from(quote))?;
         let value_end = checked_offset_add(value_start, value_end_rel)?;
-        return Some(decode_xml_entities(tag.get(value_start..value_end)?));
+        return Some(decode_xml_entities(tag.get(value_start..value_end)?).into_owned());
     }
     None
 }
@@ -181,7 +182,10 @@ pub(in crate::excel) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usiz
     }
     None
 }
-pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Option<String> {
+pub(in crate::excel) fn extract_first_tag_text<'xml>(
+    xml: &'xml str,
+    tag_name: &str,
+) -> Option<&'xml str> {
     let open_start = find_start_tag(xml, tag_name, 0)?;
     let open_end = find_tag_end(xml, open_start)?;
     let body_start = checked_offset_add(open_end, 1)?;
@@ -190,11 +194,7 @@ pub(in crate::excel) fn extract_first_tag_text(xml: &str, tag_name: &str) -> Opt
         start: body_start,
         end: body_end,
     };
-    let text = xml.get(body_span)?;
-    let mut out = String::new();
-    out.try_reserve(text.len()).ok()?;
-    out.push_str(text);
-    Some(out)
+    xml.get(body_span)
 }
 pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Option<String> {
     let mut cursor = 0_usize;
@@ -209,15 +209,19 @@ pub(in crate::excel) fn extract_all_tag_text(xml: &str, tag_name: &str) -> Optio
             start: body_start,
             end: body_end,
         };
-        out.push_str(xml.get(body_span)?);
+        let body = xml.get(body_span)?;
+        match decode_xml_entities(body) {
+            Cow::Borrowed(text) => out.push_str(text),
+            Cow::Owned(text) => out.push_str(&text),
+        }
         let close_tag_len = checked_offset_add(tag_name.len(), 3)?;
         cursor = checked_offset_add(body_end, close_tag_len)?;
     }
     (!out.is_empty()).then_some(out)
 }
-pub(in crate::excel) fn decode_xml_entities(text: &str) -> String {
+pub(in crate::excel) fn decode_xml_entities(text: &str) -> Cow<'_, str> {
     if !text.contains('&') {
-        return text.to_owned();
+        return Cow::Borrowed(text);
     }
     let capacity = text.len();
     let mut out = String::with_capacity(capacity);
@@ -268,7 +272,7 @@ pub(in crate::excel) fn decode_xml_entities(text: &str) -> String {
             break;
         }
     }
-    out
+    Cow::Owned(out)
 }
 fn local_tag_name(name: &str) -> &str {
     match name.rsplit_once(':') {

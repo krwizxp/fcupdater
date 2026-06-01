@@ -4,7 +4,6 @@ use crate::{
 };
 use alloc::collections::BTreeMap;
 use core::{
-    array,
     char::{REPLACEMENT_CHARACTER, decode_utf16},
     fmt::Display,
     range::Range,
@@ -33,7 +32,7 @@ const SOURCE_COLUMN_COUNT: usize = COL_DIESEL + 1;
 pub struct SourceReader<'path> {
     pub path: &'path Path,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CfbDirectoryEntry {
     name: String,
     object_type: u8,
@@ -55,7 +54,7 @@ struct CfbFile {
     mini_stream_cutoff_size: u32,
     sector_size: usize,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct BiffBoundSheet {
     offset: usize,
     sheet_type: u8,
@@ -77,11 +76,11 @@ struct CfbDirectoryParser<'stream> {
 struct CfbFileOpener<'path> {
     path: &'path Path,
 }
-struct SourceHeaderValidator<'rows> {
-    rows: &'rows [(usize, SourceRow)],
+struct SourceHeaderValidator<'rows, 'strings> {
+    rows: &'rows [(usize, SourceRow<'strings>)],
 }
-struct SourceRow {
-    cells: [String; SOURCE_COLUMN_COUNT],
+struct SourceRow<'strings> {
+    cells: [Option<&'strings str>; SOURCE_COLUMN_COUNT],
 }
 struct SstParser<'chunks, 'chunk> {
     chunks: &'chunks [&'chunk [u8]],
@@ -93,23 +92,23 @@ struct SstChunkReader<'chunks, 'chunk> {
 }
 struct WorksheetCellsParser<'workbook, 'strings> {
     pos: usize,
-    rows_map: BTreeMap<usize, SourceRow>,
+    rows_map: BTreeMap<usize, SourceRow<'strings>>,
     shared_strings: &'strings [String],
     workbook_stream: &'workbook [u8],
 }
-impl SourceRow {
-    fn set(&mut self, col: usize, value: String) -> Result<()> {
+impl<'strings> SourceRow<'strings> {
+    fn set(&mut self, col: usize, value: &'strings str) -> Result<()> {
         let Some(cell) = self.cells.get_mut(col) else {
             return Err(err(prefixed_display_message(
                 "Opinet 고정 소스 열 범위 오류: ",
                 col.saturating_add(1),
             )));
         };
-        *cell = value;
+        *cell = Some(value);
         Ok(())
     }
     fn text(&self, idx: usize) -> Option<&str> {
-        self.cells.get(idx).map(String::as_str)
+        self.cells.get(idx).copied().flatten()
     }
 }
 impl CfbDataParser<'_, '_> {
@@ -242,7 +241,9 @@ impl CfbDataParser<'_, '_> {
 }
 impl CfbDirectoryParser<'_> {
     fn parse_entries(&self) -> Result<Vec<CfbDirectoryEntry>> {
-        let (chunks, _) = self.dir_stream.as_chunks::<128>();
+        let (chunks, &[]) = self.dir_stream.as_chunks::<128>() else {
+            return Err(err("CFB 디렉터리 stream 길이가 128바이트 단위가 아닙니다."));
+        };
         let mut entries: Vec<CfbDirectoryEntry> = Vec::new();
         entries.try_reserve_exact(chunks.len()).map_err(|source| {
             let chunk_count = chunks.len();
@@ -430,25 +431,27 @@ impl SourceReader<'_> {
                     source,
                 )
             })?;
-        for row_entry in &rows {
-            if row_entry.0 < SOURCE_FIRST_DATA_ROW {
+        for (row_num, row) in rows {
+            if row_num < SOURCE_FIRST_DATA_ROW {
                 continue;
             }
-            let row = &row_entry.1;
-            let name = row_text(row, COL_NAME);
-            let address = row_text(row, COL_ADDRESS);
+            let name = row_text_owned(&row, COL_NAME);
+            let address = row_text_owned(&row, COL_ADDRESS);
             if address.is_empty() {
                 continue;
             }
+            let diesel = normalize_fuel_price(row_i32(&row, COL_DIESEL));
+            let gasoline = normalize_fuel_price(row_i32(&row, COL_GASOLINE));
+            let premium = normalize_fuel_price(row_i32(&row, COL_PREMIUM));
             records.push(SourceRecord {
                 address,
-                brand: row_text(row, COL_BRAND),
-                diesel: normalize_fuel_price(row_i32(row, COL_DIESEL)),
-                gasoline: normalize_fuel_price(row_i32(row, COL_GASOLINE)),
+                brand: row_text_owned(&row, COL_BRAND),
+                diesel,
+                gasoline,
                 name,
-                premium: normalize_fuel_price(row_i32(row, COL_PREMIUM)),
-                region: row_text(row, COL_REGION),
-                self_yn: row_text(row, COL_SELF_YN),
+                premium,
+                region: row_text_owned(&row, COL_REGION),
+                self_yn: row_text_owned(&row, COL_SELF_YN),
             });
         }
         if records.is_empty() {
@@ -735,11 +738,11 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             shared_strings,
         })
     }
-    fn parse_worksheet_cells(
+    fn parse_worksheet_cells<'strings>(
         &self,
         sheet_offset: usize,
-        shared_strings: &[String],
-    ) -> Result<Vec<(usize, SourceRow)>> {
+        shared_strings: &'strings [String],
+    ) -> Result<Vec<(usize, SourceRow<'strings>)>> {
         if sheet_offset >= self.workbook_stream.len() {
             return Err(err(prefixed_display_message(
                 "worksheet offset이 workbook stream 범위를 벗어났습니다: ",
@@ -755,7 +758,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         .parse()
     }
 }
-impl SourceHeaderValidator<'_> {
+impl SourceHeaderValidator<'_, '_> {
     fn validate(&self) -> Result<()> {
         let Some(header_entry) = self
             .rows
@@ -775,7 +778,7 @@ impl SourceHeaderValidator<'_> {
             (COL_GASOLINE, "휘발유"),
             (COL_DIESEL, "경유"),
         ] {
-            let actual = row_text(header, col);
+            let actual = header.text(col).map(str::trim).unwrap_or_default();
             if actual != expected {
                 return Err(err(format!(
                     "Opinet 소스 헤더가 예상과 다릅니다: col={}, expected={expected}, actual={actual}",
@@ -857,12 +860,12 @@ impl SstParser<'_, '_> {
         Ok(out)
     }
 }
-impl<'workbook> WorksheetCellsParser<'workbook, '_> {
-    fn finalize_source_rows(self) -> Result<Vec<(usize, SourceRow)>> {
+impl<'workbook, 'strings> WorksheetCellsParser<'workbook, 'strings> {
+    fn finalize_source_rows(self) -> Result<Vec<(usize, SourceRow<'strings>)>> {
         if self.rows_map.is_empty() {
             return Ok(Vec::new());
         }
-        let mut rows: Vec<(usize, SourceRow)> = Vec::new();
+        let mut rows: Vec<(usize, SourceRow<'strings>)> = Vec::new();
         rows.try_reserve_exact(self.rows_map.len())
             .map_err(|source| {
                 let row_count = self.rows_map.len();
@@ -911,15 +914,19 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
         let idx_u32 = read_u32_le(header, 6)?;
         let idx = usize::try_from(idx_u32)
             .map_err(|source| err_with_source("SST index 변환에 실패했습니다.", source))?;
-        let value = self.shared_strings.get(idx).cloned().ok_or_else(|| {
-            err(format!(
-                "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
-            ))
-        })?;
+        let value = self
+            .shared_strings
+            .get(idx)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                err(format!(
+                    "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
+                ))
+            })?;
         self.rows_map
             .entry(row)
             .or_insert_with(|| SourceRow {
-                cells: array::repeat(String::new()),
+                cells: [None; SOURCE_COLUMN_COUNT],
             })
             .set(col, value)?;
         Ok(())
@@ -937,7 +944,7 @@ impl<'workbook> WorksheetCellsParser<'workbook, '_> {
         }
         Ok(false)
     }
-    fn parse(mut self) -> Result<Vec<(usize, SourceRow)>> {
+    fn parse(mut self) -> Result<Vec<(usize, SourceRow<'strings>)>> {
         while let Some((record_id, data)) = self.read_record()? {
             if self.handle_record(record_id, data)? {
                 break;
@@ -998,13 +1005,11 @@ fn reserve_seen_set(
 fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
     value.filter(|fuel_price| *fuel_price > 0_i32)
 }
-fn row_i32(row: &SourceRow, idx: usize) -> Option<i32> {
+fn row_i32(row: &SourceRow<'_>, idx: usize) -> Option<i32> {
     parse_i32_str(row.text(idx)?)
 }
-fn row_text(row: &SourceRow, idx: usize) -> String {
-    row.text(idx)
-        .map(|cell| cell.trim().to_owned())
-        .unwrap_or_default()
+fn row_text_owned(row: &SourceRow<'_>, idx: usize) -> String {
+    row.text(idx).map(str::trim).unwrap_or_default().to_owned()
 }
 fn checked_pow2_from_shift(shift: u16, context: &str) -> Result<usize> {
     let shift_u32 = u32::from(shift);
