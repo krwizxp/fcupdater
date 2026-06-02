@@ -5,7 +5,7 @@ use core::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::excel) enum XmlTagKind {
+enum XmlTagKind {
     End,
     Start,
 }
@@ -33,7 +33,7 @@ impl<'xml> XmlScanner<'xml> {
     {
         iter::from_fn(|| self.next_tag()).find(predicate)
     }
-    pub(in crate::excel) const fn from(xml: &'xml str, cursor: usize) -> Self {
+    const fn from(xml: &'xml str, cursor: usize) -> Self {
         Self { cursor, xml }
     }
     pub(in crate::excel) const fn new(xml: &'xml str) -> Self {
@@ -114,7 +114,7 @@ impl<'xml> XmlTag<'xml> {
     pub(in crate::excel) fn local_name(&self) -> &str {
         local_tag_name(self.name)
     }
-    pub(in crate::excel) const fn start(&self) -> usize {
+    const fn start(&self) -> usize {
         self.span.start
     }
     pub(in crate::excel) const fn tag(&self) -> &'xml str {
@@ -124,37 +124,58 @@ impl<'xml> XmlTag<'xml> {
 const fn checked_offset_add(base: usize, add: usize) -> Option<usize> {
     base.checked_add(add)
 }
-pub(in crate::excel) fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let mut pattern = String::new();
-    pattern
-        .try_reserve(attr_name.len().saturating_add(1))
-        .ok()?;
-    pattern.push_str(attr_name);
-    pattern.push('=');
-    let pattern_len = pattern.len();
+pub(in crate::excel) fn extract_attr<'tag>(
+    tag: &'tag str,
+    attr_name: &str,
+) -> Option<Cow<'tag, str>> {
+    if attr_name.is_empty() {
+        return None;
+    }
     let bytes = tag.as_bytes();
-    let mut cursor = 0_usize;
-    while let Some(rel) = tag.get(cursor..)?.find(&pattern) {
-        let idx = checked_offset_add(cursor, rel)?;
-        if idx > 0 {
-            let prev = *bytes.get(idx.checked_sub(1)?)?;
-            if !prev.is_ascii_whitespace() && prev != b'<' {
-                cursor = checked_offset_add(idx, pattern_len)?;
-                continue;
-            }
+    let mut cursor = checked_offset_add(tag.find('<')?, 1)?;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/' && *byte != b'>')
+    {
+        cursor = checked_offset_add(cursor, 1)?;
+    }
+    loop {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor = checked_offset_add(cursor, 1)?;
         }
-        let quote_idx = checked_offset_add(idx, pattern_len)?;
-        let quote = *bytes.get(quote_idx)?;
+        match bytes.get(cursor).copied() {
+            Some(b'/' | b'>') | None => return None,
+            Some(_) => {}
+        }
+        let name_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| {
+            !byte.is_ascii_whitespace() && *byte != b'=' && *byte != b'/' && *byte != b'>'
+        }) {
+            cursor = checked_offset_add(cursor, 1)?;
+        }
+        let name_end = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor = checked_offset_add(cursor, 1)?;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            return None;
+        }
+        cursor = checked_offset_add(cursor, 1)?;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor = checked_offset_add(cursor, 1)?;
+        }
+        let quote = *bytes.get(cursor)?;
         if quote != b'"' && quote != b'\'' {
-            cursor = quote_idx;
-            continue;
+            return None;
         }
-        let value_start = checked_offset_add(quote_idx, 1)?;
+        let value_start = checked_offset_add(cursor, 1)?;
         let value_end_rel = tag.get(value_start..)?.find(char::from(quote))?;
         let value_end = checked_offset_add(value_start, value_end_rel)?;
-        return Some(decode_xml_entities(tag.get(value_start..value_end)?).into_owned());
+        if tag.get(name_start..name_end)? == attr_name {
+            return Some(decode_xml_entities(tag.get(value_start..value_end)?));
+        }
+        cursor = checked_offset_add(value_end, 1)?;
     }
-    None
 }
 pub(in crate::excel) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     XmlScanner::from(xml, from)

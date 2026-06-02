@@ -38,19 +38,6 @@ const GAS_STATION_API_GBN: &str = "A";
 const DEFAULT_REGION_LABEL: &str = "선택하세요.";
 const USER_AGENT: &str = concat!("fcupdater/", env!("CARGO_PKG_VERSION"));
 const NETFUNNEL_POLL_LIMIT: usize = 20;
-pub const TARGET_REGION_KEYS: [&str; 11] = [
-    "대전대덕구",
-    "대전동구",
-    "대전서구",
-    "대전유성구",
-    "대전중구",
-    "세종시",
-    "충북청주시",
-    "충남공주시",
-    "충남보령시",
-    "충남아산시",
-    "충남천안시",
-];
 #[derive(Debug)]
 struct DownloadError(Cow<'static, str>);
 type DownloadResult<T> = CoreResult<T, DownloadError>;
@@ -58,6 +45,23 @@ type DownloadResult<T> = CoreResult<T, DownloadError>;
 struct StreamedBodySummary {
     bytes_seen: usize,
     preview: Vec<u8>,
+}
+#[derive(Debug)]
+struct HttpHeader {
+    name: String,
+    value: String,
+}
+#[derive(Debug)]
+struct HttpResponse {
+    body: Vec<u8>,
+    headers: Vec<HttpHeader>,
+    status: u32,
+}
+#[derive(Debug)]
+struct HttpStreamResponse {
+    body: StreamedBodySummary,
+    headers: Vec<HttpHeader>,
+    status: u32,
 }
 struct StreamingBodySink<'writer> {
     error: Option<Cow<'static, str>>,
@@ -67,7 +71,7 @@ struct StreamingBodySink<'writer> {
 }
 impl StreamedBodySummary {
     fn preview_lossy(&self) -> Cow<'_, str> {
-        lossy_prefix(&self.preview, self.preview.len())
+        String::from_utf8_lossy(&self.preview)
     }
     fn starts_with(&self, prefix: &[u8]) -> bool {
         self.bytes_seen >= prefix.len() && self.preview.starts_with(prefix)
@@ -139,13 +143,6 @@ impl StreamingBodySink<'_> {
         true
     }
 }
-fn lossy_prefix(bytes: &[u8], max_len: usize) -> Cow<'_, str> {
-    let prefix_len = bytes.len().min(max_len);
-    let Some(prefix) = bytes.get(..prefix_len) else {
-        return String::from_utf8_lossy(bytes);
-    };
-    String::from_utf8_lossy(prefix)
-}
 cfg_select! {
     windows => {
         fn checked_http_buffer_len(
@@ -169,14 +166,11 @@ cfg_select! {
     }
     _ => {}
 }
-fn enforce_http_content_length_limit(
-    headers: &[(String, String)],
-    limit: usize,
-) -> DownloadResult<()> {
+fn enforce_http_content_length_limit(headers: &[HttpHeader], limit: usize) -> DownloadResult<()> {
     for value in headers
         .iter()
-        .filter(|header| header.0.eq_ignore_ascii_case("Content-Length"))
-        .map(|header| &header.1)
+        .filter(|header| header.name.eq_ignore_ascii_case("Content-Length"))
+        .map(|header| &header.value)
     {
         let parsed = value
             .trim_ascii()

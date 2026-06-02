@@ -1,11 +1,7 @@
-use super::RowRange;
+use super::FilterDatabaseDefinedNameUpdater;
 use crate::excel;
 use core::range::Range;
-pub(super) struct FilterDatabaseDefinedNameUpdater<'xml> {
-    pub data_end_col: u32,
-    pub data_rows: RowRange,
-    pub workbook_xml: &'xml mut String,
-}
+
 impl FilterDatabaseDefinedNameUpdater<'_> {
     pub(super) fn update(&mut self) {
         let end_col = excel::writer::col_to_name(self.data_end_col.max(1));

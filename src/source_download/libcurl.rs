@@ -1,8 +1,7 @@
 use super::{
-    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, StreamedBodySummary,
-    StreamingBodySink,
+    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpHeader, HttpResponse,
+    HttpStreamResponse, StreamedBodySummary, StreamingBodySink,
     enforce_http_content_length_limit,
-    http_client::{HttpResponse, HttpStreamResponse},
 };
 use alloc::{borrow::Cow, ffi::CString, string::String};
 use core::{
@@ -61,6 +60,10 @@ struct BoundedResponseBuffer {
     error: Option<Cow<'static, str>>,
     label: &'static str,
     limit: usize,
+}
+struct CurlPerformResult {
+    code: CurlCode,
+    response_code: Option<c_long>,
 }
 struct ResponseBuffers {
     body: BoundedResponseBuffer,
@@ -288,7 +291,7 @@ impl Client {
             body: BoundedResponseBuffer::new("본문", HTTP_MAX_BODY_BYTES),
             headers: BoundedResponseBuffer::new("헤더", HTTP_MAX_HEADER_BYTES),
         };
-        let (perform_code, raw_status_opt) = Self::with_reusable_handle(|handle| {
+        let perform = Self::with_reusable_handle(|handle| {
             Self::configure_request(
                 handle,
                 url.as_c_str(),
@@ -307,29 +310,37 @@ impl Client {
                 handle.perform()
             };
             if perform_code == CURLE_OK {
-                Ok((perform_code, Some(handle.response_code()?)))
+                Ok(CurlPerformResult {
+                    code: perform_code,
+                    response_code: Some(handle.response_code()?),
+                })
             } else {
-                Ok((perform_code, None))
+                Ok(CurlPerformResult {
+                    code: perform_code,
+                    response_code: None,
+                })
             }
         })?;
         if let Some(mut callback_error) = response_buffers.take_error().map(Cow::into_owned) {
             Self::append_clear_reusable_handle_error(&mut callback_error);
             return Err(callback_error.into());
         }
-        if perform_code != CURLE_OK {
+        if perform.code != CURLE_OK {
             let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
             let mut perform_error = if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
                 && !message_cstr.to_bytes().is_empty()
             {
                 let message = message_cstr.to_string_lossy();
-                format!("curl_easy_perform 실패: {message} ({perform_code})")
+                format!("curl_easy_perform 실패: {message} ({})", perform.code)
             } else {
-                curl_error("curl_easy_perform", perform_code)
+                curl_error("curl_easy_perform", perform.code)
             };
             Self::append_clear_reusable_handle_error(&mut perform_error);
             return Err(perform_error.into());
         }
-        let raw_status = raw_status_opt.ok_or("curl response code가 비어 있습니다.")?;
+        let raw_status = perform
+            .response_code
+            .ok_or("curl response code가 비어 있습니다.")?;
         let status = u32::try_from(raw_status)
             .map_err(|source| format!("HTTP 상태 코드 변환 실패: {source}"))?;
         let headers = response_buffers.parsed_headers()?;
@@ -378,7 +389,7 @@ impl Client {
             writer,
         };
         let mut header_buffer = BoundedResponseBuffer::new("헤더", HTTP_MAX_HEADER_BYTES);
-        let (perform_code, raw_status_opt) = Self::with_reusable_handle(|handle| {
+        let perform = Self::with_reusable_handle(|handle| {
             Self::configure_request(
                 handle,
                 url.as_c_str(),
@@ -397,9 +408,15 @@ impl Client {
                 handle.perform()
             };
             if perform_code == CURLE_OK {
-                Ok((perform_code, Some(handle.response_code()?)))
+                Ok(CurlPerformResult {
+                    code: perform_code,
+                    response_code: Some(handle.response_code()?),
+                })
             } else {
-                Ok((perform_code, None))
+                Ok(CurlPerformResult {
+                    code: perform_code,
+                    response_code: None,
+                })
             }
         })?;
         if let Some(mut callback_error) = body_sink
@@ -411,20 +428,22 @@ impl Client {
             Self::append_clear_reusable_handle_error(&mut callback_error);
             return Err(callback_error.into());
         }
-        if perform_code != CURLE_OK {
+        if perform.code != CURLE_OK {
             let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
             let mut perform_error = if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
                 && !message_cstr.to_bytes().is_empty()
             {
                 let message = message_cstr.to_string_lossy();
-                format!("curl_easy_perform 실패: {message} ({perform_code})")
+                format!("curl_easy_perform 실패: {message} ({})", perform.code)
             } else {
-                curl_error("curl_easy_perform", perform_code)
+                curl_error("curl_easy_perform", perform.code)
             };
             Self::append_clear_reusable_handle_error(&mut perform_error);
             return Err(perform_error.into());
         }
-        let raw_status = raw_status_opt.ok_or("curl response code가 비어 있습니다.")?;
+        let raw_status = perform
+            .response_code
+            .ok_or("curl response code가 비어 있습니다.")?;
         let status = u32::try_from(raw_status)
             .map_err(|source| format!("HTTP 상태 코드 변환 실패: {source}"))?;
         let headers = parsed_headers_from_bytes(&header_buffer.bytes)?;
@@ -500,14 +519,14 @@ impl BoundedResponseBuffer {
     }
 }
 impl ResponseBuffers {
-    fn parsed_headers(&self) -> DownloadResult<Vec<(String, String)>> {
+    fn parsed_headers(&self) -> DownloadResult<Vec<HttpHeader>> {
         parsed_headers_from_bytes(&self.headers.bytes)
     }
     fn take_error(&mut self) -> Option<Cow<'static, str>> {
         self.body.error.take().or_else(|| self.headers.error.take())
     }
 }
-fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<Vec<(String, String)>> {
+fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<Vec<HttpHeader>> {
     let text = String::from_utf8_lossy(header_bytes);
     let separator = if text.contains("\r\n\r\n") {
         "\r\n\r\n"
@@ -546,7 +565,10 @@ fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<Vec<(String,
             .try_reserve(value.len())
             .map_err(|source| format!("HTTP header 값 메모리 확보 실패: {source}"))?;
         header_value.push_str(value);
-        headers.push((header_name, header_value));
+        headers.push(HttpHeader {
+            name: header_name,
+            value: header_value,
+        });
     }
     Ok(headers)
 }

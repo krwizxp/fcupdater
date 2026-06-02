@@ -12,6 +12,14 @@ use std::{
     path::Path,
 };
 const CENTRAL_FILE_HEADER_BASE_LEN: usize = 46;
+struct CentralDirectoryPlan {
+    max_header_capacity: usize,
+    size: usize,
+}
+struct CompressedPart {
+    data: Vec<u8>,
+    method: u16,
+}
 struct WriteEntry {
     compressed_size: usize,
     crc32: u32,
@@ -66,19 +74,24 @@ impl StreamingZipWriter<'_> {
                 source,
             ))
         })?;
-        let Some((central_dir_size_usize, max_header_capacity)) =
-            self.entries
-                .iter()
-                .try_fold((0_usize, 0_usize), |(size, max_capacity), entry| {
-                    let header_len = CENTRAL_FILE_HEADER_BASE_LEN.checked_add(entry.name.len())?;
-                    Some((size.checked_add(header_len)?, max_capacity.max(header_len)))
+        let Some(central_dir_plan) = self.entries.iter().try_fold(
+            CentralDirectoryPlan {
+                max_header_capacity: 0,
+                size: 0,
+            },
+            |plan, entry| {
+                let header_len = CENTRAL_FILE_HEADER_BASE_LEN.checked_add(entry.name.len())?;
+                Some(CentralDirectoryPlan {
+                    max_header_capacity: plan.max_header_capacity.max(header_len),
+                    size: plan.size.checked_add(header_len)?,
                 })
-        else {
+            },
+        ) else {
             return Err(err(
                 "ZIP 중앙 디렉터리 크기 계산 중 overflow가 발생했습니다.",
             ));
         };
-        let central_dir_size = u32::try_from(central_dir_size_usize).map_err(|source| {
+        let central_dir_size = u32::try_from(central_dir_plan.size).map_err(|source| {
             err(prefixed_message(
                 "ZIP 중앙 디렉터리 크기 변환 실패: ",
                 source,
@@ -88,7 +101,7 @@ impl StreamingZipWriter<'_> {
             .map_err(|source| err(prefixed_message("ZIP entry 수 변환 실패: ", source)))?;
         let mut central_header = Vec::new();
         central_header
-            .try_reserve(max_header_capacity)
+            .try_reserve(central_dir_plan.max_header_capacity)
             .map_err(|source| {
                 err(prefixed_message(
                     "ZIP 중앙 header 메모리 확보 실패: ",
@@ -135,10 +148,16 @@ impl StreamingZipWriter<'_> {
         let crc32 = crc32(&data);
         let uncompressed_size = data.len();
         let deflated = deflate::DeflateWriter { bytes: &data }.deflate()?;
-        let (method, compressed_data) = if deflated.len() < uncompressed_size {
-            (METHOD_DEFLATE, deflated)
+        let compressed = if deflated.len() < uncompressed_size {
+            CompressedPart {
+                data: deflated,
+                method: METHOD_DEFLATE,
+            }
         } else {
-            (METHOD_STORE, data)
+            CompressedPart {
+                data,
+                method: METHOD_STORE,
+            }
         };
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err(prefixed_message("ZIP offset 변환 실패: ", source)))?;
@@ -154,23 +173,24 @@ impl StreamingZipWriter<'_> {
                     source,
                 ))
             })?;
+        let compressed_size = compressed.data.len();
         write_file_header(
             &mut local_header,
             ZipFileHeader::Local {
                 crc32,
-                compressed_len: compressed_data.len(),
-                method,
+                compressed_len: compressed_size,
+                method: compressed.method,
                 name: &file.name,
                 uncompressed_len: uncompressed_size,
             },
         )?;
         self.write_all(&local_header, "xlsx 압축 local header 쓰기 실패")?;
-        self.write_all(&compressed_data, "xlsx 압축 파일 데이터 쓰기 실패")?;
+        self.write_all(&compressed.data, "xlsx 압축 파일 데이터 쓰기 실패")?;
         self.entries.push(WriteEntry {
-            compressed_size: compressed_data.len(),
+            compressed_size,
             crc32,
             local_header_offset,
-            method,
+            method: compressed.method,
             name: file.name,
             uncompressed_size,
         });

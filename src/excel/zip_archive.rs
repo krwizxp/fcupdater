@@ -358,6 +358,10 @@ struct ZipCentralDirectory<'bytes> {
     end: usize,
     remaining_entries: usize,
 }
+struct HeaderSplit<'bytes, const LEN: usize> {
+    header: &'bytes [u8; LEN],
+    tail: &'bytes [u8],
+}
 impl AsRef<str> for ZipError {
     fn as_ref(&self) -> &str {
         self.0.as_ref()
@@ -392,12 +396,14 @@ impl ZipEntry<'_> {
     fn data<'bytes>(&self, bytes: &'bytes [u8], expected_len: usize) -> Result<Cow<'bytes, [u8]>> {
         let local_offset = usize::try_from(self.local_header_offset)
             .map_err(|source| err(format!("ZIP local header offset 변환 실패: {source}")))?;
-        let (local_header, local_tail) = split_header_at::<LOCAL_FILE_HEADER_LEN>(
+        let local_split = split_header_at::<LOCAL_FILE_HEADER_LEN>(
             bytes,
             local_offset,
             ZIP_BAD_LOCAL_HEADER_MESSAGE,
         )
         .map_err(|source| err(zip_entry_message(source.as_ref(), self.name)))?;
+        let local_header = local_split.header;
+        let local_tail = local_split.tail;
         if read_u32(local_header, 0)? != LOCAL_FILE_HEADER_SIGNATURE {
             return Err(zip_entry_message(ZIP_BAD_LOCAL_HEADER_MESSAGE, self.name).into());
         }
@@ -477,11 +483,13 @@ impl ZipCentralDirectory<'_> {
             }
             return Ok(None);
         }
-        let (header, tail) = split_header_at::<CENTRAL_DIRECTORY_HEADER_LEN>(
+        let central_split = split_header_at::<CENTRAL_DIRECTORY_HEADER_LEN>(
             self.bytes,
             self.cursor,
             ZIP_CENTRAL_HEADER_RANGE,
         )?;
+        let header = central_split.header;
+        let tail = central_split.tail;
         if read_u32(header, 0)? != CENTRAL_DIRECTORY_SIGNATURE {
             return Err(zip_static(ZIP_BAD_CENTRAL_SIGNATURE_MESSAGE).into());
         }
@@ -555,11 +563,12 @@ impl ZipArchiveExtractor<'_> {
                 return Err(zip_static("ZIP EOCD를 찾지 못했습니다.").into());
             };
             let offset = min_offset.saturating_add(relative_offset);
-            let (eocd, _) = split_header_at::<END_OF_CENTRAL_DIRECTORY_LEN>(
+            let eocd = split_header_at::<END_OF_CENTRAL_DIRECTORY_LEN>(
                 bytes.as_slice(),
                 offset,
                 ZIP_EOCD_HEADER_RANGE,
-            )?;
+            )?
+            .header;
             let comment_len = usize::from(read_u16(eocd, 20)?);
             if offset
                 .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
@@ -589,8 +598,9 @@ impl ZipArchiveExtractor<'_> {
         let mut total_uncompressed = 0_usize;
         while let Some(entry) = central_directory.next_entry()? {
             let entry_name = entry.name;
+            let is_dir = entry_name.ends_with('/');
             let relative_path = entry.relative_path()?;
-            if entry_name.ends_with('/') {
+            if is_dir {
                 let dir_path = self.unpack_dir.join(&relative_path);
                 create_zip_dir(&dir_path, "xlsx 압축 폴더 생성 실패")?;
                 continue;
@@ -759,11 +769,14 @@ fn split_header_at<'bytes, const LEN: usize>(
     bytes: &'bytes [u8],
     offset: usize,
     context: &'static str,
-) -> ZipResult<(&'bytes [u8; LEN], &'bytes [u8])> {
-    bytes
+) -> ZipResult<HeaderSplit<'bytes, LEN>> {
+    let Some((header, tail)) = bytes
         .get(offset..)
-        .and_then(|tail| tail.split_first_chunk::<LEN>())
-        .ok_or_else(|| zip_static(context))
+        .and_then(|remaining| remaining.split_first_chunk::<LEN>())
+    else {
+        return Err(zip_static(context));
+    };
+    Ok(HeaderSplit { header, tail })
 }
 fn read_u16(bytes: &[u8], offset: usize) -> ZipResult<u16> {
     Ok(u16::from_le_bytes(read_array::<2>(

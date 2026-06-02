@@ -3,8 +3,8 @@ use alloc::borrow::Cow;
 use cli::{APP_NAME, APP_VERSION, ParseAction, usage_text};
 use core::{error::Error, fmt, fmt::Display, result::Result as CoreResult};
 use io_util::write_line_ignored;
-pub(crate) use region::{normalize_address_key, parse_region_label};
-pub(crate) use sheet_util::{
+use region::{normalize_address_key, parse_region_label};
+use sheet_util::{
     add_row_offset, canon_header, parse_i32_str, same_trimmed, shift_row, usize_to_u32,
 };
 use std::{
@@ -23,7 +23,8 @@ mod region;
 mod sheet_util;
 mod source_download;
 mod update_run;
-pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
+const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
+type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = CoreResult<T, AppError>;
 #[derive(Debug)]
 struct SourceRecord {
@@ -63,7 +64,12 @@ struct StoreRow {
     premium: Option<i32>,
     region: String,
 }
-pub(crate) struct AppError {
+struct MasterSheetUpdateResult<'source> {
+    added: Vec<AddedStoreRow<'source>>,
+    changes: Vec<ChangeRow<'source>>,
+    deleted: Vec<StoreRow>,
+}
+struct AppError {
     message: Cow<'static, str>,
     source: Option<BoxError>,
 }
@@ -82,7 +88,8 @@ struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
     dir: &'dir Path,
     out: &'out mut W,
 }
-struct UpdateRunContext<'out> {
+struct UpdateRun<'out> {
+    master_path: &'out Path,
     out: &'out mut dyn Write,
 }
 impl AppError {
@@ -247,8 +254,11 @@ fn main() -> Result<()> {
     };
     match action {
         ParseAction::Run => {
-            let mut context = UpdateRunContext { out: &mut out };
-            context.run_update()
+            let mut update = UpdateRun {
+                master_path: Path::new(MASTER_PATH),
+                out: &mut out,
+            };
+            update.run()
         }
         ParseAction::Help(text) | ParseAction::Version(text) => {
             write_line_ignored(&mut out, format_args!("{text}"));

@@ -1,23 +1,44 @@
 use alloc::string::String;
-const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
-    ("충청남도", "충남"),
-    ("충청북도", "충북"),
-    ("대전광역시", "대전"),
-    ("세종특별자치시", "세종"),
+const ADDRESS_KEY_REPLACEMENTS: [AddressKeyReplacement; 4] = [
+    AddressKeyReplacement {
+        from: "충청남도",
+        to: "충남",
+    },
+    AddressKeyReplacement {
+        from: "충청북도",
+        to: "충북",
+    },
+    AddressKeyReplacement {
+        from: "대전광역시",
+        to: "대전",
+    },
+    AddressKeyReplacement {
+        from: "세종특별자치시",
+        to: "세종",
+    },
 ];
 const REGION_LABEL_SUFFIXES: [&str; 3] = ["특별자치시", "광역시", "특별시"];
+struct AddressKeyReplacement {
+    from: &'static str,
+    to: &'static str,
+}
+struct AddressKeyMatch<'tail> {
+    replacement: &'static str,
+    tail: &'tail str,
+}
 pub fn normalize_address_key(addr: &str) -> String {
     let mut rest = addr.trim();
     let capacity = rest.len();
     let mut out = String::with_capacity(capacity);
     while !rest.is_empty() {
-        if let Some((tail, to)) = ADDRESS_KEY_REPLACEMENTS
-            .iter()
-            .copied()
-            .find_map(|(from, to)| rest.strip_prefix(from).map(|tail| (tail, to)))
-        {
-            out.push_str(to);
-            rest = tail;
+        if let Some(rule_match) = ADDRESS_KEY_REPLACEMENTS.iter().find_map(|rule| {
+            rest.strip_prefix(rule.from).map(|tail| AddressKeyMatch {
+                replacement: rule.to,
+                tail,
+            })
+        }) {
+            out.push_str(rule_match.replacement);
+            rest = rule_match.tail;
             continue;
         }
         let mut chars = rest.chars();

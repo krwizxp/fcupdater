@@ -1,11 +1,10 @@
 use crate::{
     AddedStoreRow, ChangeLogUpdater, ChangeRow, MasterSheetUpdater, Result, SourceDownload,
-    SourceRecord, StoreRow, UpdateRunContext, err, err_with_source,
+    SourceRecord, StoreRow, UpdateRun, err, err_with_source,
     excel::{source_reader, writer::Workbook as StdWorkbook},
     io_util::write_line_ignored,
     path_source_message, prefixed_message,
     region::normalize_address_key,
-    source_download,
 };
 use core::{result::Result as CoreResult, time::Duration};
 use std::{
@@ -14,7 +13,6 @@ use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
-const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
 const MAX_DELETED_RATIO_NUMERATOR: usize = 1;
 const MAX_DELETED_RATIO_DENOMINATOR: usize = 2;
 const DAYS_PER_100_YEARS_I64: i64 = 36_524;
@@ -33,15 +31,33 @@ const MONTH_TERM_MULTIPLIER_I64: i64 = 153;
 const MONTH_TERM_OFFSET_I64: i64 = 2;
 const PRE_MARCH_MONTH_OFFSET_I64: i64 = 9;
 const SECS_PER_DAY_U64: u64 = 86_400;
+const TARGET_REGION_KEYS: [&str; 11] = [
+    "대전대덕구",
+    "대전동구",
+    "대전서구",
+    "대전유성구",
+    "대전중구",
+    "세종시",
+    "충북청주시",
+    "충남공주시",
+    "충남보령시",
+    "충남아산시",
+    "충남천안시",
+];
 struct KstDate {
     day: u32,
     month: u32,
     year: i32,
 }
+struct KstDateRangeError;
+struct LoadedSource {
+    index: HashMap<String, SourceRecord>,
+    name: String,
+}
 impl TryFrom<i32> for KstDate {
-    type Error = ();
+    type Error = KstDateRangeError;
     fn try_from(day_index: i32) -> CoreResult<Self, Self::Error> {
-        let Some((year, month, day)) = (|| {
+        let Some(date) = (|| {
             let shifted_days = i64::from(day_index).checked_add(DAYS_UNTIL_UNIX_EPOCH_I64)?;
             let era = shifted_days.div_euclid(DAYS_PER_400_YEARS_I64);
             let doe = shifted_days.rem_euclid(DAYS_PER_400_YEARS_I64);
@@ -77,15 +93,15 @@ impl TryFrom<i32> for KstDate {
             let month = u32::try_from(month_i64).ok()?;
             let year_adjust = i64::from(month <= MARCH_MONTH_THRESHOLD);
             let year = i32::try_from(y.checked_add(year_adjust)?).ok()?;
-            Some((year, month, day))
+            Some(Self { day, month, year })
         })() else {
-            return Err(());
+            return Err(KstDateRangeError);
         };
-        Ok(Self { day, month, year })
+        Ok(date)
     }
 }
-impl UpdateRunContext<'_> {
-    fn load_source(&mut self) -> Result<(HashMap<String, SourceRecord>, String)> {
+impl UpdateRun<'_> {
+    fn load_source(&mut self) -> Result<LoadedSource> {
         let source_path = SourceDownload {
             dir: Path::new("."),
             out: &mut *self.out,
@@ -110,7 +126,7 @@ impl UpdateRunContext<'_> {
             })?;
             records.retain(|record| {
                 let region_key = normalize_address_key(&record.region);
-                source_download::TARGET_REGION_KEYS.contains(&region_key.as_str())
+                TARGET_REGION_KEYS.contains(&region_key.as_str())
             });
             if records.is_empty() {
                 return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
@@ -150,7 +166,10 @@ impl UpdateRunContext<'_> {
                 ),
             ),
         }
-        Ok((result?, source_name))
+        Ok(LoadedSource {
+            index: result?,
+            name: source_name,
+        })
     }
     fn print_added_rows(&mut self, title: &str, rows: &[AddedStoreRow<'_>]) {
         if rows.is_empty() {
@@ -208,7 +227,10 @@ impl UpdateRunContext<'_> {
         deleted: &[StoreRow],
     ) {
         write_line_ignored(self.out, format_args!("\n==== 현행화 요약 ===="));
-        write_line_ignored(self.out, format_args!("- 파일: {MASTER_PATH}"));
+        write_line_ignored(
+            self.out,
+            format_args!("- 파일: {}", self.master_path.display()),
+        );
         write_line_ignored(self.out, format_args!("- 소스: {source_name}"));
         write_line_ignored(
             self.out,
@@ -227,8 +249,8 @@ impl UpdateRunContext<'_> {
         self.print_store_rows("폐업 업체 삭제 목록 (상위 20개)", deleted);
         write_line_ignored(self.out, format_args!("=====================\n"));
     }
-    pub(crate) fn run_update(&mut self) -> Result<()> {
-        let master_path = Path::new(MASTER_PATH);
+    pub(super) fn run(&mut self) -> Result<()> {
+        let master_path = self.master_path;
         if !master_path.try_exists().map_err(|source_err| {
             err(path_source_message(
                 "마스터 파일 경로 확인 실패",
@@ -238,21 +260,25 @@ impl UpdateRunContext<'_> {
         })? {
             return Err(err(prefixed_message(
                 "마스터 파일이 없습니다: ",
-                MASTER_PATH,
+                master_path.display(),
             )));
         }
-        let (source_index, source_name) = self.load_source()?;
+        let loaded_source = self.load_source()?;
         write_line_ignored(self.out, format_args!("마스터 파일 처리 중..."));
         let mut book = StdWorkbook::open(master_path)?;
-        let (changes, added, deleted) = MasterSheetUpdater {
-            source_index: &source_index,
+        let master_update = MasterSheetUpdater {
+            source_index: &loaded_source.index,
         }
         .update(&mut book)?;
-        let total_considered = source_index.len().saturating_add(deleted.len());
+        let total_considered = loaded_source
+            .index
+            .len()
+            .saturating_add(master_update.deleted.len());
         if total_considered == 0 {
             return Err(err("현행화 대상 레코드를 찾지 못했습니다."));
         }
-        let deleted_scaled = deleted
+        let deleted_scaled = master_update
+            .deleted
             .len()
             .checked_mul(MAX_DELETED_RATIO_DENOMINATOR)
             .ok_or_else(|| err("폐업 처리 비율 계산 중 overflow가 발생했습니다."))?;
@@ -262,7 +288,7 @@ impl UpdateRunContext<'_> {
         if deleted_scaled >= limit_scaled {
             return Err(err(format!(
                 "폐업 처리 건수가 비정상적으로 많아 저장을 중단합니다: {}건 / {}건",
-                deleted.len(),
+                master_update.deleted.len(),
                 total_considered
             )));
         }
@@ -286,7 +312,7 @@ impl UpdateRunContext<'_> {
         let day_index = i32::try_from(day_index_i64)
             .map_err(|source| err_with_source("KST 날짜 범위 변환에 실패했습니다.", source))?;
         let KstDate { day, month, year } = KstDate::try_from(day_index)
-            .map_err(|()| err("KST 날짜 계산 중 범위 오류가 발생했습니다."))?;
+            .map_err(|KstDateRangeError| err("KST 날짜 계산 중 범위 오류가 발생했습니다."))?;
         let today = format!("{year:04}-{month:02}-{day:02}");
         if !is_yyyy_mm_dd(&today) {
             return Err(err(prefixed_message(
@@ -294,24 +320,31 @@ impl UpdateRunContext<'_> {
                 &today,
             )));
         }
-        book.with_sheet_mut(
+        let Some(change_log_result) = book.with_sheet_mut(
             "변경내역",
             |worksheet, shared_string_table| -> Result<()> {
                 let mut updater = ChangeLogUpdater {
-                    added: &added,
-                    changes: &changes,
-                    deleted: &deleted,
+                    added: &master_update.added,
+                    changes: &master_update.changes,
+                    deleted: &master_update.deleted,
                     shared_string_table,
                     today: &today,
                     worksheet,
                 };
                 updater.update()
             },
-        )
-        .ok_or_else(|| err("마스터 파일에 '변경내역' 시트가 없습니다"))??;
+        ) else {
+            return Err(err("마스터 파일에 '변경내역' 시트가 없습니다"));
+        };
+        change_log_result?;
         write_line_ignored(self.out, format_args!("마스터 파일 저장 중..."));
         book.save(master_path)?;
-        self.print_update_summary(&source_name, &changes, &added, &deleted);
+        self.print_update_summary(
+            &loaded_source.name,
+            &master_update.changes,
+            &master_update.added,
+            &master_update.deleted,
+        );
         Ok(())
     }
 }

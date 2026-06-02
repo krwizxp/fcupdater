@@ -1,8 +1,8 @@
 use super::{
-    DownloadError, DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES,
+    DownloadError, DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpHeader,
+    HttpResponse, HttpStreamResponse,
     checked_http_buffer_len,
     enforce_http_content_length_limit,
-    http_client::{HttpResponse, HttpStreamResponse},
     StreamedBodySummary, StreamingBodySink,
 };
 use alloc::{borrow::Cow, string::String, vec::Vec};
@@ -235,7 +235,7 @@ impl Client {
             Ok(available)
         }
     }
-    fn query_headers(&self, request: &Handle) -> DownloadResult<Vec<(String, String)>> {
+    fn query_headers(&self, request: &Handle) -> DownloadResult<Vec<HttpHeader>> {
         let mut bytes = 0_u32;
         let mut index = 0_u32;
         // SAFETY: request is valid; this first call probes the required buffer size.
@@ -301,7 +301,10 @@ impl Client {
                 .try_reserve(value.len())
                 .map_err(|source| format!("응답 header 값 메모리 확보 실패: {source}"))?;
             header_value.push_str(value);
-            parsed.push((header_name, header_value));
+            parsed.push(HttpHeader {
+                name: header_name,
+                value: header_value,
+            });
         }
         Ok(parsed)
     }

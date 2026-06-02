@@ -1,7 +1,7 @@
 use super::{
-    DownloadResult, HTTP_MAX_BODY_BYTES, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT,
-    NETFUNNEL_SERVICE_ID, StreamedBodySummary, USER_AGENT, attach_remove_file_error,
-    enforce_http_content_length_limit, lossy_prefix,
+    DownloadResult, HTTP_MAX_BODY_BYTES, HttpHeader, HttpResponse, HttpStreamResponse,
+    NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, USER_AGENT,
+    attach_remove_file_error, enforce_http_content_length_limit,
 };
 use crate::{path_source_message, prefixed_message};
 use alloc::{string::String, vec::Vec};
@@ -15,18 +15,6 @@ use std::{
 };
 const U32_DECIMAL_MAX_LEN: usize = 10;
 const U128_DECIMAL_MAX_LEN: usize = 39;
-#[derive(Debug)]
-pub(super) struct HttpResponse {
-    pub body: Vec<u8>,
-    pub headers: Vec<(String, String)>,
-    pub status: u32,
-}
-#[derive(Debug)]
-pub(super) struct HttpStreamResponse {
-    pub body: StreamedBodySummary,
-    pub headers: Vec<(String, String)>,
-    pub status: u32,
-}
 #[derive(Default)]
 pub(super) struct HttpClient {
     cookies: Vec<Cookie>,
@@ -323,7 +311,11 @@ impl HttpClient {
         enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
         self.store_response_cookies_from_headers(&response.headers)?;
         if !(200..300).contains(&response.status) {
-            let body_preview = lossy_prefix(&response.body, 512);
+            let preview_len = response.body.len().min(512);
+            let body_preview = match response.body.get(..preview_len) {
+                Some(preview) => String::from_utf8_lossy(preview),
+                None => String::from_utf8_lossy(&response.body),
+            };
             let status = response.status;
             return Err(format!("HTTP {status}: {body_preview}").into());
         }
@@ -493,12 +485,13 @@ impl HttpClient {
     }
     fn store_response_cookies_from_headers(
         &mut self,
-        headers: &[(String, String)],
+        headers: &[HttpHeader],
     ) -> DownloadResult<()> {
         for (cookie_name, cookie_value) in headers
             .iter()
-            .filter(|header| header.0.eq_ignore_ascii_case("set-cookie"))
-            .filter_map(|header| split_head_or_all(&header.1, ';').split_once('='))
+            .filter(|header| header.name.eq_ignore_ascii_case("set-cookie"))
+            .map(|header| header.value.as_str())
+            .filter_map(|value| split_head_or_all(value, ';').split_once('='))
         {
             self.add_cookie(cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
         }

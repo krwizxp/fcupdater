@@ -77,10 +77,22 @@ struct CfbFileOpener<'path> {
     path: &'path Path,
 }
 struct SourceHeaderValidator<'rows, 'strings> {
-    rows: &'rows [(usize, SourceRow<'strings>)],
+    rows: &'rows [SourceRowEntry<'strings>],
 }
 struct SourceRow<'strings> {
     cells: [Option<&'strings str>; SOURCE_COLUMN_COUNT],
+}
+struct SourceRowEntry<'strings> {
+    row: SourceRow<'strings>,
+    row_num: usize,
+}
+struct BiffRecord<'workbook> {
+    data: &'workbook [u8],
+    id: u16,
+}
+struct SstChunks<'workbook> {
+    chunks: Vec<&'workbook [u8]>,
+    next_offset: usize,
 }
 struct SstParser<'chunks, 'chunk> {
     chunks: &'chunks [&'chunk [u8]],
@@ -431,10 +443,11 @@ impl SourceReader<'_> {
                     source,
                 )
             })?;
-        for (row_num, row) in rows {
-            if row_num < SOURCE_FIRST_DATA_ROW {
+        for entry in rows {
+            if entry.row_num < SOURCE_FIRST_DATA_ROW {
                 continue;
             }
+            let row = entry.row;
             let name = row_text_owned(&row, COL_NAME);
             let address = row_text_owned(&row, COL_ADDRESS);
             if address.is_empty() {
@@ -621,7 +634,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         &self,
         first_chunk: &'workbook [u8],
         first_chunk_end: usize,
-    ) -> Result<(Vec<&'workbook [u8]>, usize)> {
+    ) -> Result<SstChunks<'workbook>> {
         let mut chunks: Vec<&[u8]> = Vec::new();
         reserve_vec_entries_exact(&mut chunks, 8, "xls SST chunk 목록 메모리 확보 실패")?;
         chunks.push(first_chunk);
@@ -658,7 +671,10 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             chunks.push(chunk);
             next = next_data.end;
         }
-        Ok((chunks, next))
+        Ok(SstChunks {
+            chunks,
+            next_offset: next,
+        })
     }
     fn parse_globals(&self) -> Result<BiffGlobals> {
         let mut pos = 0_usize;
@@ -678,15 +694,15 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             let data_end = data_start.checked_add(record_len).ok_or_else(|| {
                 err("xls BIFF globals 레코드 길이 계산 중 overflow가 발생했습니다.")
             })?;
-            let record_data = Range {
-                start: data_start,
-                end: data_end,
-            };
             let data = record_tail
                 .get(..record_len)
                 .ok_or_else(|| err("xls BIFF globals 레코드 범위 오류"))?;
-            match record_id {
-                0x0085 if let Some(header) = data.first_chunk::<8>() => {
+            let record = BiffRecord {
+                data,
+                id: record_id,
+            };
+            match record.id {
+                0x0085 if let Some(header) = record.data.first_chunk::<8>() => {
                     if boundsheet.is_some() {
                         return Err(err("Opinet 고정 소스와 다른 worksheet 개수입니다."));
                     }
@@ -696,7 +712,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     let sheet_type = header[5];
                     boundsheet = Some(BiffBoundSheet { offset, sheet_type });
                 }
-                0x0042 if let Some(header) = data.first_chunk::<2>() => {
+                0x0042 if let Some(header) = record.data.first_chunk::<2>() => {
                     code_page = Some(read_u16_le(header, 0)?);
                     if code_page != Some(EXPECTED_BIFF_CODE_PAGE) {
                         return Err(err(format!(
@@ -705,20 +721,23 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     }
                 }
                 0x00FC => {
-                    let (chunks, next) = self.collect_sst_chunks(data, data_end)?;
+                    let sst_chunks = self.collect_sst_chunks(record.data, data_end)?;
                     if code_page != Some(EXPECTED_BIFF_CODE_PAGE) {
                         return Err(err(format!(
                             "Opinet 고정 소스의 BIFF code page가 예상과 다릅니다: {code_page:?}"
                         )));
                     }
-                    shared_strings = SstParser { chunks: &chunks }.parse()?;
-                    pos = next;
+                    shared_strings = SstParser {
+                        chunks: &sst_chunks.chunks,
+                    }
+                    .parse()?;
+                    pos = sst_chunks.next_offset;
                     continue;
                 }
                 _ => {}
             }
-            pos = record_data.end;
-            if record_id == 0x000A && boundsheet.is_some() {
+            pos = data_end;
+            if record.id == 0x000A && boundsheet.is_some() {
                 break;
             }
         }
@@ -742,7 +761,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         &self,
         sheet_offset: usize,
         shared_strings: &'strings [String],
-    ) -> Result<Vec<(usize, SourceRow<'strings>)>> {
+    ) -> Result<Vec<SourceRowEntry<'strings>>> {
         if sheet_offset >= self.workbook_stream.len() {
             return Err(err(prefixed_display_message(
                 "worksheet offset이 workbook stream 범위를 벗어났습니다: ",
@@ -760,29 +779,61 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
 }
 impl SourceHeaderValidator<'_, '_> {
     fn validate(&self) -> Result<()> {
-        let Some(header_entry) = self
+        struct HeaderExpectation {
+            col: usize,
+            text: &'static str,
+        }
+        let Some(header) = self
             .rows
             .iter()
-            .find(|row_entry| row_entry.0 == SOURCE_HEADER_ROW)
+            .find(|entry| entry.row_num == SOURCE_HEADER_ROW)
+            .map(|entry| &entry.row)
         else {
             return Err(err("Opinet 소스 헤더 행을 찾지 못했습니다."));
         };
-        let header = &header_entry.1;
-        for (col, expected) in [
-            (COL_REGION, "지역"),
-            (COL_NAME, "상호"),
-            (COL_ADDRESS, "주소"),
-            (COL_BRAND, "상표"),
-            (COL_SELF_YN, "셀프여부"),
-            (COL_PREMIUM, "고급휘발유"),
-            (COL_GASOLINE, "휘발유"),
-            (COL_DIESEL, "경유"),
+        for expected_header in [
+            HeaderExpectation {
+                col: COL_REGION,
+                text: "지역",
+            },
+            HeaderExpectation {
+                col: COL_NAME,
+                text: "상호",
+            },
+            HeaderExpectation {
+                col: COL_ADDRESS,
+                text: "주소",
+            },
+            HeaderExpectation {
+                col: COL_BRAND,
+                text: "상표",
+            },
+            HeaderExpectation {
+                col: COL_SELF_YN,
+                text: "셀프여부",
+            },
+            HeaderExpectation {
+                col: COL_PREMIUM,
+                text: "고급휘발유",
+            },
+            HeaderExpectation {
+                col: COL_GASOLINE,
+                text: "휘발유",
+            },
+            HeaderExpectation {
+                col: COL_DIESEL,
+                text: "경유",
+            },
         ] {
-            let actual = header.text(col).map(str::trim).unwrap_or_default();
-            if actual != expected {
+            let actual = header
+                .text(expected_header.col)
+                .map(str::trim)
+                .unwrap_or_default();
+            if actual != expected_header.text {
+                let col = expected_header.col.saturating_add(1);
+                let expected = expected_header.text;
                 return Err(err(format!(
-                    "Opinet 소스 헤더가 예상과 다릅니다: col={}, expected={expected}, actual={actual}",
-                    col.saturating_add(1)
+                    "Opinet 소스 헤더가 예상과 다릅니다: col={col}, expected={expected}, actual={actual}"
                 )));
             }
         }
@@ -861,11 +912,11 @@ impl SstParser<'_, '_> {
     }
 }
 impl<'workbook, 'strings> WorksheetCellsParser<'workbook, 'strings> {
-    fn finalize_source_rows(self) -> Result<Vec<(usize, SourceRow<'strings>)>> {
+    fn finalize_source_rows(self) -> Result<Vec<SourceRowEntry<'strings>>> {
         if self.rows_map.is_empty() {
             return Ok(Vec::new());
         }
-        let mut rows: Vec<(usize, SourceRow<'strings>)> = Vec::new();
+        let mut rows: Vec<SourceRowEntry<'strings>> = Vec::new();
         rows.try_reserve_exact(self.rows_map.len())
             .map_err(|source| {
                 let row_count = self.rows_map.len();
@@ -874,7 +925,11 @@ impl<'workbook, 'strings> WorksheetCellsParser<'workbook, 'strings> {
                     source,
                 )
             })?;
-        rows.extend(self.rows_map);
+        rows.extend(
+            self.rows_map
+                .into_iter()
+                .map(|(row_num, row)| SourceRowEntry { row, row_num }),
+        );
         Ok(rows)
     }
     fn handle_label_sst_record(&mut self, data: &[u8]) -> Result<()> {
@@ -944,15 +999,15 @@ impl<'workbook, 'strings> WorksheetCellsParser<'workbook, 'strings> {
         }
         Ok(false)
     }
-    fn parse(mut self) -> Result<Vec<(usize, SourceRow<'strings>)>> {
-        while let Some((record_id, data)) = self.read_record()? {
-            if self.handle_record(record_id, data)? {
+    fn parse(mut self) -> Result<Vec<SourceRowEntry<'strings>>> {
+        while let Some(record) = self.read_record()? {
+            if self.handle_record(record.id, record.data)? {
                 break;
             }
         }
         self.finalize_source_rows()
     }
-    fn read_record(&mut self) -> Result<Option<(u16, &'workbook [u8])>> {
+    fn read_record(&mut self) -> Result<Option<BiffRecord<'workbook>>> {
         let Some((record_header, record_tail)) = self
             .workbook_stream
             .get(self.pos..)
@@ -969,15 +1024,14 @@ impl<'workbook, 'strings> WorksheetCellsParser<'workbook, 'strings> {
         let data_end = data_start
             .checked_add(record_len)
             .ok_or_else(|| err("xls worksheet 레코드 길이 계산 중 overflow가 발생했습니다."))?;
-        let record_data = Range {
-            start: data_start,
-            end: data_end,
-        };
-        self.pos = record_data.end;
+        self.pos = data_end;
         let data = record_tail
             .get(..record_len)
             .ok_or_else(|| err("xls worksheet 레코드 범위 오류"))?;
-        Ok(Some((record_id, data)))
+        Ok(Some(BiffRecord {
+            data,
+            id: record_id,
+        }))
     }
 }
 fn reserve_vec_entries_exact<T>(

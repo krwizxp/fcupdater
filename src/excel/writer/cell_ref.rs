@@ -1,3 +1,4 @@
+use super::{CellReference, RangeTokenParts, RewrittenCellReference};
 use crate::{Result, err, err_with_source};
 const COL_NAME_BUF_LEN: usize = 8;
 const COL_NAME_CHARS: [char; 26] = [
@@ -7,15 +8,16 @@ const COL_NAME_CHARS: [char; 26] = [
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
 pub(super) const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CellReference {
-    pub col: u32,
-    pub col_locked: bool,
-    pub row: u32,
-    pub row_locked: bool,
+pub(super) struct FormulaRewrite {
+    end_index: usize,
+    replacement: String,
+}
+struct LockPrefix<'reference> {
+    locked: bool,
+    rest: &'reference str,
 }
 impl CellReference {
-    pub const fn unlocked(col: u32, row: u32) -> Self {
+    pub(super) const fn unlocked(col: u32, row: u32) -> Self {
         Self {
             col,
             col_locked: false,
@@ -55,19 +57,27 @@ pub(super) fn col_to_name(mut col: u32) -> String {
         .map(|chars| chars.iter().collect())
         .unwrap_or_default()
 }
-pub(super) fn parse_range_token(token: &str) -> (&str, &str) {
-    token.split_once(':').unwrap_or((token, token))
+pub(super) fn parse_range_token(token: &str) -> RangeTokenParts<'_> {
+    match token.split_once(':') {
+        Some((start_ref, end_ref)) => RangeTokenParts { end_ref, start_ref },
+        None => RangeTokenParts {
+            end_ref: token,
+            start_ref: token,
+        },
+    }
 }
 pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
-    let (col_lock, after_col_lock) = strip_ref_lock_prefix(reference);
-    let col_end = after_col_lock
+    let col_prefix = strip_ref_lock_prefix(reference);
+    let col_end = col_prefix
+        .rest
         .find(|ch: char| !ch.is_ascii_alphabetic())
-        .unwrap_or(after_col_lock.len());
+        .unwrap_or(col_prefix.rest.len());
     if col_end == 0 {
         return None;
     }
-    let (col_s, after_col) = after_col_lock.split_at_checked(col_end)?;
-    let (row_lock, row_part) = strip_ref_lock_prefix(after_col);
+    let (col_s, after_col) = col_prefix.rest.split_at_checked(col_end)?;
+    let row_prefix = strip_ref_lock_prefix(after_col);
+    let row_part = row_prefix.rest;
     let row_end = row_part
         .find(|ch: char| !ch.is_ascii_digit())
         .unwrap_or(row_part.len());
@@ -90,9 +100,9 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     let row = row_part.parse::<u32>().ok()?;
     Some(CellReference {
         col,
-        col_locked: col_lock,
+        col_locked: col_prefix.locked,
         row,
-        row_locked: row_lock,
+        row_locked: row_prefix.locked,
     })
 }
 pub(super) fn ref_with_locks(reference: CellReference) -> String {
@@ -120,7 +130,7 @@ pub(super) fn rewrite_formula_cell_refs<F>(
     mut try_rewrite_cell_ref: F,
 ) -> Result<String>
 where
-    F: FnMut(&[char], usize) -> Result<Option<(usize, String)>>,
+    F: FnMut(&[char], usize) -> Result<Option<FormulaRewrite>>,
 {
     let mut chars: Vec<char> = Vec::new();
     chars.try_reserve_exact(formula.len()).map_err(|source| {
@@ -190,10 +200,10 @@ where
             }
         }
         if (ch == '$' || ch.is_ascii_alphabetic())
-            && let Some((end_idx, replaced)) = try_rewrite_cell_ref(&chars, i)?
+            && let Some(rewrite) = try_rewrite_cell_ref(&chars, i)?
         {
-            out.push_str(&replaced);
-            i = end_idx;
+            out.push_str(&rewrite.replacement);
+            i = rewrite.end_index;
             continue;
         }
         out.push(ch);
@@ -219,9 +229,9 @@ pub(super) fn try_parse_and_rewrite_cell_ref<F>(
     chars: &[char],
     start: usize,
     mut rewrite_ref: F,
-) -> Result<Option<(usize, String)>>
+) -> Result<Option<FormulaRewrite>>
 where
-    F: FnMut(u32, u32, bool, bool) -> Result<(u32, u32)>,
+    F: FnMut(u32, u32, bool, bool) -> Result<RewrittenCellReference>,
 {
     let mut index = start;
     let mut col_lock = false;
@@ -311,20 +321,30 @@ where
     if !(1..=MAX_A1_ROW).contains(&base_row) {
         return Ok(None);
     }
-    let (new_col, new_row) = rewrite_ref(base_col, base_row, col_lock, row_lock)?;
+    let rewritten = rewrite_ref(base_col, base_row, col_lock, row_lock)?;
     let replaced = ref_with_locks(CellReference {
-        col: new_col,
+        col: rewritten.col,
         col_locked: col_lock,
-        row: new_row,
+        row: rewritten.row,
         row_locked: row_lock,
     });
-    Ok(Some((index, replaced)))
+    Ok(Some(FormulaRewrite {
+        end_index: index,
+        replacement: replaced,
+    }))
 }
 const fn is_ref_neighbor_identifier(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'
 }
-fn strip_ref_lock_prefix(reference: &str) -> (bool, &str) {
-    reference
-        .strip_prefix('$')
-        .map_or((false, reference), |tail| (true, tail))
+fn strip_ref_lock_prefix(reference: &str) -> LockPrefix<'_> {
+    reference.strip_prefix('$').map_or(
+        LockPrefix {
+            locked: false,
+            rest: reference,
+        },
+        |tail| LockPrefix {
+            locked: true,
+            rest: tail,
+        },
+    )
 }

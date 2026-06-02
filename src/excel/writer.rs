@@ -1,9 +1,8 @@
 use self::cell_ref::{
-    CellReference, MAX_A1_COL, MAX_A1_ROW, parse_range_token, parse_ref_with_locks, ref_with_locks,
+    MAX_A1_COL, MAX_A1_ROW, parse_range_token, parse_ref_with_locks, ref_with_locks,
     rewrite_formula_cell_refs, shift_formula_index, try_parse_and_rewrite_cell_ref,
 };
 use super::{
-    ooxml,
     xlsx_container::XlsxContainer,
     xml::{
         XmlScanner, decode_xml_entities, extract_all_tag_text, extract_first_tag_text,
@@ -56,6 +55,10 @@ struct XmlAttr {
     name: String,
     value: String,
 }
+struct NewSharedString {
+    idx: usize,
+    value: String,
+}
 struct WorksheetRowParser<'row> {
     row_body: &'row str,
     row_num: u32,
@@ -95,13 +98,25 @@ enum XmlReserveMode {
     Additional,
     Exact,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CellReference {
+    col: u32,
+    col_locked: bool,
+    row: u32,
+    row_locked: bool,
+}
+pub(super) struct RewrittenCellReference {
+    col: u32,
+    row: u32,
+}
+struct RangeTokenParts<'token> {
+    end_ref: &'token str,
+    start_ref: &'token str,
+}
 impl Workbook {
     pub fn open(path: &Path) -> Result<Self> {
         let container = XlsxContainer::open(path)?;
-        let ooxml = ooxml::XlsxOoxml {
-            container: &container,
-        };
-        let sheet_catalog = ooxml.load_sheet_catalog()?;
+        let sheet_catalog = container.load_sheet_catalog()?;
         let workbook_xml = container.read_text("xl/workbook.xml")?;
         let shared_strings_xml_text = if container
             .unpack_dir()
@@ -113,7 +128,7 @@ impl Workbook {
         } else {
             None
         };
-        let shared_strings = ooxml.load_shared_strings()?;
+        let shared_strings = container.load_shared_strings()?;
         let mut sheets = BTreeMap::new();
         for sheet_info in sheet_catalog {
             let xml = container.read_text(&sheet_info.path)?;
@@ -182,18 +197,14 @@ impl Workbook {
                         let Some(inner_xml) = cell.inner_xml.as_deref() else {
                             continue;
                         };
-                        let Some(text) = ({
-                            if !inner_xml.contains("<is")
-                                || inner_xml.contains("<r")
-                                || inner_xml.contains("<rPr")
-                                || inner_xml.contains("<rPh")
-                                || inner_xml.contains("<phoneticPr")
-                            {
-                                None
-                            } else {
-                                extract_all_tag_text(inner_xml, "t")
-                            }
-                        }) else {
+                        if !inner_xml.contains("<is")
+                            || ["<r", "<rPr", "<rPh", "<phoneticPr"]
+                                .iter()
+                                .any(|needle| inner_xml.contains(needle))
+                        {
+                            continue;
+                        }
+                        let Some(text) = extract_all_tag_text(inner_xml, "t") else {
                             continue;
                         };
                         let shared_idx = if let Some(&idx) = existing_index.get(text.as_str()) {
@@ -220,7 +231,7 @@ impl Workbook {
         if new_index.is_empty() {
             return Ok(());
         }
-        let mut new_strings: Vec<(usize, String)> = Vec::new();
+        let mut new_strings: Vec<NewSharedString> = Vec::new();
         new_strings
             .try_reserve_exact(new_index.len())
             .map_err(|source| {
@@ -230,10 +241,14 @@ impl Workbook {
                     source,
                 )
             })?;
-        new_strings.extend(new_index.into_iter().map(|(value, idx)| (idx, value)));
-        new_strings.sort_unstable_by_key(|entry| entry.0);
+        new_strings.extend(
+            new_index
+                .into_iter()
+                .map(|(value, idx)| NewSharedString { idx, value }),
+        );
+        new_strings.sort_unstable_by_key(|entry| entry.idx);
         self.shared_strings
-            .extend(new_strings.into_iter().map(|(_, value)| value));
+            .extend(new_strings.into_iter().map(|entry| entry.value));
         self.update_shared_strings_xml_text(existing_total, existing_unique)
     }
     fn remove_excel_recovery_artifacts(&mut self) -> Result<()> {
@@ -728,51 +743,60 @@ impl Worksheet {
                     .ok_or_else(|| err("conditionalFormatting 태그 범위가 손상되었습니다."))?;
                 parse_tag_attrs(tag)?
             };
-            if let Some(sqref) = get_attr(&attrs, "sqref").map(ToOwned::to_owned) {
-                let updated_sqref = {
-                    let mut changed = false;
-                    let range_count = sqref.split_whitespace().count();
-                    let mut ranges_out: Vec<String> = Vec::new();
-                    ranges_out
-                        .try_reserve_exact(range_count)
-                        .map_err(|source| {
-                            err_with_source(
-                                format!(
-                                    "conditionalFormatting range 목록 메모리 확보 실패: {range_count} ranges"
-                                ),
-                                source,
-                            )
-                        })?;
-                    for token in sqref.split_whitespace() {
-                        let (start_ref, end_ref) = parse_range_token(token);
-                        let Some(start_reference) = parse_ref_with_locks(start_ref) else {
-                            ranges_out.push(token.to_owned());
-                            continue;
-                        };
-                        let Some(end_reference) = parse_ref_with_locks(end_ref) else {
-                            ranges_out.push(token.to_owned());
-                            continue;
-                        };
-                        if start_reference.row != data_start_row
-                            || end_reference.row != data_start_row
-                        {
-                            ranges_out.push(token.to_owned());
-                            continue;
-                        }
-                        if !target_cols
-                            .iter()
-                            .any(|col| (start_reference.col..=end_reference.col).contains(col))
-                        {
-                            ranges_out.push(token.to_owned());
-                            continue;
-                        }
-                        let new_start = ref_with_locks(start_reference.with_row(data_start_row));
-                        let new_end = ref_with_locks(end_reference.with_row(last_data_row));
-                        ranges_out.push(format!("{new_start}:{new_end}"));
-                        changed = true;
+            if let Some(sqref_index) = attrs.iter().position(|attr| attr.name == "sqref") {
+                let sqref = attrs.swap_remove(sqref_index).value;
+                let mut changed = false;
+                let mut ranges_out: Vec<Cow<'_, str>> = Vec::new();
+                let range_count = sqref.split_whitespace().count();
+                ranges_out.try_reserve_exact(range_count).map_err(|source| {
+                    err_with_source(
+                        format!(
+                            "conditionalFormatting range 목록 메모리 확보 실패: {range_count} ranges"
+                        ),
+                        source,
+                    )
+                })?;
+                for token in sqref.split_whitespace() {
+                    let range_parts = parse_range_token(token);
+                    let Some(start_reference) = parse_ref_with_locks(range_parts.start_ref) else {
+                        ranges_out.push(Cow::Borrowed(token));
+                        continue;
+                    };
+                    let Some(end_reference) = parse_ref_with_locks(range_parts.end_ref) else {
+                        ranges_out.push(Cow::Borrowed(token));
+                        continue;
+                    };
+                    let target_col_hit = target_cols
+                        .iter()
+                        .any(|col| (start_reference.col..=end_reference.col).contains(col));
+                    if start_reference.row != data_start_row
+                        || end_reference.row != data_start_row
+                        || !target_col_hit
+                    {
+                        ranges_out.push(Cow::Borrowed(token));
+                        continue;
                     }
-                    if changed { ranges_out.join(" ") } else { sqref }
+                    let new_start = ref_with_locks(start_reference.with_row(data_start_row));
+                    let new_end = ref_with_locks(end_reference.with_row(last_data_row));
+                    ranges_out.push(Cow::Owned(format!("{new_start}:{new_end}")));
+                    changed = true;
+                }
+                let maybe_updated_sqref = if changed {
+                    let mut out_sqref = String::new();
+                    out_sqref.try_reserve(sqref.len()).map_err(|source| {
+                        err_with_source("conditionalFormatting sqref 메모리 확보 실패", source)
+                    })?;
+                    for (index, range) in ranges_out.iter().enumerate() {
+                        if index != 0 {
+                            out_sqref.push(' ');
+                        }
+                        out_sqref.push_str(range.as_ref());
+                    }
+                    Some(out_sqref)
+                } else {
+                    None
                 };
+                let updated_sqref = maybe_updated_sqref.unwrap_or(sqref);
                 set_attr(&mut attrs, "sqref", updated_sqref);
                 let new_tag = build_open_tag("conditionalFormatting", &attrs);
                 out.replace_range(cf_span, &new_tag);
@@ -951,7 +975,10 @@ impl Worksheet {
                                 } else {
                                     shift_formula_index(base_row, delta_row, MAX_A1_ROW)?
                                 };
-                                Ok((new_col, new_row))
+                                Ok(RewrittenCellReference {
+                                    col: new_col,
+                                    row: new_row,
+                                })
                             },
                         )
                     })?
@@ -1125,7 +1152,7 @@ impl Worksheet {
             };
             let end_col = if let Some(existing_ref) = get_attr(&attrs, "ref")
                 && let Some(parsed_end_reference) =
-                    parse_ref_with_locks(parse_range_token(existing_ref).1)
+                    parse_ref_with_locks(parse_range_token(existing_ref).end_ref)
             {
                 parsed_end_reference.col
             } else {
@@ -1228,23 +1255,25 @@ pub fn remap_row_numbers(row: &mut Row, new_row: u32, resolver: &dyn Fn(u32) -> 
         if let Some(inner) = cell.inner_xml.as_mut()
             && let Some(text) = extract_first_tag_text(inner, "f")
         {
-            let rewrite_result =
-                rewrite_formula_cell_refs(&decode_xml_entities(text), |chars, start| {
-                    try_parse_and_rewrite_cell_ref(
-                        chars,
-                        start,
-                        |base_col, base_row, _col_lock, row_lock| {
-                            let updated_row = if row_lock {
-                                base_row
-                            } else {
-                                resolver(base_row)
-                            };
-                            Ok((base_col, updated_row))
-                        },
-                    )
-                });
-            let rewritten =
-                rewrite_result.unwrap_or_else(|_| decode_xml_entities(text).into_owned());
+            let decoded = decode_xml_entities(text);
+            let rewrite_result = rewrite_formula_cell_refs(decoded.as_ref(), |chars, start| {
+                try_parse_and_rewrite_cell_ref(
+                    chars,
+                    start,
+                    |base_col, base_row, _col_lock, row_lock| {
+                        let updated_row = if row_lock {
+                            base_row
+                        } else {
+                            resolver(base_row)
+                        };
+                        Ok(RewrittenCellReference {
+                            col: base_col,
+                            row: updated_row,
+                        })
+                    },
+                )
+            });
+            let rewritten = rewrite_result.unwrap_or_else(|_| decoded.into_owned());
             let encoded = xml_escape_text(&rewritten);
             replace_first_tag_text(inner, "f", &encoded)?;
         }
@@ -1254,21 +1283,24 @@ pub fn remap_row_numbers(row: &mut Row, new_row: u32, resolver: &dyn Fn(u32) -> 
 pub fn col_to_name(col: u32) -> String {
     cell_ref::col_to_name(col)
 }
-fn attr_sort_key(name: &str) -> (u8, &str) {
+fn attr_sort_rank(name: &str) -> u8 {
     if name == "r" {
-        (0, name)
+        0
     } else if name == "s" {
-        (1, name)
+        1
     } else if name == "t" {
-        (2, name)
+        2
     } else {
-        (3, name)
+        3
     }
 }
 fn push_sorted_attrs_xml(out: &mut String, attrs: &[XmlAttr]) {
     let mut sorted_attrs = attrs.iter().collect::<Vec<_>>();
-    sorted_attrs
-        .sort_unstable_by(|left, right| attr_sort_key(&left.name).cmp(&attr_sort_key(&right.name)));
+    sorted_attrs.sort_unstable_by(|left, right| {
+        attr_sort_rank(&left.name)
+            .cmp(&attr_sort_rank(&right.name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
     for attr in sorted_attrs {
         push_attr_xml(out, attr);
     }

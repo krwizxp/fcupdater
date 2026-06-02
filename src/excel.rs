@@ -1,5 +1,4 @@
 use std::path::Path;
-mod ooxml;
 mod path_util;
 pub mod source_reader;
 pub mod writer;
@@ -13,4 +12,8 @@ struct ZipArchiveBuilder<'path> {
 struct ZipArchiveExtractor<'path> {
     archive_path: &'path Path,
     unpack_dir: &'path Path,
+}
+struct SheetInfo {
+    name: String,
+    path: String,
 }
