@@ -273,7 +273,8 @@ impl UpdateRun<'_> {
         let total_considered = loaded_source
             .index
             .len()
-            .saturating_add(master_update.deleted.len());
+            .checked_add(master_update.deleted.len())
+            .ok_or_else(|| err("현행화 대상 레코드 수 계산 중 overflow가 발생했습니다."))?;
         if total_considered == 0 {
             return Err(err("현행화 대상 레코드를 찾지 못했습니다."));
         }

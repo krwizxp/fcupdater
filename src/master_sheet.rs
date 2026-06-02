@@ -123,6 +123,7 @@ struct RankFormulaCacheWriter<'sheet, 'cache> {
 struct FormulaCacheWrite<'value> {
     col: Option<u32>,
     value: Option<&'value str>,
+    value_type: Option<&'static str>,
 }
 struct RankFormulaRangeRewriter<'formula> {
     data_rows: RowRange,
@@ -824,7 +825,8 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
         let final_count = self
             .kept_source_rows
             .len()
-            .saturating_add(self.new_sources.len());
+            .checked_add(self.new_sources.len())
+            .ok_or_else(|| err("최종 마스터 행 수 계산 중 overflow가 발생했습니다."))?;
         let row_mapper = self.row_mapper(old_count, old_data_rows, final_count)?;
         let rebuild_result = self.rebuild_rows(&original_rows, &row_mapper, old_data_rows);
         let rebuilt = match rebuild_result {
@@ -1080,60 +1082,72 @@ impl RankFormulaCacheWriter<'_, '_> {
             FormulaCacheWrite {
                 col: self.layout.smart_discount,
                 value: Some(smart_discount_text.as_str()),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.adjusted_gasoline,
                 value: adjusted_gasoline.as_deref(),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.adjusted_premium,
                 value: adjusted_premium.as_deref(),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.adjusted_diesel,
                 value: adjusted_diesel.as_deref(),
+                value_type: None,
+            },
+            FormulaCacheWrite {
+                col: self.layout.fuel_total_text,
+                value: self.cache.fuel_total_text.as_deref(),
+                value_type: Some("str"),
             },
             FormulaCacheWrite {
                 col: self.layout.total_price,
                 value: total_price.as_deref(),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.region_rate,
                 value: region_rate.as_deref(),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.region_discount,
                 value: region_discount.as_deref(),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.regional_total,
                 value: regional_total.as_deref(),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.sort_key,
                 value: Some(sort_key.as_ref()),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.unit_price_with_currency,
                 value: self.cache.unit_price_with_currency.as_deref(),
+                value_type: None,
             },
             FormulaCacheWrite {
                 col: self.layout.unit_price_without_currency,
                 value: self.cache.unit_price_without_currency.as_deref(),
+                value_type: None,
             },
         ] {
             let Some(formula_col_num) = item.col else {
                 continue;
             };
-            self.ws
-                .set_formula_cached_value_at(formula_col_num, self.row, item.value, None)?;
-        }
-        if let Some(formula_col_num) = self.layout.fuel_total_text {
             self.ws.set_formula_cached_value_at(
                 formula_col_num,
                 self.row,
-                self.cache.fuel_total_text.as_deref(),
-                Some("str"),
+                item.value,
+                item.value_type,
             )?;
         }
         Ok(())
@@ -1145,13 +1159,7 @@ impl RankFormulaRefresher<'_, '_> {
         display_total_qty: Option<ScaledDecimal>,
         sort_context: &RankSortContext,
     ) -> Result<Vec<RankTotalRow>> {
-        let capacity = usize::try_from(
-            self.data_rows
-                .last
-                .saturating_sub(self.data_rows.start)
-                .saturating_add(1),
-        )
-        .unwrap_or_default();
+        let capacity = row_range_len(self.data_rows, "랭크 캐시 대상 행 수")?;
         let mut rank_totals: Vec<RankTotalRow> = Vec::new();
         rank_totals.try_reserve_exact(capacity).map_err(|source| {
             err_with_source(
@@ -1336,13 +1344,7 @@ impl RankRowsSorter<'_, '_> {
         self.apply_sorted_rows(data_rows, &row_mapping)
     }
     fn sorted_data_rows(&self, sort_context: &RankSortContext) -> Result<Vec<SortableRankRow>> {
-        let row_count = usize::try_from(
-            self.data_rows
-                .last
-                .saturating_sub(self.data_rows.start)
-                .saturating_add(1),
-        )
-        .unwrap_or_default();
+        let row_count = row_range_len(self.data_rows, "정렬 대상 행 수")?;
         let mut data_rows: Vec<SortableRankRow> = Vec::new();
         data_rows.try_reserve_exact(row_count).map_err(|source| {
             err_with_source(
@@ -1814,6 +1816,18 @@ impl<'source> MasterSheetUpdater<'source> {
         ws.set_i32_at(layout.premium, row, src.premium);
         ws.set_i32_at(layout.diesel, row, src.diesel);
     }
+}
+fn row_range_len(rows: RowRange, context: &'static str) -> Result<usize> {
+    if rows.start > rows.last {
+        return Ok(0);
+    }
+    let row_count = rows
+        .last
+        .checked_sub(rows.start)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| err(format!("{context} 계산 중 overflow가 발생했습니다.")))?;
+    usize::try_from(row_count)
+        .map_err(|source| err_with_source(format!("{context} 변환 실패"), source))
 }
 fn mapped_contiguous_row(
     row_mapping: &[Option<u32>],

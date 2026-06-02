@@ -783,14 +783,14 @@ impl SourceHeaderValidator<'_, '_> {
             col: usize,
             text: &'static str,
         }
-        let Some(header) = self
+        let Some(header_entry) = self
             .rows
             .iter()
             .find(|entry| entry.row_num == SOURCE_HEADER_ROW)
-            .map(|entry| &entry.row)
         else {
             return Err(err("Opinet 소스 헤더 행을 찾지 못했습니다."));
         };
+        let header = &header_entry.row;
         for expected_header in [
             HeaderExpectation {
                 col: COL_REGION,

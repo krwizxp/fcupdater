@@ -63,14 +63,21 @@ impl HttpClient {
         if self.cookies.is_empty() {
             return Ok(None);
         }
-        let capacity = self.cookies.iter().fold(
-            self.cookies.len().saturating_sub(1).saturating_mul(2),
-            |sum, cookie| {
-                sum.saturating_add(cookie.name.len())
-                    .saturating_add(1)
-                    .saturating_add(cookie.value.len())
-            },
-        );
+        let separator_capacity = self
+            .cookies
+            .len()
+            .checked_sub(1)
+            .and_then(|count| count.checked_mul(2))
+            .ok_or("Cookie header 용량 계산 실패")?;
+        let capacity = self
+            .cookies
+            .iter()
+            .try_fold(separator_capacity, |sum, cookie| {
+                sum.checked_add(cookie.name.len())?
+                    .checked_add(1)?
+                    .checked_add(cookie.value.len())
+            })
+            .ok_or("Cookie header 용량 계산 실패")?;
         let mut out = String::new();
         out.try_reserve(capacity)
             .map_err(|source| prefixed_message("Cookie header 메모리 확보 실패: ", source))?;

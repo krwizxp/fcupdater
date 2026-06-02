@@ -448,11 +448,14 @@ impl Client {
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
         let path_wide = wide(path)?;
-        let header_capacity = headers.iter().fold(0_usize, |acc, &(name, value)| {
-            acc.saturating_add(name.len())
-                .saturating_add(value.len())
-                .saturating_add(4)
-        });
+        let header_capacity = headers
+            .iter()
+            .try_fold(0_usize, |acc, &(name, value)| {
+                acc.checked_add(name.len())?
+                    .checked_add(value.len())?
+                    .checked_add(4)
+            })
+            .ok_or("요청 헤더 용량 계산 실패")?;
         let mut headers_text = String::new();
         headers_text
             .try_reserve(header_capacity)
@@ -501,11 +504,14 @@ impl Client {
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
         let path_wide = wide(path)?;
-        let header_capacity = headers.iter().fold(0_usize, |acc, &(name, value)| {
-            acc.saturating_add(name.len())
-                .saturating_add(value.len())
-                .saturating_add(4)
-        });
+        let header_capacity = headers
+            .iter()
+            .try_fold(0_usize, |acc, &(name, value)| {
+                acc.checked_add(name.len())?
+                    .checked_add(value.len())?
+                    .checked_add(4)
+            })
+            .ok_or("요청 헤더 용량 계산 실패")?;
         let mut headers_text = String::new();
         headers_text
             .try_reserve(header_capacity)
