@@ -1,6 +1,8 @@
 use crate::{
-    ChangeLogUpdater, Result, add_row_offset, err,
+    diagnostic::{Result, err},
     excel::writer::{Worksheet, col_to_name},
+    rows::{AddedStoreRow, ChangeRow, StoreRow},
+    sheet_util::add_row_offset,
 };
 use core::range::RangeInclusive;
 const CHANGELOG_HEADER_ROW: u32 = 3;
@@ -19,6 +21,14 @@ const CHANGELOG_COL_DELTA_PREMIUM: u32 = 10;
 const CHANGELOG_COL_OLD_DIESEL: u32 = 11;
 const CHANGELOG_COL_NEW_DIESEL: u32 = 12;
 const CHANGELOG_COL_DELTA_DIESEL: u32 = 13;
+pub struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
+    pub added: &'data [AddedStoreRow<'source>],
+    pub changes: &'data [ChangeRow<'source>],
+    pub deleted: &'data [StoreRow],
+    pub shared_string_table: &'shared [String],
+    pub today: &'data str,
+    pub worksheet: &'sheet mut Worksheet,
+}
 struct ChangeLogLayout {
     col_address: u32,
     col_delta_diesel: u32,
@@ -87,7 +97,7 @@ impl ChangeLogRowValues<'_> {
                 value: self.reason,
             },
         ] {
-            worksheet.set_string_at(cell.col, row, cell.value);
+            worksheet.set_string_at(cell.col, row, cell.value)?;
         }
         for cell in [
             OptionalIntCell {
@@ -115,7 +125,7 @@ impl ChangeLogRowValues<'_> {
                 value: self.new_diesel,
             },
         ] {
-            worksheet.set_i32_at(cell.col, row, cell.value);
+            worksheet.set_i32_at(cell.col, row, cell.value)?;
         }
         for column in delta_columns {
             let old_col = column.old_ref;
@@ -129,7 +139,7 @@ impl ChangeLogRowValues<'_> {
     }
 }
 impl ChangeLogUpdater<'_, '_, '_, '_> {
-    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) {
+    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<()> {
         let cols = [
             layout.col_region,
             layout.col_name,
@@ -142,14 +152,16 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             layout.col_old_diesel,
             layout.col_new_diesel,
         ];
-        let last_row = self
-            .worksheet
-            .row_numbers_from(layout.data_start_row)
-            .rev()
-            .find(|&row| {
-                self.worksheet
-                    .row_has_any_data(row, &cols, self.shared_string_table)
-            });
+        let mut last_row = None;
+        for row in self.worksheet.row_numbers_from(layout.data_start_row).rev() {
+            if self
+                .worksheet
+                .row_has_any_data(row, &cols, self.shared_string_table)?
+            {
+                last_row = Some(row);
+                break;
+            }
+        }
         if let Some(last_data_row) = last_row {
             self.worksheet.clear_cells_in_rows_through_col(
                 RangeInclusive {
@@ -159,6 +171,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 layout.max_col,
             );
         }
+        Ok(())
     }
     fn find_layout(&self) -> Result<ChangeLogLayout> {
         self.validate_fixed_header()?;
@@ -180,30 +193,32 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             max_col: CHANGELOG_COL_DELTA_DIESEL,
         })
     }
-    fn select_style_template_row(&self, layout: &ChangeLogLayout) -> u32 {
+    fn select_style_template_row(&self, layout: &ChangeLogLayout) -> Result<u32> {
         if CHANGELOG_STYLE_TEMPLATE_ROW >= layout.data_start_row
             && self
                 .worksheet
                 .has_any_row_format(CHANGELOG_STYLE_TEMPLATE_ROW, layout.max_col)
         {
-            return CHANGELOG_STYLE_TEMPLATE_ROW;
+            return Ok(CHANGELOG_STYLE_TEMPLATE_ROW);
         }
         let end = if CHANGELOG_STYLE_TEMPLATE_ROW > layout.data_start_row {
             CHANGELOG_STYLE_TEMPLATE_ROW
         } else {
-            layout.data_start_row.saturating_add(1)
+            layout.data_start_row.checked_add(1).ok_or_else(|| {
+                err("변경 이력 style template 행 계산 중 overflow가 발생했습니다.")
+            })?
         };
-        (layout.data_start_row..end)
+        Ok((layout.data_start_row..end)
             .rev()
             .find(|row| self.worksheet.has_any_row_format(*row, layout.max_col))
-            .unwrap_or(layout.data_start_row)
+            .unwrap_or(layout.data_start_row))
     }
-    pub(super) fn update(&mut self) -> Result<()> {
+    pub fn update(&mut self) -> Result<()> {
         let date_text = format!("현행화 일자: {}", self.today);
-        self.worksheet.set_string_at(1, 2, &date_text);
+        self.worksheet.set_string_at(1, 2, &date_text)?;
         let layout = self.find_layout()?;
-        let style_template_row = self.select_style_template_row(&layout);
-        self.clear_existing_rows(&layout);
+        let style_template_row = self.select_style_template_row(&layout)?;
+        self.clear_existing_rows(&layout)?;
         self.write_entries(&layout, style_template_row)?;
         self.worksheet.update_dimension()?;
         Ok(())
@@ -268,11 +283,11 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             },
         ];
         for expected in expected_headers {
-            let actual = self.worksheet.get_display_at(
+            let actual = self.worksheet.try_get_display_at(
                 expected.col,
                 CHANGELOG_HEADER_ROW,
                 self.shared_string_table,
-            );
+            )?;
             let trimmed = actual.trim();
             if trimmed != expected.text {
                 let col = expected.col;
@@ -330,12 +345,12 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             reason: "폐업",
             region: item.region.as_str(),
         });
-        let old_gas_col = col_to_name(layout.col_old_gas);
-        let new_gas_col = col_to_name(layout.col_new_gas);
-        let old_premium_col = col_to_name(layout.col_old_premium);
-        let new_premium_col = col_to_name(layout.col_new_premium);
-        let old_diesel_col = col_to_name(layout.col_old_diesel);
-        let new_diesel_col = col_to_name(layout.col_new_diesel);
+        let old_gas_col = col_to_name(layout.col_old_gas)?;
+        let new_gas_col = col_to_name(layout.col_new_gas)?;
+        let old_premium_col = col_to_name(layout.col_old_premium)?;
+        let new_premium_col = col_to_name(layout.col_new_premium)?;
+        let old_diesel_col = col_to_name(layout.col_old_diesel)?;
+        let new_diesel_col = col_to_name(layout.col_new_diesel)?;
         let delta_columns = [
             DeltaFormulaColumn {
                 new_ref: new_gas_col.as_str(),
@@ -361,7 +376,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             let row = add_row_offset(layout.data_start_row, index, "변경내역 데이터 쓰기")?;
             if row > style_template_row {
                 self.worksheet
-                    .clone_row_style(style_template_row, row, layout.max_col)?;
+                    .copy_row_style(style_template_row, row, layout.max_col)?;
             }
             values.write_to(self.worksheet, layout, row, &delta_columns)?;
         }

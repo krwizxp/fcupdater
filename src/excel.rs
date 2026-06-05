@@ -1,10 +1,13 @@
 use std::path::Path;
 mod path_util;
-pub mod source_reader;
+mod source_reader;
 pub mod writer;
-pub mod xlsx_container;
+mod xlsx_container;
 mod xml;
 mod zip_archive;
+pub struct SourceReader<'path> {
+    pub path: &'path Path,
+}
 struct ZipArchiveBuilder<'path> {
     archive_path: &'path Path,
     root: &'path Path,

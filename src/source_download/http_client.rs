@@ -1,28 +1,44 @@
 use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HttpHeader, HttpResponse, HttpStreamResponse,
-    NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, USER_AGENT,
-    attach_remove_file_error, enforce_http_content_length_limit,
+    NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, ReservedDownloadFile, USER_AGENT,
+    attach_remove_file_error, download_error_with_source, enforce_http_content_length_limit,
 };
-use crate::{path_source_message, prefixed_message};
+use crate::diagnostic::{path_context_message, prefixed_message};
 use alloc::{string::String, vec::Vec};
 use core::{fmt::Write as FmtWrite, time::Duration};
 use std::{
-    fs::File,
     io::Write as IoWrite,
-    path::Path,
+    path::PathBuf,
     thread::sleep,
     time::{SystemTime, UNIX_EPOCH},
 };
 const U32_DECIMAL_MAX_LEN: usize = 10;
 const U128_DECIMAL_MAX_LEN: usize = 39;
+cfg_select! {
+    windows => {
+        type PlatformHttpClient = super::winhttp::Client;
+    }
+    any(target_os = "linux", target_os = "macos") => {
+        type PlatformHttpClient = super::libcurl::Client;
+    }
+    _ => {
+        #[derive(Default)]
+        struct PlatformHttpClient;
+    }
+}
 #[derive(Default)]
 pub(super) struct HttpClient {
     cookies: Vec<Cookie>,
+    platform: PlatformHttpClient,
 }
 #[derive(Clone, Copy)]
 pub(super) enum PostHeaderProfile {
     Ajax,
     Standard,
+}
+pub(super) struct DownloadedFileResponse {
+    pub path: PathBuf,
+    pub response: HttpStreamResponse,
 }
 struct Cookie {
     name: String,
@@ -32,16 +48,15 @@ impl HttpClient {
     fn add_cookie(&mut self, name: &str, value: &str) -> DownloadResult<()> {
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
             cookie.value.clear();
-            cookie
-                .value
-                .try_reserve(value.len())
-                .map_err(|source| prefixed_message("Cookie 값 메모리 확보 실패: ", source))?;
+            cookie.value.try_reserve(value.len()).map_err(|source| {
+                download_error_with_source("Cookie 값 메모리 확보 실패", source)
+            })?;
             cookie.value.push_str(value);
             return Ok(());
         }
         self.cookies
             .try_reserve(1)
-            .map_err(|source| prefixed_message("Cookie 목록 메모리 확보 실패: ", source))?;
+            .map_err(|source| download_error_with_source("Cookie 목록 메모리 확보 실패", source))?;
         let mut cookie = Cookie {
             name: String::new(),
             value: String::new(),
@@ -49,11 +64,11 @@ impl HttpClient {
         cookie
             .name
             .try_reserve(name.len())
-            .map_err(|source| prefixed_message("Cookie 이름 메모리 확보 실패: ", source))?;
+            .map_err(|source| download_error_with_source("Cookie 이름 메모리 확보 실패", source))?;
         cookie
             .value
             .try_reserve(value.len())
-            .map_err(|source| prefixed_message("Cookie 값 메모리 확보 실패: ", source))?;
+            .map_err(|source| download_error_with_source("Cookie 값 메모리 확보 실패", source))?;
         cookie.name.push_str(name);
         cookie.value.push_str(value);
         self.cookies.push(cookie);
@@ -79,8 +94,9 @@ impl HttpClient {
             })
             .ok_or("Cookie header 용량 계산 실패")?;
         let mut out = String::new();
-        out.try_reserve(capacity)
-            .map_err(|source| prefixed_message("Cookie header 메모리 확보 실패: ", source))?;
+        out.try_reserve(capacity).map_err(|source| {
+            download_error_with_source("Cookie header 메모리 확보 실패", source)
+        })?;
         for (index, cookie) in self.cookies.iter().enumerate() {
             if index != 0 {
                 out.push_str("; ");
@@ -107,7 +123,9 @@ impl HttpClient {
         });
         let mut body = String::new();
         body.try_reserve(body_capacity.ok_or("HTTP form body 메모리 용량 계산 실패")?)
-            .map_err(|source| prefixed_message("HTTP form body 메모리 확보 실패: ", source))?;
+            .map_err(|source| {
+                download_error_with_source("HTTP form body 메모리 확보 실패", source)
+            })?;
         for (index, &(name, value)) in form.iter().enumerate() {
             if index != 0 {
                 body.push('&');
@@ -126,7 +144,12 @@ impl HttpClient {
         if value.is_empty() {
             return Err(prefixed_message("NetFunnel key 비어 있음: ", result).into());
         }
-        Ok(value.to_owned())
+        let mut out = String::new();
+        out.try_reserve(value.len()).map_err(|source| {
+            download_error_with_source("NetFunnel key 메모리 확보 실패", source)
+        })?;
+        out.push_str(value);
+        Ok(out)
     }
     pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> DownloadResult<String> {
         let mut current_key: Option<String> = None;
@@ -139,7 +162,7 @@ impl HttpClient {
             let code_text = split_head_or_all(code_tail, ':');
             let code = code_text
                 .parse::<u32>()
-                .map_err(|source| prefixed_message("NetFunnel 코드 파싱 실패: ", source))?;
+                .map_err(|source| download_error_with_source("NetFunnel 코드 파싱 실패", source))?;
             match code {
                 200 | 300 | 303 => return Self::extract_netfunnel_key(&result),
                 201 | 202 | 302 => {
@@ -164,9 +187,9 @@ impl HttpClient {
         referer: Option<&str>,
     ) -> DownloadResult<String> {
         let mut headers = Vec::new();
-        headers
-            .try_reserve(3)
-            .map_err(|source| prefixed_message("HTTP GET header 메모리 확보 실패: ", source))?;
+        headers.try_reserve(3).map_err(|source| {
+            download_error_with_source("HTTP GET header 메모리 확보 실패", source)
+        })?;
         headers.push((
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -175,8 +198,8 @@ impl HttpClient {
             headers.push(("Referer", referer_value));
         }
         let response = self.request("GET", host, path, None, &headers)?;
-        Ok(String::from_utf8(response.body)
-            .map_err(|source| prefixed_message("HTTP 응답 UTF-8 변환 실패: ", source))?)
+        String::from_utf8(response.body)
+            .map_err(|source| download_error_with_source("HTTP 응답 UTF-8 변환 실패", source))
     }
     pub(super) fn post_form(
         &mut self,
@@ -197,13 +220,14 @@ impl HttpClient {
         form: &[(&str, &str)],
         referer: Option<&str>,
         profile: PostHeaderProfile,
-        target: &Path,
-    ) -> DownloadResult<HttpStreamResponse> {
+        target: ReservedDownloadFile,
+    ) -> DownloadResult<DownloadedFileResponse> {
+        let ReservedDownloadFile {
+            mut file,
+            path: target_path,
+        } = target;
         let body = Self::encoded_form_body(form)?;
         let headers = Self::post_headers(referer, profile)?;
-        let mut file = File::create(target).map_err(|source| {
-            path_source_message("다운로드 임시 파일 생성 실패", target, source)
-        })?;
         let response = match self.request_to_writer(
             "POST",
             host,
@@ -213,26 +237,32 @@ impl HttpClient {
             &mut file,
         ) {
             Ok(response) => response,
-            Err(error_text) => {
+            Err(error) => {
                 drop(file);
-                return Err(attach_remove_file_error(error_text.to_string(), target).into());
+                return Err(attach_remove_file_error(error, &target_path));
             }
         };
         if let Err(source) = IoWrite::flush(&mut file) {
             drop(file);
-            let error_text = path_source_message("다운로드 임시 파일 flush 실패", target, source);
-            return Err(attach_remove_file_error(error_text, target).into());
+            let error = download_error_with_source(
+                path_context_message("다운로드 임시 파일 flush 실패", &target_path),
+                source,
+            );
+            return Err(attach_remove_file_error(error, &target_path));
         }
-        Ok(response)
+        Ok(DownloadedFileResponse {
+            path: target_path,
+            response,
+        })
     }
     fn post_headers(
         referer: Option<&str>,
         profile: PostHeaderProfile,
     ) -> DownloadResult<Vec<(&str, &str)>> {
         let mut headers = Vec::new();
-        headers
-            .try_reserve(6)
-            .map_err(|source| prefixed_message("HTTP POST header 메모리 확보 실패: ", source))?;
+        headers.try_reserve(6).map_err(|source| {
+            download_error_with_source("HTTP POST header 메모리 확보 실패", source)
+        })?;
         headers.extend_from_slice(&[
             (
                 "Content-Type",
@@ -262,16 +292,8 @@ impl HttpClient {
                     let high = other >> 4_u8;
                     let low = other & 0x0F;
                     out.push('%');
-                    out.push(match high {
-                        0..=9 => char::from(b'0'.saturating_add(high)),
-                        10..=15 => char::from(b'A'.saturating_add(high.saturating_sub(10))),
-                        _ => '?',
-                    });
-                    out.push(match low {
-                        0..=9 => char::from(b'0'.saturating_add(low)),
-                        10..=15 => char::from(b'A'.saturating_add(low.saturating_sub(10))),
-                        _ => '?',
-                    });
+                    out.push(hex_digit(high));
+                    out.push(hex_digit(low));
                 }
             }
         }
@@ -285,10 +307,13 @@ impl HttpClient {
         headers: &[(&str, &str)],
     ) -> DownloadResult<HttpResponse> {
         let mut merged_headers = Vec::new();
-        let merged_header_capacity = headers.len().saturating_add(3);
+        let merged_header_capacity =
+            checked_capacity_sum(&[headers.len(), 3], "HTTP request header 용량 계산 실패")?;
         merged_headers
             .try_reserve(merged_header_capacity)
-            .map_err(|source| prefixed_message("HTTP request header 메모리 확보 실패: ", source))?;
+            .map_err(|source| {
+                download_error_with_source("HTTP request header 메모리 확보 실패", source)
+            })?;
         merged_headers.push(("User-Agent", USER_AGENT));
         merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
         merged_headers.extend_from_slice(headers);
@@ -299,10 +324,10 @@ impl HttpClient {
         let response = {
             cfg_select! {
                 windows => {
-                    super::winhttp::CLIENT.request(method, host, path, body, &merged_headers)
+                    self.platform.request(method, host, path, body, &merged_headers)
                 }
                 any(target_os = "linux", target_os = "macos") => {
-                    super::libcurl::CLIENT.request(method, host, path, body, &merged_headers)
+                    self.platform.request(method, host, path, body, &merged_headers)
                 }
                 _ => {
                     let body_len = body.map_or(0, <[u8]>::len);
@@ -337,7 +362,7 @@ impl HttpClient {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
-            .map_err(|source| prefixed_message("현재 시간 조회 실패: ", source))?;
+            .map_err(|source| download_error_with_source("현재 시간 조회 실패", source))?;
         let opcode = if key.is_some() { "5002" } else { "5101" };
         let key_fragment = if let Some(key_value) = key {
             let encoded_capacity = key_value
@@ -349,7 +374,7 @@ impl HttpClient {
                 .ok_or("NetFunnel key fragment 용량 계산 실패")?;
             let mut fragment = String::new();
             fragment.try_reserve(capacity).map_err(|source| {
-                prefixed_message("NetFunnel key fragment 메모리 확보 실패: ", source)
+                download_error_with_source("NetFunnel key fragment 메모리 확보 실패", source)
             })?;
             fragment.push_str("&key=");
             Self::push_percent_encoded(&mut fragment, key_value.as_bytes());
@@ -364,32 +389,38 @@ impl HttpClient {
                     .ok_or("NetFunnel ttl fragment 용량 계산 실패")?;
                 let mut fragment = String::new();
                 fragment.try_reserve(capacity).map_err(|source| {
-                    prefixed_message("NetFunnel ttl fragment 메모리 확보 실패: ", source)
+                    download_error_with_source("NetFunnel ttl fragment 메모리 확보 실패", source)
                 })?;
                 fragment.push_str("&ttl=");
-                FmtWrite::write_fmt(&mut fragment, format_args!("{ttl_value}"))
-                    .map_err(|error| format!("NetFunnel ttl fragment 작성 실패: {error}"))?;
+                FmtWrite::write_fmt(&mut fragment, format_args!("{ttl_value}")).map_err(
+                    |error| download_error_with_source("NetFunnel ttl fragment 작성 실패", error),
+                )?;
                 fragment
             }
             None => String::new(),
         };
-        let path_capacity = "/ts.wseq?opcode="
-            .len()
-            .saturating_add(opcode.len())
-            .saturating_add(key_fragment.len())
-            .saturating_add("&nfid=0&prefix=NetFunnel.gRtype%3D".len())
-            .saturating_add(opcode.len())
-            .saturating_add("%3B".len())
-            .saturating_add(ttl_fragment.len())
-            .saturating_add("&sid=".len())
-            .saturating_add(NETFUNNEL_SERVICE_ID.len())
-            .saturating_add("&aid=".len())
-            .saturating_add(action_id.len())
-            .saturating_add("&js=yes&".len())
-            .saturating_add(U128_DECIMAL_MAX_LEN);
+        let path_capacity = checked_capacity_sum(
+            &[
+                "/ts.wseq?opcode=".len(),
+                opcode.len(),
+                key_fragment.len(),
+                "&nfid=0&prefix=NetFunnel.gRtype%3D".len(),
+                opcode.len(),
+                "%3B".len(),
+                ttl_fragment.len(),
+                "&sid=".len(),
+                NETFUNNEL_SERVICE_ID.len(),
+                "&aid=".len(),
+                action_id.len(),
+                "&js=yes&".len(),
+                U128_DECIMAL_MAX_LEN,
+            ],
+            "NetFunnel path 용량 계산 실패",
+        )?;
         let mut path = String::new();
-        path.try_reserve(path_capacity)
-            .map_err(|source| prefixed_message("NetFunnel path 메모리 확보 실패: ", source))?;
+        path.try_reserve(path_capacity).map_err(|source| {
+            download_error_with_source("NetFunnel path 메모리 확보 실패", source)
+        })?;
         path.push_str("/ts.wseq?opcode=");
         path.push_str(opcode);
         path.push_str(&key_fragment);
@@ -402,8 +433,9 @@ impl HttpClient {
         path.push_str("&aid=");
         path.push_str(action_id);
         path.push_str("&js=yes&");
-        FmtWrite::write_fmt(&mut path, format_args!("{timestamp}"))
-            .map_err(|error| format!("NetFunnel timestamp fragment 작성 실패: {error}"))?;
+        FmtWrite::write_fmt(&mut path, format_args!("{timestamp}")).map_err(|error| {
+            download_error_with_source("NetFunnel timestamp fragment 작성 실패", error)
+        })?;
         let response = self.request(
             "GET",
             NETFUNNEL_HOST,
@@ -411,8 +443,9 @@ impl HttpClient {
             None,
             &[("Accept", "application/javascript,*/*;q=0.8")],
         )?;
-        let text = String::from_utf8(response.body)
-            .map_err(|source| prefixed_message("NetFunnel 응답 UTF-8 변환 실패: ", source))?;
+        let text = String::from_utf8(response.body).map_err(|source| {
+            download_error_with_source("NetFunnel 응답 UTF-8 변환 실패", source)
+        })?;
         let result = text
             .split_once("result='")
             .and_then(|(_, rest)| rest.split_once('\''))
@@ -421,8 +454,9 @@ impl HttpClient {
             return Err(prefixed_message("NetFunnel result 파싱 실패: ", text).into());
         };
         let mut out = String::new();
-        out.try_reserve(value.len())
-            .map_err(|source| prefixed_message("NetFunnel result 메모리 확보 실패: ", source))?;
+        out.try_reserve(value.len()).map_err(|source| {
+            download_error_with_source("NetFunnel result 메모리 확보 실패", source)
+        })?;
         out.push_str(value);
         Ok(out)
     }
@@ -436,10 +470,13 @@ impl HttpClient {
         writer: &mut dyn IoWrite,
     ) -> DownloadResult<HttpStreamResponse> {
         let mut merged_headers = Vec::new();
-        let merged_header_capacity = headers.len().saturating_add(3);
+        let merged_header_capacity =
+            checked_capacity_sum(&[headers.len(), 3], "HTTP request header 용량 계산 실패")?;
         merged_headers
             .try_reserve(merged_header_capacity)
-            .map_err(|source| prefixed_message("HTTP request header 메모리 확보 실패: ", source))?;
+            .map_err(|source| {
+                download_error_with_source("HTTP request header 메모리 확보 실패", source)
+            })?;
         merged_headers.push(("User-Agent", USER_AGENT));
         merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
         merged_headers.extend_from_slice(headers);
@@ -450,7 +487,7 @@ impl HttpClient {
         let response = {
             cfg_select! {
                 windows => {
-                    super::winhttp::CLIENT.request_to_writer(
+                    self.platform.request_to_writer(
                         method,
                         host,
                         path,
@@ -460,7 +497,7 @@ impl HttpClient {
                     )
                 }
                 any(target_os = "linux", target_os = "macos") => {
-                    super::libcurl::CLIENT.request_to_writer(
+                    self.platform.request_to_writer(
                         method,
                         host,
                         path,
@@ -497,12 +534,41 @@ impl HttpClient {
         for (cookie_name, cookie_value) in headers
             .iter()
             .filter(|header| header.name.eq_ignore_ascii_case("set-cookie"))
-            .map(|header| header.value.as_str())
-            .filter_map(|value| split_head_or_all(value, ';').split_once('='))
+            .filter_map(|header| split_head_or_all(&header.value, ';').split_once('='))
         {
             self.add_cookie(cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
         }
         Ok(())
+    }
+}
+fn checked_capacity_sum(parts: &[usize], context: &'static str) -> DownloadResult<usize> {
+    let Some(capacity) = parts
+        .iter()
+        .try_fold(0_usize, |sum, &part| sum.checked_add(part))
+    else {
+        return Err(context.into());
+    };
+    Ok(capacity)
+}
+const fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0 => '0',
+        1 => '1',
+        2 => '2',
+        3 => '3',
+        4 => '4',
+        5 => '5',
+        6 => '6',
+        7 => '7',
+        8 => '8',
+        9 => '9',
+        10 => 'A',
+        11 => 'B',
+        12 => 'C',
+        13 => 'D',
+        14 => 'E',
+        15 => 'F',
+        _ => '?',
     }
 }
 fn split_head_or_all(value: &str, separator: char) -> &str {

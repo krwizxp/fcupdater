@@ -3,10 +3,12 @@ use self::format::{
     missing_sort_target_row_error, split_negative_prefix,
 };
 use crate::{
-    AddedStoreRow, ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, Result, SourceRecord,
-    StoreRow, add_row_offset, canon_header, err, err_with_source, excel,
+    diagnostic::{Result, err, err_with_source},
+    excel,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
-    normalize_address_key, parse_region_label, same_trimmed, shift_row, usize_to_u32,
+    region::normalize_address_key,
+    rows::{AddedStoreRow, ChangeRow, MasterSheetUpdateResult, SourceRecord, StoreRow},
+    sheet_util::{add_row_offset, usize_to_u32},
 };
 use alloc::{borrow::Cow, collections::BTreeMap};
 use core::range::RangeInclusive;
@@ -14,10 +16,14 @@ use std::collections::{HashMap, HashSet};
 mod filter;
 mod format;
 const MASTER_HEADER_SCAN_ROWS: u32 = 200;
+const REGION_LABEL_SUFFIXES: [&str; 3] = ["특별자치시", "광역시", "특별시"];
 const DECIMAL_SCALE: ScaledDecimal = ScaledDecimal(1_000_000);
 const DECIMAL_SCALE_SQUARED: ScaledSortKey = ScaledSortKey(1_000_000_000_000);
 const DECIMAL_SCALE_CUBED: ScaledSortKey = ScaledSortKey(1_000_000_000_000_000_000);
 type RowRange = RangeInclusive<u32>;
+pub struct MasterSheetUpdater<'source> {
+    pub source_index: &'source HashMap<String, SourceRecord>,
+}
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 struct ScaledDecimal(i64);
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -33,11 +39,11 @@ impl ScaledDecimal {
     fn checked_add(self, rhs: Self) -> Option<Self> {
         self.0.checked_add(rhs.0).map(Self)
     }
+    fn checked_sub(self, rhs: Self) -> Option<Self> {
+        self.0.checked_sub(rhs.0).map(Self)
+    }
     const fn is_zero(self) -> bool {
         self.0 == 0
-    }
-    const fn saturating_sub(self, rhs: Self) -> Self {
-        Self(self.0.saturating_sub(rhs.0))
     }
 }
 impl ScaledSortKey {
@@ -165,7 +171,7 @@ struct RankSortRefresher<'sheet, 'strings> {
 }
 struct RebasedNonDataRowsBuilder<'rows, 'mapper> {
     old_data_rows: RowRange,
-    original_rows: &'rows BTreeMap<u32, StdRow>,
+    original_rows: &'rows mut BTreeMap<u32, StdRow>,
     row_mapper: &'mapper RowMapper,
 }
 struct SourceRowsWriter<'sheet, 'kept, 'new_rows, 'rows, 'source> {
@@ -292,7 +298,7 @@ struct KeptRowsPlacer<'work, 'kept, 'source> {
     data_start_row: u32,
     kept_source_rows: &'kept [KeptSourceRow<'source>],
     new_rows_map: &'work mut BTreeMap<u32, StdRow>,
-    original_rows: &'work BTreeMap<u32, StdRow>,
+    original_rows: &'work mut BTreeMap<u32, StdRow>,
     row_mapper: &'work RowMapper,
 }
 struct MasterRowEvaluation<'source> {
@@ -309,33 +315,35 @@ struct RowMapper {
     old_data_rows: RowRange,
 }
 impl RowMapper {
-    fn map(&self, old_ref_row: u32) -> u32 {
+    fn map(&self, old_ref_row: u32) -> Result<u32> {
         if self.old_data_rows.contains(&old_ref_row) {
             let deleted_le = u32::try_from(
                 self.deleted_rows
                     .partition_point(|deleted_row| *deleted_row <= old_ref_row),
             )
             .unwrap_or(self.old_count_u32);
-            return old_ref_row.saturating_sub(deleted_le);
+            return old_ref_row
+                .checked_sub(deleted_le)
+                .ok_or_else(|| err("행 참조 재배치 중 row 번호가 0 이하가 되었습니다."));
         }
         if old_ref_row > self.old_data_rows.last {
-            return shift_row(old_ref_row, self.increase, self.decrease);
+            return shift_row(old_ref_row, self.increase, self.decrease, "행 참조 재배치");
         }
-        old_ref_row
+        Ok(old_ref_row)
     }
-    fn shift(&self, row: u32) -> u32 {
-        shift_row(row, self.increase, self.decrease)
+    fn shift(&self, row: u32) -> Result<u32> {
+        shift_row(row, self.increase, self.decrease, "비데이터 행 재배치")
     }
 }
 impl<'source> ChangeRowBuilder<'_, 'source> {
-    fn build(&self) -> Option<ChangeRow<'source>> {
+    fn build(&self) -> Result<Option<ChangeRow<'source>>> {
         let name_changed = !same_trimmed(self.old.name, &self.src.name);
         let brand_changed = !same_trimmed(self.old.brand, &self.src.brand);
-        let self_yn_changed = canon_header(self.old.self_yn) != canon_header(&self.src.self_yn);
+        let self_yn_changed = canon_header(self.old.self_yn)? != canon_header(&self.src.self_yn)?;
         let gas_changed = self.old.gasoline != self.src.gasoline;
         let premium_changed = self.old.premium != self.src.premium;
         let diesel_changed = self.old.diesel != self.src.diesel;
-        (name_changed
+        Ok((name_changed
             || brand_changed
             || self_yn_changed
             || gas_changed
@@ -367,7 +375,7 @@ impl<'source> ChangeRowBuilder<'_, 'source> {
                     old_diesel: self.old.diesel,
                     new_diesel: self.src.diesel,
                 }
-            })
+            }))
     }
 }
 impl DeletedRowsBuilder<'_, '_, '_> {
@@ -407,50 +415,48 @@ impl MasterDataRowsCollector<'_, '_> {
                     source,
                 )
             })?;
-        rows.extend(
-            self.ws
-                .row_numbers_from(self.data_start_row)
-                .filter(|&row| {
-                    let region =
-                        self.ws
-                            .get_display_at(self.layout.region, row, self.shared_strings);
-                    let name = self
-                        .ws
-                        .get_display_at(self.layout.name, row, self.shared_strings);
-                    let addr =
-                        self.ws
-                            .get_display_at(self.layout.address, row, self.shared_strings);
-                    !(region.trim().is_empty() && name.trim().is_empty() && addr.trim().is_empty())
-                }),
-        );
+        for row in self.ws.row_numbers_from(self.data_start_row) {
+            let region =
+                self.ws
+                    .try_get_display_at(self.layout.region, row, self.shared_strings)?;
+            let name = self
+                .ws
+                .try_get_display_at(self.layout.name, row, self.shared_strings)?;
+            let addr = self
+                .ws
+                .try_get_display_at(self.layout.address, row, self.shared_strings)?;
+            if !(region.trim().is_empty() && name.trim().is_empty() && addr.trim().is_empty()) {
+                rows.push(row);
+            }
+        }
         Ok(rows)
     }
 }
 impl<'source> MasterRowEvaluator<'_, '_, 'source> {
-    fn evaluate(&self) -> MasterRowDecision<'source> {
+    fn evaluate(&self) -> Result<MasterRowDecision<'source>> {
         let region_display =
             self.ws
-                .get_display_at(self.layout.region, self.old_row, self.shared_strings);
+                .try_get_display_at(self.layout.region, self.old_row, self.shared_strings)?;
         let name_display =
             self.ws
-                .get_display_at(self.layout.name, self.old_row, self.shared_strings);
+                .try_get_display_at(self.layout.name, self.old_row, self.shared_strings)?;
         let addr_display =
             self.ws
-                .get_display_at(self.layout.address, self.old_row, self.shared_strings);
+                .try_get_display_at(self.layout.address, self.old_row, self.shared_strings)?;
         let region = region_display.trim();
         let name = name_display.trim();
         let addr = addr_display.trim();
         if addr.is_empty() {
-            return MasterRowDecision {
+            return Ok(MasterRowDecision {
                 src: None,
                 matched_key: None,
                 change: None,
                 deleted: None,
-            };
+            });
         }
-        let key = normalize_address_key(addr);
+        let key = normalize_address_key(addr)?;
         let Some((matched_key, src)) = self.source_index.get_key_value(&key) else {
-            return MasterRowDecision {
+            return Ok(MasterRowDecision {
                 src: None,
                 matched_key: None,
                 change: None,
@@ -462,41 +468,41 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
                         self.layout.gasoline,
                         self.old_row,
                         self.shared_strings,
-                    )),
+                    )?),
                     premium: MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
                         self.layout.premium,
                         self.old_row,
                         self.shared_strings,
-                    )),
+                    )?),
                     diesel: MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
                         self.layout.diesel,
                         self.old_row,
                         self.shared_strings,
-                    )),
+                    )?),
                 }),
-            };
+            });
         };
         let old_brand_display =
             self.ws
-                .get_display_at(self.layout.brand, self.old_row, self.shared_strings);
+                .try_get_display_at(self.layout.brand, self.old_row, self.shared_strings)?;
         let old_self_yn_display =
             self.ws
-                .get_display_at(self.layout.self_yn, self.old_row, self.shared_strings);
+                .try_get_display_at(self.layout.self_yn, self.old_row, self.shared_strings)?;
         let old_gas = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.gasoline,
             self.old_row,
             self.shared_strings,
-        ));
+        )?);
         let old_premium = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.premium,
             self.old_row,
             self.shared_strings,
-        ));
+        )?);
         let old_diesel = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.diesel,
             self.old_row,
             self.shared_strings,
-        ));
+        )?);
         let old = ExistingMasterRow {
             brand: old_brand_display.trim(),
             premium: old_premium,
@@ -506,38 +512,50 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
             region,
             self_yn: old_self_yn_display.trim(),
         };
-        let change = ChangeRowBuilder { old: &old, src }.build();
-        MasterRowDecision {
+        let change = ChangeRowBuilder { old: &old, src }.build()?;
+        Ok(MasterRowDecision {
             src: Some(src),
             matched_key: Some(matched_key.as_str()),
             change,
             deleted: None,
-        }
+        })
     }
 }
 impl RebasedNonDataRowsBuilder<'_, '_> {
-    fn build(&self) -> Result<BTreeMap<u32, StdRow>> {
-        let mut new_rows_map = BTreeMap::new();
-        for (row_ref, row_obj) in self.original_rows {
-            let row_num = *row_ref;
+    fn move_rows_into(&mut self, new_rows_map: &mut BTreeMap<u32, StdRow>) -> Result<()> {
+        let mut row_numbers: Vec<u32> = Vec::new();
+        row_numbers
+            .try_reserve_exact(self.original_rows.len())
+            .map_err(|source| {
+                let row_count = self.original_rows.len();
+                err_with_source(
+                    format!("비데이터 행 번호 목록 메모리 확보 실패: {row_count} rows"),
+                    source,
+                )
+            })?;
+        row_numbers.extend(self.original_rows.keys().copied());
+        for row_num in row_numbers {
             if self.old_data_rows.contains(&row_num) {
                 continue;
             }
-            let mut cloned_row = row_obj.clone();
+            let mut row_obj = self
+                .original_rows
+                .remove(&row_num)
+                .ok_or_else(|| err(format!("비데이터 원본 행을 찾지 못했습니다: {row_num}")))?;
             if row_num < self.old_data_rows.start {
-                remap_row_numbers(&mut cloned_row, row_num, &|old_ref_row| {
+                remap_row_numbers(&mut row_obj, row_num, &|old_ref_row| {
                     self.row_mapper.map(old_ref_row)
                 })?;
-                new_rows_map.insert(row_num, cloned_row);
+                new_rows_map.insert(row_num, row_obj);
             } else {
-                let shifted = self.row_mapper.shift(row_num);
-                remap_row_numbers(&mut cloned_row, shifted, &|old_ref_row| {
+                let shifted = self.row_mapper.shift(row_num)?;
+                remap_row_numbers(&mut row_obj, shifted, &|old_ref_row| {
                     self.row_mapper.map(old_ref_row)
                 })?;
-                new_rows_map.insert(shifted, cloned_row);
+                new_rows_map.insert(shifted, row_obj);
             }
         }
-        Ok(new_rows_map)
+        Ok(())
     }
 }
 impl<'source> KeptRowsPlacer<'_, '_, 'source> {
@@ -558,13 +576,12 @@ impl<'source> KeptRowsPlacer<'_, '_, 'source> {
             let new_row = add_row_offset(self.data_start_row, i, "유류비 기존행 재배치")?;
             let mut row_obj = self
                 .original_rows
-                .get(&old_row)
-                .cloned()
+                .remove(&old_row)
                 .unwrap_or_else(|| MasterSheetUpdater::default_row(old_row));
             let old_row_value = old_row;
             let resolver = |old_ref_row: u32| {
                 if old_ref_row == old_row_value {
-                    new_row
+                    Ok(new_row)
                 } else {
                     self.row_mapper.map(old_ref_row)
                 }
@@ -602,15 +619,14 @@ impl<'sources, 'source> NewSourcePlacementPlan<'_, 'sources, 'source> {
                 .checked_add(i)
                 .ok_or_else(|| err("유류비 신규행 오프셋 계산 중 overflow가 발생했습니다."))?;
             let new_row = add_row_offset(data_start_row, offset, "유류비 신규행 추가")?;
-            let mut row_obj = template_row.clone();
             let resolver = |old_ref_row: u32| {
                 if old_ref_row == template_row_num {
-                    new_row
+                    Ok(new_row)
                 } else {
                     row_mapper.map(old_ref_row)
                 }
             };
-            remap_row_numbers(&mut row_obj, new_row, &resolver)?;
+            let row_obj = template_row.copy_for_row(new_row, &resolver)?;
             new_rows_map.insert(new_row, row_obj);
             new_rows_from_sources.push(NewSourcePlacement { new_row, source });
         }
@@ -618,7 +634,7 @@ impl<'sources, 'source> NewSourcePlacementPlan<'_, 'sources, 'source> {
     }
 }
 impl SourceRowsWriter<'_, '_, '_, '_, '_> {
-    fn write(&mut self) {
+    fn write(&mut self) -> Result<()> {
         for plan in self.kept_rows {
             if let Some(src) = plan.src {
                 MasterSheetUpdater::write_master_row_from_source(
@@ -626,57 +642,79 @@ impl SourceRowsWriter<'_, '_, '_, '_, '_> {
                     plan.new_row,
                     src,
                     self.layout,
-                );
+                )?;
             }
         }
         for source_row in self.new_rows_from_sources {
             let new_row = source_row.new_row;
             let src = source_row.source.record;
-            MasterSheetUpdater::write_master_row_from_source(self.ws, new_row, src, self.layout);
+            MasterSheetUpdater::write_master_row_from_source(self.ws, new_row, src, self.layout)?;
             let region_label = source_row.source.region;
             if !region_label.trim().is_empty() {
                 self.ws
-                    .set_string_at(self.layout.region, new_row, region_label);
+                    .set_string_at(self.layout.region, new_row, region_label)?;
             }
         }
+        Ok(())
     }
 }
 impl RankFormulaRangeRewriter<'_> {
-    fn rewrite(&self) -> Option<String> {
-        let sort_key_col_name = excel::writer::col_to_name(self.sort_key_col);
+    fn rewrite(&self) -> Result<Option<String>> {
+        let sort_key_col_name = excel::writer::col_to_name(self.sort_key_col)?;
         let range_marker = format!("${sort_key_col_name}$");
-        let first_col_pos = self.formula.find(&range_marker)?;
-        let start_digits_start = first_col_pos.checked_add(range_marker.len())?;
-        let start_digits_tail = self.formula.get(start_digits_start..)?;
+        let Some(first_col_pos) = self.formula.find(&range_marker) else {
+            return Ok(None);
+        };
+        let Some(start_digits_start) = first_col_pos.checked_add(range_marker.len()) else {
+            return Ok(None);
+        };
+        let Some(start_digits_tail) = self.formula.get(start_digits_start..) else {
+            return Ok(None);
+        };
         let start_digits_len = start_digits_tail
             .chars()
             .take_while(char::is_ascii_digit)
             .count();
         if start_digits_len == 0 {
-            return None;
+            return Ok(None);
         }
-        let second_col_pos = start_digits_start
+        let Some(second_col_pos) = start_digits_start
             .checked_add(start_digits_len)
-            .and_then(|value| value.checked_add(1))?;
-        let second_tail = self.formula.get(second_col_pos..)?;
-        let end_digits_start = second_col_pos.checked_add(range_marker.len())?;
-        let end_digits_tail = second_tail.strip_prefix(range_marker.as_str())?;
+            .and_then(|value| value.checked_add(1))
+        else {
+            return Ok(None);
+        };
+        let Some(second_tail) = self.formula.get(second_col_pos..) else {
+            return Ok(None);
+        };
+        let Some(end_digits_start) = second_col_pos.checked_add(range_marker.len()) else {
+            return Ok(None);
+        };
+        let Some(end_digits_tail) = second_tail.strip_prefix(range_marker.as_str()) else {
+            return Ok(None);
+        };
         let end_digits_len = end_digits_tail
             .chars()
             .take_while(char::is_ascii_digit)
             .count();
         if end_digits_len == 0 {
-            return None;
+            return Ok(None);
         }
-        let end_digits_end = end_digits_start.checked_add(end_digits_len)?;
-        let prefix = self.formula.get(..first_col_pos)?;
-        let suffix = self.formula.get(end_digits_end..)?;
+        let Some(end_digits_end) = end_digits_start.checked_add(end_digits_len) else {
+            return Ok(None);
+        };
+        let Some(prefix) = self.formula.get(..first_col_pos) else {
+            return Ok(None);
+        };
+        let Some(suffix) = self.formula.get(end_digits_end..) else {
+            return Ok(None);
+        };
         let data_start_row = self.data_rows.start;
         let data_end_row = self.data_rows.last;
         let updated = format!(
             "{prefix}${sort_key_col_name}${data_start_row}:${sort_key_col_name}${data_end_row}{suffix}"
         );
-        (updated != self.formula).then_some(updated)
+        Ok((updated != self.formula).then_some(updated))
     }
 }
 impl MasterHeaderResolver<'_> {
@@ -714,7 +752,9 @@ impl MasterHeaderResolver<'_> {
     }
     fn optional(&self, keys: &[&str]) -> Option<u32> {
         for key in keys {
-            let canon = canon_header(key);
+            let Ok(canon) = canon_header(key) else {
+                return None;
+            };
             if let Some(col) = self.headers.get(&canon) {
                 return Some(*col);
             }
@@ -727,15 +767,22 @@ impl MasterHeaderResolver<'_> {
     }
 }
 impl MasterSheetLayoutFinder<'_, '_> {
-    fn collect_row_headers(&self, row: u32, max_cols: u32, headers: &mut HashMap<String, u32>) {
+    fn collect_row_headers(
+        &self,
+        row: u32,
+        max_cols: u32,
+        headers: &mut HashMap<String, u32>,
+    ) -> Result<()> {
         headers.clear();
         for col in 1..=max_cols {
-            let key = canon_header(self.ws.get_display_at(col, row, self.shared_strings).trim());
+            let display = self.ws.try_get_display_at(col, row, self.shared_strings)?;
+            let key = canon_header(display.trim())?;
             if key.is_empty() {
                 continue;
             }
             headers.entry(key).or_insert(col);
         }
+        Ok(())
     }
     fn find(&self) -> Result<MasterSheetPlan> {
         let max_cols = self.ws.max_cell_col().clamp(20, 200);
@@ -749,13 +796,15 @@ impl MasterSheetLayoutFinder<'_, '_> {
             )
         })?;
         for row in 1..=MASTER_HEADER_SCAN_ROWS {
-            self.collect_row_headers(row, max_cols, &mut headers);
+            self.collect_row_headers(row, max_cols, &mut headers)?;
             let resolver = MasterHeaderResolver { headers: &headers };
             if headers.is_empty() || resolver.optional(&["지역화폐적용순위"]).is_none() {
                 continue;
             }
             return Ok(MasterSheetPlan {
-                data_start_row: row.saturating_add(1),
+                data_start_row: row
+                    .checked_add(1)
+                    .ok_or_else(|| err("마스터 데이터 시작 행 계산 중 overflow가 발생했습니다."))?,
                 header_row: row,
                 layout: resolver.layout()?,
             });
@@ -771,32 +820,24 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
         if final_count == 0 {
             return Ok(data_start_row);
         }
+        let row_offset = final_count_u32
+            .checked_sub(1)
+            .ok_or_else(|| err("유류비 마지막 행 offset 계산 중 overflow가 발생했습니다."))?;
         data_start_row
-            .checked_add(final_count_u32.saturating_sub(1))
+            .checked_add(row_offset)
             .ok_or_else(|| err("유류비 마지막 행 계산 중 overflow가 발생했습니다."))
     }
-    fn finish_rebuild(
-        &mut self,
-        header_row: u32,
-        filter_end_row: u32,
-        original_rows: BTreeMap<u32, StdRow>,
-    ) -> Result<FilterTarget> {
-        if let Err(error) = self.ws.update_auto_filter_ref(RowRange {
+    fn finish_rebuild(&mut self, header_row: u32, filter_end_row: u32) -> Result<FilterTarget> {
+        self.ws.update_auto_filter_ref(RowRange {
             start: header_row,
             last: filter_end_row,
-        }) {
-            self.ws.replace_rows(original_rows);
-            return Err(error);
-        }
+        })?;
         let filter_end_col = self
             .ws
             .max_col_in_row(header_row)
             .unwrap_or(1)
             .max(self.ws.max_cell_col());
-        if let Err(error) = self.ws.update_dimension() {
-            self.ws.replace_rows(original_rows);
-            return Err(error);
-        }
+        self.ws.update_dimension()?;
         Ok(FilterTarget {
             data_end_col: filter_end_col,
             data_rows: RowRange {
@@ -812,11 +853,12 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
             layout,
         } = self.plan;
         let old_count = self.old_rows.len();
-        let old_end_row = self
-            .old_rows
-            .last()
-            .copied()
-            .unwrap_or_else(|| data_start_row.saturating_sub(1));
+        let old_end_row = match self.old_rows.last().copied() {
+            Some(row) => row,
+            None => data_start_row
+                .checked_sub(1)
+                .ok_or_else(|| err("기존 유류비 마지막 행 계산 중 overflow가 발생했습니다."))?,
+        };
         let old_data_rows = RowRange {
             start: data_start_row,
             last: old_end_row,
@@ -828,14 +870,7 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
             .checked_add(self.new_sources.len())
             .ok_or_else(|| err("최종 마스터 행 수 계산 중 overflow가 발생했습니다."))?;
         let row_mapper = self.row_mapper(old_count, old_data_rows, final_count)?;
-        let rebuild_result = self.rebuild_rows(&original_rows, &row_mapper, old_data_rows);
-        let rebuilt = match rebuild_result {
-            Ok(values) => values,
-            Err(error) => {
-                self.ws.replace_rows(original_rows);
-                return Err(error);
-            }
-        };
+        let rebuilt = self.rebuild_rows(original_rows, &row_mapper, old_data_rows)?;
         self.ws.replace_rows(rebuilt.new_rows_map);
         SourceRowsWriter {
             kept_rows: &rebuilt.kept_rows,
@@ -843,7 +878,7 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
             new_rows_from_sources: &rebuilt.new_rows_from_sources,
             ws: self.ws,
         }
-        .write();
+        .write()?;
         let final_count_u32 = usize_to_u32(final_count, "최종 유류비 행 수")?;
         let filter_end_row = self.filter_end_row(final_count, final_count_u32)?;
         if final_count > 0 {
@@ -858,41 +893,46 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
             }
             .refresh()?;
         }
-        self.finish_rebuild(header_row, filter_end_row, original_rows)
+        self.finish_rebuild(header_row, filter_end_row)
     }
     fn rebuild_rows(
         &self,
-        original_rows: &BTreeMap<u32, StdRow>,
+        mut original_rows: BTreeMap<u32, StdRow>,
         row_mapper: &RowMapper,
         old_data_rows: RowRange,
     ) -> Result<RebuiltMasterRows<'sources, 'source>> {
         let data_start_row = self.plan.data_start_row;
         let template_row_num = self.old_rows.last().copied().unwrap_or(data_start_row);
+        let fallback_template = (!original_rows.contains_key(&template_row_num))
+            .then(|| MasterSheetUpdater::default_row(template_row_num));
         let template_row = original_rows
             .get(&template_row_num)
-            .cloned()
-            .unwrap_or_else(|| MasterSheetUpdater::default_row(template_row_num));
-        let mut new_rows_map = RebasedNonDataRowsBuilder {
+            .or(fallback_template.as_ref())
+            .ok_or_else(|| err("유류비 신규행 template row 준비에 실패했습니다."))?;
+        let mut new_rows_map = BTreeMap::new();
+        let new_rows_from_sources = {
+            NewSourcePlacementPlan {
+                new_rows_map: &mut new_rows_map,
+                template_row,
+                template_row_num,
+                kept_count: self.kept_source_rows.len(),
+                new_sources: self.new_sources,
+                data_start_row,
+                row_mapper,
+            }
+            .place()?
+        };
+        RebasedNonDataRowsBuilder {
             old_data_rows,
-            original_rows,
+            original_rows: &mut original_rows,
             row_mapper,
         }
-        .build()?;
+        .move_rows_into(&mut new_rows_map)?;
         let kept_rows = KeptRowsPlacer {
             data_start_row,
             kept_source_rows: self.kept_source_rows,
             new_rows_map: &mut new_rows_map,
-            original_rows,
-            row_mapper,
-        }
-        .place()?;
-        let new_rows_from_sources = NewSourcePlacementPlan {
-            new_rows_map: &mut new_rows_map,
-            template_row: &template_row,
-            template_row_num,
-            kept_count: self.kept_source_rows.len(),
-            new_sources: self.new_sources,
-            data_start_row,
+            original_rows: &mut original_rows,
             row_mapper,
         }
         .place()?;
@@ -910,6 +950,21 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
     ) -> Result<RowMapper> {
         let old_count_u32 = usize_to_u32(old_count, "기존 유류비 행 수")?;
         let final_count_u32 = usize_to_u32(final_count, "최종 유류비 행 수")?;
+        let (increase, decrease) = if final_count_u32 >= old_count_u32 {
+            (
+                final_count_u32
+                    .checked_sub(old_count_u32)
+                    .ok_or_else(|| err("유류비 행 증가 수 계산에 실패했습니다."))?,
+                0_u32,
+            )
+        } else {
+            (
+                0_u32,
+                old_count_u32
+                    .checked_sub(final_count_u32)
+                    .ok_or_else(|| err("유류비 행 감소 수 계산에 실패했습니다."))?,
+            )
+        };
         Ok(RowMapper {
             old_data_rows,
             deleted_rows: DeletedRowsBuilder {
@@ -918,49 +973,49 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
             }
             .build()?,
             old_count_u32,
-            increase: final_count_u32.saturating_sub(old_count_u32),
-            decrease: old_count_u32.saturating_sub(final_count_u32),
+            increase,
+            decrease,
         })
     }
 }
 impl RankFormulaCacheBuilder<'_, '_, '_> {
-    fn adjusted_prices(&self, smart_discount: ScaledDecimal) -> AdjustedFuelPrices {
+    fn adjusted_prices(&self, smart_discount: ScaledDecimal) -> Result<AdjustedFuelPrices> {
         let gasoline = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.gasoline,
             self.row,
             self.shared_strings,
-        ));
+        )?);
         let premium = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.premium,
             self.row,
             self.shared_strings,
-        ));
+        )?);
         let diesel = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.diesel,
             self.row,
             self.shared_strings,
-        ));
-        AdjustedFuelPrices {
+        )?);
+        Ok(AdjustedFuelPrices {
             gasoline: MasterSheetUpdater::adjusted_fuel_price(gasoline, smart_discount),
             premium: MasterSheetUpdater::adjusted_fuel_price(premium, smart_discount),
             diesel: MasterSheetUpdater::adjusted_fuel_price(diesel, smart_discount),
-        }
+        })
     }
-    fn build(&self) -> RankFormulaCache {
-        let region = self
-            .ws
-            .get_display_at(self.layout.region, self.row, self.shared_strings);
+    fn build(&self) -> Result<RankFormulaCache> {
+        let region =
+            self.ws
+                .try_get_display_at(self.layout.region, self.row, self.shared_strings)?;
         let name = self
             .ws
-            .get_display_at(self.layout.name, self.row, self.shared_strings);
+            .try_get_display_at(self.layout.name, self.row, self.shared_strings)?;
         let smart_discount = if name.contains("현대오일뱅크") && name.contains("직영") {
             self.sort_context.smart_discount
         } else {
             ScaledDecimal::ZERO
         };
-        let prices = self.adjusted_prices(smart_discount);
+        let prices = self.adjusted_prices(smart_discount)?;
         let total_price = self.total_price(prices);
-        let region_rate = self.region_rate(&region, total_price);
+        let region_rate = self.region_rate(&region, total_price)?;
         let regional_discount = total_price.and_then(|value| {
             value
                 .checked_mul(ScaledSortKey(region_rate.as_i128()))?
@@ -970,11 +1025,11 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
         let rank_total = total_price
             .zip(regional_discount)
             .and_then(|(total, discount)| total.checked_sub(discount));
-        RankFormulaCache {
+        Ok(RankFormulaCache {
             adjusted_diesel: prices.diesel,
             adjusted_gasoline: prices.gasoline,
             adjusted_premium: prices.premium,
-            fuel_total_text: self.fuel_total_text(prices),
+            fuel_total_text: self.fuel_total_text(prices)?,
             rank_total,
             region_rate: total_price.is_some().then_some(region_rate),
             regional_discount,
@@ -986,57 +1041,83 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
             unit_price_without_currency: total_price
                 .zip(self.display_total_qty)
                 .and_then(|(value, qty)| format_unit_price_text(value, qty)),
-        }
+        })
     }
-    fn fuel_total_text(&self, prices: AdjustedFuelPrices) -> Option<String> {
-        self.display_total_qty?;
+    fn fuel_total_text(&self, prices: AdjustedFuelPrices) -> Result<Option<String>> {
+        if self.display_total_qty.is_none() {
+            return Ok(None);
+        }
         let mut parts = String::new();
         if !self.sort_context.gasoline_qty.is_zero() {
-            let total = self
+            let Some(gasoline) = prices.gasoline else {
+                return Ok(None);
+            };
+            let Some(total) = self
                 .sort_context
                 .gasoline_qty
                 .as_i128()
-                .checked_mul(prices.gasoline?.as_i128())?;
+                .checked_mul(gasoline.as_i128())
+            else {
+                return Ok(None);
+            };
             push_joined_text(
                 &mut parts,
                 " / ",
-                &format_fuel_price_text("휘발유", ScaledSortKey(total)),
+                &format_fuel_price_text("휘발유", ScaledSortKey(total))?,
             );
         }
         if !self.sort_context.premium_qty.is_zero() {
-            let total = self
+            let Some(premium) = prices.premium else {
+                return Ok(None);
+            };
+            let Some(total) = self
                 .sort_context
                 .premium_qty
                 .as_i128()
-                .checked_mul(prices.premium?.as_i128())?;
+                .checked_mul(premium.as_i128())
+            else {
+                return Ok(None);
+            };
             push_joined_text(
                 &mut parts,
                 " / ",
-                &format_fuel_price_text("고급유", ScaledSortKey(total)),
+                &format_fuel_price_text("고급유", ScaledSortKey(total))?,
             );
         }
         if !self.sort_context.diesel_qty.is_zero() {
-            let total = self
+            let Some(diesel) = prices.diesel else {
+                return Ok(None);
+            };
+            let Some(total) = self
                 .sort_context
                 .diesel_qty
                 .as_i128()
-                .checked_mul(prices.diesel?.as_i128())?;
+                .checked_mul(diesel.as_i128())
+            else {
+                return Ok(None);
+            };
             push_joined_text(
                 &mut parts,
                 " / ",
-                &format_fuel_price_text("경유", ScaledSortKey(total)),
+                &format_fuel_price_text("경유", ScaledSortKey(total))?,
             );
         }
-        Some(parts)
+        Ok(Some(parts))
     }
-    fn region_rate(&self, region: &str, total_price: Option<ScaledSortKey>) -> ScaledDecimal {
-        let currency_apply = self.layout.currency_apply.is_some_and(|col| {
+    fn region_rate(
+        &self,
+        region: &str,
+        total_price: Option<ScaledSortKey>,
+    ) -> Result<ScaledDecimal> {
+        let currency_apply = if let Some(col) = self.layout.currency_apply {
             self.ws
-                .get_display_at(col, self.row, self.shared_strings)
+                .try_get_display_at(col, self.row, self.shared_strings)?
                 .trim()
                 .eq_ignore_ascii_case("Y")
-        });
-        if currency_apply && total_price.is_some() {
+        } else {
+            false
+        };
+        Ok(if currency_apply && total_price.is_some() {
             self.sort_context
                 .region_rates
                 .get(region.trim())
@@ -1044,7 +1125,7 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
                 .unwrap_or_default()
         } else {
             ScaledDecimal::ZERO
-        }
+        })
     }
     fn total_price(&self, prices: AdjustedFuelPrices) -> Option<ScaledSortKey> {
         self.display_total_qty?;
@@ -1178,7 +1259,7 @@ impl RankFormulaRefresher<'_, '_> {
                     sort_context,
                     display_total_qty,
                 }
-                .build()
+                .build()?
             };
             RankFormulaCacheWriter {
                 ws: self.ws,
@@ -1196,7 +1277,7 @@ impl RankFormulaRefresher<'_, '_> {
     }
     fn refresh_caches(&mut self) -> Result<()> {
         let display_total_qty = MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)
-            .filter(|value| !MasterSheetUpdater::is_zero(*value));
+            .map(|value| value.filter(|qty| !MasterSheetUpdater::is_zero(*qty)))?;
         let sort_context =
             MasterSheetUpdater::build_rank_sort_context(self.ws, self.shared_strings)?;
         self.ws
@@ -1218,12 +1299,15 @@ impl RankFormulaRefresher<'_, '_> {
         visible_rank_totals.extend(rank_totals.iter().filter_map(|entry| entry.total));
         visible_rank_totals.sort_unstable();
         for entry in rank_totals {
-            let rank_text = entry.total.map(|current| {
+            let rank_text = if let Some(current) = entry.total {
                 let rank = visible_rank_totals
                     .partition_point(|value| *value < current)
-                    .saturating_add(1);
-                rank.to_string()
-            });
+                    .checked_add(1)
+                    .ok_or_else(|| err("지역화폐 순위 계산 중 overflow가 발생했습니다."))?;
+                Some(rank.to_string())
+            } else {
+                None
+            };
             self.ws.set_formula_cached_value_at(
                 self.layout.rank,
                 entry.row,
@@ -1238,16 +1322,16 @@ impl RankFormulaRefresher<'_, '_> {
             return Ok(());
         };
         for row in self.data_rows {
-            let Some(formula) = self.ws.get_formula_at(self.layout.rank, row) else {
+            let Some(formula) = self.ws.try_get_formula_at(self.layout.rank, row)? else {
                 continue;
             };
-            if let Some(updated) = (RankFormulaRangeRewriter {
+            let rewrite_result = RankFormulaRangeRewriter {
                 formula: formula.as_ref(),
                 sort_key_col,
                 data_rows: self.data_rows,
             }
-            .rewrite())
-            {
+            .rewrite()?;
+            if let Some(updated) = rewrite_result {
                 self.ws.set_formula_at(self.layout.rank, row, &updated)?;
             }
         }
@@ -1293,8 +1377,10 @@ impl RankRowsSorter<'_, '_> {
                 .and_then(Option::take)
                 .ok_or_else(|| missing_sort_target_row_error(old_row))?;
             remap_row_numbers(&mut row, new_row, &|old_ref_row| {
-                mapped_contiguous_row(row_mapping, self.data_rows.start, old_ref_row)
-                    .unwrap_or(old_ref_row)
+                Ok(
+                    mapped_contiguous_row(row_mapping, self.data_rows.start, old_ref_row)
+                        .unwrap_or(old_ref_row),
+                )
             })?;
             self.ws.insert_row(new_row, row);
         }
@@ -1363,7 +1449,7 @@ impl RankRowsSorter<'_, '_> {
                 layout: self.layout,
                 sort_context,
             }
-            .build();
+            .build()?;
             data_rows.push(SortableRankRow {
                 row: row_num,
                 key: sort_key,
@@ -1391,31 +1477,31 @@ impl RankRowsSorter<'_, '_> {
     }
 }
 impl RankSortKeyBuilder<'_, '_, '_> {
-    fn build(&self) -> RankSortKey {
-        let region = self
-            .ws
-            .get_display_at(self.layout.region, self.row, self.shared_strings);
+    fn build(&self) -> Result<RankSortKey> {
+        let region =
+            self.ws
+                .try_get_display_at(self.layout.region, self.row, self.shared_strings)?;
         let name = self
             .ws
-            .get_display_at(self.layout.name, self.row, self.shared_strings);
-        let address = self
-            .ws
-            .get_display_at(self.layout.address, self.row, self.shared_strings);
+            .try_get_display_at(self.layout.name, self.row, self.shared_strings)?;
+        let address =
+            self.ws
+                .try_get_display_at(self.layout.address, self.row, self.shared_strings)?;
         let gasoline = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.gasoline,
             self.row,
             self.shared_strings,
-        ));
+        )?);
         let premium = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.premium,
             self.row,
             self.shared_strings,
-        ));
+        )?);
         let diesel = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
             self.layout.diesel,
             self.row,
             self.shared_strings,
-        ));
+        )?);
         let is_direct_hyundai = name.contains("현대오일뱅크") && name.contains("직영");
         let discount = if is_direct_hyundai {
             self.sort_context.smart_discount
@@ -1425,12 +1511,14 @@ impl RankSortKeyBuilder<'_, '_, '_> {
         let adjusted_gasoline = MasterSheetUpdater::adjusted_fuel_price(gasoline, discount);
         let adjusted_premium = MasterSheetUpdater::adjusted_fuel_price(premium, discount);
         let adjusted_diesel = MasterSheetUpdater::adjusted_fuel_price(diesel, discount);
-        let currency_apply = self.layout.currency_apply.is_some_and(|col| {
+        let currency_apply = if let Some(col) = self.layout.currency_apply {
             self.ws
-                .get_display_at(col, self.row, self.shared_strings)
+                .try_get_display_at(col, self.row, self.shared_strings)?
                 .trim()
                 .eq_ignore_ascii_case("Y")
-        });
+        } else {
+            false
+        };
         let region_rate = if currency_apply {
             self.sort_context
                 .region_rates
@@ -1440,7 +1528,9 @@ impl RankSortKeyBuilder<'_, '_, '_> {
         } else {
             ScaledDecimal::ZERO
         };
-        let region_multiplier = DECIMAL_SCALE.saturating_sub(region_rate);
+        let region_multiplier = DECIMAL_SCALE
+            .checked_sub(region_rate)
+            .ok_or_else(|| err("지역 보정률이 100%를 초과했습니다."))?;
         let regional_adjusted_gasoline = adjusted_gasoline
             .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
             .map(ScaledSortKey);
@@ -1472,7 +1562,7 @@ impl RankSortKeyBuilder<'_, '_, '_> {
                 .filter(|value| *value != ScaledSortKey::ZERO)
             }
         });
-        RankSortKey {
+        Ok(RankSortKey {
             has_rank_total: rank_total.is_some(),
             rank_total: rank_total.unwrap_or(ScaledSortKey::MAX),
             gasoline: MasterSheetUpdater::fuel_sort_value(regional_adjusted_gasoline),
@@ -1481,7 +1571,7 @@ impl RankSortKeyBuilder<'_, '_, '_> {
             region: region.into_owned(),
             name: name.into_owned(),
             address: address.into_owned(),
-        }
+        })
     }
 }
 impl RankSortRefresher<'_, '_> {
@@ -1515,23 +1605,24 @@ impl<'source> MasterSheetUpdater<'source> {
         ws: &excel::writer::Worksheet,
         shared_strings: &[String],
     ) -> Result<RankSortContext> {
-        let gasoline_qty = Self::get_f64_at(ws, 2, 4, shared_strings).unwrap_or_default();
-        let premium_qty = Self::get_f64_at(ws, 2, 5, shared_strings).unwrap_or_default();
-        let diesel_qty = Self::get_f64_at(ws, 2, 6, shared_strings).unwrap_or_default();
+        let gasoline_qty = Self::get_f64_at(ws, 2, 4, shared_strings)?.unwrap_or_default();
+        let premium_qty = Self::get_f64_at(ws, 2, 5, shared_strings)?.unwrap_or_default();
+        let diesel_qty = Self::get_f64_at(ws, 2, 6, shared_strings)?.unwrap_or_default();
         let mut region_rates = HashMap::new();
         region_rates.try_reserve(10).map_err(|source| {
             err_with_source("지역 보정률 맵 메모리 확보 실패: 10 regions", source)
         })?;
         for row in 4..=13 {
-            let region = ws.get_display_at(3, row, shared_strings).trim().to_owned();
+            let region_display = ws.try_get_display_at(3, row, shared_strings)?;
+            let region = region_display.trim();
             if region.is_empty() {
                 continue;
             }
-            if let Some(rate) = Self::get_f64_at(ws, 4, row, shared_strings) {
-                region_rates.insert(region, rate);
+            if let Some(rate) = Self::get_f64_at(ws, 4, row, shared_strings)? {
+                region_rates.insert(region.to_owned(), rate);
             }
         }
-        let total_qty = Self::get_f64_at(ws, 2, 10, shared_strings)
+        let total_qty = Self::get_f64_at(ws, 2, 10, shared_strings)?
             .filter(|value| !Self::is_zero(*value))
             .or_else(|| {
                 let derived_total = gasoline_qty
@@ -1544,7 +1635,7 @@ impl<'source> MasterSheetUpdater<'source> {
             premium_qty,
             diesel_qty,
             total_qty,
-            smart_discount: Self::get_f64_at(ws, 2, 13, shared_strings).unwrap_or_default(),
+            smart_discount: Self::get_f64_at(ws, 2, 13, shared_strings)?.unwrap_or_default(),
             region_rates,
         })
     }
@@ -1676,7 +1767,7 @@ impl<'source> MasterSheetUpdater<'source> {
                 source_index: self.source_index,
                 ws,
             }
-            .evaluate();
+            .evaluate()?;
             if let Some(row) = deleted_row {
                 deleted.push(row);
                 continue;
@@ -1707,11 +1798,11 @@ impl<'source> MasterSheetUpdater<'source> {
         col: u32,
         row: u32,
         shared_strings: &[String],
-    ) -> Option<ScaledDecimal> {
-        let display_text = ws.get_display_at(col, row, shared_strings);
+    ) -> Result<Option<ScaledDecimal>> {
+        let display_text = ws.try_get_display_at(col, row, shared_strings)?;
         let trimmed = display_text.trim();
         if trimmed.is_empty() || trimmed == "-" {
-            return None;
+            return Ok(None);
         }
         let normalized_storage;
         let normalized = if trimmed.contains(',') {
@@ -1722,21 +1813,45 @@ impl<'source> MasterSheetUpdater<'source> {
         };
         let (sign, digits) = split_negative_prefix(normalized, 1_i64, -1_i64);
         let (whole_text, fraction_text) = digits.split_once('.').unwrap_or((digits, ""));
-        let whole = whole_text.parse::<i64>().ok()?;
+        let Some(whole) = whole_text.parse::<i64>().ok() else {
+            return Ok(None);
+        };
         let mut fraction = 0_i64;
         let mut fraction_digit_count = 0_u8;
         for digit_byte in fraction_text.bytes().filter(u8::is_ascii_digit).take(6) {
-            let digit = i64::from(digit_byte.checked_sub(b'0')?);
-            fraction = fraction.checked_mul(10)?.checked_add(digit)?;
-            fraction_digit_count = fraction_digit_count.checked_add(1)?;
+            let Some(digit_raw) = digit_byte.checked_sub(b'0') else {
+                return Ok(None);
+            };
+            let digit = i64::from(digit_raw);
+            let Some(next_fraction) = fraction
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(digit))
+            else {
+                return Ok(None);
+            };
+            fraction = next_fraction;
+            let Some(next_digit_count) = fraction_digit_count.checked_add(1) else {
+                return Ok(None);
+            };
+            fraction_digit_count = next_digit_count;
         }
         while fraction_digit_count < 6 {
-            fraction = fraction.checked_mul(10)?;
-            fraction_digit_count = fraction_digit_count.checked_add(1)?;
+            let Some(next_fraction) = fraction.checked_mul(10) else {
+                return Ok(None);
+            };
+            fraction = next_fraction;
+            let Some(next_digit_count) = fraction_digit_count.checked_add(1) else {
+                return Ok(None);
+            };
+            fraction_digit_count = next_digit_count;
         }
-        let whole_scaled = whole.checked_mul(DECIMAL_SCALE.as_i64())?;
-        let combined = whole_scaled.checked_add(fraction)?;
-        combined.checked_mul(sign).map(ScaledDecimal)
+        let Some(whole_scaled) = whole.checked_mul(DECIMAL_SCALE.as_i64()) else {
+            return Ok(None);
+        };
+        let Some(combined) = whole_scaled.checked_add(fraction) else {
+            return Ok(None);
+        };
+        Ok(combined.checked_mul(sign).map(ScaledDecimal))
     }
     const fn is_zero(value: ScaledDecimal) -> bool {
         value.is_zero()
@@ -1744,10 +1859,7 @@ impl<'source> MasterSheetUpdater<'source> {
     fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
         value.filter(|price| *price > 0_i32)
     }
-    pub(super) fn update(
-        &self,
-        book: &mut StdWorkbook,
-    ) -> Result<MasterSheetUpdateResult<'source>> {
+    pub fn update(&self, book: &mut StdWorkbook) -> Result<MasterSheetUpdateResult<'source>> {
         let Some(outcome_result) =
             book.with_sheet_mut("유류비", |ws, shared_strings| -> Result<_> {
                 let plan = MasterSheetLayoutFinder { shared_strings, ws }.find()?;
@@ -1795,7 +1907,7 @@ impl<'source> MasterSheetUpdater<'source> {
             data_rows,
             data_end_col,
         }
-        .update();
+        .update()?;
         Ok(MasterSheetUpdateResult {
             added: outcome.added,
             changes: outcome.changes,
@@ -1807,14 +1919,15 @@ impl<'source> MasterSheetUpdater<'source> {
         row: u32,
         src: &SourceRecord,
         layout: MasterSheetLayout,
-    ) {
-        ws.set_string_at(layout.name, row, &src.name);
-        ws.set_string_at(layout.brand, row, &src.brand);
-        ws.set_string_at(layout.self_yn, row, &src.self_yn);
-        ws.set_string_at(layout.address, row, &src.address);
-        ws.set_i32_at(layout.gasoline, row, src.gasoline);
-        ws.set_i32_at(layout.premium, row, src.premium);
-        ws.set_i32_at(layout.diesel, row, src.diesel);
+    ) -> Result<()> {
+        ws.set_string_at(layout.name, row, &src.name)?;
+        ws.set_string_at(layout.brand, row, &src.brand)?;
+        ws.set_string_at(layout.self_yn, row, &src.self_yn)?;
+        ws.set_string_at(layout.address, row, &src.address)?;
+        ws.set_i32_at(layout.gasoline, row, src.gasoline)?;
+        ws.set_i32_at(layout.premium, row, src.premium)?;
+        ws.set_i32_at(layout.diesel, row, src.diesel)?;
+        Ok(())
     }
 }
 fn row_range_len(rows: RowRange, context: &'static str) -> Result<usize> {
@@ -1838,9 +1951,72 @@ fn mapped_contiguous_row(
     let index = usize::try_from(offset).ok()?;
     row_mapping.get(index).copied().flatten()
 }
+fn canon_header(text: &str) -> Result<String> {
+    let mut out = String::new();
+    out.try_reserve(text.len())
+        .map_err(|source| err_with_source("header 정규화 메모리 확보 실패", source))?;
+    out.extend(text.chars().filter(|ch| !ch.is_whitespace()));
+    Ok(out)
+}
+fn parse_region_label(text: &str) -> Option<&str> {
+    let mut tokens = text.split_whitespace();
+    let first = tokens.next()?;
+    let second = tokens.next();
+    if let Some(label) = REGION_LABEL_SUFFIXES
+        .iter()
+        .filter_map(|suffix| first.strip_suffix(suffix))
+        .find(|label| !label.is_empty())
+    {
+        return Some(label);
+    }
+    if first.ends_with('도')
+        || matches!(
+            first,
+            "충남" | "충북" | "경기" | "강원" | "전북" | "전남" | "경북" | "경남" | "제주"
+        )
+    {
+        return second.map(|token| strip_basic_region_suffix(token).unwrap_or(token));
+    }
+    if matches!(
+        first,
+        "서울" | "부산" | "대구" | "인천" | "광주" | "대전" | "울산" | "세종"
+    ) {
+        return Some(first);
+    }
+    match strip_basic_region_suffix(first) {
+        Some(label) => Some(label),
+        None if second.is_none() => Some(first),
+        None => None,
+    }
+}
 fn push_joined_text(out: &mut String, separator: &str, value: &str) {
     if !out.is_empty() {
         out.push_str(separator);
     }
     out.push_str(value);
+}
+fn same_trimmed(left: &str, right: &str) -> bool {
+    left.trim() == right.trim()
+}
+fn shift_row(row: u32, increase: u32, decrease: u32, context: &str) -> Result<u32> {
+    if increase > 0 {
+        row.checked_add(increase).ok_or_else(|| {
+            err(format!(
+                "{context} 중 행 번호 overflow가 발생했습니다. ({row} + {increase})"
+            ))
+        })
+    } else {
+        row.checked_sub(decrease)
+            .filter(|shifted| *shifted >= 1)
+            .ok_or_else(|| {
+                err(format!(
+                    "{context} 중 행 번호가 1보다 작아졌습니다. ({row} - {decrease})"
+                ))
+            })
+    }
+}
+fn strip_basic_region_suffix(token: &str) -> Option<&str> {
+    token
+        .strip_suffix(['시', '군', '구'])
+        .filter(|label| !label.is_empty())
 }

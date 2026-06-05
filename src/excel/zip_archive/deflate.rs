@@ -1,8 +1,3 @@
-use self::{
-    bit_io::{BitReader, BitWriter},
-    huffman::{Huffman, HuffmanCode, WriteHuffman},
-    token::{CodeLengthToken, DeflateToken, HuffmanBuildNode, HuffmanLeafLength},
-};
 use super::{
     CODE_LENGTH_ORDER, CODE_LENGTH_SYMBOLS, DEFLATE_MAX_BITS, DEFLATE_MAX_BITS_U8, DISTANCE_BASES,
     DISTANCE_EXTRA_BITS, DISTANCE_SYMBOLS, FIXED_DISTANCE_SYMBOLS, FIXED_LITERAL_SYMBOLS,
@@ -11,57 +6,6 @@ use super::{
 };
 use alloc::vec::Vec;
 use core::{array::from_fn, cmp::Ordering, iter::repeat_n, range::Range};
-mod bit_io {
-    use alloc::vec::Vec;
-    pub(super) struct BitReader<'bytes> {
-        pub bit_buffer: u32,
-        pub bit_count: u8,
-        pub bytes: &'bytes [u8],
-        pub cursor: usize,
-    }
-    pub(super) struct BitWriter {
-        pub bit_buffer: u8,
-        pub bit_count: u8,
-        pub bytes: Vec<u8>,
-    }
-}
-mod huffman {
-    use super::DEFLATE_MAX_BITS;
-    use alloc::vec::Vec;
-    pub(super) struct Huffman {
-        pub codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1],
-    }
-    pub(super) struct WriteHuffman {
-        pub codes: Vec<u16>,
-        pub lengths: Vec<u8>,
-    }
-    pub(super) struct HuffmanCode {
-        pub code: u16,
-        pub symbol: u16,
-    }
-}
-mod token {
-    #[derive(Clone, Copy)]
-    pub(super) enum DeflateToken {
-        Literal(u8),
-        Match { distance: usize, length: usize },
-    }
-    #[derive(Clone, Copy)]
-    pub(super) struct CodeLengthToken {
-        pub extra: u16,
-        pub extra_bits: u8,
-        pub symbol: u8,
-    }
-    pub(super) struct HuffmanBuildNode {
-        pub freq: u64,
-        pub parent: Option<usize>,
-    }
-    pub(super) struct HuffmanLeafLength {
-        pub freq: u32,
-        pub len: usize,
-        pub symbol: usize,
-    }
-}
 const TOO_FAR_MATCH_DISTANCE: usize = 4096;
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 const XML_NICE_MATCH_LEN: usize = 128;
@@ -74,6 +18,48 @@ const XLSX_XML_NEEDLES: [&[u8]; 7] = [
     b"<Types",
     b"schemas.openxmlformats.org",
 ];
+struct BitReader<'bytes> {
+    bit_buffer: u32,
+    bit_count: u8,
+    bytes: &'bytes [u8],
+    cursor: usize,
+}
+struct BitWriter {
+    bit_buffer: u8,
+    bit_count: u8,
+    bytes: Vec<u8>,
+}
+struct Huffman {
+    codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1],
+}
+struct WriteHuffman {
+    codes: Vec<u16>,
+    lengths: Vec<u8>,
+}
+struct HuffmanCode {
+    code: u16,
+    symbol: u16,
+}
+#[derive(Clone, Copy)]
+enum DeflateToken {
+    Literal(u8),
+    Match { distance: usize, length: usize },
+}
+#[derive(Clone, Copy)]
+struct CodeLengthToken {
+    extra: u16,
+    extra_bits: u8,
+    symbol: u8,
+}
+struct HuffmanBuildNode {
+    freq: u64,
+    parent: Option<usize>,
+}
+struct HuffmanLeafLength {
+    freq: u32,
+    len: usize,
+    symbol: usize,
+}
 pub(super) struct DeflateInflater<'bytes> {
     pub bytes: &'bytes [u8],
     pub expected_len: usize,
@@ -878,7 +864,7 @@ impl DynamicTokenWriter<'_, '_> {
     }
 }
 impl FixedDeflateWriter<'_> {
-    fn deflate(&self) -> ZipResult<Vec<u8>> {
+    pub(super) fn deflate(&self) -> ZipResult<Vec<u8>> {
         let mut writer =
             BitWriter::with_capacity(self.byte_len.saturating_div(2), "deflate fixed 출력")?;
         writer.write_bits(1, 1);

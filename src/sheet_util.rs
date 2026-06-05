@@ -1,4 +1,4 @@
-use crate::{Result, err, err_with_source};
+use crate::diagnostic::{Result, err, err_with_source};
 const EXPONENT_BIAS: i32 = 1_023;
 const EXPONENT_MASK: u64 = 0x07ff;
 const FRACTION_BITS: u32 = 52;
@@ -6,12 +6,6 @@ const FRACTION_MASK: u64 = (1_u64 << FRACTION_BITS) - 1;
 const I32_MIN_F64: f64 = -2_147_483_648.0;
 const I32_MAX_F64: f64 = 2_147_483_647.0;
 const SIGNIFICAND_HIDDEN_BIT: u64 = 1_u64 << FRACTION_BITS;
-pub fn canon_header(text: &str) -> String {
-    text.chars().filter(|ch| !ch.is_whitespace()).collect()
-}
-pub fn same_trimmed(left: &str, right: &str) -> bool {
-    left.trim() == right.trim()
-}
 pub fn parse_i32_str(text: &str) -> Option<i32> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed == "-" {
@@ -63,13 +57,6 @@ pub fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
         let out = format!("{context} 값이 너무 큽니다. (value={value})");
         err_with_source(out, source)
     })
-}
-pub fn shift_row(row: u32, increase: u32, decrease: u32) -> u32 {
-    if increase > 0 {
-        row.saturating_add(increase)
-    } else {
-        row.saturating_sub(decrease).max(1)
-    }
 }
 pub fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
     let offset_u32 = usize_to_u32(offset, context)?;

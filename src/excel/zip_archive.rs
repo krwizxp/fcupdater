@@ -1,10 +1,14 @@
-use super::ZipArchiveExtractor;
-use crate::{Result, err, path_pair_source_message, path_source_message, prefixed_message};
+use super::{ZipArchiveExtractor, path_util::path_to_slashes};
+use crate::diagnostic::{
+    AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
+};
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use core::{fmt, range::Range, result::Result as CoreResult, str};
+use core::{error::Error, fmt, range::Range, result::Result as CoreResult, str};
 use std::{
-    fs,
-    path::{Component, Path, PathBuf},
+    collections::HashSet,
+    fs::{self, File},
+    io::Read as _,
+    path::{Path, PathBuf},
 };
 mod deflate;
 mod write;
@@ -303,6 +307,7 @@ const ZIP_MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 const ZIP_UNSAFE_PATH_MESSAGE: &str = "허용되지 않은 압축 경로가 포함되어 있습니다";
+const ZIP_READ_CHUNK_BYTES: usize = 8 * 1024;
 const LENGTH_BASES: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
@@ -362,16 +367,12 @@ struct HeaderSplit<'bytes, const LEN: usize> {
     header: &'bytes [u8; LEN],
     tail: &'bytes [u8],
 }
-impl AsRef<str> for ZipError {
-    fn as_ref(&self) -> &str {
-        self.0.as_ref()
-    }
-}
 impl fmt::Display for ZipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0.as_ref())
     }
 }
+impl Error for ZipError {}
 impl From<Cow<'static, str>> for ZipError {
     fn from(value: Cow<'static, str>) -> Self {
         Self(value)
@@ -387,7 +388,7 @@ impl From<&'static str> for ZipError {
         Self(Cow::Borrowed(value))
     }
 }
-impl From<ZipError> for crate::AppError {
+impl From<ZipError> for AppError {
     fn from(value: ZipError) -> Self {
         Self::from(value.0)
     }
@@ -395,13 +396,13 @@ impl From<ZipError> for crate::AppError {
 impl ZipEntry<'_> {
     fn data<'bytes>(&self, bytes: &'bytes [u8], expected_len: usize) -> Result<Cow<'bytes, [u8]>> {
         let local_offset = usize::try_from(self.local_header_offset)
-            .map_err(|source| err(format!("ZIP local header offset 변환 실패: {source}")))?;
+            .map_err(|source| err_with_source("ZIP local header offset 변환 실패", source))?;
         let local_split = split_header_at::<LOCAL_FILE_HEADER_LEN>(
             bytes,
             local_offset,
             ZIP_BAD_LOCAL_HEADER_MESSAGE,
         )
-        .map_err(|source| err(zip_entry_message(source.as_ref(), self.name)))?;
+        .map_err(|source| err(zip_entry_message(source.0.as_ref(), self.name)))?;
         let local_header = local_split.header;
         let local_tail = local_split.tail;
         if read_u32(local_header, 0)? != LOCAL_FILE_HEADER_SIGNATURE {
@@ -409,11 +410,21 @@ impl ZipEntry<'_> {
         }
         let name_len = usize::from(read_u16(local_header, 26)?);
         let extra_len = usize::from(read_u16(local_header, 28)?);
+        let local_name = local_tail
+            .get(..name_len)
+            .ok_or_else(|| zip_static("ZIP local header 이름 범위 오류"))?;
+        if local_name != self.name.as_bytes() {
+            return Err(zip_entry_message(
+                "ZIP local header 이름이 중앙 디렉터리와 다릅니다",
+                self.name,
+            )
+            .into());
+        }
         let data_start = name_len
             .checked_add(extra_len)
             .ok_or_else(|| zip_static("ZIP data offset 계산 실패"))?;
         let compressed_len = usize::try_from(self.compressed_size)
-            .map_err(|source| err(format!("ZIP 압축 크기 변환 실패: {source}")))?;
+            .map_err(|source| err_with_source("ZIP 압축 크기 변환 실패", source))?;
         let compressed_span = Range {
             start: data_start,
             end: data_start
@@ -442,7 +453,7 @@ impl ZipEntry<'_> {
         if output.len() != expected_len {
             return Err(zip_entry_message(ZIP_BAD_SIZE_MESSAGE, self.name).into());
         }
-        if crc32(output.as_ref()) != self.crc32 {
+        if crc32(output.as_ref())? != self.crc32 {
             return Err(zip_entry_message(ZIP_BAD_CRC_MESSAGE, self.name).into());
         }
         Ok(output)
@@ -521,7 +532,7 @@ impl ZipCentralDirectory<'_> {
             return Err(zip_static("ZIP entry 이름이 파일 범위를 벗어났습니다.").into());
         };
         let name = str::from_utf8(name_bytes)
-            .map_err(|source| err(format!("ZIP entry 이름이 UTF-8이 아닙니다: {source}")))?;
+            .map_err(|source| err_with_source("ZIP entry 이름이 UTF-8이 아닙니다", source))?;
         self.cursor = next_cursor;
         self.remaining_entries = self
             .remaining_entries
@@ -543,12 +554,19 @@ impl ZipArchiveExtractor<'_> {
         if bytes.len() < END_OF_CENTRAL_DIRECTORY_LEN {
             return Err(zip_static("ZIP 파일이 너무 짧습니다.").into());
         }
-        let min_offset = bytes
+        let search_window = END_OF_CENTRAL_DIRECTORY_LEN
+            .checked_add(ZIP_COMMENT_MAX_LEN)
+            .ok_or_else(|| zip_static("ZIP EOCD 최대 검색 범위 계산 실패"))?;
+        let min_offset = bytes.len().saturating_sub(search_window);
+        let max_offset = bytes
             .len()
-            .saturating_sub(END_OF_CENTRAL_DIRECTORY_LEN.saturating_add(ZIP_COMMENT_MAX_LEN));
-        let max_offset = bytes.len().saturating_sub(END_OF_CENTRAL_DIRECTORY_LEN);
+            .checked_sub(END_OF_CENTRAL_DIRECTORY_LEN)
+            .ok_or_else(|| zip_static("ZIP EOCD 최대 offset 계산 실패"))?;
+        let search_end = max_offset
+            .checked_add(4_usize)
+            .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 계산 실패"))?;
         let search_bytes = bytes
-            .get(min_offset..max_offset.saturating_add(4_usize))
+            .get(min_offset..search_end)
             .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 오류"))?;
         let eocd_signature = END_OF_CENTRAL_DIRECTORY_SIGNATURE.to_le_bytes();
         let mut search_len = search_bytes.len();
@@ -562,7 +580,9 @@ impl ZipArchiveExtractor<'_> {
             else {
                 return Err(zip_static("ZIP EOCD를 찾지 못했습니다.").into());
             };
-            let offset = min_offset.saturating_add(relative_offset);
+            let offset = min_offset
+                .checked_add(relative_offset)
+                .ok_or_else(|| zip_static("ZIP EOCD offset 계산 실패"))?;
             let eocd = split_header_at::<END_OF_CENTRAL_DIRECTORY_LEN>(
                 bytes.as_slice(),
                 offset,
@@ -579,10 +599,17 @@ impl ZipArchiveExtractor<'_> {
             }
             search_len = relative_offset;
         };
+        let disk_no = read_u16(eocd, 4)?;
+        let central_dir_start_disk = read_u16(eocd, 6)?;
+        let entries_this_disk = read_u16(eocd, 8)?;
+        let entries_total = read_u16(eocd, 10)?;
+        if disk_no != 0 || central_dir_start_disk != 0 || entries_this_disk != entries_total {
+            return Err(zip_static("분할 ZIP archive는 지원하지 않습니다.").into());
+        }
         let central_dir_size = usize::try_from(read_u32(eocd, 12)?)
-            .map_err(|source| err(format!("ZIP 중앙 디렉터리 크기 변환 실패: {source}")))?;
+            .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
         let central_dir_offset = usize::try_from(read_u32(eocd, 16)?)
-            .map_err(|source| err(format!("ZIP 중앙 디렉터리 offset 변환 실패: {source}")))?;
+            .map_err(|source| err_with_source("ZIP 중앙 디렉터리 offset 변환 실패", source))?;
         let central_dir_end = central_dir_offset
             .checked_add(central_dir_size)
             .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 범위 계산 실패"))?;
@@ -593,58 +620,89 @@ impl ZipArchiveExtractor<'_> {
             bytes: bytes.as_slice(),
             cursor: central_dir_offset,
             end: central_dir_end,
-            remaining_entries: usize::from(read_u16(eocd, 10)?),
+            remaining_entries: usize::from(entries_total),
         };
         let mut total_uncompressed = 0_usize;
-        while let Some(entry) = central_directory.next_entry()? {
-            let entry_name = entry.name;
-            let is_dir = entry_name.ends_with('/');
-            let relative_path = entry.relative_path()?;
-            if is_dir {
-                let dir_path = self.unpack_dir.join(&relative_path);
-                create_zip_dir(&dir_path, "xlsx 압축 폴더 생성 실패")?;
-                continue;
-            }
-            let entry_path = self.unpack_dir.join(relative_path);
-            if let Some(parent) = entry_path.parent() {
-                create_zip_dir(parent, "xlsx 압축 해제 폴더 생성 실패")?;
-            }
-            let expected_len = usize::try_from(entry.uncompressed_size)
-                .map_err(|source| err(format!("ZIP 해제 크기 변환 실패: {source}")))?;
-            ensure_zip_size_limit(
-                "entry 해제",
-                expected_len,
-                ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
-                entry_name,
-            )?;
-            total_uncompressed = total_uncompressed
-                .checked_add(expected_len)
-                .ok_or_else(|| zip_static("ZIP 전체 해제 크기 계산 실패"))?;
-            ensure_zip_size_limit(
-                "전체 해제",
-                total_uncompressed,
-                ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES,
-                entry_name,
-            )?;
-            let data = entry.data(bytes.as_slice(), expected_len)?;
-            fs::write(&entry_path, data.as_ref()).map_err(|source_err| {
-                err(path_pair_source_message(
-                    "xlsx 압축 해제 파일 쓰기 실패",
-                    self.archive_path,
-                    &entry_path,
-                    source_err,
-                ))
+        let mut seen_paths = HashSet::new();
+        seen_paths
+            .try_reserve(usize::from(entries_total))
+            .map_err(|source| {
+                err_with_source("ZIP entry path 방문 집합 메모리 확보 실패", source)
             })?;
+        while let Some(entry) = central_directory.next_entry()? {
+            let relative_path = entry.relative_path()?;
+            if seen_paths.contains(&relative_path) {
+                return Err(err(format!(
+                    "ZIP 중복 entry 경로가 있습니다: {}",
+                    entry.name
+                )));
+            }
+            total_uncompressed =
+                self.extract_entry(bytes.as_slice(), &entry, &relative_path, total_uncompressed)?;
+            seen_paths.insert(relative_path);
         }
         Ok(())
     }
-    fn read_archive_bytes(&self) -> Result<Vec<u8>> {
-        let metadata = fs::metadata(self.archive_path).map_err(|source_err| {
-            err(path_source_message(
-                "xlsx 압축 파일 정보 확인 실패",
-                self.archive_path,
+    fn extract_entry(
+        &self,
+        bytes: &[u8],
+        entry: &ZipEntry<'_>,
+        relative_path: &Path,
+        total_uncompressed: usize,
+    ) -> Result<usize> {
+        let entry_name = entry.name;
+        let is_dir = entry_name.ends_with('/');
+        if is_dir {
+            let dir_path = self.unpack_dir.join(relative_path);
+            create_zip_dir(&dir_path, "xlsx 압축 폴더 생성 실패")?;
+            return Ok(total_uncompressed);
+        }
+        let entry_path = self.unpack_dir.join(relative_path);
+        if let Some(parent) = entry_path.parent() {
+            create_zip_dir(parent, "xlsx 압축 해제 폴더 생성 실패")?;
+        }
+        let expected_len = usize::try_from(entry.uncompressed_size)
+            .map_err(|source| err_with_source("ZIP 해제 크기 변환 실패", source))?;
+        ensure_zip_size_limit(
+            "entry 해제",
+            expected_len,
+            ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
+            entry_name,
+        )?;
+        let next_total_uncompressed = total_uncompressed
+            .checked_add(expected_len)
+            .ok_or_else(|| zip_static("ZIP 전체 해제 크기 계산 실패"))?;
+        ensure_zip_size_limit(
+            "전체 해제",
+            next_total_uncompressed,
+            ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES,
+            entry_name,
+        )?;
+        let data = entry.data(bytes, expected_len)?;
+        fs::write(&entry_path, data.as_ref()).map_err(|source_err| {
+            err_with_source(
+                path_pair_context_message(
+                    "xlsx 압축 해제 파일 쓰기 실패",
+                    self.archive_path,
+                    &entry_path,
+                ),
                 source_err,
-            ))
+            )
+        })?;
+        Ok(next_total_uncompressed)
+    }
+    fn read_archive_bytes(&self) -> Result<Vec<u8>> {
+        let file = File::open(self.archive_path).map_err(|source_err| {
+            err_with_source(
+                path_context_message("xlsx 압축 파일 열기 실패", self.archive_path),
+                source_err,
+            )
+        })?;
+        let metadata = file.metadata().map_err(|source_err| {
+            err_with_source(
+                path_context_message("xlsx 압축 파일 정보 확인 실패", self.archive_path),
+                source_err,
+            )
         })?;
         let archive_len = usize::try_from(metadata.len()).map_err(|source| {
             err(format!(
@@ -658,13 +716,45 @@ impl ZipArchiveExtractor<'_> {
                 self.archive_path.display()
             )));
         }
-        fs::read(self.archive_path).map_err(|source_err| {
-            err(path_source_message(
-                "xlsx 압축 파일 읽기 실패",
-                self.archive_path,
-                source_err,
-            ))
-        })
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(archive_len)
+            .map_err(|source| err_with_source("xlsx 압축 파일 메모리 확보 실패", source))?;
+        let read_limit = u64::try_from(ZIP_MAX_ARCHIVE_BYTES)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| err("xlsx 압축 파일 읽기 한도 계산 실패"))?;
+        let mut limited = file.take(read_limit);
+        let mut chunk = [0_u8; ZIP_READ_CHUNK_BYTES];
+        loop {
+            let read = limited.read(&mut chunk).map_err(|source_err| {
+                err_with_source(
+                    path_context_message("xlsx 압축 파일 읽기 실패", self.archive_path),
+                    source_err,
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            let next_len = bytes
+                .len()
+                .checked_add(read)
+                .ok_or_else(|| err("xlsx 압축 파일 읽기 길이 계산 실패"))?;
+            if next_len > ZIP_MAX_ARCHIVE_BYTES {
+                return Err(err(format!(
+                    "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
+                    self.archive_path.display()
+                )));
+            }
+            bytes.try_reserve(read).map_err(|source| {
+                err_with_source("xlsx 압축 파일 추가 메모리 확보 실패", source)
+            })?;
+            let segment = chunk
+                .get(..read)
+                .ok_or_else(|| err("xlsx 압축 파일 읽기 chunk 범위 오류"))?;
+            bytes.extend_from_slice(segment);
+        }
+        Ok(bytes)
     }
 }
 struct PendingFile {
@@ -676,7 +766,7 @@ const fn zip_static(message: &'static str) -> ZipError {
 }
 fn create_zip_dir(path: &Path, context: &str) -> Result<()> {
     fs::create_dir_all(path)
-        .map_err(|source_err| err(path_source_message(context, path, source_err)))
+        .map_err(|source_err| err_with_source(path_context_message(context, path), source_err))
 }
 fn ensure_zip_size_limit(
     scope: &str,
@@ -697,60 +787,31 @@ fn zip_entry_message(context: &str, entry_name: &str) -> String {
 }
 fn collect_files(root: &Path, dir: &Path, files: &mut Vec<PendingFile>) -> Result<()> {
     for entry_result in fs::read_dir(dir).map_err(|source_err| {
-        err(path_source_message(
-            "xlsx 파트 폴더 읽기 실패",
-            dir,
+        err_with_source(
+            path_context_message("xlsx 파트 폴더 읽기 실패", dir),
             source_err,
-        ))
+        )
     })? {
         let entry = entry_result.map_err(|source_err| {
-            err(path_source_message(
-                "xlsx 파트 항목 읽기 실패",
-                dir,
+            err_with_source(
+                path_context_message("xlsx 파트 항목 읽기 실패", dir),
                 source_err,
-            ))
+            )
         })?;
         let path = entry.path();
         let metadata = entry.metadata().map_err(|source_err| {
-            err(path_source_message(
-                "xlsx 파트 속성 읽기 실패",
-                &path,
+            err_with_source(
+                path_context_message("xlsx 파트 속성 읽기 실패", &path),
                 source_err,
-            ))
+            )
         })?;
         match (metadata.is_dir(), metadata.is_file()) {
             (true, _) => collect_files(root, &path, files)?,
             (false, true) => {
-                let rel = path.strip_prefix(root).map_err(|source| {
-                    err(prefixed_message("xlsx 상대 경로 계산 실패: ", source))
-                })?;
-                let mut name = String::new();
-                for component in rel.components() {
-                    let Component::Normal(part) = component else {
-                        return Err(err(prefixed_message(
-                            "xlsx 압축 경로에 허용되지 않은 component가 있습니다: ",
-                            rel.display(),
-                        )));
-                    };
-                    let Some(text) = part.to_str() else {
-                        return Err(err(prefixed_message(
-                            "xlsx 압축 경로가 UTF-8이 아닙니다: ",
-                            rel.display(),
-                        )));
-                    };
-                    let separator_len = usize::from(!name.is_empty());
-                    name.try_reserve(separator_len.saturating_add(text.len()))
-                        .map_err(|source| {
-                            err(prefixed_message(
-                                "xlsx 압축 경로 메모리 확보 실패: ",
-                                source,
-                            ))
-                        })?;
-                    if !name.is_empty() {
-                        name.push('/');
-                    }
-                    name.push_str(text);
-                }
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|source| err_with_source("xlsx 상대 경로 계산 실패", source))?;
+                let name = path_to_slashes(rel, rel.display())?;
                 files.push(PendingFile { name, path });
             }
             (false, false) => {}
@@ -758,12 +819,17 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<PendingFile>) -> Resul
     }
     Ok(())
 }
-fn crc32(bytes: &[u8]) -> u32 {
-    !bytes.iter().fold(u32::MAX, |crc, &byte| {
-        let table_index = usize::from((crc ^ u32::from(byte)).to_le_bytes()[0]);
-        let table_value = CRC32_TABLE.get(table_index).copied().unwrap_or_default();
-        (crc >> 8_u8) ^ table_value
-    })
+fn crc32(bytes: &[u8]) -> ZipResult<u32> {
+    bytes
+        .iter()
+        .try_fold(u32::MAX, |crc, &byte| {
+            let table_index = usize::from((crc ^ u32::from(byte)).to_le_bytes()[0]);
+            let Some(table_value) = CRC32_TABLE.get(table_index).copied() else {
+                return Err(zip_static("ZIP CRC32 table 범위가 손상되었습니다."));
+            };
+            Ok((crc >> 8_u8) ^ table_value)
+        })
+        .map(|crc| !crc)
 }
 fn split_header_at<'bytes, const LEN: usize>(
     bytes: &'bytes [u8],

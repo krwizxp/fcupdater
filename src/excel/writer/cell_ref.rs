@@ -1,5 +1,5 @@
 use super::{CellReference, RangeTokenParts, RewrittenCellReference};
-use crate::{Result, err, err_with_source};
+use crate::diagnostic::{Result, err, err_with_source};
 const COL_NAME_BUF_LEN: usize = 8;
 const COL_NAME_CHARS: [char; 26] = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
@@ -29,33 +29,35 @@ impl CellReference {
         Self { row, ..self }
     }
 }
-pub(super) fn col_to_name(mut col: u32) -> String {
-    if col == 0 {
-        return "A".into();
+pub(super) fn col_to_name(mut col: u32) -> Result<String> {
+    if !(1..=MAX_A1_COL).contains(&col) {
+        return Err(err(format!("Excel column 범위를 벗어났습니다: {col}")));
     }
     let mut rev = ['\0'; COL_NAME_BUF_LEN];
     let mut index = rev.len();
     while col > 0 {
-        let base = col.saturating_sub(1);
-        let Ok(rem) = u8::try_from(base.rem_euclid(26)) else {
-            return String::new();
-        };
-        let Some(letter) = COL_NAME_CHARS.get(usize::from(rem)).copied() else {
-            return String::new();
-        };
-        let Some(next_index) = index.checked_sub(1) else {
-            return String::new();
-        };
+        let base = col
+            .checked_sub(1)
+            .ok_or_else(|| err("Excel column 변환 중 underflow가 발생했습니다."))?;
+        let rem = u8::try_from(base.rem_euclid(26))
+            .map_err(|source| err_with_source("Excel column 나머지 변환 실패", source))?;
+        let letter = COL_NAME_CHARS
+            .get(usize::from(rem))
+            .copied()
+            .ok_or_else(|| err("Excel column 문자 범위가 손상되었습니다."))?;
+        let next_index = index
+            .checked_sub(1)
+            .ok_or_else(|| err("Excel column buffer index 계산 실패"))?;
         index = next_index;
-        let Some(slot) = rev.get_mut(index) else {
-            return String::new();
-        };
+        let slot = rev
+            .get_mut(index)
+            .ok_or_else(|| err("Excel column buffer 범위가 손상되었습니다."))?;
         *slot = letter;
         col = base.div_euclid(26);
     }
     rev.get(index..)
         .map(|chars| chars.iter().collect())
-        .unwrap_or_default()
+        .ok_or_else(|| err("Excel column 결과 범위가 손상되었습니다."))
 }
 pub(super) fn parse_range_token(token: &str) -> RangeTokenParts<'_> {
     match token.split_once(':') {
@@ -65,6 +67,10 @@ pub(super) fn parse_range_token(token: &str) -> RangeTokenParts<'_> {
             start_ref: token,
         },
     }
+}
+fn advance_index(index: &mut usize, context: &'static str) -> Result<()> {
+    *index = index.checked_add(1).ok_or_else(|| err(context))?;
+    Ok(())
 }
 pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     let col_prefix = strip_ref_lock_prefix(reference);
@@ -90,9 +96,8 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
             return None;
         }
         let upper = u8::try_from(u32::from(ch.to_ascii_uppercase())).ok()?;
-        col = col
-            .checked_mul(26)?
-            .checked_add(u32::from(upper.saturating_sub(b'A')).saturating_add(1))?;
+        let one_based = upper.checked_sub(b'A')?.checked_add(1)?;
+        col = col.checked_mul(26)?.checked_add(u32::from(one_based))?;
     }
     if !(1..=MAX_A1_COL).contains(&col) {
         return None;
@@ -105,25 +110,27 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         row_locked: row_prefix.locked,
     })
 }
-pub(super) fn ref_with_locks(reference: CellReference) -> String {
-    let col_name = col_to_name(reference.col);
+pub(super) fn ref_with_locks(reference: CellReference) -> Result<String> {
+    let col_name = col_to_name(reference.col)?;
     let col_prefix = if reference.col_locked { "$" } else { "" };
     let row_prefix = if reference.row_locked { "$" } else { "" };
     let row_text = reference.row.to_string();
-    let capacity = col_prefix
+    let Some(capacity) = col_prefix
         .len()
-        .saturating_add(col_name.len())
-        .saturating_add(row_prefix.len())
-        .saturating_add(row_text.len());
+        .checked_add(col_name.len())
+        .and_then(|value| value.checked_add(row_prefix.len()))
+        .and_then(|value| value.checked_add(row_text.len()))
+    else {
+        return Err(err("Excel cell reference 용량 계산 실패"));
+    };
     let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("{col_prefix}{col_name}{row_prefix}{row_text}");
-    }
+    out.try_reserve(capacity)
+        .map_err(|source| err_with_source("Excel cell reference 메모리 확보 실패", source))?;
     out.push_str(col_prefix);
     out.push_str(&col_name);
     out.push_str(row_prefix);
     out.push_str(&row_text);
-    out
+    Ok(out)
 }
 pub(super) fn rewrite_formula_cell_refs<F>(
     formula: &str,
@@ -165,30 +172,41 @@ where
             } else {
                 in_string = true;
             }
-            i = i.saturating_add(1);
+            advance_index(&mut i, "formula 문자열 cursor 계산에 실패했습니다.")?;
             continue;
         }
         if in_string {
             out.push(ch);
-            i = i.saturating_add(1);
+            advance_index(&mut i, "formula 문자열 cursor 계산에 실패했습니다.")?;
             continue;
         }
         if ch == '\'' {
             let mut quoted_end = None;
-            let mut quoted_index = i.saturating_add(1);
+            let mut quoted_index = i
+                .checked_add(1)
+                .ok_or_else(|| err("formula quoted sheet cursor 계산에 실패했습니다."))?;
             while let Some(&quoted_char) = chars.get(quoted_index) {
                 if quoted_char == '\'' {
-                    let next_idx = quoted_index.saturating_add(1);
+                    let next_idx = quoted_index
+                        .checked_add(1)
+                        .ok_or_else(|| err("formula quoted sheet cursor 계산에 실패했습니다."))?;
                     if chars.get(next_idx) == Some(&'\'') {
-                        quoted_index = quoted_index.saturating_add(2);
+                        quoted_index = quoted_index.checked_add(2).ok_or_else(|| {
+                            err("formula quoted sheet escaped quote cursor 계산에 실패했습니다.")
+                        })?;
                         continue;
                     }
                     if chars.get(next_idx) == Some(&'!') {
-                        quoted_end = Some(quoted_index.saturating_add(2));
+                        quoted_end = Some(quoted_index.checked_add(2).ok_or_else(|| {
+                            err("formula quoted sheet 종료 cursor 계산에 실패했습니다.")
+                        })?);
                     }
                     break;
                 }
-                quoted_index = quoted_index.saturating_add(1);
+                advance_index(
+                    &mut quoted_index,
+                    "formula quoted sheet cursor 계산에 실패했습니다.",
+                )?;
             }
             if let Some(next_idx) = quoted_end {
                 let quoted = chars
@@ -207,7 +225,7 @@ where
             continue;
         }
         out.push(ch);
-        i = i.saturating_add(1);
+        advance_index(&mut i, "formula cursor 계산에 실패했습니다.")?;
     }
     Ok(out)
 }
@@ -223,7 +241,7 @@ pub(super) fn shift_formula_index(value: u32, delta: i64, max: u32) -> Result<u3
         )));
     }
     u32::try_from(shifted)
-        .map_err(|source| err(format!("shared formula index 변환 실패: {source}")))
+        .map_err(|source| err_with_source("shared formula index 변환 실패", source))
 }
 pub(super) fn try_parse_and_rewrite_cell_ref<F>(
     chars: &[char],
@@ -237,11 +255,14 @@ where
     let mut col_lock = false;
     if chars.get(index) == Some(&'$') {
         col_lock = true;
-        index = index.saturating_add(1);
+        advance_index(
+            &mut index,
+            "formula column lock cursor 계산에 실패했습니다.",
+        )?;
     }
     let col_start = index;
     while chars.get(index).is_some_and(char::is_ascii_alphabetic) {
-        index = index.saturating_add(1);
+        advance_index(&mut index, "formula column cursor 계산에 실패했습니다.")?;
     }
     if index == col_start {
         return Ok(None);
@@ -278,19 +299,16 @@ where
     let mut row_lock = false;
     if chars.get(index) == Some(&'$') {
         row_lock = true;
-        index = index.saturating_add(1);
+        advance_index(&mut index, "formula row lock cursor 계산에 실패했습니다.")?;
     }
     let row_start = index;
     while chars.get(index).is_some_and(char::is_ascii_digit) {
-        index = index.saturating_add(1);
+        advance_index(&mut index, "formula row cursor 계산에 실패했습니다.")?;
     }
     if index == row_start {
         return Ok(None);
     }
-    let previous = start
-        .checked_sub(1)
-        .and_then(|previous_index| chars.get(previous_index))
-        .copied();
+    let previous = start.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
     if previous.is_some_and(is_ref_neighbor_identifier) {
         return Ok(None);
     }
@@ -327,7 +345,7 @@ where
         col_locked: col_lock,
         row: rewritten.row,
         row_locked: row_lock,
-    });
+    })?;
     Ok(Some(FormulaRewrite {
         end_index: index,
         replacement: replaced,

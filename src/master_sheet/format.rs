@@ -1,29 +1,54 @@
 use super::{DECIMAL_SCALE, DECIMAL_SCALE_SQUARED, ScaledDecimal, ScaledSortKey};
-use crate::{AppError, err};
+use crate::diagnostic::{AppError, Result, err, err_with_source};
 use alloc::string::String;
-pub(super) fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> String {
+pub(super) fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> Result<String> {
     let half_scale = ScaledSortKey(DECIMAL_SCALE_SQUARED.as_i128().div_euclid(2));
     let rounded = total
         .checked_add(half_scale)
-        .unwrap_or(total)
+        .ok_or_else(|| err("연료비 반올림 계산 중 overflow가 발생했습니다."))?
         .as_i128()
         .div_euclid(DECIMAL_SCALE_SQUARED.as_i128());
     let raw = rounded.to_string();
     let (sign, digits) = split_negative_prefix(raw.as_str(), "", "-");
-    let groups = digits.len().saturating_sub(1).div_euclid(3);
-    let mut amount = String::with_capacity(
-        sign.len()
-            .saturating_add(digits.len())
-            .saturating_add(groups),
-    );
+    let groups = digits
+        .len()
+        .checked_sub(1)
+        .map_or(0, |remaining| remaining.div_euclid(3));
+    let amount_capacity = sign
+        .len()
+        .checked_add(digits.len())
+        .and_then(|value| value.checked_add(groups))
+        .ok_or_else(|| err("연료비 금액 문자열 용량 계산 실패"))?;
+    let mut amount = String::new();
+    amount
+        .try_reserve(amount_capacity)
+        .map_err(|source| err_with_source("연료비 표시 문자열 메모리 확보 실패", source))?;
     amount.push_str(sign);
     for (index, ch) in digits.chars().enumerate() {
-        if index != 0 && digits.len().saturating_sub(index).is_multiple_of(3) {
+        if index != 0
+            && digits
+                .len()
+                .checked_sub(index)
+                .is_some_and(|remaining| remaining.is_multiple_of(3))
+        {
             amount.push(',');
         }
         amount.push(ch);
     }
-    format!("{label} {amount}원")
+    let output_capacity = label
+        .len()
+        .checked_add(" ".len())
+        .and_then(|value| value.checked_add(amount.len()))
+        .and_then(|value| value.checked_add("원".len()))
+        .ok_or_else(|| err("연료비 표시 문자열 용량 계산 실패"))?;
+    let mut out = String::new();
+    out.try_reserve(output_capacity)
+        .map_err(|source| err_with_source("연료비 표시 문자열 메모리 확보 실패", source))?;
+    out.push_str(label);
+    out.push(' ');
+    out.push_str(&amount);
+    out.push('원');
+    Ok(out)
 }
 pub(super) fn split_negative_prefix<T>(value: &str, positive: T, negative: T) -> (T, &str) {
     value
@@ -72,7 +97,7 @@ pub(super) fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -
         remainder = remainder.checked_mul(10)?;
         let digit = remainder.div_euclid(denominator);
         let digit_u8 = u8::try_from(digit).ok()?;
-        frac_text.push(char::from(b'0'.saturating_add(digit_u8)));
+        frac_text.push(char::from(b'0'.checked_add(digit_u8)?));
         remainder = remainder.rem_euclid(denominator);
     }
     let trimmed_frac_len = frac_text.trim_end_matches('0').len();

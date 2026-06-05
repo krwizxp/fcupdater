@@ -1,20 +1,20 @@
 use super::{
     SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
-    path_util::path_from_slashes,
+    path_util::{path_from_slashes, path_to_slashes},
     xml::{
         XmlScanner, extract_all_tag_text, extract_attr, find_end_tag, find_start_tag, find_tag_end,
     },
 };
-use crate::{
-    Result, append_error_text, err, err_with_source, path_pair_source_message, path_source_message,
-    prefixed_message,
+use crate::diagnostic::{
+    Result, err, err_with_source, path_context_message, path_pair_context_message,
+    path_source_message, prefixed_message,
 };
 use alloc::borrow::Cow;
-use core::{iter, mem, range::Range, time::Duration};
+use core::{mem, range::Range, time::Duration};
 use std::{
     collections::HashMap,
     env, fs,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Read as _},
     path::{Component, Path, PathBuf},
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -27,7 +27,7 @@ cfg_select! {
 }
 const TEMP_ARCHIVE_PROMOTION_ATTEMPTS: u32 = 5;
 const TEMP_ARCHIVE_PROMOTION_RETRY_DELAY: Duration = Duration::from_millis(50);
-
+const MAX_XLSX_TEXT_PART_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Debug)]
 pub(super) struct XlsxContainer {
     archive_path: PathBuf,
@@ -54,10 +54,9 @@ struct SavedArchiveVerifier<'path> {
 impl SavedArchiveVerifier<'_> {
     fn verify(&self) -> Result<()> {
         let container = XlsxContainer::open(self.saved_archive).map_err(|source_err| {
-            err(path_source_message(
+            source_err.prepend_context(path_context_message(
                 "저장 검증 실패: 저장 직후 압축 해제 점검에 실패했습니다",
                 self.saved_archive,
-                source_err,
             ))
         })?;
         for rel in [
@@ -66,18 +65,16 @@ impl SavedArchiveVerifier<'_> {
             "xl/_rels/workbook.xml.rels",
         ] {
             container.read_text(rel).map_err(|source_err| {
-                err(path_source_message(
+                source_err.prepend_context(path_context_message(
                     "저장 검증 실패: 필수 OOXML 파트 읽기 실패",
                     self.saved_archive,
-                    source_err,
                 ))
             })?;
         }
         super::writer::Workbook::open(self.saved_archive).map_err(|source_err| {
-            err(path_source_message(
+            source_err.prepend_context(path_context_message(
                 "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
                 self.saved_archive,
-                source_err,
             ))
         })?;
         Ok(())
@@ -130,12 +127,10 @@ impl TempArchivePromotion<'_> {
         let Some(source_err) = last_error else {
             return Err(err("xlsx 저장 시도 횟수가 비정상적으로 비어 있습니다."));
         };
-        Err(err(path_pair_source_message(
-            "xlsx 저장 실패",
-            self.temp_archive,
-            self.target_xlsx,
+        Err(err_with_source(
+            path_pair_context_message("xlsx 저장 실패", self.temp_archive, self.target_xlsx),
             source_err,
-        )))
+        ))
     }
 }
 impl XlsxContainer {
@@ -161,30 +156,41 @@ impl XlsxContainer {
                     source,
                 )
             })?;
-        let mut cursor = 0_usize;
-        while let Some(si_start) = find_start_tag(&xml, "si", cursor) {
-            let Some(si_tag_end) = find_tag_end(&xml, si_start) else {
-                break;
-            };
+        let mut scanner = XmlScanner::new(&xml);
+        while let Some(si_tag) = scanner.next_start_named("si") {
+            if si_tag.is_self_closing() {
+                out.push(String::new());
+                continue;
+            }
+            let si_tag_end = si_tag.end();
             let Some(body_start) = si_tag_end.checked_add(1) else {
-                break;
+                return Err(err(
+                    "sharedStrings.xml의 <si> 본문 시작 계산에 실패했습니다.",
+                ));
             };
             let Some(si_end) = find_end_tag(&xml, "si", body_start) else {
-                break;
+                return Err(err("sharedStrings.xml의 </si> 태그를 찾지 못했습니다."));
             };
             let si_body_span = Range {
                 start: body_start,
                 end: si_end,
             };
             let Some(si_body) = xml.get(si_body_span) else {
-                break;
+                return Err(err("sharedStrings.xml의 <si> 본문 범위가 손상되었습니다."));
             };
-            let text = extract_all_tag_text(si_body, "t").unwrap_or_default();
+            let text = extract_all_tag_text(si_body, "t")?
+                .map(Cow::into_owned)
+                .unwrap_or_default();
             out.push(text);
-            let Some(next_cursor) = si_end.checked_add("</si>".len()) else {
-                break;
+            let Some(si_close_end) = find_tag_end(&xml, si_end) else {
+                return Err(err("sharedStrings.xml의 </si> 태그가 손상되었습니다."));
             };
-            cursor = next_cursor;
+            let Some(next_cursor) = si_close_end.checked_add(1) else {
+                return Err(err(
+                    "sharedStrings.xml의 다음 <si> 위치 계산에 실패했습니다.",
+                ));
+            };
+            scanner.skip_to(next_cursor);
         }
         Ok(out)
     }
@@ -201,10 +207,30 @@ impl XlsxContainer {
                     source,
                 )
             })?;
-        rid_to_target.extend(
-            iter_start_tags(&rels_xml, "Relationship")
-                .filter_map(|tag| Some((extract_attr(tag, "Id")?, extract_attr(tag, "Target")?))),
-        );
+        let mut rels_cursor = 0_usize;
+        while let Some(rel_start) = find_start_tag(&rels_xml, "Relationship", rels_cursor) {
+            let Some(rel_end) = find_tag_end(&rels_xml, rel_start) else {
+                return Err(err("workbook Relationship 시작 태그가 손상되었습니다."));
+            };
+            let Some(tag) = rels_xml.get(rel_start..=rel_end) else {
+                return Err(err("workbook Relationship 태그 범위가 손상되었습니다."));
+            };
+            let id = extract_attr(tag, "Id")?
+                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Id 속성이 없습니다."))?;
+            let target = extract_attr(tag, "Target")?
+                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Target 속성이 없습니다."))?;
+            if rid_to_target.contains_key(id.as_ref()) {
+                return Err(err(format!(
+                    "workbook.xml.rels에 중복 Relationship Id가 있습니다: {}",
+                    id.as_ref()
+                )));
+            }
+            rid_to_target.insert(id, target);
+            let Some(next_cursor) = rel_end.checked_add(1) else {
+                return Err(err("다음 workbook Relationship 위치 계산에 실패했습니다."));
+            };
+            rels_cursor = next_cursor;
+        }
         let sheet_count = workbook_xml.matches("<sheet").count();
         let mut sheets = Vec::new();
         sheets.try_reserve_exact(sheet_count).map_err(|source| {
@@ -213,54 +239,52 @@ impl XlsxContainer {
                 source,
             )
         })?;
-        for tag in iter_start_tags(&workbook_xml, "sheet") {
-            let Some(name) = extract_attr(tag, "name") else {
-                continue;
+        let mut sheet_cursor = 0_usize;
+        while let Some(sheet_start) = find_start_tag(&workbook_xml, "sheet", sheet_cursor) {
+            let Some(sheet_end) = find_tag_end(&workbook_xml, sheet_start) else {
+                return Err(err("workbook.xml의 sheet 시작 태그가 손상되었습니다."));
             };
-            let Some(rid) = extract_attr(tag, "r:id") else {
-                continue;
+            let Some(tag) = workbook_xml.get(sheet_start..=sheet_end) else {
+                return Err(err("workbook.xml의 sheet 태그 범위가 손상되었습니다."));
+            };
+            let Some(name) = extract_attr(tag, "name")? else {
+                return Err(err("workbook.xml의 sheet에 name 속성이 없습니다."));
+            };
+            let Some(rid) = extract_attr(tag, "r:id")? else {
+                return Err(err("workbook.xml의 sheet에 r:id 속성이 없습니다."));
             };
             let Some(target) = rid_to_target.get(rid.as_ref()) else {
-                continue;
+                return Err(err(format!(
+                    "workbook.xml.rels에서 sheet 관계 target을 찾지 못했습니다: {}",
+                    rid.as_ref()
+                )));
             };
             let target_text = target.as_ref();
             let resolved = if target_text.starts_with('/') {
-                Cow::Borrowed(target_text.trim_start_matches('/'))
+                return Err(err(format!(
+                    "sheet 관계 target에 절대 경로는 허용되지 않습니다: {target_text}"
+                )));
             } else {
                 let mut base: PathBuf = "xl/workbook.xml".into();
                 base.pop();
                 let combined = base.join(path_from_slashes(target_text));
-                let mut normalized = PathBuf::default();
-                for component in combined.components() {
-                    match component {
-                        Component::ParentDir => {
-                            normalized.pop();
-                        }
-                        Component::Normal(path_segment) => normalized.push(path_segment),
-                        Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-                    }
+                let normalized = normalize_safe_relative_path(&combined, target_text)?;
+                let resolved_path = path_to_slashes(&normalized, target_text)?;
+                if resolved_path.is_empty() {
+                    return Err(err(format!(
+                        "sheet 관계 target 정규화 결과가 비어 있습니다: {target_text}"
+                    )));
                 }
-                let mut resolved_path = String::new();
-                for component in normalized.components() {
-                    let Component::Normal(path_segment) = component else {
-                        continue;
-                    };
-                    let segment = path_segment.to_string_lossy();
-                    let separator_len = usize::from(!resolved_path.is_empty());
-                    resolved_path
-                        .try_reserve(separator_len.saturating_add(segment.len()))
-                        .map_err(|source| err_with_source("시트 경로 메모리 확보 실패", source))?;
-                    if !resolved_path.is_empty() {
-                        resolved_path.push('/');
-                    }
-                    resolved_path.push_str(&segment);
-                }
-                Cow::Owned(resolved_path)
+                resolved_path
             };
             sheets.push(SheetInfo {
                 name: name.into_owned(),
-                path: resolved.into_owned(),
+                path: resolved,
             });
+            let Some(next_cursor) = sheet_end.checked_add(1) else {
+                return Err(err("workbook.xml의 다음 sheet 위치 계산에 실패했습니다."));
+            };
+            sheet_cursor = next_cursor;
         }
         if sheets.is_empty() {
             return Err(err("workbook에서 시트 정보를 찾지 못했습니다."));
@@ -269,11 +293,10 @@ impl XlsxContainer {
     }
     pub(super) fn open(source_xlsx: &Path) -> Result<Self> {
         if !source_xlsx.try_exists().map_err(|source_err| {
-            err(path_source_message(
-                "xlsx 파일 경로 확인 실패",
-                source_xlsx,
+            err_with_source(
+                path_context_message("xlsx 파일 경로 확인 실패", source_xlsx),
                 source_err,
-            ))
+            )
         })? {
             return Err(err(prefixed_message(
                 "xlsx 파일이 없습니다: ",
@@ -294,12 +317,10 @@ impl XlsxContainer {
         let archive_path = cleanup.path.join("workbook.zip");
         create_dir_all_checked(&unpack_dir, "임시 폴더 생성 실패")?;
         fs::copy(source_xlsx, &archive_path).map_err(|source_err| {
-            err(path_pair_source_message(
-                "xlsx 임시 복사 실패",
-                source_xlsx,
-                &archive_path,
+            err_with_source(
+                path_pair_context_message("xlsx 임시 복사 실패", source_xlsx, &archive_path),
                 source_err,
-            ))
+            )
         })?;
         ZipArchiveExtractor {
             archive_path: archive_path.as_path(),
@@ -316,59 +337,91 @@ impl XlsxContainer {
     }
     pub(super) fn read_text(&self, relative_path: &str) -> Result<String> {
         let path = self.resolve_relative_path(relative_path)?;
-        fs::read_to_string(&path)
-            .map_err(|source_err| err(path_source_message("파일 읽기 실패", &path, source_err)))
+        let file = fs::File::open(&path).map_err(|source_err| {
+            err_with_source(path_context_message("파일 열기 실패", &path), source_err)
+        })?;
+        let file_size = file
+            .metadata()
+            .map_err(|source_err| {
+                err_with_source(
+                    path_context_message("파일 메타데이터 조회 실패", &path),
+                    source_err,
+                )
+            })?
+            .len();
+        if file_size > MAX_XLSX_TEXT_PART_BYTES {
+            return Err(err(format!(
+                "xlsx XML part가 너무 큽니다: {} ({file_size} bytes, 최대 {MAX_XLSX_TEXT_PART_BYTES} bytes)",
+                path.display()
+            )));
+        }
+        let data_len = usize::try_from(file_size)
+            .map_err(|source| err_with_source("xlsx XML part 크기 변환 실패", source))?;
+        let read_limit = MAX_XLSX_TEXT_PART_BYTES
+            .checked_add(1)
+            .ok_or_else(|| err("xlsx XML part 읽기 한도 계산 실패"))?;
+        let mut reader = file.take(read_limit);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(data_len)
+            .map_err(|source| err_with_source("xlsx XML part 메모리 확보 실패", source))?;
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut chunk).map_err(|source_err| {
+                err_with_source(path_context_message("파일 읽기 실패", &path), source_err)
+            })?;
+            if read == 0 {
+                break;
+            }
+            let next_len = bytes
+                .len()
+                .checked_add(read)
+                .ok_or_else(|| err("xlsx XML part 읽기 길이 계산 실패"))?;
+            if u64::try_from(next_len).is_ok_and(|actual| actual > MAX_XLSX_TEXT_PART_BYTES) {
+                return Err(err(format!(
+                    "xlsx XML part가 너무 큽니다: {} (최대 {MAX_XLSX_TEXT_PART_BYTES} bytes)",
+                    path.display()
+                )));
+            }
+            bytes
+                .try_reserve(read)
+                .map_err(|source| err_with_source("xlsx XML part 추가 메모리 확보 실패", source))?;
+            let segment = chunk
+                .get(..read)
+                .ok_or_else(|| err("xlsx XML part 읽기 chunk 범위 오류"))?;
+            bytes.extend_from_slice(segment);
+        }
+        String::from_utf8(bytes).map_err(|source| {
+            err_with_source(path_context_message("파일 UTF-8 해석 실패", &path), source)
+        })
     }
     pub(super) fn remove_file_if_exists(&self, relative_path: &str) -> Result<()> {
         let path = self.resolve_relative_path(relative_path)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(io_err) if io_err.kind() == ErrorKind::NotFound => Ok(()),
-            Err(io_err) => Err(err(path_source_message("파일 삭제 실패", &path, io_err))),
+            Err(io_err) => Err(err_with_source(
+                path_context_message("파일 삭제 실패", &path),
+                io_err,
+            )),
         }
     }
     fn resolve_relative_path(&self, relative_path: &str) -> Result<PathBuf> {
-        let mut path = PathBuf::new();
-        for component in Path::new(relative_path).components() {
-            match component {
-                Component::CurDir => {}
-                Component::Normal(segment) => path.push(segment),
-                Component::ParentDir => {
-                    return Err(err(relative_path_policy_message(
-                        "상위 경로 탐색은 허용되지 않습니다: ",
-                        relative_path,
-                    )));
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(err(relative_path_policy_message(
-                        "절대 경로는 허용되지 않습니다: ",
-                        relative_path,
-                    )));
-                }
-            }
-        }
-        if path.as_os_str().is_empty() {
-            return Err(err(relative_path_policy_message(
-                "상대 경로가 비어 있습니다: ",
-                relative_path,
-            )));
-        }
+        let path = normalize_safe_relative_path(Path::new(relative_path), relative_path)?;
         Ok(self.unpack_dir.join(path))
     }
     pub(super) fn save(&self, target_xlsx: &Path) -> Result<()> {
         if self.archive_path.try_exists().map_err(|source_err| {
-            err(path_source_message(
-                "archive 경로 확인 실패",
-                &self.archive_path,
+            err_with_source(
+                path_context_message("archive 경로 확인 실패", &self.archive_path),
                 source_err,
-            ))
+            )
         })? {
             fs::remove_file(&self.archive_path).map_err(|source_err| {
-                err(path_source_message(
-                    "기존 archive 삭제 실패",
-                    &self.archive_path,
+                err_with_source(
+                    path_context_message("기존 archive 삭제 실패", &self.archive_path),
                     source_err,
-                ))
+                )
             })?;
         }
         ZipArchiveBuilder {
@@ -397,12 +450,14 @@ impl XlsxContainer {
         )?;
         let result = (|| -> Result<()> {
             fs::copy(&self.archive_path, &tmp_archive).map_err(|source_err| {
-                err(path_pair_source_message(
-                    "xlsx 임시 저장 실패",
-                    &self.archive_path,
-                    &tmp_archive,
+                err_with_source(
+                    path_pair_context_message(
+                        "xlsx 임시 저장 실패",
+                        &self.archive_path,
+                        &tmp_archive,
+                    ),
                     source_err,
-                ))
+                )
             })?;
             SavedArchiveVerifier {
                 saved_archive: &tmp_archive,
@@ -420,12 +475,11 @@ impl XlsxContainer {
             Err(source) => match fs::remove_file(&tmp_archive) {
                 Ok(()) => Err(source),
                 Err(error) if error.kind() == ErrorKind::NotFound => Err(source),
-                Err(error) => {
-                    let error_text = source.to_string();
-                    let cleanup_text =
-                        path_source_message("xlsx 임시 저장 파일 삭제 실패", &tmp_archive, error);
-                    Err(err(append_error_text(&error_text, &cleanup_text)))
-                }
+                Err(error) => Err(source.prepend_context(path_source_message(
+                    "xlsx 임시 저장 파일 삭제 실패",
+                    &tmp_archive,
+                    error,
+                ))),
             },
         }
     }
@@ -437,8 +491,9 @@ impl XlsxContainer {
         if let Some(parent) = path.parent() {
             create_dir_all_checked(parent, "폴더 생성 실패")?;
         }
-        fs::write(&path, content)
-            .map_err(|source_err| err(path_source_message("파일 쓰기 실패", &path, source_err)))
+        fs::write(&path, content).map_err(|source_err| {
+            err_with_source(path_context_message("파일 쓰기 실패", &path), source_err)
+        })
     }
 }
 impl Drop for XlsxContainer {
@@ -463,8 +518,37 @@ cfg_select! {
     _ => {}
 }
 fn create_dir_all_checked(path: &Path, failure_label: &str) -> Result<()> {
-    fs::create_dir_all(path)
-        .map_err(|source_err| err(path_source_message(failure_label, path, source_err)))
+    fs::create_dir_all(path).map_err(|source_err| {
+        err_with_source(path_context_message(failure_label, path), source_err)
+    })
+}
+fn normalize_safe_relative_path(path: &Path, relative_path: &str) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => normalized.push(segment),
+            Component::ParentDir => {
+                return Err(err(relative_path_policy_message(
+                    "상위 경로 탐색은 허용되지 않습니다: ",
+                    relative_path,
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(err(relative_path_policy_message(
+                    "절대 경로는 허용되지 않습니다: ",
+                    relative_path,
+                )));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(err(relative_path_policy_message(
+            "상대 경로가 비어 있습니다: ",
+            relative_path,
+        )));
+    }
+    Ok(normalized)
 }
 fn reserve_unique_temp_entry<FBuild, FCreate>(
     build_path: FBuild,
@@ -480,7 +564,7 @@ where
     for seq in 0..1024_u32 {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|source| err_with_source("임시 xlsx 경로 시각 계산 실패", source))?
             .as_nanos();
         let path = build_path(pid, nanos, seq);
         match create_entry(&path) {
@@ -489,11 +573,10 @@ where
                 thread::sleep(Duration::from_micros(50));
             }
             Err(io_err) => {
-                return Err(err(path_source_message(
-                    create_failure_label,
-                    &path,
+                return Err(err_with_source(
+                    path_context_message(create_failure_label, &path),
                     io_err,
-                )));
+                ));
             }
         }
     }
@@ -501,14 +584,4 @@ where
 }
 fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
     format!("{prefix}{relative_path}")
-}
-fn iter_start_tags<'xml, 'tag>(
-    xml: &'xml str,
-    tag_name: &'tag str,
-) -> impl Iterator<Item = &'xml str> + use<'xml, 'tag>
-where
-    'xml: 'tag,
-{
-    let mut scanner = XmlScanner::new(xml);
-    iter::from_fn(move || scanner.next_start_named(tag_name).map(|tag| tag.tag()))
 }
