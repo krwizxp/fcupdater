@@ -70,12 +70,34 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
     }
     let mut frac_text = frac.to_string();
     let width = usize::try_from(scale_abs.ilog10()).unwrap_or_default();
-    while frac_text.len() < width {
-        frac_text.insert(0, '0');
+    let zero_padding = width.saturating_sub(frac_text.len());
+    let trailing_zeros = frac_text
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'0')
+        .count();
+    let padded_len = zero_padding.saturating_add(frac_text.len());
+    let trimmed_padded_len = padded_len.saturating_sub(trailing_zeros);
+    let kept_padding = zero_padding.min(trimmed_padded_len);
+    let kept_digits = trimmed_padded_len.saturating_sub(zero_padding);
+    frac_text.truncate(kept_digits);
+    let mut out = String::new();
+    let capacity = sign
+        .len()
+        .saturating_add(whole_text.len())
+        .saturating_add(1)
+        .saturating_add(kept_padding)
+        .saturating_add(frac_text.len());
+    out.reserve(capacity);
+    out.push_str(sign);
+    out.push_str(&whole_text);
+    out.push('.');
+    for _ in 0..kept_padding {
+        out.push('0');
     }
-    let trimmed_frac_len = frac_text.trim_end_matches('0').len();
-    frac_text.truncate(trimmed_frac_len);
-    format!("{sign}{whole_text}.{frac_text}")
+    out.push_str(&frac_text);
+    out
 }
 pub(super) fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -> Option<String> {
     if qty.is_zero() {

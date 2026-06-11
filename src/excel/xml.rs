@@ -312,27 +312,41 @@ pub(super) fn extract_all_tag_text<'xml>(
         .or_else(|| saw_text_tag.then_some(Cow::Borrowed(""))))
 }
 pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
-    ensure_valid_xml_text(text, "XML text")?;
-    if text.contains('<') {
-        return Err(err("XML text에 raw '<' 문자가 포함되어 있습니다."));
-    }
-    if text.contains("]]>") {
-        return Err(err(
-            "XML text에 허용되지 않는 ']]>' 시퀀스가 포함되어 있습니다.",
-        ));
-    }
-    if !text.contains('&') {
-        return Ok(Cow::Borrowed(text));
-    }
-    let mut out = String::new();
-    out.try_reserve(text.len())
-        .map_err(|source| err_with_source("XML entity decode 메모리 확보 실패", source))?;
+    let mut out: Option<String> = None;
     let mut i = 0_usize;
     while i < text.len() {
         let rest = text
             .get(i..)
             .ok_or_else(|| err("XML entity decode cursor 범위가 손상되었습니다."))?;
+        if rest.starts_with("]]>") {
+            return Err(err(
+                "XML text에 허용되지 않는 ']]>' 시퀀스가 포함되어 있습니다.",
+            ));
+        }
+        let Some(ch) = rest.chars().next() else {
+            return Err(err("XML entity decode 문자를 읽지 못했습니다."));
+        };
+        if !is_valid_xml_char(ch) {
+            return Err(err(format!(
+                "XML text: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{:04X}",
+                u32::from(ch)
+            )));
+        }
+        if ch == '<' {
+            return Err(err("XML text에 raw '<' 문자가 포함되어 있습니다."));
+        }
         if let Some(after_amp) = rest.strip_prefix('&') {
+            if out.is_none() {
+                let mut out_text = String::new();
+                out_text.try_reserve(text.len()).map_err(|source| {
+                    err_with_source("XML entity decode 메모리 확보 실패", source)
+                })?;
+                let prefix = text
+                    .get(..i)
+                    .ok_or_else(|| err("XML entity decode prefix 범위가 손상되었습니다."))?;
+                out_text.push_str(prefix);
+                out = Some(out_text);
+            }
             let Some((entity, _after_semi)) = after_amp.split_once(';') else {
                 return Err(err("XML entity 종료 세미콜론을 찾지 못했습니다."));
             };
@@ -371,21 +385,23 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                     "XML numeric entity가 XML 1.0 유효 문자 범위를 벗어났습니다: &{entity};"
                 )));
             }
-            out.push(decoded_char);
+            let Some(out_text) = out.as_mut() else {
+                return Err(err("XML entity decode output 상태가 손상되었습니다."));
+            };
+            out_text.push(decoded_char);
             let consumed = checked_offset_add(entity.len(), 2)
                 .ok_or_else(|| err("XML entity 소비 길이 계산에 실패했습니다."))?;
             i = checked_offset_add(i, consumed)
                 .ok_or_else(|| err("XML entity 다음 cursor 계산에 실패했습니다."))?;
             continue;
         }
-        let Some(ch) = rest.chars().next() else {
-            return Err(err("XML entity decode 문자를 읽지 못했습니다."));
-        };
-        out.push(ch);
+        if let Some(out_text) = out.as_mut() {
+            out_text.push(ch);
+        }
         i = checked_offset_add(i, ch.len_utf8())
             .ok_or_else(|| err("XML entity decode cursor 계산에 실패했습니다."))?;
     }
-    Ok(Cow::Owned(out))
+    Ok(out.map_or(Cow::Borrowed(text), Cow::Owned))
 }
 pub(super) fn ensure_valid_xml_text(text: &str, context: &str) -> Result<()> {
     for ch in text.chars() {

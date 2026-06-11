@@ -3,7 +3,7 @@ use super::{
     CENTRAL_DIRECTORY_SIGNATURE, DOS_DATE_1980_01_01, END_OF_CENTRAL_DIRECTORY_LEN,
     END_OF_CENTRAL_DIRECTORY_SIGNATURE, GENERAL_PURPOSE_UTF8_FLAG, LOCAL_FILE_HEADER_LEN,
     LOCAL_FILE_HEADER_SIGNATURE, METHOD_DEFLATE, METHOD_STORE, PendingFile, VERSION_NEEDED,
-    ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, ZIP_READ_CHUNK_BYTES, collect_files, crc32, deflate,
+    ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, collect_files, crc32, deflate,
 };
 use crate::diagnostic::{
     Result, err, err_with_source, path_context_message, path_pair_context_message, prefixed_message,
@@ -223,35 +223,18 @@ impl StreamingZipWriter<'_> {
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| err("xlsx 파트 읽기 한도 계산 실패"))?;
         let mut limited = source_file.take(read_limit);
-        let mut chunk = [0_u8; ZIP_READ_CHUNK_BYTES];
-        loop {
-            let read = IoRead::read(&mut limited, &mut chunk).map_err(|source_err| {
-                err_with_source(
-                    path_pair_context_message("xlsx 파트 읽기 실패", self.archive_path, &file.path),
-                    source_err,
-                )
-            })?;
-            if read == 0 {
-                break;
-            }
-            let next_len = bytes
-                .len()
-                .checked_add(read)
-                .ok_or_else(|| err("xlsx 파트 읽기 길이 계산 실패"))?;
-            if next_len > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES {
-                return Err(err(format!(
-                    "xlsx 파트 크기가 허용 한도({ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} bytes)를 초과했습니다: {} -> {}",
-                    self.archive_path.display(),
-                    file.path.display()
-                )));
-            }
-            bytes
-                .try_reserve(read)
-                .map_err(|source| err_with_source("xlsx 파트 추가 메모리 확보 실패", source))?;
-            let segment = chunk
-                .get(..read)
-                .ok_or_else(|| err("xlsx 파트 읽기 chunk 범위 오류"))?;
-            bytes.extend_from_slice(segment);
+        IoRead::read_to_end(&mut limited, &mut bytes).map_err(|source_err| {
+            err_with_source(
+                path_pair_context_message("xlsx 파트 읽기 실패", self.archive_path, &file.path),
+                source_err,
+            )
+        })?;
+        if bytes.len() > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES {
+            return Err(err(format!(
+                "xlsx 파트 크기가 허용 한도({ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} bytes)를 초과했습니다: {} -> {}",
+                self.archive_path.display(),
+                file.path.display()
+            )));
         }
         if bytes.len() != part_len {
             return Err(err(format!(

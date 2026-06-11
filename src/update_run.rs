@@ -35,19 +35,6 @@ const MONTH_TERM_MULTIPLIER_I64: i64 = 153;
 const MONTH_TERM_OFFSET_I64: i64 = 2;
 const PRE_MARCH_MONTH_OFFSET_I64: i64 = 9;
 const SECS_PER_DAY_U64: u64 = 86_400;
-const TARGET_REGION_KEYS: [&str; 11] = [
-    "대전대덕구",
-    "대전동구",
-    "대전서구",
-    "대전유성구",
-    "대전중구",
-    "세종시",
-    "충북청주시",
-    "충남공주시",
-    "충남보령시",
-    "충남아산시",
-    "충남천안시",
-];
 struct KstDate {
     day: u32,
     month: u32,
@@ -88,47 +75,47 @@ impl UpdateRun<'_> {
                     &source_path,
                 ))
             })?;
-            let mut filtered_records = Vec::new();
-            filtered_records
-                .try_reserve(source_records.len())
-                .map_err(|source| {
-                    let record_count = source_records.len();
-                    err_with_source(
-                        format!("대상 지역 소스 목록 메모리 확보 실패: {record_count} records"),
-                        source,
-                    )
-                })?;
+            let mut map: HashMap<String, SourceRecord> = HashMap::new();
+            let mut target_record_count = 0_usize;
             for record in source_records {
                 let region_key = normalize_address_key(&record.region)?;
-                if TARGET_REGION_KEYS.contains(&region_key.as_str()) {
-                    filtered_records.push(record);
+                if matches!(
+                    region_key.as_str(),
+                    "대전대덕구"
+                        | "대전동구"
+                        | "대전서구"
+                        | "대전유성구"
+                        | "대전중구"
+                        | "세종시"
+                        | "충북청주시"
+                        | "충남공주시"
+                        | "충남보령시"
+                        | "충남아산시"
+                        | "충남천안시"
+                ) {
+                    target_record_count = target_record_count
+                        .checked_add(1)
+                        .ok_or_else(|| err("대상 지역 소스 레코드 수 계산 실패"))?;
+                    map.try_reserve(1).map_err(|source| {
+                        err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
+                    })?;
+                    let key = normalize_address_key(&record.address)?;
+                    match map.entry(key) {
+                        Entry::Vacant(vacant_entry) => {
+                            vacant_entry.insert(record);
+                        }
+                        Entry::Occupied(occupied_entry) => {
+                            let existing = occupied_entry.get();
+                            return Err(err(format!(
+                                "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
+                                existing.address, existing.name, record.name
+                            )));
+                        }
+                    }
                 }
             }
-            if filtered_records.is_empty() {
+            if target_record_count == 0 {
                 return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
-            }
-            let mut map: HashMap<String, SourceRecord> = HashMap::new();
-            map.try_reserve(filtered_records.len()).map_err(|source| {
-                let record_count = filtered_records.len();
-                err_with_source(
-                    format!("소스 index 맵 메모리 확보 실패: {record_count} entries"),
-                    source,
-                )
-            })?;
-            for record in filtered_records {
-                let key = normalize_address_key(&record.address)?;
-                match map.entry(key) {
-                    Entry::Vacant(vacant_entry) => {
-                        vacant_entry.insert(record);
-                    }
-                    Entry::Occupied(occupied_entry) => {
-                        let existing = occupied_entry.get();
-                        return Err(err(format!(
-                            "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
-                            existing.address, existing.name, record.name
-                        )));
-                    }
-                }
             }
             Ok(map)
         })();

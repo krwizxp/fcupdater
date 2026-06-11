@@ -24,9 +24,9 @@ type RowRange = RangeInclusive<u32>;
 pub struct MasterSheetUpdater<'source> {
     pub source_index: &'source HashMap<String, SourceRecord>,
 }
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ScaledDecimal(i64);
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ScaledSortKey(i128);
 impl ScaledDecimal {
     const ZERO: Self = Self(0);
@@ -1275,35 +1275,49 @@ impl RankFormulaRefresher<'_, '_> {
         }
         Ok(rank_totals)
     }
-    fn refresh_caches(&mut self) -> Result<()> {
+    fn refresh_caches(&mut self, sort_context: &RankSortContext) -> Result<()> {
         let display_total_qty = MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)
             .map(|value| value.filter(|qty| !MasterSheetUpdater::is_zero(*qty)))?;
-        let sort_context =
-            MasterSheetUpdater::build_rank_sort_context(self.ws, self.shared_strings)?;
         self.ws
             .clear_formula_cached_values_in_range(self.data_rows)?;
-        let rank_totals = self.collect_rank_totals(display_total_qty, &sort_context)?;
+        let rank_totals = self.collect_rank_totals(display_total_qty, sort_context)?;
         let mut visible_rank_totals: Vec<ScaledSortKey> = Vec::new();
-        let visible_rank_count = rank_totals
-            .iter()
-            .filter(|entry| entry.total.is_some())
-            .count();
         visible_rank_totals
-            .try_reserve_exact(visible_rank_count)
+            .try_reserve(rank_totals.len())
             .map_err(|source| {
                 err_with_source(
-                    format!("표시 랭크 합계 목록 메모리 확보 실패: {visible_rank_count} rows"),
+                    format!(
+                        "표시 랭크 합계 목록 메모리 확보 실패: {} rows",
+                        rank_totals.len()
+                    ),
                     source,
                 )
             })?;
         visible_rank_totals.extend(rank_totals.iter().filter_map(|entry| entry.total));
         visible_rank_totals.sort_unstable();
+        let mut rank_by_total: HashMap<ScaledSortKey, usize> = HashMap::new();
+        rank_by_total
+            .try_reserve(visible_rank_totals.len())
+            .map_err(|source| {
+                err_with_source(
+                    format!(
+                        "표시 랭크 합계 순위 맵 메모리 확보 실패: {} rows",
+                        visible_rank_totals.len()
+                    ),
+                    source,
+                )
+            })?;
+        for (index, total) in visible_rank_totals.iter().copied().enumerate() {
+            let rank = index
+                .checked_add(1)
+                .ok_or_else(|| err("지역화폐 순위 계산 중 overflow가 발생했습니다."))?;
+            rank_by_total.entry(total).or_insert(rank);
+        }
         for entry in rank_totals {
             let rank_text = if let Some(current) = entry.total {
-                let rank = visible_rank_totals
-                    .partition_point(|value| *value < current)
-                    .checked_add(1)
-                    .ok_or_else(|| err("지역화폐 순위 계산 중 overflow가 발생했습니다."))?;
+                let rank = *rank_by_total
+                    .get(&current)
+                    .ok_or_else(|| err("지역화폐 순위 맵에서 값을 찾지 못했습니다."))?;
                 Some(rank.to_string())
             } else {
                 None
@@ -1419,13 +1433,11 @@ impl RankRowsSorter<'_, '_> {
         }
         Ok(row_mapping)
     }
-    fn sort(&mut self) -> Result<()> {
+    fn sort(&mut self, sort_context: &RankSortContext) -> Result<()> {
         if self.data_rows.start >= self.data_rows.last {
             return Ok(());
         }
-        let sort_context =
-            MasterSheetUpdater::build_rank_sort_context(self.ws, self.shared_strings)?;
-        let data_rows = self.sorted_data_rows(&sort_context)?;
+        let data_rows = self.sorted_data_rows(sort_context)?;
         let row_mapping = self.row_mapping(&data_rows)?;
         self.apply_sorted_rows(data_rows, &row_mapping)
     }
@@ -1576,13 +1588,15 @@ impl RankSortKeyBuilder<'_, '_, '_> {
 }
 impl RankSortRefresher<'_, '_> {
     fn refresh(&mut self) -> Result<()> {
+        let sort_context =
+            MasterSheetUpdater::build_rank_sort_context(self.ws, self.shared_strings)?;
         RankRowsSorter {
             data_rows: self.data_rows,
             layout: self.layout,
             shared_strings: self.shared_strings,
             ws: self.ws,
         }
-        .sort()?;
+        .sort(&sort_context)?;
         let mut formula_refresher = RankFormulaRefresher {
             data_rows: self.data_rows,
             layout: self.layout,
@@ -1590,7 +1604,17 @@ impl RankSortRefresher<'_, '_> {
             ws: self.ws,
         };
         formula_refresher.repair_formulas()?;
-        formula_refresher.refresh_caches()
+        let refreshed_sort_context;
+        let cache_sort_context = if (4..=13).any(|row| self.data_rows.contains(&row)) {
+            refreshed_sort_context = MasterSheetUpdater::build_rank_sort_context(
+                formula_refresher.ws,
+                self.shared_strings,
+            )?;
+            &refreshed_sort_context
+        } else {
+            &sort_context
+        };
+        formula_refresher.refresh_caches(cache_sort_context)
     }
 }
 impl<'source> MasterSheetUpdater<'source> {

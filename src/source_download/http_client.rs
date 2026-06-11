@@ -28,6 +28,8 @@ cfg_select! {
 }
 #[derive(Default)]
 pub(super) struct HttpClient {
+    cookie_header_cache: Option<String>,
+    cookie_header_dirty: bool,
     cookies: Vec<Cookie>,
     platform: PlatformHttpClient,
 }
@@ -52,6 +54,7 @@ impl HttpClient {
                 download_error_with_source("Cookie 값 메모리 확보 실패", source)
             })?;
             cookie.value.push_str(value);
+            self.cookie_header_dirty = true;
             return Ok(());
         }
         self.cookies
@@ -72,47 +75,13 @@ impl HttpClient {
         cookie.name.push_str(name);
         cookie.value.push_str(value);
         self.cookies.push(cookie);
+        self.cookie_header_dirty = true;
         Ok(())
-    }
-    fn cookie_header(&self) -> DownloadResult<Option<String>> {
-        if self.cookies.is_empty() {
-            return Ok(None);
-        }
-        let separator_capacity = self
-            .cookies
-            .len()
-            .checked_sub(1)
-            .and_then(|count| count.checked_mul(2))
-            .ok_or("Cookie header 용량 계산 실패")?;
-        let capacity = self
-            .cookies
-            .iter()
-            .try_fold(separator_capacity, |sum, cookie| {
-                sum.checked_add(cookie.name.len())?
-                    .checked_add(1)?
-                    .checked_add(cookie.value.len())
-            })
-            .ok_or("Cookie header 용량 계산 실패")?;
-        let mut out = String::new();
-        out.try_reserve(capacity).map_err(|source| {
-            download_error_with_source("Cookie header 메모리 확보 실패", source)
-        })?;
-        for (index, cookie) in self.cookies.iter().enumerate() {
-            if index != 0 {
-                out.push_str("; ");
-            }
-            out.push_str(&cookie.name);
-            out.push('=');
-            out.push_str(&cookie.value);
-        }
-        Ok(Some(out))
     }
     fn encoded_form_body(form: &[(&str, &str)]) -> DownloadResult<String> {
         let body_capacity = form.iter().try_fold(0_usize, |sum, &(name, value)| {
-            let encoded_capacity = name
-                .len()
-                .checked_add(value.len())?
-                .checked_mul(3)?
+            let encoded_capacity = Self::percent_encoded_len(name.as_bytes())?
+                .checked_add(Self::percent_encoded_len(value.as_bytes())?)?
                 .checked_add(1)?;
             let separated_capacity = if sum == 0 {
                 encoded_capacity
@@ -200,6 +169,20 @@ impl HttpClient {
         let response = self.request("GET", host, path, None, &headers)?;
         String::from_utf8(response.body)
             .map_err(|source| download_error_with_source("HTTP 응답 UTF-8 변환 실패", source))
+    }
+    fn percent_encoded_len(bytes: &[u8]) -> Option<usize> {
+        bytes.iter().try_fold(0_usize, |sum, byte| {
+            let byte_len = match *byte {
+                unreserved
+                    if unreserved.is_ascii_alphanumeric()
+                        || matches!(unreserved, b'-' | b'_' | b'.' | b'~' | b' ') =>
+                {
+                    1
+                }
+                _ => 3,
+            };
+            sum.checked_add(byte_len)
+        })
     }
     pub(super) fn post_form(
         &mut self,
@@ -298,6 +281,46 @@ impl HttpClient {
             }
         }
     }
+    fn refresh_cookie_header_cache(&mut self) -> DownloadResult<()> {
+        if !self.cookie_header_dirty {
+            return Ok(());
+        }
+        if self.cookies.is_empty() {
+            self.cookie_header_cache = None;
+            self.cookie_header_dirty = false;
+            return Ok(());
+        }
+        let separator_capacity = self
+            .cookies
+            .len()
+            .checked_sub(1)
+            .and_then(|count| count.checked_mul(2))
+            .ok_or("Cookie header 용량 계산 실패")?;
+        let capacity = self
+            .cookies
+            .iter()
+            .try_fold(separator_capacity, |sum, cookie| {
+                sum.checked_add(cookie.name.len())?
+                    .checked_add(1)?
+                    .checked_add(cookie.value.len())
+            })
+            .ok_or("Cookie header 용량 계산 실패")?;
+        let mut out = String::new();
+        out.try_reserve(capacity).map_err(|source| {
+            download_error_with_source("Cookie header 메모리 확보 실패", source)
+        })?;
+        for (index, cookie) in self.cookies.iter().enumerate() {
+            if index != 0 {
+                out.push_str("; ");
+            }
+            out.push_str(&cookie.name);
+            out.push('=');
+            out.push_str(&cookie.value);
+        }
+        self.cookie_header_cache = Some(out);
+        self.cookie_header_dirty = false;
+        Ok(())
+    }
     fn request(
         &mut self,
         method: &str,
@@ -306,9 +329,13 @@ impl HttpClient {
         body: Option<&[u8]>,
         headers: &[(&str, &str)],
     ) -> DownloadResult<HttpResponse> {
+        self.refresh_cookie_header_cache()?;
+        let cookie_header = self.cookie_header_cache.as_deref();
         let mut merged_headers = Vec::new();
-        let merged_header_capacity =
-            checked_capacity_sum(&[headers.len(), 3], "HTTP request header 용량 계산 실패")?;
+        let merged_header_capacity = checked_capacity_sum(
+            &[headers.len(), 2, usize::from(cookie_header.is_some())],
+            "HTTP request header 용량 계산 실패",
+        )?;
         merged_headers
             .try_reserve(merged_header_capacity)
             .map_err(|source| {
@@ -317,8 +344,7 @@ impl HttpClient {
         merged_headers.push(("User-Agent", USER_AGENT));
         merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
         merged_headers.extend_from_slice(headers);
-        let cookie_header = self.cookie_header()?;
-        if let Some(cookie_text) = cookie_header.as_deref() {
+        if let Some(cookie_text) = cookie_header {
             merged_headers.push(("Cookie", cookie_text));
         }
         let response = {
@@ -365,9 +391,7 @@ impl HttpClient {
             .map_err(|source| download_error_with_source("현재 시간 조회 실패", source))?;
         let opcode = if key.is_some() { "5002" } else { "5101" };
         let key_fragment = if let Some(key_value) = key {
-            let encoded_capacity = key_value
-                .len()
-                .checked_mul(3)
+            let encoded_capacity = Self::percent_encoded_len(key_value.as_bytes())
                 .ok_or("NetFunnel key 인코딩 용량 계산 실패")?;
             let capacity = encoded_capacity
                 .checked_add("&key=".len())
@@ -469,9 +493,13 @@ impl HttpClient {
         headers: &[(&str, &str)],
         writer: &mut dyn IoWrite,
     ) -> DownloadResult<HttpStreamResponse> {
+        self.refresh_cookie_header_cache()?;
+        let cookie_header = self.cookie_header_cache.as_deref();
         let mut merged_headers = Vec::new();
-        let merged_header_capacity =
-            checked_capacity_sum(&[headers.len(), 3], "HTTP request header 용량 계산 실패")?;
+        let merged_header_capacity = checked_capacity_sum(
+            &[headers.len(), 2, usize::from(cookie_header.is_some())],
+            "HTTP request header 용량 계산 실패",
+        )?;
         merged_headers
             .try_reserve(merged_header_capacity)
             .map_err(|source| {
@@ -480,8 +508,7 @@ impl HttpClient {
         merged_headers.push(("User-Agent", USER_AGENT));
         merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
         merged_headers.extend_from_slice(headers);
-        let cookie_header = self.cookie_header()?;
-        if let Some(cookie_text) = cookie_header.as_deref() {
+        if let Some(cookie_text) = cookie_header {
             merged_headers.push(("Cookie", cookie_text));
         }
         let response = {

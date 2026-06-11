@@ -365,31 +365,14 @@ impl XlsxContainer {
         bytes
             .try_reserve_exact(data_len)
             .map_err(|source| err_with_source("xlsx XML part 메모리 확보 실패", source))?;
-        let mut chunk = [0_u8; 8192];
-        loop {
-            let read = reader.read(&mut chunk).map_err(|source_err| {
-                err_with_source(path_context_message("파일 읽기 실패", &path), source_err)
-            })?;
-            if read == 0 {
-                break;
-            }
-            let next_len = bytes
-                .len()
-                .checked_add(read)
-                .ok_or_else(|| err("xlsx XML part 읽기 길이 계산 실패"))?;
-            if u64::try_from(next_len).is_ok_and(|actual| actual > MAX_XLSX_TEXT_PART_BYTES) {
-                return Err(err(format!(
-                    "xlsx XML part가 너무 큽니다: {} (최대 {MAX_XLSX_TEXT_PART_BYTES} bytes)",
-                    path.display()
-                )));
-            }
-            bytes
-                .try_reserve(read)
-                .map_err(|source| err_with_source("xlsx XML part 추가 메모리 확보 실패", source))?;
-            let segment = chunk
-                .get(..read)
-                .ok_or_else(|| err("xlsx XML part 읽기 chunk 범위 오류"))?;
-            bytes.extend_from_slice(segment);
+        reader.read_to_end(&mut bytes).map_err(|source_err| {
+            err_with_source(path_context_message("파일 읽기 실패", &path), source_err)
+        })?;
+        if u64::try_from(bytes.len()).is_ok_and(|actual| actual > MAX_XLSX_TEXT_PART_BYTES) {
+            return Err(err(format!(
+                "xlsx XML part가 너무 큽니다: {} (최대 {MAX_XLSX_TEXT_PART_BYTES} bytes)",
+                path.display()
+            )));
         }
         String::from_utf8(bytes).map_err(|source| {
             err_with_source(path_context_message("파일 UTF-8 해석 실패", &path), source)

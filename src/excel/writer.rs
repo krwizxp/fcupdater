@@ -1182,32 +1182,49 @@ impl Worksheet {
         mem::take(&mut self.rows)
     }
     pub fn to_xml(&self) -> Result<String> {
-        let mut estimated_row_attrs = Some(0_usize);
-        let mut estimated_cell_count = Some(0_usize);
-        let mut estimated_inner_len = Some(0_usize);
-        for row in self.rows.values() {
-            estimated_row_attrs =
-                estimated_row_attrs.and_then(|value| value.checked_add(row.attrs.len()));
-            estimated_cell_count =
-                estimated_cell_count.and_then(|value| value.checked_add(row.cells.len()));
-            for cell in row.cells.values() {
-                estimated_inner_len = estimated_inner_len.and_then(|value| {
-                    value.checked_add(cell.inner_xml.as_deref().map_or(0, str::len))
-                });
-            }
-        }
         let estimated_capacity = (|| {
-            let row_markup = self.rows.len().checked_mul("<row></row>".len())?;
-            let row_attrs = estimated_row_attrs?.checked_mul(12)?;
-            let cell_markup = estimated_cell_count?.checked_mul("<c></c>".len())?;
-            checked_capacity(&[
-                self.prefix.len(),
-                self.suffix.len(),
-                row_markup,
-                row_attrs,
-                cell_markup,
-                estimated_inner_len?,
-            ])
+            let mut capacity = checked_capacity(&[self.prefix.len(), self.suffix.len()])?;
+            for row in self.rows.values() {
+                capacity = capacity.checked_add("<row".len())?;
+                let row_attrs_len = row.attrs.iter().try_fold(0_usize, |sum, attr| {
+                    checked_capacity(&[
+                        sum,
+                        " ".len(),
+                        attr.name.len(),
+                        "=\"".len(),
+                        xml_escaped_len(&attr.value, XmlEscapeContext::Attribute)?,
+                        "\"".len(),
+                    ])
+                })?;
+                capacity = capacity.checked_add(row_attrs_len)?;
+                if row.cells.is_empty() {
+                    capacity = capacity.checked_add("/>".len())?;
+                    continue;
+                }
+                capacity = capacity.checked_add(">".len())?;
+                for cell in row.cells.values() {
+                    capacity = capacity.checked_add("<c".len())?;
+                    let cell_attrs_len = cell.attrs.iter().try_fold(0_usize, |sum, attr| {
+                        checked_capacity(&[
+                            sum,
+                            " ".len(),
+                            attr.name.len(),
+                            "=\"".len(),
+                            xml_escaped_len(&attr.value, XmlEscapeContext::Attribute)?,
+                            "\"".len(),
+                        ])
+                    })?;
+                    capacity = capacity.checked_add(cell_attrs_len)?;
+                    if let Some(inner) = cell.inner_xml.as_ref() {
+                        capacity =
+                            checked_capacity(&[capacity, ">".len(), inner.len(), "</c>".len()])?;
+                    } else {
+                        capacity = capacity.checked_add("/>".len())?;
+                    }
+                }
+                capacity = capacity.checked_add("</row>".len())?;
+            }
+            Some(capacity)
         })();
         let capacity = estimated_capacity.ok_or_else(|| err("worksheet XML 용량 계산 실패"))?;
         let mut out = String::new();
@@ -1546,6 +1563,12 @@ fn attr_sort_rank(name: &str) -> u8 {
     }
 }
 fn push_sorted_attrs_xml(out: &mut String, attrs: &[XmlAttr]) {
+    if attrs.len() == 1
+        && let Some(attr) = attrs.first()
+    {
+        push_attr_xml(out, attr);
+        return;
+    }
     let mut sorted_attrs = attrs.iter().collect::<Vec<_>>();
     sorted_attrs.sort_unstable_by(|left, right| {
         attr_sort_rank(&left.name)
@@ -2076,25 +2099,26 @@ fn try_xml_escape_text(
     error_context: &'static str,
 ) -> Result<String> {
     ensure_valid_xml_text(text, error_context)?;
-    let capacity = text
-        .chars()
-        .try_fold(0_usize, |total, ch| {
-            let encoded_len = match ch {
-                '&' => "&amp;".len(),
-                '<' => "&lt;".len(),
-                '>' => "&gt;".len(),
-                '"' if matches!(context, XmlEscapeContext::Attribute) => "&quot;".len(),
-                '\'' if matches!(context, XmlEscapeContext::Attribute) => "&apos;".len(),
-                _ => ch.len_utf8(),
-            };
-            total.checked_add(encoded_len)
-        })
+    let capacity = xml_escaped_len(text, context)
         .ok_or_else(|| err(format!("{error_context} 용량 계산 실패")))?;
     let mut out = String::new();
     out.try_reserve(capacity)
         .map_err(|source| err_with_source(format!("{error_context} 메모리 확보 실패"), source))?;
     append_xml_escaped(&mut out, text, context);
     Ok(out)
+}
+fn xml_escaped_len(text: &str, context: XmlEscapeContext) -> Option<usize> {
+    text.chars().try_fold(0_usize, |total, ch| {
+        let encoded_len = match ch {
+            '&' => "&amp;".len(),
+            '<' => "&lt;".len(),
+            '>' => "&gt;".len(),
+            '"' if matches!(context, XmlEscapeContext::Attribute) => "&quot;".len(),
+            '\'' if matches!(context, XmlEscapeContext::Attribute) => "&apos;".len(),
+            _ => ch.len_utf8(),
+        };
+        total.checked_add(encoded_len)
+    })
 }
 fn append_xml_escaped(out: &mut String, text: &str, context: XmlEscapeContext) {
     for ch in text.chars() {

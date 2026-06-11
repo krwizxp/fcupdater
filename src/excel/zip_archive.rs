@@ -307,7 +307,6 @@ const ZIP_MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 const ZIP_UNSAFE_PATH_MESSAGE: &str = "허용되지 않은 압축 경로가 포함되어 있습니다";
-const ZIP_READ_CHUNK_BYTES: usize = 8 * 1024;
 const LENGTH_BASES: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
@@ -725,34 +724,17 @@ impl ZipArchiveExtractor<'_> {
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| err("xlsx 압축 파일 읽기 한도 계산 실패"))?;
         let mut limited = file.take(read_limit);
-        let mut chunk = [0_u8; ZIP_READ_CHUNK_BYTES];
-        loop {
-            let read = limited.read(&mut chunk).map_err(|source_err| {
-                err_with_source(
-                    path_context_message("xlsx 압축 파일 읽기 실패", self.archive_path),
-                    source_err,
-                )
-            })?;
-            if read == 0 {
-                break;
-            }
-            let next_len = bytes
-                .len()
-                .checked_add(read)
-                .ok_or_else(|| err("xlsx 압축 파일 읽기 길이 계산 실패"))?;
-            if next_len > ZIP_MAX_ARCHIVE_BYTES {
-                return Err(err(format!(
-                    "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
-                    self.archive_path.display()
-                )));
-            }
-            bytes.try_reserve(read).map_err(|source| {
-                err_with_source("xlsx 압축 파일 추가 메모리 확보 실패", source)
-            })?;
-            let segment = chunk
-                .get(..read)
-                .ok_or_else(|| err("xlsx 압축 파일 읽기 chunk 범위 오류"))?;
-            bytes.extend_from_slice(segment);
+        limited.read_to_end(&mut bytes).map_err(|source_err| {
+            err_with_source(
+                path_context_message("xlsx 압축 파일 읽기 실패", self.archive_path),
+                source_err,
+            )
+        })?;
+        if bytes.len() > ZIP_MAX_ARCHIVE_BYTES {
+            return Err(err(format!(
+                "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
+                self.archive_path.display()
+            )));
         }
         Ok(bytes)
     }

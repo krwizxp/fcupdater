@@ -548,18 +548,15 @@ fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<Vec<HttpHead
     else {
         return Ok(Vec::new());
     };
-    let header_items = || {
-        selected
-            .lines()
-            .filter(|line| !line.starts_with("HTTP/"))
-            .filter_map(|line| line.split_once(':'))
-    };
-    let header_count = header_items().count();
     let mut headers = Vec::new();
-    headers
-        .try_reserve(header_count)
-        .map_err(|source| download_error_with_source("HTTP header 목록 메모리 확보 실패", source))?;
-    for (raw_name, raw_value) in header_items() {
+    for (raw_name, raw_value) in selected
+        .lines()
+        .filter(|line| !line.starts_with("HTTP/"))
+        .filter_map(|line| line.split_once(':'))
+    {
+        headers.try_reserve(1).map_err(|source| {
+            download_error_with_source("HTTP header 목록 메모리 확보 실패", source)
+        })?;
         let name = raw_name.trim_ascii();
         let value = raw_value.trim_ascii();
         let mut header_name = String::new();

@@ -125,15 +125,15 @@ impl Handle {
 impl Client {
     fn cached_connect_ptr(
         &mut self,
-        user_agent: &[u16],
         host: &str,
         host_wide: &[u16],
         port: u16,
     ) -> DownloadResult<HInternet> {
         if self.session_cache.is_none() {
+            let user_agent = wide(super::USER_AGENT)?;
             self.session_cache = Some(SessionCache {
                 connects: Vec::new(),
-                session: self.open_session(user_agent)?,
+                session: self.open_session(&user_agent)?,
             });
         }
         let error_code_label = self.error_code_label;
@@ -309,13 +309,10 @@ impl Client {
         let raw = String::from_utf16(&buffer)
             .map_err(|source| download_error_with_source("응답 헤더 UTF-16 변환 실패", source))?;
         let mut parsed = Vec::new();
-        let header_line_count = raw.lines().skip(1).count();
-        parsed
-            .try_reserve(header_line_count)
-            .map_err(|source| {
+        for (raw_name, raw_value) in raw.lines().skip(1).filter_map(|line| line.split_once(':')) {
+            parsed.try_reserve(1).map_err(|source| {
                 download_error_with_source("응답 header 목록 메모리 확보 실패", source)
             })?;
-        for (raw_name, raw_value) in raw.lines().skip(1).filter_map(|line| line.split_once(':')) {
             let name = raw_name.trim_ascii();
             let value = raw_value.trim_ascii();
             let mut header_name = String::new();
@@ -478,7 +475,6 @@ impl Client {
         request_body: Option<&[u8]>,
         headers: &[(&str, &str)],
     ) -> DownloadResult<HttpResponse> {
-        let user_agent = wide(super::USER_AGENT)?;
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
         let path_wide = wide(path)?;
@@ -504,12 +500,7 @@ impl Client {
         let body_slice = request_body.map_or(&[][..], |body| body);
         let body_len = u32::try_from(body_slice.len())
             .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
-        let connect = self.cached_connect_ptr(
-            &user_agent,
-            host,
-            &host_wide,
-            self.default_https_port,
-        )?;
+        let connect = self.cached_connect_ptr(host, &host_wide, self.default_https_port)?;
         let response = (|| {
             let request = self.open_request(connect, &method_wide, &path_wide)?;
             self.send_request(&request, &headers_wide, body_slice, body_len)?;
@@ -538,7 +529,6 @@ impl Client {
         headers: &[(&str, &str)],
         writer: &mut dyn IoWrite,
     ) -> DownloadResult<HttpStreamResponse> {
-        let user_agent = wide(super::USER_AGENT)?;
         let host_wide = wide(host)?;
         let method_wide = wide(method)?;
         let path_wide = wide(path)?;
@@ -564,12 +554,7 @@ impl Client {
         let body_slice = request_body.map_or(&[][..], |body| body);
         let body_len = u32::try_from(body_slice.len())
             .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
-        let connect = self.cached_connect_ptr(
-            &user_agent,
-            host,
-            &host_wide,
-            self.default_https_port,
-        )?;
+        let connect = self.cached_connect_ptr(host, &host_wide, self.default_https_port)?;
         let response = (|| {
             let request = self.open_request(connect, &method_wide, &path_wide)?;
             self.send_request(&request, &headers_wide, body_slice, body_len)?;
