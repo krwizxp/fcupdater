@@ -1,16 +1,14 @@
 use super::{
     SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
-    path_util::{path_from_slashes, path_to_slashes},
-    xml::{
-        XmlScanner, extract_all_tag_text, extract_attr, find_end_tag, find_start_tag, find_tag_end,
-    },
+    path_util::path_to_slashes,
+    xml::{extract_attr, find_start_tag, find_tag_end},
 };
 use crate::diagnostic::{
     Result, err, err_with_source, path_context_message, path_pair_context_message,
     path_source_message, prefixed_message,
 };
 use alloc::borrow::Cow;
-use core::{mem, range::Range, time::Duration};
+use core::{mem, time::Duration};
 use std::{
     collections::HashMap,
     env, fs,
@@ -58,18 +56,14 @@ impl SavedArchiveVerifier<'_> {
                 self.saved_archive,
             ))
         })?;
-        for rel in [
-            "[Content_Types].xml",
-            "xl/workbook.xml",
-            "xl/_rels/workbook.xml.rels",
-        ] {
-            container.read_text(rel).map_err(|source_err| {
+        container
+            .read_text("[Content_Types].xml")
+            .map_err(|source_err| {
                 source_err.prepend_context(path_context_message(
                     "저장 검증 실패: 필수 OOXML 파트 읽기 실패",
                     self.saved_archive,
                 ))
             })?;
-        }
         super::writer::Workbook::from_container(container).map_err(|source_err| {
             source_err.prepend_context(path_context_message(
                 "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
@@ -133,68 +127,7 @@ impl TempArchivePromotion<'_> {
     }
 }
 impl XlsxContainer {
-    pub(super) fn load_shared_strings(&self) -> Result<Vec<String>> {
-        let path = self
-            .unpack_dir()
-            .join(path_from_slashes("xl/sharedStrings.xml"));
-        if !(path.try_exists().map_err(|source_err| {
-            err(format!(
-                "sharedStrings.xml 경로 확인 실패: {} ({source_err})",
-                path.display()
-            ))
-        }))? {
-            return Ok(Vec::new());
-        }
-        let xml = self.read_text("xl/sharedStrings.xml")?;
-        let shared_string_count = xml.matches("<si").count();
-        let mut out: Vec<String> = Vec::new();
-        out.try_reserve_exact(shared_string_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("sharedStrings 메모리 확보 실패: {shared_string_count} entries"),
-                    source,
-                )
-            })?;
-        let mut scanner = XmlScanner::new(&xml);
-        while let Some(si_tag) = scanner.next_start_named("si") {
-            if si_tag.is_self_closing() {
-                out.push(String::new());
-                continue;
-            }
-            let si_tag_end = si_tag.end();
-            let Some(body_start) = si_tag_end.checked_add(1) else {
-                return Err(err(
-                    "sharedStrings.xml의 <si> 본문 시작 계산에 실패했습니다.",
-                ));
-            };
-            let Some(si_end) = find_end_tag(&xml, "si", body_start) else {
-                return Err(err("sharedStrings.xml의 </si> 태그를 찾지 못했습니다."));
-            };
-            let si_body_span = Range {
-                start: body_start,
-                end: si_end,
-            };
-            let Some(si_body) = xml.get(si_body_span) else {
-                return Err(err("sharedStrings.xml의 <si> 본문 범위가 손상되었습니다."));
-            };
-            let text = extract_all_tag_text(si_body, "t")?
-                .map(Cow::into_owned)
-                .unwrap_or_default();
-            out.push(text);
-            let Some(si_close_end) = find_tag_end(&xml, si_end) else {
-                return Err(err("sharedStrings.xml의 </si> 태그가 손상되었습니다."));
-            };
-            let Some(next_cursor) = si_close_end.checked_add(1) else {
-                return Err(err(
-                    "sharedStrings.xml의 다음 <si> 위치 계산에 실패했습니다.",
-                ));
-            };
-            scanner.skip_to(next_cursor);
-        }
-        Ok(out)
-    }
-    pub(super) fn load_sheet_catalog(&self) -> Result<Vec<SheetInfo>> {
-        let workbook_xml = self.read_text("xl/workbook.xml")?;
+    pub(super) fn load_sheet_catalog(&self, workbook_xml: &str) -> Result<Vec<SheetInfo>> {
         let rels_xml = self.read_text("xl/_rels/workbook.xml.rels")?;
         let relationship_count = rels_xml.matches("<Relationship").count();
         let mut rid_to_target: HashMap<Cow<'_, str>, Cow<'_, str>> = HashMap::new();
@@ -239,8 +172,8 @@ impl XlsxContainer {
             )
         })?;
         let mut sheet_cursor = 0_usize;
-        while let Some(sheet_start) = find_start_tag(&workbook_xml, "sheet", sheet_cursor) {
-            let Some(sheet_end) = find_tag_end(&workbook_xml, sheet_start) else {
+        while let Some(sheet_start) = find_start_tag(workbook_xml, "sheet", sheet_cursor) {
+            let Some(sheet_end) = find_tag_end(workbook_xml, sheet_start) else {
                 return Err(err("workbook.xml의 sheet 시작 태그가 손상되었습니다."));
             };
             let Some(tag) = workbook_xml.get(sheet_start..=sheet_end) else {
@@ -264,9 +197,10 @@ impl XlsxContainer {
                     "sheet 관계 target에 절대 경로는 허용되지 않습니다: {target_text}"
                 )));
             } else {
-                let mut base: PathBuf = "xl/workbook.xml".into();
-                base.pop();
-                let combined = base.join(path_from_slashes(target_text));
+                let mut combined: PathBuf = "xl".into();
+                for segment in target_text.split('/').filter(|segment| !segment.is_empty()) {
+                    combined.push(segment);
+                }
                 let normalized = normalize_safe_relative_path(&combined, target_text)?;
                 let resolved_path = path_to_slashes(&normalized, target_text)?;
                 if resolved_path.is_empty() {

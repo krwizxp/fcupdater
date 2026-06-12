@@ -1,13 +1,6 @@
 use crate::diagnostic::{Result, err, err_with_source, prefixed_message};
 use core::fmt::Display;
-use std::path::{Component, Path, PathBuf};
-pub(super) fn path_from_slashes(path: &str) -> PathBuf {
-    let mut out = PathBuf::new();
-    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
-        out.push(segment);
-    }
-    out
-}
+use std::path::{Component, Path};
 pub(super) fn path_to_slashes(path: &Path, context: impl Display) -> Result<String> {
     let mut out = String::new();
     for component in path.components() {
