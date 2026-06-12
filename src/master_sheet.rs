@@ -79,12 +79,6 @@ struct DeletedRowsBuilder<'old, 'kept, 'source> {
     kept_source_rows: &'kept [KeptSourceRow<'source>],
     old_rows: &'old [u32],
 }
-struct MasterDataRowsCollector<'sheet, 'strings> {
-    data_start_row: u32,
-    layout: MasterSheetLayout,
-    shared_strings: &'strings [String],
-    ws: &'sheet excel::writer::Worksheet,
-}
 struct MasterHeaderResolver<'headers> {
     headers: &'headers HashMap<String, u32>,
 }
@@ -98,6 +92,7 @@ struct MasterSheetLayoutFinder<'sheet, 'strings> {
     ws: &'sheet excel::writer::Worksheet,
 }
 struct MasterRowEvaluator<'sheet, 'strings, 'source> {
+    identity: ParsedMasterIdentity<'strings>,
     layout: MasterSheetLayout,
     old_row: u32,
     shared_strings: &'strings [String],
@@ -248,6 +243,23 @@ struct AdjustedFuelPrices {
     gasoline: Option<ScaledDecimal>,
     premium: Option<ScaledDecimal>,
 }
+struct ParsedMasterIdentity<'text> {
+    address: Cow<'text, str>,
+    name: Cow<'text, str>,
+    region: Cow<'text, str>,
+}
+struct ParsedMasterRow<'text> {
+    diesel: Option<i32>,
+    gasoline: Option<i32>,
+    identity: ParsedMasterIdentity<'text>,
+    premium: Option<i32>,
+}
+struct RankRowBase {
+    adjusted_prices: AdjustedFuelPrices,
+    currency_apply: bool,
+    region_rate: ScaledDecimal,
+    smart_discount: ScaledDecimal,
+}
 struct ExistingMasterRow<'row> {
     brand: &'row str,
     diesel: Option<i32>,
@@ -306,6 +318,7 @@ struct MasterRowEvaluation<'source> {
     deleted: Vec<StoreRow>,
     kept_source_rows: Vec<KeptSourceRow<'source>>,
     matched_source_keys: HashSet<&'source str>,
+    old_rows: Vec<u32>,
 }
 struct RowMapper {
     decrease: u32,
@@ -378,6 +391,132 @@ impl<'source> ChangeRowBuilder<'_, 'source> {
             }))
     }
 }
+impl<'text> ParsedMasterIdentity<'text> {
+    fn address(&self) -> &str {
+        self.address.trim()
+    }
+    fn is_empty(&self) -> bool {
+        self.region.trim().is_empty() && self.name.trim().is_empty() && self.address().is_empty()
+    }
+    fn name(&self) -> &str {
+        self.name.trim()
+    }
+    fn read(
+        ws: &'text excel::writer::Worksheet,
+        layout: MasterSheetLayout,
+        row: u32,
+        shared_strings: &'text [String],
+    ) -> Result<Self> {
+        Ok(Self {
+            address: ws.try_get_display_at(layout.address, row, shared_strings)?,
+            name: ws.try_get_display_at(layout.name, row, shared_strings)?,
+            region: ws.try_get_display_at(layout.region, row, shared_strings)?,
+        })
+    }
+    fn region(&self) -> &str {
+        self.region.trim()
+    }
+}
+impl<'text> ParsedMasterRow<'text> {
+    fn deleted_store_row(&self) -> StoreRow {
+        StoreRow {
+            region: self.identity.region().to_owned(),
+            name: self.identity.name().to_owned(),
+            address: self.identity.address().to_owned(),
+            gasoline: self.gasoline,
+            premium: self.premium,
+            diesel: self.diesel,
+        }
+    }
+    fn read(
+        ws: &'text excel::writer::Worksheet,
+        layout: MasterSheetLayout,
+        row: u32,
+        shared_strings: &'text [String],
+    ) -> Result<Self> {
+        let identity = ParsedMasterIdentity::read(ws, layout, row, shared_strings)?;
+        Self::read_with_identity(identity, ws, layout, row, shared_strings)
+    }
+    fn read_with_identity(
+        identity: ParsedMasterIdentity<'text>,
+        ws: &'text excel::writer::Worksheet,
+        layout: MasterSheetLayout,
+        row: u32,
+        shared_strings: &'text [String],
+    ) -> Result<Self> {
+        Ok(Self {
+            identity,
+            gasoline: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
+                layout.gasoline,
+                row,
+                shared_strings,
+            )?),
+            premium: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
+                layout.premium,
+                row,
+                shared_strings,
+            )?),
+            diesel: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
+                layout.diesel,
+                row,
+                shared_strings,
+            )?),
+        })
+    }
+}
+impl RankRowBase {
+    fn rank_total(
+        total_price: Option<ScaledSortKey>,
+        region_rate: ScaledDecimal,
+    ) -> Option<ScaledSortKey> {
+        let (total, discount) =
+            total_price.zip(Self::regional_discount(total_price, region_rate))?;
+        total.checked_sub(discount)
+    }
+    fn read(
+        row: &ParsedMasterRow<'_>,
+        currency_apply: bool,
+        sort_context: &RankSortContext,
+    ) -> Self {
+        let smart_discount = if row.identity.name.contains("현대오일뱅크")
+            && row.identity.name.contains("직영")
+        {
+            sort_context.smart_discount
+        } else {
+            ScaledDecimal::ZERO
+        };
+        let adjusted_prices = AdjustedFuelPrices {
+            gasoline: MasterSheetUpdater::adjusted_fuel_price(row.gasoline, smart_discount),
+            premium: MasterSheetUpdater::adjusted_fuel_price(row.premium, smart_discount),
+            diesel: MasterSheetUpdater::adjusted_fuel_price(row.diesel, smart_discount),
+        };
+        let region_rate = if currency_apply {
+            sort_context
+                .region_rates
+                .get(row.identity.region())
+                .copied()
+                .unwrap_or_default()
+        } else {
+            ScaledDecimal::ZERO
+        };
+        Self {
+            adjusted_prices,
+            currency_apply,
+            region_rate,
+            smart_discount,
+        }
+    }
+    fn regional_discount(
+        total_price: Option<ScaledSortKey>,
+        region_rate: ScaledDecimal,
+    ) -> Option<ScaledSortKey> {
+        let value = total_price?;
+        value
+            .checked_mul(ScaledSortKey(region_rate.as_i128()))?
+            .checked_div(DECIMAL_SCALE_CUBED)?
+            .checked_mul(DECIMAL_SCALE_SQUARED)
+    }
+}
 impl DeletedRowsBuilder<'_, '_, '_> {
     fn build(&self) -> Result<Vec<u32>> {
         let mut deleted_rows: Vec<u32> = Vec::new();
@@ -404,48 +543,10 @@ impl DeletedRowsBuilder<'_, '_, '_> {
         Ok(deleted_rows)
     }
 }
-impl MasterDataRowsCollector<'_, '_> {
-    fn collect(&self) -> Result<Vec<u32>> {
-        let mut rows: Vec<u32> = Vec::new();
-        rows.try_reserve_exact(self.ws.row_count())
-            .map_err(|source| {
-                let row_count = self.ws.row_count();
-                err_with_source(
-                    format!("마스터 데이터 행 목록 메모리 확보 실패: {row_count} rows"),
-                    source,
-                )
-            })?;
-        for row in self.ws.row_numbers_from(self.data_start_row) {
-            let region =
-                self.ws
-                    .try_get_display_at(self.layout.region, row, self.shared_strings)?;
-            let name = self
-                .ws
-                .try_get_display_at(self.layout.name, row, self.shared_strings)?;
-            let addr = self
-                .ws
-                .try_get_display_at(self.layout.address, row, self.shared_strings)?;
-            if !(region.trim().is_empty() && name.trim().is_empty() && addr.trim().is_empty()) {
-                rows.push(row);
-            }
-        }
-        Ok(rows)
-    }
-}
 impl<'source> MasterRowEvaluator<'_, '_, 'source> {
-    fn evaluate(&self) -> Result<MasterRowDecision<'source>> {
-        let region_display =
-            self.ws
-                .try_get_display_at(self.layout.region, self.old_row, self.shared_strings)?;
-        let name_display =
-            self.ws
-                .try_get_display_at(self.layout.name, self.old_row, self.shared_strings)?;
-        let addr_display =
-            self.ws
-                .try_get_display_at(self.layout.address, self.old_row, self.shared_strings)?;
-        let region = region_display.trim();
-        let name = name_display.trim();
-        let addr = addr_display.trim();
+    fn evaluate(self) -> Result<MasterRowDecision<'source>> {
+        let identity = self.identity;
+        let addr = identity.address();
         if addr.is_empty() {
             return Ok(MasterRowDecision {
                 src: None,
@@ -456,60 +557,40 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
         }
         let key = normalize_address_key(addr)?;
         let Some((matched_key, src)) = self.source_index.get_key_value(&key) else {
+            let row = ParsedMasterRow::read_with_identity(
+                identity,
+                self.ws,
+                self.layout,
+                self.old_row,
+                self.shared_strings,
+            )?;
             return Ok(MasterRowDecision {
                 src: None,
                 matched_key: None,
                 change: None,
-                deleted: Some(StoreRow {
-                    region: region.to_owned(),
-                    name: name.to_owned(),
-                    address: addr.to_owned(),
-                    gasoline: MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-                        self.layout.gasoline,
-                        self.old_row,
-                        self.shared_strings,
-                    )?),
-                    premium: MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-                        self.layout.premium,
-                        self.old_row,
-                        self.shared_strings,
-                    )?),
-                    diesel: MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-                        self.layout.diesel,
-                        self.old_row,
-                        self.shared_strings,
-                    )?),
-                }),
+                deleted: Some(row.deleted_store_row()),
             });
         };
+        let row = ParsedMasterRow::read_with_identity(
+            identity,
+            self.ws,
+            self.layout,
+            self.old_row,
+            self.shared_strings,
+        )?;
         let old_brand_display =
             self.ws
                 .try_get_display_at(self.layout.brand, self.old_row, self.shared_strings)?;
         let old_self_yn_display =
             self.ws
                 .try_get_display_at(self.layout.self_yn, self.old_row, self.shared_strings)?;
-        let old_gas = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.gasoline,
-            self.old_row,
-            self.shared_strings,
-        )?);
-        let old_premium = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.premium,
-            self.old_row,
-            self.shared_strings,
-        )?);
-        let old_diesel = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.diesel,
-            self.old_row,
-            self.shared_strings,
-        )?);
         let old = ExistingMasterRow {
             brand: old_brand_display.trim(),
-            premium: old_premium,
-            diesel: old_diesel,
-            gasoline: old_gas,
-            name,
-            region,
+            premium: row.premium,
+            diesel: row.diesel,
+            gasoline: row.gasoline,
+            name: row.identity.name(),
+            region: row.identity.region(),
             self_yn: old_self_yn_display.trim(),
         };
         let change = ChangeRowBuilder { old: &old, src }.build()?;
@@ -837,7 +918,8 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
             .max_col_in_row(header_row)
             .unwrap_or(1)
             .max(self.ws.max_cell_col());
-        self.ws.update_dimension()?;
+        self.ws
+            .update_dimension_with(self.ws.max_row_num(), filter_end_col)?;
         Ok(FilterTarget {
             data_end_col: filter_end_col,
             data_rows: RowRange {
@@ -979,52 +1061,24 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
     }
 }
 impl RankFormulaCacheBuilder<'_, '_, '_> {
-    fn adjusted_prices(&self, smart_discount: ScaledDecimal) -> Result<AdjustedFuelPrices> {
-        let gasoline = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.gasoline,
-            self.row,
-            self.shared_strings,
-        )?);
-        let premium = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.premium,
-            self.row,
-            self.shared_strings,
-        )?);
-        let diesel = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.diesel,
-            self.row,
-            self.shared_strings,
-        )?);
-        Ok(AdjustedFuelPrices {
-            gasoline: MasterSheetUpdater::adjusted_fuel_price(gasoline, smart_discount),
-            premium: MasterSheetUpdater::adjusted_fuel_price(premium, smart_discount),
-            diesel: MasterSheetUpdater::adjusted_fuel_price(diesel, smart_discount),
-        })
-    }
     fn build(&self) -> Result<RankFormulaCache> {
-        let region =
-            self.ws
-                .try_get_display_at(self.layout.region, self.row, self.shared_strings)?;
-        let name = self
-            .ws
-            .try_get_display_at(self.layout.name, self.row, self.shared_strings)?;
-        let smart_discount = if name.contains("현대오일뱅크") && name.contains("직영") {
-            self.sort_context.smart_discount
+        let row = ParsedMasterRow::read(self.ws, self.layout, self.row, self.shared_strings)?;
+        let currency_apply = MasterSheetUpdater::currency_apply(
+            self.ws,
+            self.layout,
+            self.row,
+            self.shared_strings,
+        )?;
+        let base = RankRowBase::read(&row, currency_apply, self.sort_context);
+        let prices = base.adjusted_prices;
+        let total_price = self.total_price(prices);
+        let region_rate = if base.currency_apply && total_price.is_some() {
+            base.region_rate
         } else {
             ScaledDecimal::ZERO
         };
-        let prices = self.adjusted_prices(smart_discount)?;
-        let total_price = self.total_price(prices);
-        let region_rate = self.region_rate(&region, total_price)?;
-        let regional_discount = total_price.and_then(|value| {
-            value
-                .checked_mul(ScaledSortKey(region_rate.as_i128()))?
-                .checked_div(DECIMAL_SCALE_CUBED)?
-                .checked_mul(DECIMAL_SCALE_SQUARED)
-        });
-        let rank_total = total_price
-            .zip(regional_discount)
-            .and_then(|(total, discount)| total.checked_sub(discount));
+        let regional_discount = RankRowBase::regional_discount(total_price, region_rate);
+        let rank_total = RankRowBase::rank_total(total_price, region_rate);
         Ok(RankFormulaCache {
             adjusted_diesel: prices.diesel,
             adjusted_gasoline: prices.gasoline,
@@ -1033,7 +1087,7 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
             rank_total,
             region_rate: total_price.is_some().then_some(region_rate),
             regional_discount,
-            smart_discount,
+            smart_discount: base.smart_discount,
             total_price,
             unit_price_with_currency: rank_total
                 .zip(self.display_total_qty)
@@ -1103,29 +1157,6 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
             );
         }
         Ok(Some(parts))
-    }
-    fn region_rate(
-        &self,
-        region: &str,
-        total_price: Option<ScaledSortKey>,
-    ) -> Result<ScaledDecimal> {
-        let currency_apply = if let Some(col) = self.layout.currency_apply {
-            self.ws
-                .try_get_display_at(col, self.row, self.shared_strings)?
-                .trim()
-                .eq_ignore_ascii_case("Y")
-        } else {
-            false
-        };
-        Ok(if currency_apply && total_price.is_some() {
-            self.sort_context
-                .region_rates
-                .get(region.trim())
-                .copied()
-                .unwrap_or_default()
-        } else {
-            ScaledDecimal::ZERO
-        })
     }
     fn total_price(&self, prices: AdjustedFuelPrices) -> Option<ScaledSortKey> {
         self.display_total_qty?;
@@ -1368,10 +1399,10 @@ impl RankRowsSorter<'_, '_> {
                     source,
                 )
             })?;
+        let mut rows = self.ws.take_rows();
         for old_row in self.data_rows {
-            let row = self
-                .ws
-                .remove_row(old_row)
+            let row = rows
+                .remove(&old_row)
                 .ok_or_else(|| missing_sort_target_row_error(old_row))?;
             detached_rows.push(Some(row));
         }
@@ -1396,8 +1427,9 @@ impl RankRowsSorter<'_, '_> {
                         .unwrap_or(old_ref_row),
                 )
             })?;
-            self.ws.insert_row(new_row, row);
+            rows.insert(new_row, row);
         }
+        self.ws.replace_rows(rows);
         Ok(())
     }
     fn row_mapping(&self, data_rows: &[SortableRankRow]) -> Result<Vec<Option<u32>>> {
@@ -1490,66 +1522,29 @@ impl RankRowsSorter<'_, '_> {
 }
 impl RankSortKeyBuilder<'_, '_, '_> {
     fn build(&self) -> Result<RankSortKey> {
-        let region =
-            self.ws
-                .try_get_display_at(self.layout.region, self.row, self.shared_strings)?;
-        let name = self
-            .ws
-            .try_get_display_at(self.layout.name, self.row, self.shared_strings)?;
-        let address =
-            self.ws
-                .try_get_display_at(self.layout.address, self.row, self.shared_strings)?;
-        let gasoline = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.gasoline,
+        let row = ParsedMasterRow::read(self.ws, self.layout, self.row, self.shared_strings)?;
+        let currency_apply = MasterSheetUpdater::currency_apply(
+            self.ws,
+            self.layout,
             self.row,
             self.shared_strings,
-        )?);
-        let premium = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.premium,
-            self.row,
-            self.shared_strings,
-        )?);
-        let diesel = MasterSheetUpdater::normalize_fuel_price(self.ws.get_i32_at(
-            self.layout.diesel,
-            self.row,
-            self.shared_strings,
-        )?);
-        let is_direct_hyundai = name.contains("현대오일뱅크") && name.contains("직영");
-        let discount = if is_direct_hyundai {
-            self.sort_context.smart_discount
-        } else {
-            ScaledDecimal::ZERO
-        };
-        let adjusted_gasoline = MasterSheetUpdater::adjusted_fuel_price(gasoline, discount);
-        let adjusted_premium = MasterSheetUpdater::adjusted_fuel_price(premium, discount);
-        let adjusted_diesel = MasterSheetUpdater::adjusted_fuel_price(diesel, discount);
-        let currency_apply = if let Some(col) = self.layout.currency_apply {
-            self.ws
-                .try_get_display_at(col, self.row, self.shared_strings)?
-                .trim()
-                .eq_ignore_ascii_case("Y")
-        } else {
-            false
-        };
-        let region_rate = if currency_apply {
-            self.sort_context
-                .region_rates
-                .get(region.trim())
-                .copied()
-                .unwrap_or_default()
-        } else {
-            ScaledDecimal::ZERO
-        };
+        )?;
+        let base = RankRowBase::read(&row, currency_apply, self.sort_context);
+        let adjusted = base.adjusted_prices;
+        let region_rate = base.region_rate;
         let region_multiplier = DECIMAL_SCALE
             .checked_sub(region_rate)
             .ok_or_else(|| err("지역 보정률이 100%를 초과했습니다."))?;
-        let regional_adjusted_gasoline = adjusted_gasoline
+        let regional_adjusted_gasoline = adjusted
+            .gasoline
             .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
             .map(ScaledSortKey);
-        let regional_adjusted_premium = adjusted_premium
+        let regional_adjusted_premium = adjusted
+            .premium
             .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
             .map(ScaledSortKey);
-        let regional_adjusted_diesel = adjusted_diesel
+        let regional_adjusted_diesel = adjusted
+            .diesel
             .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
             .map(ScaledSortKey);
         let rank_total = self.sort_context.total_qty.and_then(|total_qty| {
@@ -1558,19 +1553,13 @@ impl RankSortKeyBuilder<'_, '_, '_> {
             } else {
                 MasterSheetUpdater::compute_total_price(
                     self.sort_context.gasoline_qty,
-                    adjusted_gasoline,
+                    adjusted.gasoline,
                     self.sort_context.premium_qty,
-                    adjusted_premium,
+                    adjusted.premium,
                     self.sort_context.diesel_qty,
-                    adjusted_diesel,
+                    adjusted.diesel,
                 )
-                .and_then(|total_price| {
-                    let discount_numerator =
-                        total_price.checked_mul(ScaledSortKey(region_rate.as_i128()))?;
-                    let discount_floor = discount_numerator.checked_div(DECIMAL_SCALE_CUBED)?;
-                    let discount_value = discount_floor.checked_mul(DECIMAL_SCALE_SQUARED)?;
-                    total_price.checked_sub(discount_value)
-                })
+                .and_then(|total_price| RankRowBase::rank_total(Some(total_price), region_rate))
                 .filter(|value| *value != ScaledSortKey::ZERO)
             }
         });
@@ -1580,9 +1569,9 @@ impl RankSortKeyBuilder<'_, '_, '_> {
             gasoline: MasterSheetUpdater::fuel_sort_value(regional_adjusted_gasoline),
             premium: MasterSheetUpdater::fuel_sort_value(regional_adjusted_premium),
             diesel: MasterSheetUpdater::fuel_sort_value(regional_adjusted_diesel),
-            region: region.into_owned(),
-            name: name.into_owned(),
-            address: address.into_owned(),
+            region: row.identity.region.into_owned(),
+            name: row.identity.name.into_owned(),
+            address: row.identity.address.into_owned(),
         })
     }
 }
@@ -1728,6 +1717,20 @@ impl<'source> MasterSheetUpdater<'source> {
         }
         Some(total)
     }
+    fn currency_apply(
+        ws: &excel::writer::Worksheet,
+        layout: MasterSheetLayout,
+        row: u32,
+        shared_strings: &[String],
+    ) -> Result<bool> {
+        let Some(col) = layout.currency_apply else {
+            return Ok(false);
+        };
+        Ok(ws
+            .try_get_display_at(col, row, shared_strings)?
+            .trim()
+            .eq_ignore_ascii_case("Y"))
+    }
     fn default_row(row_num: u32) -> StdRow {
         StdRow::numbered(row_num)
     }
@@ -1735,56 +1738,62 @@ impl<'source> MasterSheetUpdater<'source> {
         &self,
         ws: &excel::writer::Worksheet,
         shared_strings: &[String],
-        old_rows: &[u32],
+        data_start_row: u32,
         layout: MasterSheetLayout,
     ) -> Result<MasterRowEvaluation<'source>> {
+        let row_count = ws.row_count();
+        let mut old_rows: Vec<u32> = Vec::new();
+        old_rows.try_reserve_exact(row_count).map_err(|source| {
+            err_with_source(
+                format!("마스터 데이터 행 목록 메모리 확보 실패: {row_count} rows"),
+                source,
+            )
+        })?;
         let mut matched_source_keys: HashSet<&str> = HashSet::new();
         matched_source_keys
-            .try_reserve(old_rows.len())
+            .try_reserve(row_count)
             .map_err(|source| {
-                let old_row_count = old_rows.len();
                 err_with_source(
-                    format!("매칭 소스 키 집합 메모리 확보 실패: {old_row_count} entries"),
+                    format!("매칭 소스 키 집합 메모리 확보 실패: {row_count} entries"),
                     source,
                 )
             })?;
         let mut kept_source_rows: Vec<KeptSourceRow<'source>> = Vec::new();
         kept_source_rows
-            .try_reserve_exact(old_rows.len())
+            .try_reserve_exact(row_count)
             .map_err(|source| {
-                let old_row_count = old_rows.len();
                 err_with_source(
-                    format!("유지 행 목록 메모리 확보 실패: {old_row_count} rows"),
+                    format!("유지 행 목록 메모리 확보 실패: {row_count} rows"),
                     source,
                 )
             })?;
         let mut changes: Vec<ChangeRow<'source>> = Vec::new();
-        changes
-            .try_reserve_exact(old_rows.len())
-            .map_err(|source| {
-                let old_row_count = old_rows.len();
-                err_with_source(
-                    format!("변경 행 목록 메모리 확보 실패: {old_row_count} rows"),
-                    source,
-                )
-            })?;
+        changes.try_reserve_exact(row_count).map_err(|source| {
+            err_with_source(
+                format!("변경 행 목록 메모리 확보 실패: {row_count} rows"),
+                source,
+            )
+        })?;
         let mut deleted: Vec<StoreRow> = Vec::new();
-        deleted
-            .try_reserve_exact(old_rows.len())
-            .map_err(|source| {
-                let old_row_count = old_rows.len();
-                err_with_source(
-                    format!("삭제 행 목록 메모리 확보 실패: {old_row_count} rows"),
-                    source,
-                )
-            })?;
-        for old_row in old_rows.iter().copied() {
+        deleted.try_reserve_exact(row_count).map_err(|source| {
+            err_with_source(
+                format!("삭제 행 목록 메모리 확보 실패: {row_count} rows"),
+                source,
+            )
+        })?;
+        for old_row in ws.row_numbers_from(data_start_row) {
+            let identity = ParsedMasterIdentity::read(ws, layout, old_row, shared_strings)?;
+            if identity.is_empty() {
+                continue;
+            }
+            old_rows.push(old_row);
             let MasterRowDecision {
                 src,
                 matched_key,
                 change,
                 deleted: deleted_row,
             } = MasterRowEvaluator {
+                identity,
                 layout,
                 old_row,
                 shared_strings,
@@ -1812,6 +1821,7 @@ impl<'source> MasterSheetUpdater<'source> {
             deleted,
             kept_source_rows,
             matched_source_keys,
+            old_rows,
         })
     }
     fn fuel_sort_value(value: Option<ScaledSortKey>) -> ScaledSortKey {
@@ -1892,21 +1902,14 @@ impl<'source> MasterSheetUpdater<'source> {
                     layout,
                     ..
                 } = plan;
-                let old_rows = MasterDataRowsCollector {
-                    data_start_row,
-                    layout,
-                    shared_strings,
-                    ws,
-                }
-                .collect()?;
                 let evaluation =
-                    self.evaluate_master_rows(ws, shared_strings, &old_rows, layout)?;
+                    self.evaluate_master_rows(ws, shared_strings, data_start_row, layout)?;
                 let added = self.collect_new_sources(&evaluation.matched_source_keys)?;
                 let filter_target = MasterRowsRebuilder {
                     ws,
                     shared_strings,
                     plan,
-                    old_rows: &old_rows,
+                    old_rows: &evaluation.old_rows,
                     kept_source_rows: &evaluation.kept_source_rows,
                     new_sources: &added,
                 }

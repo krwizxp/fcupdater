@@ -29,7 +29,7 @@ const TEMP_ARCHIVE_PROMOTION_ATTEMPTS: u32 = 5;
 const TEMP_ARCHIVE_PROMOTION_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_XLSX_TEXT_PART_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Debug)]
-pub(super) struct XlsxContainer {
+pub struct XlsxContainer {
     archive_path: PathBuf,
     unpack_dir: PathBuf,
     work_dir: PathBuf,
@@ -71,7 +71,7 @@ impl SavedArchiveVerifier<'_> {
                 ))
             })?;
         }
-        super::writer::Workbook::open(self.saved_archive).map_err(|source_err| {
+        super::writer::Workbook::from_container(container).map_err(|source_err| {
             source_err.prepend_context(path_context_message(
                 "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
                 self.saved_archive,
@@ -291,7 +291,7 @@ impl XlsxContainer {
         }
         Ok(sheets)
     }
-    pub(super) fn open(source_xlsx: &Path) -> Result<Self> {
+    pub fn open(source_xlsx: &Path) -> Result<Self> {
         if !source_xlsx.try_exists().map_err(|source_err| {
             err_with_source(
                 path_context_message("xlsx 파일 경로 확인 실패", source_xlsx),
@@ -407,11 +407,6 @@ impl XlsxContainer {
                 )
             })?;
         }
-        ZipArchiveBuilder {
-            archive_path: self.archive_path.as_path(),
-            root: self.unpack_dir.as_path(),
-        }
-        .create()?;
         let parent = if let Some(parent) = target_xlsx.parent() {
             create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
             parent
@@ -432,16 +427,11 @@ impl XlsxContainer {
             prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
         let result = (|| -> Result<()> {
-            fs::copy(&self.archive_path, &tmp_archive).map_err(|source_err| {
-                err_with_source(
-                    path_pair_context_message(
-                        "xlsx 임시 저장 실패",
-                        &self.archive_path,
-                        &tmp_archive,
-                    ),
-                    source_err,
-                )
-            })?;
+            ZipArchiveBuilder {
+                archive_path: tmp_archive.as_path(),
+                root: self.unpack_dir.as_path(),
+            }
+            .create()?;
             SavedArchiveVerifier {
                 saved_archive: &tmp_archive,
             }

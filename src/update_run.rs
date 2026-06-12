@@ -2,7 +2,7 @@ use crate::{
     change_log::ChangeLogUpdater,
     diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message},
     excel::SourceReader,
-    excel::writer::Workbook as StdWorkbook,
+    excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::MasterSheetUpdater,
     region::normalize_address_key,
     rows::{AddedStoreRow, ChangeRow, MasterSheetUpdateResult, SourceRecord, StoreRow},
@@ -139,7 +139,8 @@ impl UpdateRun<'_> {
         loaded_source: &'source LoadedSource,
     ) -> Result<UpdatedWorkbook<'source>> {
         write_line(self.out, format_args!("마스터 파일 처리 중..."))?;
-        let mut book = StdWorkbook::open(self.master_path)?;
+        let container = XlsxContainer::open(self.master_path)?;
+        let mut book = StdWorkbook::from_container(container)?;
         let master_update = MasterSheetUpdater {
             source_index: &loaded_source.index,
         }

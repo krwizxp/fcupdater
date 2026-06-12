@@ -6,7 +6,9 @@ use super::{
 };
 use alloc::vec::Vec;
 use core::{array::from_fn, cmp::Ordering, iter::repeat_n, range::Range};
+use std::io::Write as IoWrite;
 const TOO_FAR_MATCH_DISTANCE: usize = 4096;
+const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 const XML_NICE_MATCH_LEN: usize = 128;
 const XLSX_XML_NEEDLES: [&[u8]; 7] = [
@@ -24,10 +26,24 @@ struct BitReader<'bytes> {
     bytes: &'bytes [u8],
     cursor: usize,
 }
-struct BitWriter {
+trait BitOutput {
+    fn byte_len(&self) -> usize;
+    fn finish(&mut self) -> ZipResult<()>;
+    fn write_byte(&mut self, byte: u8) -> ZipResult<()>;
+}
+struct BitWriter<O: BitOutput> {
     bit_buffer: u8,
     bit_count: u8,
-    bytes: Vec<u8>,
+    output: O,
+}
+struct CountOutput {
+    len: usize,
+}
+struct StreamOutput<'writer> {
+    buffer: [u8; DEFLATE_STREAM_BUFFER_LEN],
+    buffered_len: usize,
+    len: usize,
+    writer: &'writer mut dyn IoWrite,
 }
 struct Huffman {
     codes: [Vec<HuffmanCode>; DEFLATE_MAX_BITS + 1],
@@ -67,18 +83,32 @@ pub(super) struct DeflateInflater<'bytes> {
 pub(super) struct DeflateWriter<'bytes> {
     pub bytes: &'bytes [u8],
 }
+pub(super) struct DeflatePlan {
+    compressed_len: usize,
+    dynamic_plan: Option<DynamicDeflatePlan>,
+    tokens: Vec<DeflateToken>,
+}
 struct CodeLengthTokenizer<'lengths> {
     lengths: &'lengths [u8],
 }
 struct DynamicDeflateWriter<'tokens> {
     tokens: &'tokens [DeflateToken],
 }
-struct DynamicBlockHeaderWriter<'writer, 'lengths> {
+struct DynamicDeflatePlan {
+    code_huffman: WriteHuffman,
+    code_length_count: usize,
+    code_length_tokens: Vec<CodeLengthToken>,
+    distance_count: usize,
+    distance_huffman: WriteHuffman,
+    literal_count: usize,
+    literal_huffman: WriteHuffman,
+}
+struct DynamicBlockHeaderWriter<'writer, 'lengths, O: BitOutput> {
     code_length_count: usize,
     code_lengths: &'lengths [u8],
     distance_count: usize,
     literal_count: usize,
-    writer: &'writer mut BitWriter,
+    writer: &'writer mut BitWriter<O>,
 }
 struct DynamicFrequencyCounter<'tokens> {
     tokens: &'tokens [DeflateToken],
@@ -91,10 +121,10 @@ struct DynamicTrees {
     distance: Option<Huffman>,
     literal: Huffman,
 }
-struct DynamicTokenWriter<'writer, 'huffman> {
+struct DynamicTokenWriter<'writer, 'huffman, O: BitOutput> {
     distance_huffman: &'huffman WriteHuffman,
     literal_huffman: &'huffman WriteHuffman,
-    writer: &'writer mut BitWriter,
+    writer: &'writer mut BitWriter<O>,
 }
 #[derive(Clone, Copy)]
 struct DeflateProfile {
@@ -111,11 +141,10 @@ struct DeflateMatch {
     length: usize,
 }
 struct FixedDeflateWriter<'tokens> {
-    byte_len: usize,
     tokens: &'tokens [DeflateToken],
 }
-struct FixedTokenWriter<'writer> {
-    writer: &'writer mut BitWriter,
+struct FixedTokenWriter<'writer, O: BitOutput> {
+    writer: &'writer mut BitWriter<O>,
 }
 struct FixedHuffmanCode {
     bit_count: u8,
@@ -176,25 +205,68 @@ impl BitReader<'_> {
         Ok(bytes)
     }
 }
-impl BitWriter {
-    fn finish(mut self) -> Vec<u8> {
-        if self.bit_count > 0 {
-            self.bytes.push(self.bit_buffer);
+impl BitOutput for CountOutput {
+    fn byte_len(&self) -> usize {
+        self.len
+    }
+    fn finish(&mut self) -> ZipResult<()> {
+        Ok(())
+    }
+    fn write_byte(&mut self, _byte: u8) -> ZipResult<()> {
+        self.len = self
+            .len
+            .checked_add(1)
+            .ok_or_else(|| zip_static("deflate 출력 길이 계산 실패"))?;
+        Ok(())
+    }
+}
+impl BitOutput for StreamOutput<'_> {
+    fn byte_len(&self) -> usize {
+        self.len
+    }
+    fn finish(&mut self) -> ZipResult<()> {
+        self.flush_buffer()
+    }
+    fn write_byte(&mut self, byte: u8) -> ZipResult<()> {
+        if self.buffered_len == self.buffer.len() {
+            self.flush_buffer()?;
         }
-        self.bytes
+        let Some(slot) = self.buffer.get_mut(self.buffered_len) else {
+            return Err(zip_static("deflate stream buffer 범위 오류"));
+        };
+        *slot = byte;
+        self.buffered_len = self.buffered_len.saturating_add(1);
+        self.len = self
+            .len
+            .checked_add(1)
+            .ok_or_else(|| zip_static("deflate 출력 길이 계산 실패"))?;
+        Ok(())
     }
-    fn with_capacity(capacity: usize, context: &str) -> ZipResult<Self> {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve(capacity)
-            .map_err(|source| format!("{context} 메모리 확보 실패: {source}"))?;
-        Ok(Self {
-            bit_buffer: 0,
-            bit_count: 0,
-            bytes,
-        })
+}
+impl StreamOutput<'_> {
+    fn flush_buffer(&mut self) -> ZipResult<()> {
+        if self.buffered_len == 0 {
+            return Ok(());
+        }
+        let Some(buffered) = self.buffer.get(..self.buffered_len) else {
+            return Err(zip_static("deflate stream buffer 범위 오류"));
+        };
+        self.writer
+            .write_all(buffered)
+            .map_err(|source| format!("deflate stream 쓰기 실패: {source}"))?;
+        self.buffered_len = 0;
+        Ok(())
     }
-    fn write_bits(&mut self, mut value: u16, count: u8) {
+}
+impl<O: BitOutput> BitWriter<O> {
+    fn finish(mut self) -> ZipResult<O> {
+        if self.bit_count > 0 {
+            self.output.write_byte(self.bit_buffer)?;
+        }
+        self.output.finish()?;
+        Ok(self.output)
+    }
+    fn write_bits(&mut self, mut value: u16, count: u8) -> ZipResult<()> {
         for _ in 0_u8..count {
             if value & 1_u16 != 0 {
                 self.bit_buffer |= 1_u8 << self.bit_count;
@@ -202,10 +274,34 @@ impl BitWriter {
             value >>= 1_u8;
             self.bit_count = self.bit_count.saturating_add(1);
             if self.bit_count == 8 {
-                self.bytes.push(self.bit_buffer);
+                self.output.write_byte(self.bit_buffer)?;
                 self.bit_buffer = 0;
                 self.bit_count = 0;
             }
+        }
+        Ok(())
+    }
+}
+impl BitWriter<CountOutput> {
+    const fn counting() -> Self {
+        Self {
+            bit_buffer: 0,
+            bit_count: 0,
+            output: CountOutput { len: 0 },
+        }
+    }
+}
+impl<'writer> BitWriter<StreamOutput<'writer>> {
+    fn streaming(writer: &'writer mut dyn IoWrite) -> Self {
+        Self {
+            bit_buffer: 0,
+            bit_count: 0,
+            output: StreamOutput {
+                buffer: [0; DEFLATE_STREAM_BUFFER_LEN],
+                buffered_len: 0,
+                len: 0,
+                writer,
+            },
         }
     }
 }
@@ -333,7 +429,7 @@ impl WriteHuffman {
         }
         Ok(Self { codes, lengths })
     }
-    fn write_symbol(&self, writer: &mut BitWriter, symbol: u16) -> ZipResult<()> {
+    fn write_symbol<O: BitOutput>(&self, writer: &mut BitWriter<O>, symbol: u16) -> ZipResult<()> {
         let index = usize::from(symbol);
         let Some(&len) = self.lengths.get(index) else {
             return Err(zip_static("deflate 출력 Huffman symbol 길이 범위 오류"));
@@ -344,8 +440,7 @@ impl WriteHuffman {
         let Some(&code) = self.codes.get(index) else {
             return Err(zip_static("deflate 출력 Huffman symbol code 범위 오류"));
         };
-        writer.write_bits(code, len);
-        Ok(())
+        writer.write_bits(code, len)
     }
 }
 struct InflateState<'bytes> {
@@ -657,7 +752,7 @@ impl CodeLengthTokenizer<'_> {
     }
 }
 impl DynamicDeflateWriter<'_> {
-    fn deflate(&self) -> ZipResult<Option<Vec<u8>>> {
+    fn plan(&self) -> ZipResult<Option<DynamicDeflatePlan>> {
         let Some(frequencies) = (DynamicFrequencyCounter {
             tokens: self.tokens,
         })
@@ -731,59 +826,80 @@ impl DynamicDeflateWriter<'_> {
         let literal_huffman = WriteHuffman::from_lengths(literal_lengths)?;
         let distance_huffman = WriteHuffman::from_lengths(distance_lengths)?;
         let code_huffman = WriteHuffman::from_lengths(code_lengths)?;
-        let mut writer = BitWriter::with_capacity(self.tokens.len(), "deflate dynamic 출력")?;
-        DynamicBlockHeaderWriter {
+        Ok(Some(DynamicDeflatePlan {
+            code_huffman,
             code_length_count,
-            code_lengths: &code_huffman.lengths,
+            code_length_tokens,
             distance_count,
+            distance_huffman,
             literal_count,
-            writer: &mut writer,
+            literal_huffman,
+        }))
+    }
+}
+impl DynamicDeflatePlan {
+    fn deflated_len(&self, tokens: &[DeflateToken]) -> ZipResult<usize> {
+        let mut writer = BitWriter::counting();
+        self.write(tokens, &mut writer)?;
+        Ok(writer.finish()?.byte_len())
+    }
+    fn write<O: BitOutput>(
+        &self,
+        tokens: &[DeflateToken],
+        writer: &mut BitWriter<O>,
+    ) -> ZipResult<()> {
+        DynamicBlockHeaderWriter {
+            code_length_count: self.code_length_count,
+            code_lengths: &self.code_huffman.lengths,
+            distance_count: self.distance_count,
+            literal_count: self.literal_count,
+            writer,
         }
         .write()?;
-        for token in code_length_tokens {
-            code_huffman.write_symbol(&mut writer, u16::from(token.symbol))?;
+        for &token in &self.code_length_tokens {
+            self.code_huffman
+                .write_symbol(writer, u16::from(token.symbol))?;
             if token.extra_bits > 0 {
-                writer.write_bits(token.extra, token.extra_bits);
+                writer.write_bits(token.extra, token.extra_bits)?;
             }
         }
-        for &token in self.tokens {
+        for &token in tokens {
             DynamicTokenWriter {
-                distance_huffman: &distance_huffman,
-                literal_huffman: &literal_huffman,
-                writer: &mut writer,
+                distance_huffman: &self.distance_huffman,
+                literal_huffman: &self.literal_huffman,
+                writer,
             }
             .write(token)?;
         }
-        literal_huffman.write_symbol(&mut writer, 256)?;
-        Ok(Some(writer.finish()))
+        self.literal_huffman.write_symbol(writer, 256)
     }
 }
-impl DynamicBlockHeaderWriter<'_, '_> {
+impl<O: BitOutput> DynamicBlockHeaderWriter<'_, '_, O> {
     fn write(&mut self) -> ZipResult<()> {
-        self.writer.write_bits(1, 1);
-        self.writer.write_bits(2, 2);
+        self.writer.write_bits(1, 1)?;
+        self.writer.write_bits(2, 2)?;
         self.writer.write_bits(
             u16::try_from(self.literal_count.saturating_sub(257))
                 .map_err(|source| format!("deflate HLIT 변환 실패: {source}"))?,
             5,
-        );
+        )?;
         self.writer.write_bits(
             u16::try_from(self.distance_count.saturating_sub(1))
                 .map_err(|source| format!("deflate HDIST 변환 실패: {source}"))?,
             5,
-        );
+        )?;
         self.writer.write_bits(
             u16::try_from(self.code_length_count.saturating_sub(4))
                 .map_err(|source| format!("deflate HCLEN 변환 실패: {source}"))?,
             4,
-        );
+        )?;
         for &symbol in CODE_LENGTH_ORDER.iter().take(self.code_length_count) {
             let len = self
                 .code_lengths
                 .get(symbol)
                 .copied()
                 .ok_or_else(|| zip_static("deflate code length 쓰기 범위 오류"))?;
-            self.writer.write_bits(u16::from(len), 3);
+            self.writer.write_bits(u16::from(len), 3)?;
         }
         Ok(())
     }
@@ -833,7 +949,7 @@ impl DynamicFrequencyCounter<'_> {
         }))
     }
 }
-impl DynamicTokenWriter<'_, '_> {
+impl<O: BitOutput> DynamicTokenWriter<'_, '_, O> {
     fn write(&mut self, token: DeflateToken) -> ZipResult<()> {
         match token {
             DeflateToken::Literal(byte) => self
@@ -847,7 +963,7 @@ impl DynamicTokenWriter<'_, '_> {
                     .write_symbol(self.writer, length_code.symbol)?;
                 if length_code.extra_bits > 0 {
                     self.writer
-                        .write_bits(length_code.extra, length_code.extra_bits);
+                        .write_bits(length_code.extra, length_code.extra_bits)?;
                 }
                 let Some(distance_code) = DeflateWriter::distance_symbol(distance) else {
                     return Err(zip_static("deflate distance 범위 오류"));
@@ -856,7 +972,7 @@ impl DynamicTokenWriter<'_, '_> {
                     .write_symbol(self.writer, distance_code.symbol)?;
                 if distance_code.extra_bits > 0 {
                     self.writer
-                        .write_bits(distance_code.extra, distance_code.extra_bits);
+                        .write_bits(distance_code.extra, distance_code.extra_bits)?;
                 }
                 Ok(())
             }
@@ -864,34 +980,35 @@ impl DynamicTokenWriter<'_, '_> {
     }
 }
 impl FixedDeflateWriter<'_> {
-    pub(super) fn deflate(&self) -> ZipResult<Vec<u8>> {
-        let mut writer =
-            BitWriter::with_capacity(self.byte_len.saturating_div(2), "deflate fixed 출력")?;
-        writer.write_bits(1, 1);
-        writer.write_bits(1, 2);
+    fn deflated_len(&self) -> ZipResult<usize> {
+        let mut writer = BitWriter::counting();
+        self.write_into(&mut writer)?;
+        Ok(writer.finish()?.byte_len())
+    }
+    fn write_into<O: BitOutput>(&self, writer: &mut BitWriter<O>) -> ZipResult<()> {
+        writer.write_bits(1, 1)?;
+        writer.write_bits(1, 2)?;
         for &token in self.tokens {
-            FixedTokenWriter {
-                writer: &mut writer,
-            }
-            .write_token(token)?;
+            FixedTokenWriter { writer }.write_token(token)?;
         }
-        FixedTokenWriter {
-            writer: &mut writer,
-        }
-        .write_symbol(256)?;
-        Ok(writer.finish())
+        FixedTokenWriter { writer }.write_symbol(256)
+    }
+    fn write_to(&self, writer: &mut dyn IoWrite) -> ZipResult<usize> {
+        let mut bit_writer = BitWriter::streaming(writer);
+        self.write_into(&mut bit_writer)?;
+        Ok(bit_writer.finish()?.byte_len())
     }
 }
-impl FixedTokenWriter<'_> {
+impl<O: BitOutput> FixedTokenWriter<'_, O> {
     fn write_distance(&mut self, distance: usize) -> ZipResult<()> {
         let Some(distance_code) = DeflateWriter::distance_symbol(distance) else {
             return Err(zip_static("deflate distance 범위 오류"));
         };
         self.writer
-            .write_bits(reverse_bits(distance_code.symbol, 5), 5);
+            .write_bits(reverse_bits(distance_code.symbol, 5), 5)?;
         if distance_code.extra_bits > 0 {
             self.writer
-                .write_bits(distance_code.extra, distance_code.extra_bits);
+                .write_bits(distance_code.extra, distance_code.extra_bits)?;
         }
         Ok(())
     }
@@ -902,7 +1019,7 @@ impl FixedTokenWriter<'_> {
         self.write_symbol(length_code.symbol)?;
         if length_code.extra_bits > 0 {
             self.writer
-                .write_bits(length_code.extra, length_code.extra_bits);
+                .write_bits(length_code.extra, length_code.extra_bits)?;
         }
         Ok(())
     }
@@ -929,8 +1046,7 @@ impl FixedTokenWriter<'_> {
         self.writer.write_bits(
             reverse_bits(encoded.code, encoded.bit_count),
             encoded.bit_count,
-        );
-        Ok(())
+        )
     }
     fn write_token(&mut self, token: DeflateToken) -> ZipResult<()> {
         match token {
@@ -1117,6 +1233,22 @@ impl LimitedLengthCountReducer<'_> {
         Some(())
     }
 }
+impl DeflatePlan {
+    pub(super) const fn len(&self) -> usize {
+        self.compressed_len
+    }
+    pub(super) fn write_to(&self, writer: &mut dyn IoWrite) -> ZipResult<usize> {
+        if let Some(plan) = self.dynamic_plan.as_ref() {
+            let mut bit_writer = BitWriter::streaming(writer);
+            plan.write(&self.tokens, &mut bit_writer)?;
+            return Ok(bit_writer.finish()?.byte_len());
+        }
+        FixedDeflateWriter {
+            tokens: &self.tokens,
+        }
+        .write_to(writer)
+    }
+}
 impl DeflateWriter<'_> {
     fn best_match(
         bytes: &[u8],
@@ -1165,18 +1297,6 @@ impl DeflateWriter<'_> {
             length: best_len,
         })
     }
-    pub(super) fn deflate(&self) -> ZipResult<Vec<u8>> {
-        let tokens = self.tokens()?;
-        let fixed = FixedDeflateWriter {
-            byte_len: self.bytes.len(),
-            tokens: &tokens,
-        }
-        .deflate()?;
-        match (DynamicDeflateWriter { tokens: &tokens }).deflate()? {
-            Some(dynamic) if dynamic.len() < fixed.len() => Ok(dynamic),
-            _ => Ok(fixed),
-        }
-    }
     fn distance_symbol(distance: usize) -> Option<DeflateSymbol> {
         for (index, &base) in DISTANCE_BASES.iter().enumerate().rev() {
             if distance < base {
@@ -1224,6 +1344,27 @@ impl DeflateWriter<'_> {
             });
         }
         None
+    }
+    pub(super) fn plan(&self) -> ZipResult<DeflatePlan> {
+        let tokens = self.tokens()?;
+        let fixed_writer = FixedDeflateWriter { tokens: &tokens };
+        let fixed_len = fixed_writer.deflated_len()?;
+        let dynamic_writer = DynamicDeflateWriter { tokens: &tokens };
+        if let Some(dynamic_plan) = dynamic_writer.plan()? {
+            let dynamic_len = dynamic_plan.deflated_len(&tokens)?;
+            if dynamic_len < fixed_len {
+                return Ok(DeflatePlan {
+                    compressed_len: dynamic_len,
+                    dynamic_plan: Some(dynamic_plan),
+                    tokens,
+                });
+            }
+        }
+        Ok(DeflatePlan {
+            compressed_len: fixed_len,
+            dynamic_plan: None,
+            tokens,
+        })
     }
     fn tokens(&self) -> ZipResult<Vec<DeflateToken>> {
         let xml_probe = self

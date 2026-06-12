@@ -2,7 +2,7 @@ use std::path::Path;
 mod path_util;
 mod source_reader;
 pub mod writer;
-mod xlsx_container;
+pub mod xlsx_container;
 mod xml;
 mod zip_archive;
 pub struct SourceReader<'path> {

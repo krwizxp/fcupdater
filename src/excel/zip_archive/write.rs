@@ -10,17 +10,14 @@ use crate::diagnostic::{
 };
 use std::{
     fs::File,
-    io::{Read as IoRead, Write as IoWrite},
+    io::{BufWriter, Read as IoRead, Write as IoWrite},
     path::Path,
 };
 const CENTRAL_FILE_HEADER_BASE_LEN: usize = 46;
+const ZIP_OUTPUT_BUFFER_CAPACITY: usize = 64 * 1024;
 struct CentralDirectoryPlan {
     max_header_capacity: usize,
     size: usize,
-}
-struct CompressedPart {
-    data: Vec<u8>,
-    method: u16,
 }
 struct WriteEntry {
     compressed_size: usize,
@@ -45,7 +42,7 @@ struct StreamingZipWriter<'path> {
     archive_path: &'path Path,
     bytes_written: u64,
     entries: Vec<WriteEntry>,
-    file: File,
+    file: BufWriter<File>,
 }
 impl ZipArchiveBuilder<'_> {
     pub(in crate::excel) fn create(&self) -> Result<()> {
@@ -62,12 +59,19 @@ impl ZipArchiveBuilder<'_> {
             archive_path: self.archive_path,
             bytes_written: 0,
             entries: Vec::new(),
-            file,
+            file: BufWriter::with_capacity(ZIP_OUTPUT_BUFFER_CAPACITY, file),
         }
         .write(files)
     }
 }
 impl StreamingZipWriter<'_> {
+    fn add_bytes_written(&self, len: usize, context: &str) -> Result<u64> {
+        let len_u64 = u64::try_from(len)
+            .map_err(|source| err_with_source("ZIP written byte count 변환 실패", source))?;
+        self.bytes_written
+            .checked_add(len_u64)
+            .ok_or_else(|| err(format!("{context} 중 overflow가 발생했습니다.")))
+    }
     fn append_central_directory(&mut self) -> Result<()> {
         let central_dir_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 offset 변환 실패", source))?;
@@ -134,17 +138,11 @@ impl StreamingZipWriter<'_> {
         let data = self.read_part_bytes(&file)?;
         let crc32 = crc32(&data)?;
         let uncompressed_size = data.len();
-        let deflated = deflate::DeflateWriter { bytes: &data }.deflate()?;
-        let compressed = if deflated.len() < uncompressed_size {
-            CompressedPart {
-                data: deflated,
-                method: METHOD_DEFLATE,
-            }
+        let deflate_plan = deflate::DeflateWriter { bytes: &data }.plan()?;
+        let (compressed_size, method) = if deflate_plan.len() < uncompressed_size {
+            (deflate_plan.len(), METHOD_DEFLATE)
         } else {
-            CompressedPart {
-                data,
-                method: METHOD_STORE,
-            }
+            (uncompressed_size, METHOD_STORE)
         };
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
@@ -160,24 +158,35 @@ impl StreamingZipWriter<'_> {
                     source,
                 ))
             })?;
-        let compressed_size = compressed.data.len();
         write_file_header(
             &mut local_header,
             ZipFileHeader::Local {
                 crc32,
                 compressed_len: compressed_size,
-                method: compressed.method,
+                method,
                 name: &file.name,
                 uncompressed_len: uncompressed_size,
             },
         )?;
         self.write_all(&local_header, "xlsx 압축 local header 쓰기 실패")?;
-        self.write_all(&compressed.data, "xlsx 압축 파일 데이터 쓰기 실패")?;
+        if method == METHOD_DEFLATE {
+            drop(data);
+            let actual_written = deflate_plan.write_to(&mut self.file)?;
+            if actual_written != compressed_size {
+                return Err(err(format!(
+                    "ZIP deflate 출력 크기가 계획과 다릅니다: expected={compressed_size}, actual={actual_written}"
+                )));
+            }
+            self.bytes_written =
+                self.add_bytes_written(actual_written, "ZIP deflated byte count 계산")?;
+        } else {
+            self.write_all(&data, "xlsx 압축 파일 데이터 쓰기 실패")?;
+        }
         self.entries.push(WriteEntry {
             compressed_size,
             crc32,
             local_header_offset,
-            method: compressed.method,
+            method,
             name: file.name,
             uncompressed_size,
         });
@@ -255,18 +264,19 @@ impl StreamingZipWriter<'_> {
         for file in files {
             self.append_file(file)?;
         }
-        self.append_central_directory()
+        self.append_central_directory()?;
+        IoWrite::flush(&mut self.file).map_err(|source_err| {
+            err_with_source(
+                path_context_message("xlsx 압축 파일 flush 실패", self.archive_path),
+                source_err,
+            )
+        })
     }
     fn write_all(&mut self, bytes: &[u8], context: &str) -> Result<()> {
         IoWrite::write_all(&mut self.file, bytes).map_err(|source_err| {
             err_with_source(path_context_message(context, self.archive_path), source_err)
         })?;
-        self.bytes_written =
-            self.bytes_written
-                .checked_add(u64::try_from(bytes.len()).map_err(|source| {
-                    err_with_source("ZIP written byte count 변환 실패", source)
-                })?)
-                .ok_or_else(|| err("ZIP written byte count 계산 중 overflow가 발생했습니다."))?;
+        self.bytes_written = self.add_bytes_written(bytes.len(), "ZIP written byte count 계산")?;
         Ok(())
     }
 }
