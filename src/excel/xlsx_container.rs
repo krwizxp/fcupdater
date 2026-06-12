@@ -30,7 +30,6 @@ const TEMP_ARCHIVE_PROMOTION_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_XLSX_TEXT_PART_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Debug)]
 pub struct XlsxContainer {
-    archive_path: PathBuf,
     unpack_dir: PathBuf,
     work_dir: PathBuf,
 }
@@ -314,23 +313,15 @@ impl XlsxContainer {
             keep: false,
         };
         let unpack_dir = cleanup.path.join("unzipped");
-        let archive_path = cleanup.path.join("workbook.zip");
         create_dir_all_checked(&unpack_dir, "임시 폴더 생성 실패")?;
-        fs::copy(source_xlsx, &archive_path).map_err(|source_err| {
-            err_with_source(
-                path_pair_context_message("xlsx 임시 복사 실패", source_xlsx, &archive_path),
-                source_err,
-            )
-        })?;
         ZipArchiveExtractor {
-            archive_path: archive_path.as_path(),
+            archive_path: source_xlsx,
             unpack_dir: unpack_dir.as_path(),
         }
         .extract()?;
         cleanup.keep = true;
         let work_dir = mem::take(&mut cleanup.path);
         Ok(Self {
-            archive_path,
             unpack_dir,
             work_dir,
         })
@@ -394,19 +385,6 @@ impl XlsxContainer {
         Ok(self.unpack_dir.join(path))
     }
     pub(super) fn save(&self, target_xlsx: &Path) -> Result<()> {
-        if self.archive_path.try_exists().map_err(|source_err| {
-            err_with_source(
-                path_context_message("archive 경로 확인 실패", &self.archive_path),
-                source_err,
-            )
-        })? {
-            fs::remove_file(&self.archive_path).map_err(|source_err| {
-                err_with_source(
-                    path_context_message("기존 archive 삭제 실패", &self.archive_path),
-                    source_err,
-                )
-            })?;
-        }
         let parent = if let Some(parent) = target_xlsx.parent() {
             create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
             parent
