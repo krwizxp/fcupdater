@@ -5,7 +5,7 @@ use self::cell_ref::{
 use super::{
     xlsx_container::XlsxContainer,
     xml::{
-        XmlScanner, decode_xml_entities, ensure_valid_xml_text, extract_all_tag_text, extract_attr,
+        XmlScanner, decode_xml_entities, ensure_valid_xml_text, extract_all_tag_text,
         extract_first_tag_text, find_end_tag, find_start_tag, find_tag_end,
     },
 };
@@ -536,17 +536,12 @@ impl Workbook {
 }
 impl SharedStringsXmlParser<'_> {
     fn parse(&self) -> Result<Vec<String>> {
-        let shared_string_count = self.reserve_hint();
         let mut out: Vec<String> = Vec::new();
-        out.try_reserve_exact(shared_string_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("sharedStrings 메모리 확보 실패: {shared_string_count} entries"),
-                    source,
-                )
-            })?;
         let mut scanner = XmlScanner::new(self.xml);
         while let Some(si_tag) = scanner.next_start_named("si") {
+            out.try_reserve(1).map_err(|source| {
+                err_with_source("sharedStrings entry 메모리 확보 실패", source)
+            })?;
             if si_tag.is_self_closing() {
                 out.push(String::new());
                 continue;
@@ -582,22 +577,6 @@ impl SharedStringsXmlParser<'_> {
             scanner.skip_to(next_cursor);
         }
         Ok(out)
-    }
-    fn reserve_hint(&self) -> usize {
-        if let Some(sst_tag) = XmlScanner::new(self.xml).next_start_named("sst") {
-            for attr_name in ["uniqueCount", "count"] {
-                let Some(attr_value) = extract_attr(sst_tag.tag(), attr_name).ok().flatten() else {
-                    continue;
-                };
-                let Ok(parsed) = attr_value.parse::<usize>() else {
-                    continue;
-                };
-                if parsed <= self.xml.len() {
-                    return parsed;
-                }
-            }
-        }
-        self.xml.matches("<si").count()
     }
 }
 impl WorksheetRowParser<'_> {

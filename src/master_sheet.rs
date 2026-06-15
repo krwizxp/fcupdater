@@ -73,6 +73,7 @@ struct MasterRowDecision<'source> {
 }
 struct ChangeRowBuilder<'row, 'source> {
     old: &'row ExistingMasterRow<'row>,
+    source_region: &'source str,
     src: &'source SourceRecord,
 }
 struct MasterHeaderResolver<'headers> {
@@ -343,6 +344,9 @@ impl RowMapper {
 }
 impl<'source> ChangeRowBuilder<'_, 'source> {
     fn build(&self) -> Option<ChangeRow<'source>> {
+        let source_region = self.source_region.trim();
+        let region_changed =
+            !source_region.is_empty() && !same_trimmed(self.old.region, source_region);
         let name_changed = !same_trimmed(self.old.name, &self.src.name);
         let brand_changed = !same_trimmed(self.old.brand, &self.src.brand);
         let self_yn_changed = !self
@@ -354,7 +358,8 @@ impl<'source> ChangeRowBuilder<'_, 'source> {
         let gas_changed = self.old.gasoline != self.src.gasoline;
         let premium_changed = self.old.premium != self.src.premium;
         let diesel_changed = self.old.diesel != self.src.diesel;
-        (name_changed
+        (region_changed
+            || name_changed
             || brand_changed
             || self_yn_changed
             || gas_changed
@@ -364,6 +369,9 @@ impl<'source> ChangeRowBuilder<'_, 'source> {
                 let mut reason = String::new();
                 if gas_changed || premium_changed || diesel_changed {
                     push_joined_text(&mut reason, ", ", "가격변동");
+                }
+                if region_changed {
+                    push_joined_text(&mut reason, ", ", "지역정정");
                 }
                 if name_changed {
                     push_joined_text(&mut reason, ", ", "상호변경");
@@ -376,7 +384,11 @@ impl<'source> ChangeRowBuilder<'_, 'source> {
                 }
                 ChangeRow {
                     reason,
-                    region: self.old.region.to_owned(),
+                    region: if source_region.is_empty() {
+                        self.old.region.to_owned()
+                    } else {
+                        source_region.to_owned()
+                    },
                     name: &self.src.name,
                     address: &self.src.address,
                     old_gasoline: self.old.gasoline,
@@ -565,7 +577,12 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
             region: row.identity.region(),
             self_yn: old_self_yn_display.trim(),
         };
-        let change = ChangeRowBuilder { old: &old, src }.build();
+        let change = ChangeRowBuilder {
+            old: &old,
+            source_region: source_display_region(src),
+            src,
+        }
+        .build();
         Ok(MasterRowDecision {
             src: Some(src),
             matched_key: Some(matched_key.as_str()),
@@ -692,10 +709,12 @@ impl SourceRowsWriter<'_, '_, '_, '_, '_> {
     fn write(&mut self) -> Result<()> {
         for plan in self.kept_rows {
             if let Some(src) = plan.src {
+                let region_label = source_display_region(src);
                 MasterSheetUpdater::write_master_row_from_source(
                     self.ws,
                     plan.new_row,
                     src,
+                    region_label,
                     self.layout,
                 )?;
             }
@@ -703,12 +722,14 @@ impl SourceRowsWriter<'_, '_, '_, '_, '_> {
         for source_row in self.new_rows_from_sources {
             let new_row = source_row.new_row;
             let src = source_row.source.record;
-            MasterSheetUpdater::write_master_row_from_source(self.ws, new_row, src, self.layout)?;
             let region_label = source_row.source.region;
-            if !region_label.trim().is_empty() {
-                self.ws
-                    .set_string_at(self.layout.region, new_row, region_label)?;
-            }
+            MasterSheetUpdater::write_master_row_from_source(
+                self.ws,
+                new_row,
+                src,
+                region_label,
+                self.layout,
+            )?;
         }
         Ok(())
     }
@@ -1615,9 +1636,7 @@ impl<'source> MasterSheetUpdater<'source> {
                 .iter()
                 .filter(|&(key, _rec)| !matched_source_keys.contains(key.as_str()))
                 .map(|(_key, rec)| AddedStoreRow {
-                    region: parse_region_label(&rec.region)
-                        .or_else(|| parse_region_label(&rec.address))
-                        .unwrap_or_else(|| rec.region.trim()),
+                    region: source_display_region(rec),
                     record: rec,
                 }),
         );
@@ -1901,8 +1920,12 @@ impl<'source> MasterSheetUpdater<'source> {
         ws: &mut excel::writer::Worksheet,
         row: u32,
         src: &SourceRecord,
+        region_label: &str,
         layout: MasterSheetLayout,
     ) -> Result<()> {
+        if !region_label.trim().is_empty() {
+            ws.set_string_at(layout.region, row, region_label)?;
+        }
         ws.set_string_at(layout.name, row, &src.name)?;
         ws.set_string_at(layout.brand, row, &src.brand)?;
         ws.set_string_at(layout.self_yn, row, &src.self_yn)?;
@@ -1964,6 +1987,11 @@ fn parse_region_label(text: &str) -> Option<&str> {
         None if second.is_none() => Some(first),
         None => None,
     }
+}
+fn source_display_region(source: &SourceRecord) -> &str {
+    parse_region_label(&source.region)
+        .or_else(|| parse_region_label(&source.address))
+        .unwrap_or_else(|| source.region.trim())
 }
 fn push_joined_text(out: &mut String, separator: &str, value: &str) {
     if !out.is_empty() {
