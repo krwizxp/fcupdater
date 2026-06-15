@@ -1,10 +1,7 @@
 use super::{CellReference, RangeTokenParts, RewrittenCellReference};
 use crate::diagnostic::{Result, err, err_with_source};
+use core::str;
 const COL_NAME_BUF_LEN: usize = 8;
-const COL_NAME_CHARS: [char; 26] = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
-    'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-];
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
 pub(super) const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
@@ -33,7 +30,7 @@ pub(super) fn col_to_name(mut col: u32) -> Result<String> {
     if !(1..=MAX_A1_COL).contains(&col) {
         return Err(err(format!("Excel column 범위를 벗어났습니다: {col}")));
     }
-    let mut rev = ['\0'; COL_NAME_BUF_LEN];
+    let mut rev = [0_u8; COL_NAME_BUF_LEN];
     let mut index = rev.len();
     while col > 0 {
         let base = col
@@ -41,10 +38,9 @@ pub(super) fn col_to_name(mut col: u32) -> Result<String> {
             .ok_or_else(|| err("Excel column 변환 중 underflow가 발생했습니다."))?;
         let rem = u8::try_from(base.rem_euclid(26))
             .map_err(|source| err_with_source("Excel column 나머지 변환 실패", source))?;
-        let letter = COL_NAME_CHARS
-            .get(usize::from(rem))
-            .copied()
-            .ok_or_else(|| err("Excel column 문자 범위가 손상되었습니다."))?;
+        let letter = b'A'
+            .checked_add(rem)
+            .ok_or_else(|| err("Excel column 문자 계산 실패"))?;
         let next_index = index
             .checked_sub(1)
             .ok_or_else(|| err("Excel column buffer index 계산 실패"))?;
@@ -55,9 +51,12 @@ pub(super) fn col_to_name(mut col: u32) -> Result<String> {
         *slot = letter;
         col = base.div_euclid(26);
     }
-    rev.get(index..)
-        .map(|chars| chars.iter().collect())
-        .ok_or_else(|| err("Excel column 결과 범위가 손상되었습니다."))
+    let bytes = rev
+        .get(index..)
+        .ok_or_else(|| err("Excel column 결과 범위가 손상되었습니다."))?;
+    let text = str::from_utf8(bytes)
+        .map_err(|source| err_with_source("Excel column UTF-8 변환 실패", source))?;
+    Ok(text.to_owned())
 }
 pub(super) fn parse_range_token(token: &str) -> RangeTokenParts<'_> {
     match token.split_once(':') {

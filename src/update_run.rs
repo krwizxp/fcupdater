@@ -4,7 +4,7 @@ use crate::{
     excel::SourceReader,
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::MasterSheetUpdater,
-    region::normalize_address_key,
+    region::{normalize_address_key, normalize_address_key_into},
     rows::{AddedStoreRow, ChangeRow, MasterSheetUpdateResult, SourceRecord, StoreRow},
     source_download::SourceDownload,
     write_line, write_line_best_effort,
@@ -77,8 +77,9 @@ impl UpdateRun<'_> {
             })?;
             let mut map: HashMap<String, SourceRecord> = HashMap::new();
             let mut target_record_count = 0_usize;
+            let mut region_key = String::new();
             for record in source_records {
-                let region_key = normalize_address_key(&record.region)?;
+                normalize_address_key_into(&record.region, &mut region_key)?;
                 if matches!(
                     region_key.as_str(),
                     "대전대덕구"

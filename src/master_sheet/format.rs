@@ -66,6 +66,9 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
     let frac = abs.rem_euclid(scale_abs);
     let whole_text = whole.to_string();
     if frac == 0 {
+        if sign.is_empty() {
+            return whole_text;
+        }
         return format!("{sign}{whole_text}");
     }
     let mut frac_text = frac.to_string();
@@ -111,6 +114,9 @@ pub(super) fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -
     let mut remainder = abs.rem_euclid(denominator);
     let whole_text = whole.to_string();
     if remainder == 0 {
+        if sign.is_empty() {
+            return Some(whole_text);
+        }
         return Some(format!("{sign}{whole_text}"));
     }
     let mut frac_text = String::new();
@@ -124,7 +130,18 @@ pub(super) fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -
     }
     let trimmed_frac_len = frac_text.trim_end_matches('0').len();
     frac_text.truncate(trimmed_frac_len);
-    Some(format!("{sign}{whole_text}.{frac_text}"))
+    let capacity = sign
+        .len()
+        .saturating_add(whole_text.len())
+        .saturating_add(1)
+        .saturating_add(frac_text.len());
+    let mut out = String::new();
+    out.try_reserve(capacity).ok()?;
+    out.push_str(sign);
+    out.push_str(&whole_text);
+    out.push('.');
+    out.push_str(&frac_text);
+    Some(out)
 }
 pub(super) fn missing_sort_target_row_error(row_num: u32) -> AppError {
     err(format!("정렬 대상 행을 찾지 못했습니다: {row_num}"))

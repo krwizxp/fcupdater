@@ -138,11 +138,14 @@ impl StreamingZipWriter<'_> {
         let data = self.read_part_bytes(&file)?;
         let crc32 = crc32(&data)?;
         let uncompressed_size = data.len();
-        let deflate_plan = deflate::DeflateWriter { bytes: &data }.plan()?;
-        let (compressed_size, method) = if deflate_plan.len() < uncompressed_size {
-            (deflate_plan.len(), METHOD_DEFLATE)
+        let deflate_plan = if uncompressed_size == 0 {
+            None
         } else {
-            (uncompressed_size, METHOD_STORE)
+            Some(deflate::DeflateWriter { bytes: &data }.plan()?)
+        };
+        let (compressed_size, method) = match deflate_plan.as_ref() {
+            Some(plan) if plan.len() < uncompressed_size => (plan.len(), METHOD_DEFLATE),
+            _ => (uncompressed_size, METHOD_STORE),
         };
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
@@ -171,7 +174,10 @@ impl StreamingZipWriter<'_> {
         self.write_all(&local_header, "xlsx 압축 local header 쓰기 실패")?;
         if method == METHOD_DEFLATE {
             drop(data);
-            let actual_written = deflate_plan.write_to(&mut self.file)?;
+            let plan = deflate_plan
+                .as_ref()
+                .ok_or_else(|| err("ZIP deflate plan이 비어 있습니다."))?;
+            let actual_written = plan.write_to(&mut self.file)?;
             if actual_written != compressed_size {
                 return Err(err(format!(
                     "ZIP deflate 출력 크기가 계획과 다릅니다: expected={compressed_size}, actual={actual_written}"

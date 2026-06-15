@@ -5,7 +5,7 @@ use self::cell_ref::{
 use super::{
     xlsx_container::XlsxContainer,
     xml::{
-        XmlScanner, decode_xml_entities, ensure_valid_xml_text, extract_all_tag_text,
+        XmlScanner, decode_xml_entities, ensure_valid_xml_text, extract_all_tag_text, extract_attr,
         extract_first_tag_text, find_end_tag, find_start_tag, find_tag_end,
     },
 };
@@ -14,15 +14,15 @@ use crate::{
     sheet_util::parse_i32_str,
 };
 use alloc::borrow::Cow;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, btree_map::Entry as BTreeEntry};
 use core::{
     cmp::Ordering,
-    fmt::Display,
+    fmt::{Display, Write as FmtWrite},
     mem,
     ops::{Bound, RangeBounds},
     range::{Range, RangeInclusive},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry as HashEntry};
 use std::path::Path;
 mod cell_ref;
 const XML_SPACE_PRESERVE_ATTR: &str = " xml:space=\"preserve\"";
@@ -78,10 +78,17 @@ struct WorksheetRowParser<'row> {
     row_body: &'row str,
     row_num: u32,
 }
+struct ParsedWorksheetRows {
+    formula_cells: BTreeSet<(u32, u32)>,
+    rows: BTreeMap<u32, Row>,
+}
 struct WorksheetRowsParser<'body> {
     body: &'body str,
 }
 struct WorksheetXmlParser<'xml> {
+    xml: &'xml str,
+}
+struct SharedStringsXmlParser<'xml> {
     xml: &'xml str,
 }
 #[derive(Debug)]
@@ -142,75 +149,30 @@ impl Workbook {
         } else {
             None
         };
-        let shared_strings = if let Some(xml) = shared_strings_xml_text.as_deref() {
-            let shared_string_count = xml.matches("<si").count();
-            let mut out: Vec<String> = Vec::new();
-            out.try_reserve_exact(shared_string_count)
-                .map_err(|source| {
-                    err_with_source(
-                        format!("sharedStrings 메모리 확보 실패: {shared_string_count} entries"),
-                        source,
-                    )
-                })?;
-            let mut scanner = XmlScanner::new(xml);
-            while let Some(si_tag) = scanner.next_start_named("si") {
-                if si_tag.is_self_closing() {
-                    out.push(String::new());
-                    continue;
-                }
-                let si_tag_end = si_tag.end();
-                let Some(body_start) = si_tag_end.checked_add(1) else {
-                    return Err(err(
-                        "sharedStrings.xml의 <si> 본문 시작 계산에 실패했습니다.",
-                    ));
-                };
-                let Some(si_end) = find_end_tag(xml, "si", body_start) else {
-                    return Err(err("sharedStrings.xml의 </si> 태그를 찾지 못했습니다."));
-                };
-                let si_body_span = Range {
-                    start: body_start,
-                    end: si_end,
-                };
-                let Some(si_body) = xml.get(si_body_span) else {
-                    return Err(err("sharedStrings.xml의 <si> 본문 범위가 손상되었습니다."));
-                };
-                let text = extract_all_tag_text(si_body, "t")?
-                    .map(Cow::into_owned)
-                    .unwrap_or_default();
-                out.push(text);
-                let Some(si_close_end) = find_tag_end(xml, si_end) else {
-                    return Err(err("sharedStrings.xml의 </si> 태그가 손상되었습니다."));
-                };
-                let Some(next_cursor) = si_close_end.checked_add(1) else {
-                    return Err(err(
-                        "sharedStrings.xml의 다음 <si> 위치 계산에 실패했습니다.",
-                    ));
-                };
-                scanner.skip_to(next_cursor);
-            }
-            out
-        } else {
-            Vec::new()
+        let shared_strings = match shared_strings_xml_text.as_deref() {
+            Some(xml) => SharedStringsXmlParser { xml }.parse()?,
+            None => Vec::new(),
         };
         let mut sheets = BTreeMap::new();
         for sheet_info in sheet_catalog {
-            if sheets.contains_key(sheet_info.name.as_str()) {
-                return Err(err(format!(
-                    "workbook에 중복 sheet name이 있습니다: {}",
-                    sheet_info.name
-                )));
-            }
             let xml = container.read_text(&sheet_info.path)?;
             let mut worksheet = WorksheetXmlParser { xml: &xml }.parse()?;
             worksheet.normalize_shared_formulas()?;
-            sheets.insert(
-                sheet_info.name,
-                SheetEntry {
-                    dirty: false,
-                    path: sheet_info.path,
-                    worksheet,
-                },
-            );
+            match sheets.entry(sheet_info.name) {
+                BTreeEntry::Vacant(entry) => {
+                    entry.insert(SheetEntry {
+                        dirty: false,
+                        path: sheet_info.path,
+                        worksheet,
+                    });
+                }
+                BTreeEntry::Occupied(entry) => {
+                    return Err(err(format!(
+                        "workbook에 중복 sheet name이 있습니다: {}",
+                        entry.key()
+                    )));
+                }
+            }
         }
         Ok(Self {
             container,
@@ -572,8 +534,74 @@ impl Workbook {
         &mut self.xml_text
     }
 }
+impl SharedStringsXmlParser<'_> {
+    fn parse(&self) -> Result<Vec<String>> {
+        let shared_string_count = self.reserve_hint();
+        let mut out: Vec<String> = Vec::new();
+        out.try_reserve_exact(shared_string_count)
+            .map_err(|source| {
+                err_with_source(
+                    format!("sharedStrings 메모리 확보 실패: {shared_string_count} entries"),
+                    source,
+                )
+            })?;
+        let mut scanner = XmlScanner::new(self.xml);
+        while let Some(si_tag) = scanner.next_start_named("si") {
+            if si_tag.is_self_closing() {
+                out.push(String::new());
+                continue;
+            }
+            let si_tag_end = si_tag.end();
+            let Some(body_start) = si_tag_end.checked_add(1) else {
+                return Err(err(
+                    "sharedStrings.xml의 <si> 본문 시작 계산에 실패했습니다.",
+                ));
+            };
+            let Some(si_end) = find_end_tag(self.xml, "si", body_start) else {
+                return Err(err("sharedStrings.xml의 </si> 태그를 찾지 못했습니다."));
+            };
+            let si_body_span = Range {
+                start: body_start,
+                end: si_end,
+            };
+            let Some(si_body) = self.xml.get(si_body_span) else {
+                return Err(err("sharedStrings.xml의 <si> 본문 범위가 손상되었습니다."));
+            };
+            let text = extract_all_tag_text(si_body, "t")?
+                .map(Cow::into_owned)
+                .unwrap_or_default();
+            out.push(text);
+            let Some(si_close_end) = find_tag_end(self.xml, si_end) else {
+                return Err(err("sharedStrings.xml의 </si> 태그가 손상되었습니다."));
+            };
+            let Some(next_cursor) = si_close_end.checked_add(1) else {
+                return Err(err(
+                    "sharedStrings.xml의 다음 <si> 위치 계산에 실패했습니다.",
+                ));
+            };
+            scanner.skip_to(next_cursor);
+        }
+        Ok(out)
+    }
+    fn reserve_hint(&self) -> usize {
+        if let Some(sst_tag) = XmlScanner::new(self.xml).next_start_named("sst") {
+            for attr_name in ["uniqueCount", "count"] {
+                let Some(attr_value) = extract_attr(sst_tag.tag(), attr_name).ok().flatten() else {
+                    continue;
+                };
+                let Ok(parsed) = attr_value.parse::<usize>() else {
+                    continue;
+                };
+                if parsed <= self.xml.len() {
+                    return parsed;
+                }
+            }
+        }
+        self.xml.matches("<si").count()
+    }
+}
 impl WorksheetRowParser<'_> {
-    fn parse_into(&self, row: &mut Row) -> Result<()> {
+    fn parse_into(&self, row: &mut Row, formula_cells: &mut BTreeSet<(u32, u32)>) -> Result<()> {
         let mut scanner = XmlScanner::new(self.row_body);
         let mut next_col = 1_u32;
         while let Some(cell_info) = scanner.next_start_named("c") {
@@ -650,6 +678,9 @@ impl WorksheetRowParser<'_> {
                     ))
                 })?
                 .to_owned();
+            if find_start_tag(&inner_xml, "f", 0).is_some() {
+                formula_cells.insert((self.row_num, col));
+            }
             insert_cell(
                 row,
                 self.row_num,
@@ -670,8 +701,9 @@ impl WorksheetRowParser<'_> {
     }
 }
 impl WorksheetRowsParser<'_> {
-    fn parse(&self) -> Result<BTreeMap<u32, Row>> {
+    fn parse(&self) -> Result<ParsedWorksheetRows> {
         let mut rows: BTreeMap<u32, Row> = BTreeMap::new();
+        let mut formula_cells = BTreeSet::new();
         let mut scanner = XmlScanner::new(self.body);
         while let Some(row_info) = scanner.next_start_named("row") {
             let row_tag_end = row_info.end();
@@ -747,7 +779,7 @@ impl WorksheetRowsParser<'_> {
                 attrs: row_attrs,
                 cells: BTreeMap::new(),
             };
-            WorksheetRowParser { row_body, row_num }.parse_into(&mut row)?;
+            WorksheetRowParser { row_body, row_num }.parse_into(&mut row, &mut formula_cells)?;
             if rows.insert(row_num, row).is_some() {
                 return Err(err(row_only_error(
                     "중복 worksheet row가 있습니다. (row=",
@@ -760,7 +792,10 @@ impl WorksheetRowsParser<'_> {
                 "sheetData row 다음 cursor",
             )?);
         }
-        Ok(rows)
+        Ok(ParsedWorksheetRows {
+            formula_cells,
+            rows,
+        })
     }
 }
 impl WorksheetXmlParser<'_> {
@@ -853,8 +888,10 @@ impl WorksheetXmlParser<'_> {
             .ok_or_else(|| err("worksheet XML suffix 범위가 손상되었습니다."))?;
         let prefix = prefix_raw.to_owned();
         let suffix = suffix_raw.to_owned();
-        let rows = WorksheetRowsParser { body }.parse()?;
-        let formula_cells = formula_cells_from_rows(&rows);
+        let ParsedWorksheetRows {
+            formula_cells,
+            rows,
+        } = WorksheetRowsParser { body }.parse()?;
         Ok(Worksheet {
             formula_cells,
             locations: WorksheetXmlLocations::default(),
@@ -1105,21 +1142,26 @@ impl Worksheet {
         Ok(parse_i32_str(&text))
     }
     fn get_or_create_cell_mut(&mut self, col: u32, row: u32) -> Result<&mut Cell> {
-        let cell_ref = ref_with_locks(CellReference::unlocked(col, row))?;
-        let row_obj = self
-            .rows
-            .entry(row)
-            .or_insert_with_key(|&row_key| Row::numbered(row_key));
-        if get_attr(&row_obj.attrs, "r").is_none() {
-            set_attr(&mut row_obj.attrs, "r", display_string(row));
-        }
-        Ok(row_obj
-            .cells
-            .entry(col)
-            .or_insert_with_key(|&_col_key| Cell {
-                attrs: vec![owned_attr("r", cell_ref), owned_attr("s", "0")],
-                inner_xml: None,
-            }))
+        let row_obj = match self.rows.entry(row) {
+            BTreeEntry::Occupied(entry) => {
+                let row_obj = entry.into_mut();
+                if get_attr(&row_obj.attrs, "r").is_none() {
+                    set_attr(&mut row_obj.attrs, "r", display_string(row));
+                }
+                row_obj
+            }
+            BTreeEntry::Vacant(entry) => entry.insert(Row::numbered(row)),
+        };
+        Ok(match row_obj.cells.entry(col) {
+            BTreeEntry::Occupied(entry) => entry.into_mut(),
+            BTreeEntry::Vacant(entry) => {
+                let cell_ref = ref_with_locks(CellReference::unlocked(col, row))?;
+                entry.insert(Cell {
+                    attrs: vec![owned_attr("r", cell_ref), owned_attr("s", "0")],
+                    inner_xml: None,
+                })
+            }
+        })
     }
     pub fn has_any_row_format(&self, row: u32, max_col: u32) -> bool {
         self.rows.get(&row).is_some_and(|row_obj| {
@@ -1176,20 +1218,21 @@ impl Worksheet {
                 let Some(formula_text) = spec.formula_text else {
                     continue;
                 };
-                if heads.contains_key(spec.si.as_str()) {
-                    return Err(err(format!(
-                        "shared formula si가 중복되었습니다: {}",
-                        spec.si
-                    )));
+                match heads.entry(spec.si) {
+                    HashEntry::Vacant(entry) => {
+                        entry.insert(SharedFormulaHead {
+                            anchor_col: *col_num,
+                            anchor_row: *row_num,
+                            formula: formula_text,
+                        });
+                    }
+                    HashEntry::Occupied(entry) => {
+                        return Err(err(format!(
+                            "shared formula si가 중복되었습니다: {}",
+                            entry.key()
+                        )));
+                    }
                 }
-                heads.insert(
-                    spec.si,
-                    SharedFormulaHead {
-                        anchor_col: *col_num,
-                        anchor_row: *row_num,
-                        formula: formula_text,
-                    },
-                );
             }
         }
         if heads.is_empty() {
@@ -1287,8 +1330,6 @@ impl Worksheet {
     }
     pub fn set_formula_at(&mut self, col: u32, row: u32, formula: &str) -> Result<()> {
         let cell = self.get_or_create_cell_mut(col, row)?;
-        let formula_text =
-            try_xml_escape_text(formula, XmlEscapeContext::Text, "formula XML escape")?;
         if let Some(inner) = cell.inner_xml.as_mut() {
             if find_start_tag(inner, "f", 0).is_some() {
                 *inner = replace_formula_tag_with_plain_formula(inner, formula)?;
@@ -1296,11 +1337,15 @@ impl Worksheet {
                     append_peer_text_tag(inner, "f", "v", "")?;
                 }
             } else if inner.trim().is_empty() {
+                let formula_text =
+                    try_xml_escape_text(formula, XmlEscapeContext::Text, "formula XML escape")?;
                 *inner = build_formula_with_empty_value(&formula_text)?;
             } else {
                 return Err(err("cell formula 태그를 찾지 못했습니다."));
             }
         } else {
+            let formula_text =
+                try_xml_escape_text(formula, XmlEscapeContext::Text, "formula XML escape")?;
             cell.inner_xml = Some(build_formula_with_empty_value(&formula_text)?);
         }
         self.formula_cells.insert((row, col));
@@ -1767,13 +1812,6 @@ fn push_sorted_attrs_xml(out: &mut String, attrs: &[XmlAttr]) {
     for attr in sorted_attrs {
         push_attr_xml(out, attr);
     }
-}
-fn attrs_to_xml(attrs: &[XmlAttr]) -> String {
-    let mut out = String::new();
-    for attr in attrs {
-        push_attr_xml(&mut out, attr);
-    }
-    out
 }
 fn push_attr_xml(out: &mut String, attr: &XmlAttr) {
     let name = &attr.name;
@@ -2355,48 +2393,57 @@ fn build_formula_with_empty_value(formula_text: &str) -> Result<String> {
     Ok(out)
 }
 fn build_open_tag(name: &str, attrs: &[XmlAttr]) -> String {
-    let attrs_xml = attrs_to_xml(attrs);
-    let Some(capacity) = checked_capacity(&["<>".len(), name.len(), attrs_xml.len()]) else {
-        return format!("<{name}{attrs_xml}>");
-    };
-    let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("<{name}{attrs_xml}>");
+    let mut capacity = checked_capacity(&["<>".len(), name.len()]).unwrap_or_default();
+    for attr in attrs {
+        capacity = checked_capacity(&[capacity, " =\"\"".len(), attr.name.len(), attr.value.len()])
+            .unwrap_or_default();
     }
-    push_start_tag_name(&mut out, name, &attrs_xml);
-    out
-}
-fn build_self_closing_tag(name: &str, attrs: &[XmlAttr]) -> String {
-    let attrs_xml = attrs_to_xml(attrs);
-    let Some(capacity) = checked_capacity(&["</>".len(), name.len(), attrs_xml.len()]) else {
-        return format!("<{name}{attrs_xml}/>");
-    };
     let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("<{name}{attrs_xml}/>");
+    match out.try_reserve(capacity) {
+        Ok(()) | Err(_) => {}
     }
     out.push('<');
     out.push_str(name);
-    out.push_str(&attrs_xml);
+    for attr in attrs {
+        push_attr_xml(&mut out, attr);
+    }
+    out.push('>');
+    out
+}
+fn build_self_closing_tag(name: &str, attrs: &[XmlAttr]) -> String {
+    let mut capacity = checked_capacity(&["</>".len(), name.len()]).unwrap_or_default();
+    for attr in attrs {
+        capacity = checked_capacity(&[capacity, " =\"\"".len(), attr.name.len(), attr.value.len()])
+            .unwrap_or_default();
+    }
+    let mut out = String::new();
+    match out.try_reserve(capacity) {
+        Ok(()) | Err(_) => {}
+    }
+    out.push('<');
+    out.push_str(name);
+    for attr in attrs {
+        push_attr_xml(&mut out, attr);
+    }
     out.push_str("/>");
     out
 }
 fn build_display_text_tag(name: &str, value: impl Display) -> String {
-    let value_text = value.to_string();
-    let Some(name_len) = name.len().checked_mul(2) else {
-        return format!("<{name}>{value_text}</{name}>");
-    };
-    let Some(capacity) = checked_capacity(&["<></>".len(), name_len, value_text.len()]) else {
-        return format!("<{name}>{value_text}</{name}>");
-    };
+    let capacity = name
+        .len()
+        .checked_mul(2)
+        .and_then(|name_len| checked_capacity(&["<></>".len(), name_len]))
+        .unwrap_or("<></>".len());
     let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("<{name}>{value_text}</{name}>");
+    match out.try_reserve(capacity) {
+        Ok(()) | Err(_) => {}
     }
     out.push('<');
     out.push_str(name);
     out.push('>');
-    out.push_str(&value_text);
+    match FmtWrite::write_fmt(&mut out, format_args!("{value}")) {
+        Ok(()) | Err(_) => {}
+    }
     out.push_str("</");
     out.push_str(name);
     out.push('>');

@@ -547,6 +547,21 @@ impl SstChunkReader<'_, '_> {
         Ok(())
     }
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        self.ensure_available()?;
+        let chunk = self
+            .chunks
+            .get(self.chunk_index)
+            .ok_or_else(|| err("SST chunk 접근 범위 오류"))?;
+        if let Some(bytes) = chunk
+            .get(self.offset_in_chunk..)
+            .and_then(|remaining| remaining.first_chunk::<N>())
+        {
+            self.offset_in_chunk = self
+                .offset_in_chunk
+                .checked_add(N)
+                .ok_or_else(|| err("SST chunk offset overflow가 발생했습니다."))?;
+            return Ok(*bytes);
+        }
         let mut out = [0_u8; N];
         for byte in &mut out {
             *byte = self.read_u8()?;

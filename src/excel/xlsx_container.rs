@@ -10,7 +10,7 @@ use crate::diagnostic::{
 use alloc::borrow::Cow;
 use core::{mem, time::Duration};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry as HashEntry},
     env, fs,
     io::{self, ErrorKind, Read as _},
     path::{Component, Path, PathBuf},
@@ -151,13 +151,17 @@ impl XlsxContainer {
                 .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Id 속성이 없습니다."))?;
             let target = extract_attr(tag, "Target")?
                 .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Target 속성이 없습니다."))?;
-            if rid_to_target.contains_key(id.as_ref()) {
-                return Err(err(format!(
-                    "workbook.xml.rels에 중복 Relationship Id가 있습니다: {}",
-                    id.as_ref()
-                )));
+            match rid_to_target.entry(id) {
+                HashEntry::Vacant(entry) => {
+                    entry.insert(target);
+                }
+                HashEntry::Occupied(entry) => {
+                    return Err(err(format!(
+                        "workbook.xml.rels에 중복 Relationship Id가 있습니다: {}",
+                        entry.key().as_ref()
+                    )));
+                }
             }
-            rid_to_target.insert(id, target);
             let Some(next_cursor) = rel_end.checked_add(1) else {
                 return Err(err("다음 workbook Relationship 위치 계산에 실패했습니다."));
             };
