@@ -42,9 +42,6 @@ impl ScaledDecimal {
     fn checked_sub(self, rhs: Self) -> Option<Self> {
         self.0.checked_sub(rhs.0).map(Self)
     }
-    const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
 }
 impl ScaledSortKey {
     const MAX: Self = Self(i128::MAX);
@@ -246,6 +243,7 @@ struct ParsedMasterRow<'text> {
     gasoline: Option<i32>,
     identity: ParsedMasterIdentity<'text>,
     premium: Option<i32>,
+    smart_discount: Option<ScaledDecimal>,
 }
 struct RankRowBase {
     adjusted_prices: AdjustedFuelPrices,
@@ -454,23 +452,28 @@ impl<'text> ParsedMasterRow<'text> {
         row: u32,
         shared_strings: &'text [String],
     ) -> Result<Self> {
+        let smart_discount = match layout.smart_discount {
+            Some(col) => MasterSheetUpdater::get_f64_at(ws, col, row, shared_strings)?,
+            None => None,
+        };
         Ok(Self {
-            identity,
-            gasoline: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
-                layout.gasoline,
-                row,
-                shared_strings,
-            )?),
-            premium: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
-                layout.premium,
-                row,
-                shared_strings,
-            )?),
             diesel: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
                 layout.diesel,
                 row,
                 shared_strings,
             )?),
+            gasoline: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
+                layout.gasoline,
+                row,
+                shared_strings,
+            )?),
+            identity,
+            premium: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
+                layout.premium,
+                row,
+                shared_strings,
+            )?),
+            smart_discount,
         })
     }
 }
@@ -488,8 +491,12 @@ impl RankRowBase {
         currency_apply: bool,
         sort_context: &RankSortContext,
     ) -> Self {
-        let smart_discount = if row.identity.name.contains("현대오일뱅크")
-            && row.identity.name.contains("직영")
+        let smart_discount = if row
+            .smart_discount
+            .is_some_and(|value| value == ScaledDecimal::ZERO)
+        {
+            ScaledDecimal::ZERO
+        } else if row.identity.name.contains("현대오일뱅크") && row.identity.name.contains("직영")
         {
             sort_context.smart_discount
         } else {
@@ -1083,7 +1090,7 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
             return Ok(None);
         }
         let mut parts = String::new();
-        if !self.sort_context.gasoline_qty.is_zero() {
+        if self.sort_context.gasoline_qty != ScaledDecimal::ZERO {
             let Some(gasoline) = prices.gasoline else {
                 return Ok(None);
             };
@@ -1101,7 +1108,7 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
                 &format_fuel_price_text("휘발유", ScaledSortKey(total))?,
             );
         }
-        if !self.sort_context.premium_qty.is_zero() {
+        if self.sort_context.premium_qty != ScaledDecimal::ZERO {
             let Some(premium) = prices.premium else {
                 return Ok(None);
             };
@@ -1119,7 +1126,7 @@ impl RankFormulaCacheBuilder<'_, '_, '_> {
                 &format_fuel_price_text("고급유", ScaledSortKey(total))?,
             );
         }
-        if !self.sort_context.diesel_qty.is_zero() {
+        if self.sort_context.diesel_qty != ScaledDecimal::ZERO {
             let Some(diesel) = prices.diesel else {
                 return Ok(None);
             };
@@ -1267,7 +1274,7 @@ impl RankFormulaRefresher<'_, '_> {
     }
     fn refresh_caches(&mut self, sort_context: &RankSortContext) -> Result<()> {
         let display_total_qty = MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)
-            .map(|value| value.filter(|qty| !MasterSheetUpdater::is_zero(*qty)))?;
+            .map(|value| value.filter(|qty| *qty != ScaledDecimal::ZERO))?;
         self.ws
             .clear_formula_cached_values_in_range(self.data_rows)?;
         let rank_totals = self.collect_rank_totals(display_total_qty, sort_context)?;
@@ -1513,7 +1520,7 @@ impl RankSortKeyBuilder<'_, '_, '_> {
             .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
             .map(ScaledSortKey);
         let rank_total = self.sort_context.total_qty.and_then(|total_qty| {
-            if MasterSheetUpdater::is_zero(total_qty) {
+            if total_qty == ScaledDecimal::ZERO {
                 None
             } else {
                 MasterSheetUpdater::compute_total_price(
@@ -1601,12 +1608,12 @@ impl<'source> MasterSheetUpdater<'source> {
             }
         }
         let total_qty = Self::get_f64_at(ws, 2, 10, shared_strings)?
-            .filter(|value| !Self::is_zero(*value))
+            .filter(|value| *value != ScaledDecimal::ZERO)
             .or_else(|| {
                 let derived_total = gasoline_qty
                     .checked_add(premium_qty)?
                     .checked_add(diesel_qty)?;
-                (!Self::is_zero(derived_total)).then_some(derived_total)
+                (derived_total != ScaledDecimal::ZERO).then_some(derived_total)
             });
         Ok(RankSortContext {
             gasoline_qty,
@@ -1657,21 +1664,21 @@ impl<'source> MasterSheetUpdater<'source> {
         adjusted_diesel: Option<ScaledDecimal>,
     ) -> Option<ScaledSortKey> {
         let mut total = ScaledSortKey::ZERO;
-        if !gasoline_qty.is_zero() {
+        if gasoline_qty != ScaledDecimal::ZERO {
             total = total.checked_add(ScaledSortKey(
                 gasoline_qty
                     .as_i128()
                     .checked_mul(adjusted_gasoline?.as_i128())?,
             ))?;
         }
-        if !premium_qty.is_zero() {
+        if premium_qty != ScaledDecimal::ZERO {
             total = total.checked_add(ScaledSortKey(
                 premium_qty
                     .as_i128()
                     .checked_mul(adjusted_premium?.as_i128())?,
             ))?;
         }
-        if !diesel_qty.is_zero() {
+        if diesel_qty != ScaledDecimal::ZERO {
             total = total.checked_add(ScaledSortKey(
                 diesel_qty
                     .as_i128()
@@ -1860,9 +1867,6 @@ impl<'source> MasterSheetUpdater<'source> {
             return Ok(None);
         };
         Ok(combined.checked_mul(sign).map(ScaledDecimal))
-    }
-    const fn is_zero(value: ScaledDecimal) -> bool {
-        value.is_zero()
     }
     fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
         value.filter(|price| *price > 0_i32)

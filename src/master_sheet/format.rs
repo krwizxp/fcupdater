@@ -103,7 +103,7 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
     out
 }
 pub(super) fn format_unit_price_text(total: ScaledSortKey, qty: ScaledDecimal) -> Option<String> {
-    if qty.is_zero() {
+    if qty == ScaledDecimal::ZERO {
         return None;
     }
     let denominator_raw = qty.as_i128().checked_mul(DECIMAL_SCALE.as_i128())?;
