@@ -491,17 +491,14 @@ impl RankRowBase {
         currency_apply: bool,
         sort_context: &RankSortContext,
     ) -> Self {
-        let smart_discount = if row
-            .smart_discount
-            .is_some_and(|value| value == ScaledDecimal::ZERO)
-        {
-            ScaledDecimal::ZERO
-        } else if row.identity.name.contains("현대오일뱅크") && row.identity.name.contains("직영")
-        {
-            sort_context.smart_discount
-        } else {
-            ScaledDecimal::ZERO
-        };
+        let smart_discount = row.smart_discount.unwrap_or_else(|| {
+            if row.identity.name.contains("현대오일뱅크") && row.identity.name.contains("직영")
+            {
+                sort_context.smart_discount
+            } else {
+                ScaledDecimal::ZERO
+            }
+        });
         let adjusted_prices = AdjustedFuelPrices {
             gasoline: MasterSheetUpdater::adjusted_fuel_price(row.gasoline, smart_discount),
             premium: MasterSheetUpdater::adjusted_fuel_price(row.premium, smart_discount),
@@ -737,6 +734,10 @@ impl SourceRowsWriter<'_, '_, '_, '_, '_> {
                 region_label,
                 self.layout,
             )?;
+            if let Some(col) = self.layout.smart_discount {
+                self.ws
+                    .set_formula_cached_value_at(col, new_row, None, None)?;
+            }
         }
         Ok(())
     }
