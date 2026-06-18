@@ -283,6 +283,9 @@ impl Client {
         let header_bytes = usize::try_from(bytes)
             .map_err(|source| download_error_with_source("응답 헤더 길이 변환 실패", source))?;
         checked_http_buffer_len("헤더", 0, header_bytes, HTTP_MAX_HEADER_BYTES)?;
+        if !header_bytes.is_multiple_of(2) {
+            return Err("응답 헤더 UTF-16 버퍼 길이가 2바이트 단위가 아닙니다.".into());
+        }
         let units = header_bytes
             .checked_div(2)
             .ok_or("응답 헤더 길이 계산 실패")?;
