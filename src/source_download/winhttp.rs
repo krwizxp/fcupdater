@@ -234,14 +234,17 @@ impl Client {
         };
         let session = self.non_null_handle(raw_session, "WinHttpOpen")?;
         // SAFETY: session is a valid WinHTTP session handle.
-        unsafe {
+        let timeout_ok = unsafe {
             sys::WinHttpSetTimeouts(
                 session.as_ptr(),
                 WINHTTP_RESOLVE_TIMEOUT_MS,
                 WINHTTP_CONNECT_TIMEOUT_MS,
                 WINHTTP_SEND_TIMEOUT_MS,
                 WINHTTP_RECEIVE_TIMEOUT_MS,
-            );
+            )
+        };
+        if timeout_ok == 0_i32 {
+            return Err(self.last_error_message("WinHttpSetTimeouts").into());
         }
         Ok(session)
     }

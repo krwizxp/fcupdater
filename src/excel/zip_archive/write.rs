@@ -15,6 +15,9 @@ use std::{
 };
 const CENTRAL_FILE_HEADER_BASE_LEN: usize = 46;
 const ZIP_OUTPUT_BUFFER_CAPACITY: usize = 64 * 1024;
+const STORE_WITHOUT_DEFLATE_EXTENSIONS: [&str; 10] = [
+    ".bin", ".gif", ".jpeg", ".jpg", ".mp3", ".mp4", ".png", ".webp", ".zip", ".zst",
+];
 struct CentralDirectoryPlan {
     max_header_capacity: usize,
     size: usize,
@@ -138,7 +141,12 @@ impl StreamingZipWriter<'_> {
         let data = self.read_part_bytes(&file)?;
         let crc32 = crc32(&data)?;
         let uncompressed_size = data.len();
-        let deflate_plan = if uncompressed_size == 0 {
+        let store_without_deflate = STORE_WITHOUT_DEFLATE_EXTENSIONS.iter().any(|extension| {
+            file.name
+                .get(file.name.len().saturating_sub(extension.len())..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(extension))
+        });
+        let deflate_plan = if uncompressed_size == 0 || store_without_deflate {
             None
         } else {
             Some(deflate::DeflateWriter { bytes: &data }.plan()?)

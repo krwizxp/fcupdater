@@ -56,6 +56,7 @@ static CURL_INIT: LazyLock<CurlCode> = LazyLock::new(|| {
 type Curl = c_void;
 type CurlCode = c_int;
 type CurlInfo = c_int;
+type CurlOffT = i64;
 type CurlOption = c_int;
 type CurlWriteCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
 pub(super) struct Client {
@@ -149,6 +150,15 @@ impl EasyHandle {
             Err(curl_error("curl_easy_setopt", code).into())
         }
     }
+    fn setopt_off_t(&self, option: CurlOption, value: CurlOffT) -> DownloadResult<()> {
+        // SAFETY: value is a curl_off_t scalar option value for the given CurlOption.
+        let code = unsafe { sys::curl_easy_setopt(self.as_ptr(), option, value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code).into())
+        }
+    }
     fn setopt_ptr<T>(&self, option: CurlOption, value: *const T) -> DownloadResult<()> {
         // SAFETY: value is a pointer option that remains valid for the transfer duration.
         let code = unsafe { sys::curl_easy_setopt(self.as_ptr(), option, value) };
@@ -232,11 +242,6 @@ impl Client {
                 value: 30,
             },
             CurlLongOption {
-                option: CURLOPT_MAXFILESIZE_LARGE,
-                value: c_long::try_from(HTTP_MAX_BODY_BYTES)
-                    .map_err(|source| download_error_with_source("HTTP 본문 한도 변환 실패", source))?,
-            },
-            CurlLongOption {
                 option: CURLOPT_TIMEOUT,
                 value: 60,
             },
@@ -247,6 +252,9 @@ impl Client {
         ] {
             handle.setopt_long(setting.option, setting.value)?;
         }
+        let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES)
+            .map_err(|source| download_error_with_source("HTTP 본문 한도 변환 실패", source))?;
+        handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;
         if let Some(body_bytes) = body {
             handle.setopt_long(CURLOPT_POST, 1)?;
             let post_fields = body_bytes.as_ptr().cast::<c_char>();
