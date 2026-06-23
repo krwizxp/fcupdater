@@ -6,7 +6,10 @@ use crate::{
     diagnostic::{Result, err, err_with_source},
     excel,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
-    region::normalize_address_key,
+    region::{
+        TARGET_REGION_COUNT, increment_target_region_count, normalize_address_key,
+        target_region_index,
+    },
     rows::{AddedStoreRow, ChangeRow, MasterSheetUpdateResult, SourceRecord, StoreRow},
     sheet_util::{add_row_offset, usize_to_u32},
 };
@@ -286,6 +289,7 @@ struct MasterSheetUpdateOutcome<'source> {
     added: Vec<AddedStoreRow<'source>>,
     changes: Vec<ChangeRow<'source>>,
     deleted: Vec<StoreRow>,
+    existing_region_counts: [usize; TARGET_REGION_COUNT],
     filter_target: FilterTarget,
 }
 struct NewSourcePlacementPlan<'work, 'sources, 'source> {
@@ -308,6 +312,7 @@ struct MasterRowEvaluation<'source> {
     changes: Vec<ChangeRow<'source>>,
     deleted: Vec<StoreRow>,
     deleted_rows: Vec<u32>,
+    existing_region_counts: [usize; TARGET_REGION_COUNT],
     kept_source_rows: Vec<KeptSourceRow<'source>>,
     matched_source_keys: HashSet<&'source str>,
     old_rows: Vec<u32>,
@@ -1714,12 +1719,7 @@ impl<'source> MasterSheetUpdater<'source> {
     ) -> Result<MasterRowEvaluation<'source>> {
         let row_count = ws.row_count();
         let mut old_rows: Vec<u32> = Vec::new();
-        old_rows.try_reserve_exact(row_count).map_err(|source| {
-            err_with_source(
-                format!("마스터 데이터 행 목록 메모리 확보 실패: {row_count} rows"),
-                source,
-            )
-        })?;
+        reserve_row_vec(&mut old_rows, row_count, "마스터 데이터 행 목록")?;
         let mut matched_source_keys: HashSet<&str> = HashSet::new();
         matched_source_keys
             .try_reserve(row_count)
@@ -1730,41 +1730,30 @@ impl<'source> MasterSheetUpdater<'source> {
                 )
             })?;
         let mut kept_source_rows: Vec<KeptSourceRow<'source>> = Vec::new();
-        kept_source_rows
-            .try_reserve_exact(row_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("유지 행 목록 메모리 확보 실패: {row_count} rows"),
-                    source,
-                )
-            })?;
+        reserve_row_vec(&mut kept_source_rows, row_count, "유지 행 목록")?;
         let mut changes: Vec<ChangeRow<'source>> = Vec::new();
-        changes.try_reserve_exact(row_count).map_err(|source| {
-            err_with_source(
-                format!("변경 행 목록 메모리 확보 실패: {row_count} rows"),
-                source,
-            )
-        })?;
+        reserve_row_vec(&mut changes, row_count, "변경 행 목록")?;
         let mut deleted: Vec<StoreRow> = Vec::new();
-        deleted.try_reserve_exact(row_count).map_err(|source| {
-            err_with_source(
-                format!("삭제 행 목록 메모리 확보 실패: {row_count} rows"),
-                source,
-            )
-        })?;
+        reserve_row_vec(&mut deleted, row_count, "삭제 행 목록")?;
         let mut deleted_rows: Vec<u32> = Vec::new();
-        deleted_rows
-            .try_reserve_exact(row_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("삭제 행 번호 목록 메모리 확보 실패: {row_count} rows"),
-                    source,
-                )
-            })?;
+        reserve_row_vec(&mut deleted_rows, row_count, "삭제 행 번호 목록")?;
+        let mut existing_region_counts = [0_usize; TARGET_REGION_COUNT];
+        let mut target_region_scratch = String::new();
         for old_row in ws.row_numbers_from(data_start_row) {
             let identity = ParsedMasterIdentity::read(ws, layout, old_row, shared_strings)?;
             if identity.is_empty() {
                 continue;
+            }
+            if let Some(region_index) = target_region_index(
+                identity.region(),
+                identity.address(),
+                &mut target_region_scratch,
+            )? {
+                increment_target_region_count(
+                    &mut existing_region_counts,
+                    region_index,
+                    "마스터 지역별 건수",
+                )?;
             }
             old_rows.push(old_row);
             let MasterRowDecision {
@@ -1801,6 +1790,7 @@ impl<'source> MasterSheetUpdater<'source> {
             changes,
             deleted,
             deleted_rows,
+            existing_region_counts,
             kept_source_rows,
             matched_source_keys,
             old_rows,
@@ -1898,6 +1888,7 @@ impl<'source> MasterSheetUpdater<'source> {
                     added,
                     changes: evaluation.changes,
                     deleted: evaluation.deleted,
+                    existing_region_counts: evaluation.existing_region_counts,
                     filter_target,
                 })
             })
@@ -1919,6 +1910,7 @@ impl<'source> MasterSheetUpdater<'source> {
             added: outcome.added,
             changes: outcome.changes,
             deleted: outcome.deleted,
+            existing_region_counts: outcome.existing_region_counts,
         })
     }
     fn write_master_row_from_source(
@@ -1952,6 +1944,14 @@ fn row_range_len(rows: RowRange, context: &'static str) -> Result<usize> {
         .ok_or_else(|| err(format!("{context} 계산 중 overflow가 발생했습니다.")))?;
     usize::try_from(row_count)
         .map_err(|source| err_with_source(format!("{context} 변환 실패"), source))
+}
+fn reserve_row_vec<T>(rows: &mut Vec<T>, row_count: usize, label: &str) -> Result<()> {
+    rows.try_reserve_exact(row_count).map_err(|source| {
+        err_with_source(
+            format!("{label} 메모리 확보 실패: {row_count} rows"),
+            source,
+        )
+    })
 }
 fn mapped_contiguous_row(
     row_mapping: &[Option<u32>],

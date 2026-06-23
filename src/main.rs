@@ -23,7 +23,7 @@ const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
 #[derive(Debug)]
 enum ParseAction {
     Help(String),
-    Run,
+    Run { verify_saved_archive: bool },
     Version(String),
 }
 fn main() -> Result<()> {
@@ -32,7 +32,9 @@ fn main() -> Result<()> {
     let first_arg = raw_args.next();
     let has_extra = raw_args.next().is_some();
     let action = match first_arg {
-        None => ParseAction::Run,
+        None => ParseAction::Run {
+            verify_saved_archive: false,
+        },
         Some(token) => {
             if has_extra {
                 let usage = usage_text();
@@ -45,6 +47,10 @@ fn main() -> Result<()> {
                 ParseAction::Help(usage_text())
             } else if token == OsStr::new("--version") {
                 ParseAction::Version(format!("{APP_NAME} {APP_VERSION}"))
+            } else if token == OsStr::new("--verify") {
+                ParseAction::Run {
+                    verify_saved_archive: true,
+                }
             } else {
                 let usage = usage_text();
                 return Err(err(format!(
@@ -55,10 +61,13 @@ fn main() -> Result<()> {
         }
     };
     match action {
-        ParseAction::Run => {
+        ParseAction::Run {
+            verify_saved_archive,
+        } => {
             let mut update = UpdateRun {
                 master_path: Path::new(MASTER_PATH),
                 out: &mut out,
+                verify_saved_archive,
             };
             update.run()
         }
@@ -71,9 +80,9 @@ fn main() -> Result<()> {
 fn usage_text() -> String {
     format!(
         "{APP_NAME} {APP_VERSION}\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n\
-사용법:\n  {APP_NAME}\n\n\
-고정 동작:\n  마스터: fuel_cost_chungcheong.xlsx 직접 현행화\n  소스: Opinet 현재 판매가격(주유소) 자동 다운로드 .xls\n  변경내역 시트: 항상 갱신\n  저장 검증: 항상 수행\n\n\
-옵션:\n  -h, --help               도움말\n  --version                버전"
+사용법:\n  {APP_NAME} [--verify]\n\n\
+고정 동작:\n  마스터: fuel_cost_chungcheong.xlsx 직접 현행화\n  소스: Opinet 현재 판매가격(주유소) 자동 다운로드 .xls\n  변경내역 시트: 항상 갱신\n  저장 검증: 기본 생략 (--verify 사용 시 수행)\n\n\
+옵션:\n  -h, --help               도움말\n  --verify                 저장 후 임시 XLSX를 재열어 검증한 뒤 승격\n  --version                버전"
     )
 }
 fn write_line(output: &mut dyn Write, args: Arguments<'_>) -> io::Result<()> {

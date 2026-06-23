@@ -8,7 +8,7 @@
 - 소스 기준 신규 업체 자동 추가
 - 소스 기준 업체 영업 상태 정리
 - `변경내역` 시트 항상 갱신
-- 저장 후 OOXML 필수 파트 무결성 검증
+- 기본 저장은 빠른 승격 사용, `--verify` 실행 시 저장 후 OOXML 필수 파트 무결성 검증
 ## 요구사항
 - MSRV: Rust 1.96
 - 자동 다운로드: Windows는 WinHTTP, Linux/macOS는 native libcurl 사용
@@ -33,6 +33,7 @@ fcupdater
 ## CLI
 지원 옵션은 아래와 같습니다.
 - `-h`, `--help`: 도움말
+- `--verify`: 저장 후 임시 XLSX를 재열어 검증한 뒤 대상 파일로 승격
 - `--version`: 버전 표시
 ## GitHub Actions
 `.github/workflows/ci.yml`은 `ubuntu-latest`, `macos-latest`, `windows-latest`에서 `cargo build --release --locked`를 수행하고 실행 파일을 Artifact로 업로드합니다.
@@ -52,7 +53,8 @@ Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어
 - 소스 worksheet는 1개 구조를 기준으로 읽습니다.
 - 소스 cell record는 `LABELSST` 기반 문자열 셀 구조를 기준으로 읽습니다.
 - 소스 데이터는 고정 열 구조를 사용합니다.
-- 마스터 파일을 직접 저장하고 저장 검증은 항상 수행합니다.
+- 마스터 파일을 직접 저장하며 기본 실행은 저장 검증을 생략합니다.
+- `--verify` 실행은 임시 XLSX 생성 후 재열기 검증을 통과한 경우에만 대상 파일로 승격합니다.
 - 변경내역 시트는 항상 갱신합니다.
 - 주소는 기존 업체 매칭 기준입니다. 소스 주소와 매칭되지 않는 기존 행은 폐업, 소스에만 있는 행은 신규로 처리합니다.
 ## 대상 지역

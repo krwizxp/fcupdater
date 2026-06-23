@@ -3,6 +3,7 @@ use self::cell_ref::{
     rewrite_formula_cell_refs, shift_formula_index, try_parse_and_rewrite_cell_ref,
 };
 use super::{
+    SaveVerification,
     xlsx_container::XlsxContainer,
     xml::{
         XmlScanner, decode_xml_entities, ensure_valid_xml_text, extract_all_tag_text,
@@ -191,7 +192,6 @@ impl Workbook {
         let mut existing_index: Option<HashMap<&str, usize>> = None;
         let mut new_index: HashMap<String, usize> = HashMap::new();
         let mut next_new_idx = self.shared_strings.len();
-        let mut promoted_cell_count = 0_usize;
         let (shared_strings, sheets) = (&self.shared_strings, &mut self.sheets);
         for sheet in sheets.values_mut() {
             if !sheet.dirty {
@@ -245,18 +245,11 @@ impl Workbook {
                         new_index.insert(text.into_owned(), idx);
                         idx
                     };
-                    promoted_cell_count = promoted_cell_count.checked_add(1).ok_or_else(|| {
-                        err("shared string promote cell count 계산 중 overflow가 발생했습니다.")
-                    })?;
                     set_attr(&mut cell.attrs, "t", "s");
                     cell.inner_xml = Some(build_display_text_tag("v", shared_idx));
                 }
             }
         }
-        if promoted_cell_count == 0 {
-            return Ok(());
-        }
-        let new_unique_count = new_index.len();
         let mut new_strings: Vec<NewSharedString> = Vec::new();
         new_strings
             .try_reserve_exact(new_index.len())
@@ -275,11 +268,11 @@ impl Workbook {
         new_strings.sort_unstable_by_key(|entry| entry.idx);
         self.shared_strings
             .extend(new_strings.into_iter().map(|entry| entry.value));
+        let shared_string_reference_count = self.shared_string_reference_count()?;
         self.update_shared_strings_xml_text(
             existing_table_len,
-            existing_table_len,
-            promoted_cell_count,
-            new_unique_count,
+            shared_string_reference_count,
+            self.shared_strings.len(),
         )
     }
     fn remove_excel_recovery_artifacts(&mut self) -> Result<()> {
@@ -398,7 +391,7 @@ impl Workbook {
         }
         Ok(())
     }
-    pub fn save(&mut self, target_path: &Path) -> Result<()> {
+    pub fn save(&mut self, target_path: &Path, verification: &SaveVerification) -> Result<()> {
         self.promote_safe_inline_strings_to_shared()?;
         self.request_full_recalculation()?;
         self.remove_excel_recovery_artifacts()?;
@@ -417,14 +410,28 @@ impl Workbook {
             let sheet_xml = sheet.worksheet.to_xml()?;
             self.container.write_text(&sheet.path, &sheet_xml)?;
         }
-        self.container.save(target_path)
+        self.container.save(target_path, verification)
+    }
+    fn shared_string_reference_count(&self) -> Result<usize> {
+        let mut count = 0_usize;
+        for sheet in self.sheets.values() {
+            for row in sheet.worksheet.rows.values() {
+                for cell in row.cells.values() {
+                    if get_attr(&cell.attrs, "t") == Some("s") {
+                        count = count.checked_add(1).ok_or_else(|| {
+                            err("shared string 참조 수 계산 중 overflow가 발생했습니다.")
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
     fn update_shared_strings_xml_text(
         &mut self,
         existing_table_len: usize,
-        existing_unique: usize,
-        promoted_cell_count: usize,
-        new_unique_count: usize,
+        shared_string_reference_count: usize,
+        unique_count: usize,
     ) -> Result<()> {
         let new_values = self
             .shared_strings
@@ -453,32 +460,24 @@ impl Workbook {
             "sharedStrings 속성 목록 추가 메모리 확보 실패",
             XmlReserveMode::Additional,
         )?;
-        let existing_count = usize_attr_or(
+        let _existing_count = usize_attr_or(
             &attrs,
             "count",
-            existing_table_len,
+            shared_string_reference_count,
             "sharedStrings count 해석 실패",
         )?;
-        let existing_unique_count = usize_attr_or(
+        let _existing_unique_count = usize_attr_or(
             &attrs,
             "uniqueCount",
-            existing_unique,
+            unique_count,
             "sharedStrings uniqueCount 해석 실패",
         )?;
-        set_added_usize_attr(
+        set_attr(
             &mut attrs,
             "count",
-            existing_count,
-            promoted_cell_count,
-            "sharedStrings count 계산 중 overflow가 발생했습니다.",
-        )?;
-        set_added_usize_attr(
-            &mut attrs,
-            "uniqueCount",
-            existing_unique_count,
-            new_unique_count,
-            "sharedStrings uniqueCount 계산 중 overflow가 발생했습니다.",
-        )?;
+            display_string(shared_string_reference_count),
+        );
+        set_attr(&mut attrs, "uniqueCount", display_string(unique_count));
         let sst_prefix = sst_name.rsplit_once(':').map(|(prefix, _)| prefix);
         let si_name = qualified_name_with_prefix(sst_prefix, "si", "shared string <si> 이름")?;
         let t_name = qualified_name_with_prefix(sst_prefix, "t", "shared string <t> 이름")?;
@@ -1940,17 +1939,6 @@ fn usize_attr_or(
             .parse::<usize>()
             .map_err(|source| err_with_source(context, source))
     })
-}
-fn set_added_usize_attr(
-    attrs: &mut Vec<XmlAttr>,
-    name: &str,
-    base: usize,
-    add: usize,
-    context: &str,
-) -> Result<()> {
-    let value = checked_usize_add(base, add, context)?;
-    set_attr(attrs, name, display_string(value));
-    Ok(())
 }
 fn owned_attr(name: &str, value: impl Into<String>) -> XmlAttr {
     XmlAttr {

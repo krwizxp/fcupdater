@@ -1,10 +1,14 @@
 use crate::{
     change_log::ChangeLogUpdater,
     diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message},
+    excel::SaveVerification,
     excel::SourceReader,
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::MasterSheetUpdater,
-    region::{normalize_address_key, normalize_address_key_into},
+    region::{
+        TARGET_REGION_COUNT, TARGET_REGION_LABELS, increment_target_region_count,
+        normalize_address_key, target_region_index,
+    },
     rows::{AddedStoreRow, ChangeRow, MasterSheetUpdateResult, SourceRecord, StoreRow},
     source_download::SourceDownload,
     write_line, write_line_best_effort,
@@ -19,6 +23,8 @@ use std::{
 };
 const MAX_DELETED_RATIO_EXCLUSIVE_NUMERATOR: usize = 1;
 const MAX_DELETED_RATIO_DENOMINATOR: usize = 2;
+const MIN_REGION_RETAIN_DENOMINATOR: usize = 2;
+const MIN_REGION_RETAIN_NUMERATOR: usize = 1;
 const DAYS_PER_100_YEARS_I64: i64 = 36_524;
 const DAYS_PER_400_YEARS_I64: i64 = 146_097;
 const DAYS_PER_4_YEARS_I64: i64 = 1_460;
@@ -43,6 +49,7 @@ struct KstDate {
 struct LoadedSource {
     index: HashMap<String, SourceRecord>,
     name: String,
+    region_counts: [usize; TARGET_REGION_COUNT],
 }
 struct UpdatedWorkbook<'source> {
     book: StdWorkbook,
@@ -51,6 +58,7 @@ struct UpdatedWorkbook<'source> {
 pub struct UpdateRun<'out> {
     pub master_path: &'out Path,
     pub out: &'out mut dyn Write,
+    pub verify_saved_archive: bool,
 }
 impl UpdateRun<'_> {
     fn load_source(&mut self) -> Result<LoadedSource> {
@@ -64,62 +72,66 @@ impl UpdateRun<'_> {
             .file_name()
             .and_then(|name| name.to_str())
             .map_or_else(|| source_path.display().to_string(), str::to_owned);
-        let result = (|| -> Result<HashMap<String, SourceRecord>> {
-            let source_records = SourceReader {
-                path: source_path.as_path(),
-            }
-            .read_xls_source()
-            .map_err(|source_err| {
-                source_err.prepend_context(path_context_message(
-                    "소스 xls 파일 읽기 실패",
-                    &source_path,
-                ))
-            })?;
-            let mut map: HashMap<String, SourceRecord> = HashMap::new();
-            let mut target_record_count = 0_usize;
-            let mut region_key = String::new();
-            for record in source_records {
-                normalize_address_key_into(&record.region, &mut region_key)?;
-                if matches!(
-                    region_key.as_str(),
-                    "대전대덕구"
-                        | "대전동구"
-                        | "대전서구"
-                        | "대전유성구"
-                        | "대전중구"
-                        | "세종시"
-                        | "충북청주시"
-                        | "충남공주시"
-                        | "충남보령시"
-                        | "충남아산시"
-                        | "충남천안시"
-                ) {
-                    target_record_count = target_record_count
-                        .checked_add(1)
-                        .ok_or_else(|| err("대상 지역 소스 레코드 수 계산 실패"))?;
-                    map.try_reserve(1).map_err(|source| {
-                        err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
-                    })?;
-                    let key = normalize_address_key(&record.address)?;
-                    match map.entry(key) {
-                        Entry::Vacant(vacant_entry) => {
-                            vacant_entry.insert(record);
-                        }
-                        Entry::Occupied(occupied_entry) => {
-                            let existing = occupied_entry.get();
-                            return Err(err(format!(
-                                "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
-                                existing.address, existing.name, record.name
-                            )));
+        let result =
+            (|| -> Result<(HashMap<String, SourceRecord>, [usize; TARGET_REGION_COUNT])> {
+                let source_records = SourceReader {
+                    path: source_path.as_path(),
+                }
+                .read_xls_source()
+                .map_err(|source_err| {
+                    source_err.prepend_context(path_context_message(
+                        "소스 xls 파일 읽기 실패",
+                        &source_path,
+                    ))
+                })?;
+                let mut map: HashMap<String, SourceRecord> = HashMap::new();
+                let mut target_record_count = 0_usize;
+                let mut region_counts = [0_usize; TARGET_REGION_COUNT];
+                let mut target_region_scratch = String::new();
+                for record in source_records {
+                    if let Some(region_index) = target_region_index(
+                        &record.region,
+                        &record.address,
+                        &mut target_region_scratch,
+                    )? {
+                        target_record_count = target_record_count
+                            .checked_add(1)
+                            .ok_or_else(|| err("대상 지역 소스 레코드 수 계산 실패"))?;
+                        increment_target_region_count(
+                            &mut region_counts,
+                            region_index,
+                            "소스 지역별 건수",
+                        )?;
+                        map.try_reserve(1).map_err(|source| {
+                            err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
+                        })?;
+                        let key = normalize_address_key(&record.address)?;
+                        match map.entry(key) {
+                            Entry::Vacant(vacant_entry) => {
+                                vacant_entry.insert(record);
+                            }
+                            Entry::Occupied(occupied_entry) => {
+                                let existing = occupied_entry.get();
+                                return Err(err(format!(
+                                    "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
+                                    existing.address, existing.name, record.name
+                                )));
+                            }
                         }
                     }
                 }
-            }
-            if target_record_count == 0 {
-                return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
-            }
-            Ok(map)
-        })();
+                if target_record_count == 0 {
+                    return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
+                }
+                for (label, count) in TARGET_REGION_LABELS.iter().zip(region_counts.iter()) {
+                    if *count == 0 {
+                        return Err(err(format!(
+                            "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {label}"
+                        )));
+                    }
+                }
+                Ok((map, region_counts))
+            })();
         match fs::remove_file(&source_path) {
             Ok(()) => write_line_best_effort(self.out, format_args!("임시 소스 파일 정리 완료")),
             Err(source_err) => write_line_best_effort(
@@ -130,9 +142,11 @@ impl UpdateRun<'_> {
                 ),
             ),
         }
+        let (index, region_counts) = result?;
         Ok(LoadedSource {
-            index: result?,
+            index,
             name: source_name,
+            region_counts,
         })
     }
     fn open_updated_workbook<'source>(
@@ -146,6 +160,35 @@ impl UpdateRun<'_> {
             source_index: &loaded_source.index,
         }
         .update(&mut book)?;
+        self.print_region_count_summary(
+            &master_update.existing_region_counts,
+            &loaded_source.region_counts,
+        )?;
+        for ((label, existing_count), source_count) in TARGET_REGION_LABELS
+            .iter()
+            .zip(master_update.existing_region_counts.iter())
+            .zip(loaded_source.region_counts.iter())
+        {
+            if *source_count == 0 {
+                return Err(err(format!(
+                    "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {label}"
+                )));
+            }
+            if *existing_count == 0 {
+                continue;
+            }
+            let retained_scaled = source_count
+                .checked_mul(MIN_REGION_RETAIN_DENOMINATOR)
+                .ok_or_else(|| err("지역별 소스 건수 감소율 계산 중 overflow가 발생했습니다."))?;
+            let required_scaled = existing_count
+                .checked_mul(MIN_REGION_RETAIN_NUMERATOR)
+                .ok_or_else(|| err("지역별 기존 건수 감소율 계산 중 overflow가 발생했습니다."))?;
+            if retained_scaled < required_scaled {
+                return Err(err(format!(
+                    "대상 지역 소스 건수가 기존 마스터 대비 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing_count}건 / 소스 {source_count}건"
+                )));
+            }
+        }
         let total_considered = loaded_source
             .index
             .len()
@@ -197,6 +240,24 @@ impl UpdateRun<'_> {
             write_line(
                 self.out,
                 format_args!("  ... ({}개 중 20개만 표시)", rows.len()),
+            )?;
+        }
+        Ok(())
+    }
+    fn print_region_count_summary(
+        &mut self,
+        existing_counts: &[usize; TARGET_REGION_COUNT],
+        source_counts: &[usize; TARGET_REGION_COUNT],
+    ) -> Result<()> {
+        write_line(self.out, format_args!("대상 지역별 건수 확인:"))?;
+        for ((label, existing_count), source_count) in TARGET_REGION_LABELS
+            .iter()
+            .zip(existing_counts.iter())
+            .zip(source_counts.iter())
+        {
+            write_line(
+                self.out,
+                format_args!("  {label}: 기존 {existing_count}건 / 소스 {source_count}건"),
             )?;
         }
         Ok(())
@@ -253,7 +314,12 @@ impl UpdateRun<'_> {
             self.out,
             format_args!("- 폐업 업체 삭제: {}건", deleted.len()),
         )?;
-        write_line(self.out, format_args!("- 저장 검증: 사용"))?;
+        let verification_state = if self.verify_saved_archive {
+            "사용"
+        } else {
+            "생략"
+        };
+        write_line(self.out, format_args!("- 저장 검증: {verification_state}"))?;
         self.print_added_rows("신규 업체 추가 목록 (상위 20개)", added)?;
         self.print_store_rows("폐업 업체 삭제 목록 (상위 20개)", deleted)?;
         write_line(self.out, format_args!("=====================\n"))?;
@@ -355,6 +421,13 @@ impl UpdateRun<'_> {
             &today,
         )
     }
+    const fn save_verification(&self) -> SaveVerification {
+        if self.verify_saved_archive {
+            SaveVerification::Verify
+        } else {
+            SaveVerification::Skip
+        }
+    }
     fn save_workbook_with_change_log(
         &mut self,
         loaded_source: &LoadedSource,
@@ -380,7 +453,8 @@ impl UpdateRun<'_> {
         };
         change_log_result?;
         write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
-        book.save(self.master_path)?;
+        let save_verification = self.save_verification();
+        book.save(self.master_path, &save_verification)?;
         self.print_update_summary(
             &loaded_source.name,
             &master_update.changes,

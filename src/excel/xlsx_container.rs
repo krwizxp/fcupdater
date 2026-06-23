@@ -1,5 +1,5 @@
 use super::{
-    SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
+    SaveVerification, SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
     path_util::path_to_slashes,
     xml::{extract_attr, find_start_tag, find_tag_end},
 };
@@ -322,7 +322,7 @@ impl XlsxContainer {
         let path = normalize_safe_relative_path(Path::new(relative_path), relative_path)?;
         Ok(self.unpack_dir.join(path))
     }
-    pub(super) fn save(&self, target_xlsx: &Path) -> Result<()> {
+    pub(super) fn save(&self, target_xlsx: &Path, verification: &SaveVerification) -> Result<()> {
         let parent = if let Some(parent) = target_xlsx.parent() {
             create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
             parent
@@ -348,10 +348,12 @@ impl XlsxContainer {
                 root: self.unpack_dir.as_path(),
             }
             .create()?;
-            SavedArchiveVerifier {
-                saved_archive: &tmp_archive,
+            if verification.should_verify() {
+                SavedArchiveVerifier {
+                    saved_archive: &tmp_archive,
+                }
+                .verify()?;
             }
-            .verify()?;
             TempArchivePromotion {
                 target_xlsx,
                 temp_archive: &tmp_archive,

@@ -1,3 +1,4 @@
+use crate::region::TARGET_REGION_COUNT;
 #[derive(Debug)]
 pub struct SourceRecord {
     pub address: String,
@@ -40,4 +41,5 @@ pub struct MasterSheetUpdateResult<'source> {
     pub added: Vec<AddedStoreRow<'source>>,
     pub changes: Vec<ChangeRow<'source>>,
     pub deleted: Vec<StoreRow>,
+    pub existing_region_counts: [usize; TARGET_REGION_COUNT],
 }
