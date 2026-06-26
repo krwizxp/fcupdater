@@ -1,6 +1,6 @@
 [package]
 name = "fcupdater"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2024"
 rust-version = "1.96"
 description = "CLI tool to update fuel_cost_chungcheong.xlsx from the Opinet current-price .xls source."
@@ -8,6 +8,10 @@ license = "UNLICENSED"
 repository = "https://github.com/krwizxp/fcupdater"
 keywords = ["excel", "xlsx", "xls", "cli", "sync"]
 categories = ["command-line-utilities", "encoding"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_unsafe = "deny"
 
 [lints.clippy]
 big_endian_bytes = "allow"
@@ -25,12 +29,16 @@ pedantic = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 pub_with_shorthand = "allow"
 question_mark_used = "allow"
+expect_used = "deny"
+redundant_clone = "warn"
 restriction = { level = "warn", priority = -1 }
 self_named_module_files = "allow"
 semicolon_outside_block = "allow"
 separated_literal_suffix = "allow"
 style = { level = "warn", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
 
 [profile.release]
 codegen-units = 1

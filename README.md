@@ -12,6 +12,7 @@
 ## 요구사항
 - MSRV: Rust 1.96
 - 자동 다운로드: Windows는 WinHTTP, Linux/macOS는 native libcurl 사용
+- Linux/macOS native libcurl은 HTTPS protocol allowlist 설정을 위해 7.85.0 이상이 필요합니다.
 - Linux 빌드 환경: `libcurl4-openssl-dev`
 - Linux 실행 환경: `libcurl4`
 - 현행화 일자: OS 시간대와 무관하게 KST 기준 날짜 사용

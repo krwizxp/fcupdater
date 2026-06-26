@@ -764,14 +764,16 @@ impl DynamicDeflateWriter<'_> {
             frequencies: &frequencies.literal,
             max_bits: DEFLATE_MAX_BITS_U8,
         })
-        .build() else {
+        .build()?
+        else {
             return Ok(None);
         };
         let Some(distance_lengths) = (HuffmanLengthBuilder {
             frequencies: &frequencies.distance,
             max_bits: DEFLATE_MAX_BITS_U8,
         })
-        .build() else {
+        .build()?
+        else {
             return Ok(None);
         };
         let literal_count = literal_lengths
@@ -809,7 +811,8 @@ impl DynamicDeflateWriter<'_> {
             frequencies: &code_length_freq,
             max_bits: 7,
         })
-        .build() else {
+        .build()?
+        else {
             return Ok(None);
         };
         let mut code_length_count = 4_usize;
@@ -1059,43 +1062,76 @@ impl<O: BitOutput> FixedTokenWriter<'_, O> {
     }
 }
 impl HuffmanLengthBuilder<'_> {
-    fn build(&self) -> Option<Vec<u8>> {
+    fn build(&self) -> ZipResult<Option<Vec<u8>>> {
         let mut lengths = Vec::new();
-        lengths.try_reserve(self.frequencies.len()).ok()?;
+        lengths
+            .try_reserve(self.frequencies.len())
+            .map_err(|source| format!("deflate Huffman length 메모리 확보 실패: {source}"))?;
         lengths.resize(self.frequencies.len(), 0_u8);
-        let mut leaf_lengths = self.leaf_lengths()?;
+        let Some(mut leaf_lengths) = self.leaf_lengths()? else {
+            return Ok(None);
+        };
         if leaf_lengths.is_empty() {
-            return None;
+            return Ok(None);
         }
         if leaf_lengths.len() == 1 {
-            let symbol = leaf_lengths.first()?.symbol;
-            *lengths.get_mut(symbol)? = 1;
-            return Some(lengths);
+            let Some(symbol) = leaf_lengths.first().map(|leaf| leaf.symbol) else {
+                return Ok(None);
+            };
+            let Some(slot) = lengths.get_mut(symbol) else {
+                return Ok(None);
+            };
+            *slot = 1;
+            return Ok(Some(lengths));
         }
-        let longest_len = leaf_lengths.iter().map(|leaf| leaf.len).max()?;
+        let Some(longest_len) = leaf_lengths.iter().map(|leaf| leaf.len).max() else {
+            return Ok(None);
+        };
         let max_bit_count = usize::from(self.max_bits);
         if longest_len <= max_bit_count {
             for leaf in leaf_lengths {
-                *lengths.get_mut(leaf.symbol)? = u8::try_from(leaf.len).ok()?;
+                let Some(slot) = lengths.get_mut(leaf.symbol) else {
+                    return Ok(None);
+                };
+                let Ok(bit_len) = u8::try_from(leaf.len) else {
+                    return Ok(None);
+                };
+                *slot = bit_len;
             }
-            return Some(lengths);
+            return Ok(Some(lengths));
         }
-        let length_counts = self.limited_length_counts(&leaf_lengths, longest_len)?;
+        let Some(length_counts) = self.limited_length_counts(&leaf_lengths, longest_len)? else {
+            return Ok(None);
+        };
         LimitedHuffmanLengthAssigner {
             length_counts: &length_counts,
             max_bit_count,
         }
-        .assign(&mut lengths, &mut leaf_lengths)?;
-        Some(lengths)
+        .assign(&mut lengths, &mut leaf_lengths)
+        .ok_or_else(|| zip_static("deflate limited Huffman length 할당 실패"))?;
+        Ok(Some(lengths))
     }
-    fn leaf_lengths(&self) -> Option<Vec<HuffmanLeafLength>> {
+    fn leaf_lengths(&self) -> ZipResult<Option<Vec<HuffmanLeafLength>>> {
         let mut nodes = Vec::new();
         let mut leaves = Vec::new();
         let mut active = Vec::new();
-        let node_capacity = self.frequencies.len().checked_mul(2)?.saturating_sub(1);
-        nodes.try_reserve(node_capacity).ok()?;
-        leaves.try_reserve(self.frequencies.len()).ok()?;
-        active.try_reserve(self.frequencies.len()).ok()?;
+        let Some(node_capacity) = self
+            .frequencies
+            .len()
+            .checked_mul(2)
+            .map(|len| len.saturating_sub(1))
+        else {
+            return Ok(None);
+        };
+        nodes
+            .try_reserve(node_capacity)
+            .map_err(|source| format!("deflate Huffman node 메모리 확보 실패: {source}"))?;
+        leaves
+            .try_reserve(self.frequencies.len())
+            .map_err(|source| format!("deflate Huffman leaf 메모리 확보 실패: {source}"))?;
+        active
+            .try_reserve(self.frequencies.len())
+            .map_err(|source| format!("deflate Huffman active node 메모리 확보 실패: {source}"))?;
         for (symbol, &freq) in self.frequencies.iter().enumerate() {
             if freq == 0 {
                 continue;
@@ -1109,13 +1145,17 @@ impl HuffmanLengthBuilder<'_> {
             active.push(node_index);
         }
         if active.len() == 1 {
-            let symbol = leaves.first()?.symbol;
-            let freq = *self.frequencies.get(symbol)?;
-            return Some(vec![HuffmanLeafLength {
+            let Some(symbol) = leaves.first().map(|leaf| leaf.symbol) else {
+                return Ok(None);
+            };
+            let Some(&freq) = self.frequencies.get(symbol) else {
+                return Ok(None);
+            };
+            return Ok(Some(vec![HuffmanLeafLength {
                 freq,
                 len: 1,
                 symbol,
-            }]);
+            }]));
         }
         while active.len() > 1 {
             active.sort_unstable_by(|&left, &right| {
@@ -1130,13 +1170,31 @@ impl HuffmanLengthBuilder<'_> {
                     .cmp(&left_node.freq)
                     .then_with(|| right.cmp(&left))
             });
-            let left = active.pop()?;
-            let right = active.pop()?;
+            let Some(left) = active.pop() else {
+                return Ok(None);
+            };
+            let Some(right) = active.pop() else {
+                return Ok(None);
+            };
             let parent = nodes.len();
-            let freq = nodes.get(left)?.freq.checked_add(nodes.get(right)?.freq)?;
+            let Some(left_source_node) = nodes.get(left) else {
+                return Ok(None);
+            };
+            let Some(right_source_node) = nodes.get(right) else {
+                return Ok(None);
+            };
+            let Some(freq) = left_source_node.freq.checked_add(right_source_node.freq) else {
+                return Ok(None);
+            };
             nodes.push(HuffmanBuildNode { freq, parent: None });
-            nodes.get_mut(left)?.parent = Some(parent);
-            nodes.get_mut(right)?.parent = Some(parent);
+            let Some(left_child_node) = nodes.get_mut(left) else {
+                return Ok(None);
+            };
+            left_child_node.parent = Some(parent);
+            let Some(right_child_node) = nodes.get_mut(right) else {
+                return Ok(None);
+            };
+            right_child_node.parent = Some(parent);
             active.push(parent);
         }
         self.leaf_lengths_from_nodes(&leaves, &nodes)
@@ -1145,53 +1203,76 @@ impl HuffmanLengthBuilder<'_> {
         &self,
         leaves: &[HuffmanLeafRef],
         nodes: &[HuffmanBuildNode],
-    ) -> Option<Vec<HuffmanLeafLength>> {
+    ) -> ZipResult<Option<Vec<HuffmanLeafLength>>> {
         let mut leaf_lengths = Vec::new();
-        leaf_lengths.try_reserve(leaves.len()).ok()?;
+        leaf_lengths
+            .try_reserve(leaves.len())
+            .map_err(|source| format!("deflate Huffman leaf length 메모리 확보 실패: {source}"))?;
         for leaf in leaves {
             let mut bit_len = 0_usize;
             let mut cursor = leaf.node_index;
-            while let Some(parent) = nodes.get(cursor)?.parent {
+            let Some(mut node) = nodes.get(cursor) else {
+                return Ok(None);
+            };
+            while let Some(parent) = node.parent {
                 bit_len = bit_len.saturating_add(1);
                 cursor = parent;
+                let Some(next_node) = nodes.get(cursor) else {
+                    return Ok(None);
+                };
+                node = next_node;
             }
             if bit_len == 0 {
-                return None;
+                return Ok(None);
             }
+            let Some(&freq) = self.frequencies.get(leaf.symbol) else {
+                return Ok(None);
+            };
             leaf_lengths.push(HuffmanLeafLength {
-                freq: *self.frequencies.get(leaf.symbol)?,
+                freq,
                 len: bit_len,
                 symbol: leaf.symbol,
             });
         }
-        Some(leaf_lengths)
+        Ok(Some(leaf_lengths))
     }
     fn limited_length_counts(
         &self,
         leaf_lengths: &[HuffmanLeafLength],
         longest_len: usize,
-    ) -> Option<Vec<usize>> {
+    ) -> ZipResult<Option<Vec<usize>>> {
         let max_bit_count = usize::from(self.max_bits);
         let mut length_counts = Vec::new();
         length_counts
             .try_reserve(longest_len.saturating_add(1))
-            .ok()?;
+            .map_err(|source| format!("deflate length count 메모리 확보 실패: {source}"))?;
         length_counts.resize(longest_len.saturating_add(1), 0_usize);
         for leaf in leaf_lengths {
-            let count = length_counts.get_mut(leaf.len)?;
+            let Some(count) = length_counts.get_mut(leaf.len) else {
+                return Ok(None);
+            };
             *count = count.saturating_add(1);
         }
         let mut current_bits = longest_len;
         while current_bits > max_bit_count {
-            while length_counts.get(current_bits).copied()? > 0 {
+            while {
+                let Some(count) = length_counts.get(current_bits) else {
+                    return Ok(None);
+                };
+                *count > 0
+            } {
                 LimitedLengthCountReducer {
                     length_counts: &mut length_counts,
                 }
-                .reduce(current_bits)?;
+                .reduce(current_bits)
+                .ok_or_else(|| zip_static("deflate length count 축소 실패"))?;
             }
-            current_bits = current_bits.checked_sub(1)?;
+            let Some(next_bits) = current_bits.checked_sub(1) else {
+                return Ok(None);
+            };
+            current_bits = next_bits;
         }
-        Some(length_counts)
+        Ok(Some(length_counts))
     }
 }
 impl LimitedHuffmanLengthAssigner<'_> {
@@ -1370,7 +1451,7 @@ impl DeflateWriter<'_> {
         let xml_probe = self
             .bytes
             .strip_prefix(UTF8_BOM)
-            .unwrap_or(self.bytes)
+            .map_or(self.bytes, |stripped_bytes| stripped_bytes)
             .trim_ascii_start();
         let looks_like_xlsx_xml = (xml_probe.starts_with(b"<?xml") || xml_probe.starts_with(b"<"))
             && XLSX_XML_NEEDLES.iter().any(|needle| {

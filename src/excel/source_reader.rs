@@ -1,4 +1,3 @@
-use super::SourceReader;
 use crate::{
     diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message},
     rows::SourceRecord,
@@ -72,8 +71,8 @@ struct CfbDataParser<'data, 'path> {
 struct CfbDirectoryParser<'stream> {
     dir_stream: &'stream [u8],
 }
-struct CfbFileOpener<'path> {
-    path: &'path Path,
+pub struct SourceReader<'path> {
+    pub path: &'path Path,
 }
 struct SourceHeaderValidator<'rows, 'strings> {
     rows: &'rows [SourceRowEntry<'strings>],
@@ -341,7 +340,7 @@ impl CfbDirectoryParser<'_> {
         Ok(entries)
     }
 }
-impl CfbFileOpener<'_> {
+impl SourceReader<'_> {
     fn open(&self) -> Result<CfbFile> {
         let data = self.read_file_bytes()?;
         let parser = CfbDataParser {
@@ -440,41 +439,9 @@ impl CfbFileOpener<'_> {
         }
         Ok(data)
     }
-}
-impl CfbFile {
-    fn read_stream_by_name(&self, name: &str) -> Result<Vec<u8>> {
-        let entry = self
-            .directory
-            .iter()
-            .find(|entry| entry.object_type == CFB_OBJECT_STREAM && entry.name == name)
-            .ok_or_else(|| {
-                err(prefixed_name_message(
-                    "CFB stream을 찾지 못했습니다: ",
-                    name,
-                ))
-            })?;
-        if entry.stream_size < u64::from(self.mini_stream_cutoff_size)
-            && is_regular_sector_id(entry.start_sector)
-        {
-            return Err(err(prefixed_name_message(
-                "Opinet 고정 소스에서 예상하지 않은 mini stream입니다: ",
-                name,
-            )));
-        }
-        read_stream_from_fat_chain(
-            &self.data,
-            self.sector_size,
-            &self.fat,
-            entry.start_sector,
-            Some(entry.stream_size),
-            name,
-        )
-    }
-}
-impl SourceReader<'_> {
+
     pub fn read_xls_source(&self) -> Result<Vec<SourceRecord>> {
-        let path = self.path;
-        let cfb = CfbFileOpener { path }.open()?;
+        let cfb = self.open()?;
         let workbook = cfb.read_stream_by_name("Workbook")?;
         let biff = BiffWorkbookReader {
             workbook_stream: &workbook,
@@ -504,7 +471,7 @@ impl SourceReader<'_> {
                 continue;
             }
             let row = entry.row;
-            let address_text = row.text(COL_ADDRESS).map(str::trim).unwrap_or_default();
+            let address_text = row.text(COL_ADDRESS).map_or("", str::trim);
             if address_text.is_empty() {
                 continue;
             }
@@ -527,6 +494,36 @@ impl SourceReader<'_> {
             return Err(err("xls 시트에서 유효한 소스 데이터를 찾지 못했습니다."));
         }
         Ok(records)
+    }
+}
+impl CfbFile {
+    fn read_stream_by_name(&self, name: &str) -> Result<Vec<u8>> {
+        let entry = self
+            .directory
+            .iter()
+            .find(|entry| entry.object_type == CFB_OBJECT_STREAM && entry.name == name)
+            .ok_or_else(|| {
+                err(prefixed_name_message(
+                    "CFB stream을 찾지 못했습니다: ",
+                    name,
+                ))
+            })?;
+        if entry.stream_size < u64::from(self.mini_stream_cutoff_size)
+            && is_regular_sector_id(entry.start_sector)
+        {
+            return Err(err(prefixed_name_message(
+                "Opinet 고정 소스에서 예상하지 않은 mini stream입니다: ",
+                name,
+            )));
+        }
+        read_stream_from_fat_chain(
+            &self.data,
+            self.sector_size,
+            &self.fat,
+            entry.start_sector,
+            Some(entry.stream_size),
+            name,
+        )
     }
 }
 impl SstChunkReader<'_, '_> {
@@ -928,10 +925,7 @@ impl SourceHeaderValidator<'_, '_> {
                 text: "경유",
             },
         ] {
-            let actual = header
-                .text(expected_header.col)
-                .map(str::trim)
-                .unwrap_or_default();
+            let actual = header.text(expected_header.col).map_or("", str::trim);
             if actual != expected_header.text {
                 let col = expected_header
                     .col
@@ -1168,7 +1162,7 @@ fn row_i32(row: &SourceRow<'_>, idx: usize) -> Option<i32> {
     parse_i32_str(row.text(idx)?)
 }
 fn row_text_owned(row: &SourceRow<'_>, idx: usize) -> String {
-    row.text(idx).map(str::trim).unwrap_or_default().to_owned()
+    row.text(idx).map_or("", str::trim).to_owned()
 }
 fn checked_pow2_from_shift(shift: u16, context: &str) -> Result<usize> {
     let shift_u32 = u32::from(shift);
@@ -1251,7 +1245,7 @@ fn read_stream_from_fat_chain(
         })
         .transpose()?;
     let mut out = Vec::new();
-    out.try_reserve_exact(remaining.unwrap_or(sector_size))
+    out.try_reserve_exact(remaining.map_or(sector_size, |bytes| bytes))
         .map_err(|source| err_with_source("FAT stream 메모리 확보 실패", source))?;
     let mut seen = Vec::new();
     reserve_vec_entries_exact(

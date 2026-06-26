@@ -2,6 +2,7 @@ use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpHeader,
     HttpResponse, HttpStreamResponse, StreamedBodySummary, StreamingBodySink,
     checked_http_buffer_len, download_error_with_source, enforce_http_content_length_limit,
+    http_client::HttpMethod,
 };
 use alloc::{string::String, vec::Vec};
 use core::{
@@ -40,10 +41,6 @@ mod sys {
             accept_types: *const *const u16,
             flags: u32,
         ) -> HInternet;
-        pub(super) fn WinHttpQueryDataAvailable(
-            h_request: HInternet,
-            bytes_available: *mut u32,
-        ) -> i32;
         pub(super) fn WinHttpQueryHeaders(
             h_request: HInternet,
             info_level: u32,
@@ -68,6 +65,12 @@ mod sys {
             total_length: u32,
             context: usize,
         ) -> i32;
+        pub(super) fn WinHttpSetOption(
+            h_internet: HInternet,
+            option: u32,
+            buffer: *mut c_void,
+            buffer_length: u32,
+        ) -> i32;
         pub(super) fn WinHttpSetTimeouts(
             h_internet: HInternet,
             resolve_timeout: i32,
@@ -83,8 +86,24 @@ mod sys {
 }
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
-const WINHTTP_ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
+const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
 const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
+const WINHTTP_OPTION_DISABLE_FEATURE: u32 = 63;
+const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
+const WINHTTP_OPTION_SECURE_PROTOCOLS: u32 = 84;
+const WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE: u32 = 91;
+const WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK: u32 = 144;
+const WINHTTP_OPTION_IPV6_FAST_FALLBACK: u32 = 140;
+const WINHTTP_OPTION_DISABLE_GLOBAL_POOLING: u32 = 195;
+const WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP: u32 = 1;
+const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2: u32 = 0x0000_0800;
+const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3: u32 = 0x0000_2000;
+const WINHTTP_SECURE_PROTOCOLS_MIN_TLS_1_2: u32 =
+    WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+const WINHTTP_DISABLE_COOKIES: u32 = 0x0000_0001;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_WINHTTP_INVALID_OPTION: u32 = 12_009;
+const ERROR_WINHTTP_OPTION_NOT_SETTABLE: u32 = 12_011;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
@@ -93,6 +112,9 @@ const WINHTTP_CONNECT_CACHE_LIMIT: usize = 4;
 const WINHTTP_RECEIVE_TIMEOUT_MS: i32 = 60_000;
 const WINHTTP_RESOLVE_TIMEOUT_MS: i32 = 30_000;
 const WINHTTP_SEND_TIMEOUT_MS: i32 = 60_000;
+const WINHTTP_READ_BUFFER_BYTES: usize = 64 * 1024;
+const METHOD_GET_WIDE: [u16; 4] = [0x47, 0x45, 0x54, 0];
+const METHOD_POST_WIDE: [u16; 5] = [0x50, 0x4F, 0x53, 0x54, 0];
 type HInternet = *mut c_void;
 pub(super) struct Client {
     default_https_port: u16,
@@ -204,14 +226,19 @@ impl Client {
     fn open_request(
         &self,
         connect: HInternet,
-        method: &[u16],
+        method: &HttpMethod,
         path: &[u16],
     ) -> DownloadResult<Handle> {
+        let method_wide: &[u16] = if matches!(method, HttpMethod::Post) {
+            &METHOD_POST_WIDE
+        } else {
+            &METHOD_GET_WIDE
+        };
         // SAFETY: method and path are NUL-terminated and connect is valid.
         let raw_request = unsafe {
             sys::WinHttpOpenRequest(
                 connect,
-                method.as_ptr(),
+                method_wide.as_ptr(),
                 path.as_ptr(),
                 null(),
                 null(),
@@ -219,14 +246,16 @@ impl Client {
                 WINHTTP_FLAG_SECURE,
             )
         };
-        self.non_null_handle(raw_request, "WinHttpOpenRequest")
+        let request = self.non_null_handle(raw_request, "WinHttpOpenRequest")?;
+        self.set_request_options(&request)?;
+        Ok(request)
     }
     fn open_session(&self, user_agent: &[u16]) -> DownloadResult<Handle> {
         // SAFETY: user_agent is NUL-terminated and optional proxy pointers are intentionally null.
         let raw_session = unsafe {
             sys::WinHttpOpen(
                 user_agent.as_ptr(),
-                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                 null(),
                 null(),
                 0,
@@ -246,18 +275,26 @@ impl Client {
         if timeout_ok == 0_i32 {
             return Err(self.last_error_message("WinHttpSetTimeouts").into());
         }
+        self.set_secure_protocols(&session)?;
+        self.set_optional_dword_option(
+            &session,
+            WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK,
+            1,
+            "WinHttpSetOption DISABLE_SECURE_PROTOCOL_FALLBACK",
+        )?;
+        self.set_optional_dword_option(
+            &session,
+            WINHTTP_OPTION_DISABLE_GLOBAL_POOLING,
+            1,
+            "WinHttpSetOption DISABLE_GLOBAL_POOLING",
+        )?;
+        self.set_optional_dword_option(
+            &session,
+            WINHTTP_OPTION_IPV6_FAST_FALLBACK,
+            1,
+            "WinHttpSetOption IPV6_FAST_FALLBACK",
+        )?;
         Ok(session)
-    }
-    fn query_data_available(&self, request: &Handle) -> DownloadResult<u32> {
-        let mut available = 0_u32;
-        // SAFETY: available is a valid output buffer and request is a valid request handle.
-        let available_ok =
-            unsafe { sys::WinHttpQueryDataAvailable(request.as_ptr(), &raw mut available) };
-        if available_ok == 0_i32 {
-            Err(self.last_error_message("WinHttpQueryDataAvailable").into())
-        } else {
-            Ok(available)
-        }
     }
     fn query_headers(&self, request: &Handle) -> DownloadResult<Vec<HttpHeader>> {
         let mut bytes = 0_u32;
@@ -367,31 +404,33 @@ impl Client {
     }
     fn read_body(&self, request: &Handle) -> DownloadResult<Vec<u8>> {
         let mut body = Vec::new();
+        let mut chunk_buffer = Vec::new();
+        chunk_buffer
+            .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
+            .map_err(|source| {
+                download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
+            })?;
+        chunk_buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
         loop {
-            let available = self.query_data_available(request)?;
-            if available == 0 {
+            let read = self.read_chunk(request, &mut chunk_buffer)?;
+            let read_len = usize::try_from(read)
+                .map_err(|source| download_error_with_source("응답 read 길이 변환 실패", source))?;
+            if read_len == 0 {
                 break;
             }
-            let chunk_len = usize::try_from(available)
-                .map_err(|source| download_error_with_source("응답 chunk 길이 변환 실패", source))?;
             let old_len = body.len();
             let buffered_len =
-                checked_http_buffer_len("본문", old_len, chunk_len, HTTP_MAX_BODY_BYTES)?;
-            body.try_reserve(chunk_len)
+                checked_http_buffer_len("본문", old_len, read_len, HTTP_MAX_BODY_BYTES)?;
+            body.try_reserve(read_len)
                 .map_err(|source| download_error_with_source("응답 본문 메모리 확보 실패", source))?;
             body.resize(buffered_len, 0);
             let chunk = body
                 .get_mut(old_len..buffered_len)
                 .ok_or("응답 본문 chunk 범위 계산 실패")?;
-            let read = self.read_chunk(request, chunk, available)?;
-            let read_len = usize::try_from(read)
-                .map_err(|source| download_error_with_source("응답 read 길이 변환 실패", source))?;
-            let actual_len =
-                checked_http_buffer_len("본문", old_len, read_len, HTTP_MAX_BODY_BYTES)?;
-            body.truncate(actual_len);
-            if read == 0 {
-                break;
-            }
+            let read_chunk = chunk_buffer
+                .get(..read_len)
+                .ok_or("응답 본문 chunk 범위 계산 실패")?;
+            chunk.copy_from_slice(read_chunk);
         }
         Ok(body)
     }
@@ -410,34 +449,28 @@ impl Client {
             writer,
         };
         let mut chunk_buffer = Vec::new();
+        chunk_buffer
+            .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
+            .map_err(|source| {
+                download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
+            })?;
+        chunk_buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
         loop {
-            let available = self.query_data_available(request)?;
-            if available == 0 {
-                break;
-            }
-            let chunk_len = usize::try_from(available)
-                .map_err(|source| download_error_with_source("응답 chunk 길이 변환 실패", source))?;
-            checked_http_buffer_len("본문", 0, chunk_len, HTTP_MAX_BODY_BYTES)?;
-            chunk_buffer.clear();
-            chunk_buffer
-                .try_reserve(chunk_len)
-                .map_err(|source| {
-                    download_error_with_source("응답 본문 chunk 메모리 확보 실패", source)
-                })?;
-            chunk_buffer.resize(chunk_len, 0);
-            let read = self.read_chunk(request, &mut chunk_buffer, available)?;
+            let read = self.read_chunk(request, &mut chunk_buffer)?;
             let read_len = usize::try_from(read)
                 .map_err(|source| download_error_with_source("응답 read 길이 변환 실패", source))?;
-            checked_http_buffer_len("본문", 0, read_len, HTTP_MAX_BODY_BYTES)?;
-            chunk_buffer.truncate(read_len);
-            if !sink.append(&chunk_buffer) {
-                return Err(sink
-                    .error
-                    .take()
-                    .unwrap_or_else(|| "응답 본문 파일 쓰기 실패".into()));
-            }
-            if read == 0 {
+            if read_len == 0 {
                 break;
+            }
+            checked_http_buffer_len("본문", 0, read_len, HTTP_MAX_BODY_BYTES)?;
+            let read_chunk = chunk_buffer
+                .get(..read_len)
+                .ok_or("응답 본문 chunk 범위 계산 실패")?;
+            if !sink.append(read_chunk) {
+                if let Some(error) = sink.error.take() {
+                    return Err(error);
+                }
+                return Err("응답 본문 파일 쓰기 실패".into());
             }
         }
         Ok(sink.summary)
@@ -446,15 +479,16 @@ impl Client {
         &self,
         request: &Handle,
         chunk: &mut [u8],
-        available: u32,
     ) -> DownloadResult<u32> {
         let mut read = 0_u32;
+        let bytes_to_read = u32::try_from(chunk.len())
+            .map_err(|source| download_error_with_source("응답 read 버퍼 길이 변환 실패", source))?;
         // SAFETY: chunk is a valid writable buffer and read is a valid output buffer.
         let read_ok = unsafe {
             sys::WinHttpReadData(
                 request.as_ptr(),
                 chunk.as_mut_ptr().cast::<c_void>(),
-                available,
+                bytes_to_read,
                 &raw mut read,
             )
         };
@@ -475,40 +509,25 @@ impl Client {
     }
     pub(super) fn request(
         &mut self,
-        method: &str,
+        method: &HttpMethod,
         host: &str,
         path: &str,
         request_body: Option<&[u8]>,
         headers: &[(&str, &str)],
     ) -> DownloadResult<HttpResponse> {
         let host_wide = wide(host)?;
-        let method_wide = wide(method)?;
         let path_wide = wide(path)?;
-        let header_capacity = headers
-            .iter()
-            .try_fold(0_usize, |acc, &(name, value)| {
-                acc.checked_add(name.len())?
-                    .checked_add(value.len())?
-                    .checked_add(4)
-            })
-            .ok_or("요청 헤더 용량 계산 실패")?;
-        let mut headers_text = String::new();
-        headers_text
-            .try_reserve(header_capacity)
-            .map_err(|source| download_error_with_source("요청 헤더 메모리 확보 실패", source))?;
-        for &(name, value) in headers {
-            headers_text.push_str(name);
-            headers_text.push_str(": ");
-            headers_text.push_str(value);
-            headers_text.push_str("\r\n");
-        }
-        let headers_wide = wide(&headers_text)?;
-        let body_slice = request_body.map_or(&[][..], |body| body);
+        let headers_wide = Self::request_headers_wide(headers)?;
+        let body_slice = if matches!(method, HttpMethod::Post) {
+            request_body.ok_or("POST 요청 본문이 비어 있습니다.")?
+        } else {
+            request_body.map_or(&[][..], |body| body)
+        };
         let body_len = u32::try_from(body_slice.len())
             .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
         let connect = self.cached_connect_ptr(host, &host_wide, self.default_https_port)?;
         let response = (|| {
-            let request = self.open_request(connect, &method_wide, &path_wide)?;
+            let request = self.open_request(connect, method, &path_wide)?;
             self.send_request(&request, &headers_wide, body_slice, body_len)?;
             self.receive_response(&request)?;
             let status = self.query_status(&request)?;
@@ -526,18 +545,7 @@ impl Client {
         }
         response
     }
-    pub(super) fn request_to_writer(
-        &mut self,
-        method: &str,
-        host: &str,
-        path: &str,
-        request_body: Option<&[u8]>,
-        headers: &[(&str, &str)],
-        writer: &mut dyn IoWrite,
-    ) -> DownloadResult<HttpStreamResponse> {
-        let host_wide = wide(host)?;
-        let method_wide = wide(method)?;
-        let path_wide = wide(path)?;
+    fn request_headers_wide(headers: &[(&str, &str)]) -> DownloadResult<Vec<u16>> {
         let header_capacity = headers
             .iter()
             .try_fold(0_usize, |acc, &(name, value)| {
@@ -556,13 +564,30 @@ impl Client {
             headers_text.push_str(value);
             headers_text.push_str("\r\n");
         }
-        let headers_wide = wide(&headers_text)?;
-        let body_slice = request_body.map_or(&[][..], |body| body);
+        wide(&headers_text)
+    }
+    pub(super) fn request_to_writer(
+        &mut self,
+        method: &HttpMethod,
+        host: &str,
+        path: &str,
+        request_body: Option<&[u8]>,
+        headers: &[(&str, &str)],
+        writer: &mut dyn IoWrite,
+    ) -> DownloadResult<HttpStreamResponse> {
+        let host_wide = wide(host)?;
+        let path_wide = wide(path)?;
+        let headers_wide = Self::request_headers_wide(headers)?;
+        let body_slice = if matches!(method, HttpMethod::Post) {
+            request_body.ok_or("POST 요청 본문이 비어 있습니다.")?
+        } else {
+            request_body.map_or(&[][..], |body| body)
+        };
         let body_len = u32::try_from(body_slice.len())
             .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
         let connect = self.cached_connect_ptr(host, &host_wide, self.default_https_port)?;
         let response = (|| {
-            let request = self.open_request(connect, &method_wide, &path_wide)?;
+            let request = self.open_request(connect, method, &path_wide)?;
             self.send_request(&request, &headers_wide, body_slice, body_len)?;
             self.receive_response(&request)?;
             let status = self.query_status(&request)?;
@@ -615,6 +640,109 @@ impl Client {
         } else {
             Ok(())
         }
+    }
+    fn set_dword_option(
+        &self,
+        handle: &Handle,
+        option: u32,
+        value: u32,
+        context: &str,
+    ) -> DownloadResult<()> {
+        let mut raw_value = value;
+        let buffer_length = u32::try_from(size_of::<u32>())
+            .map_err(|source| download_error_with_source("WinHTTP 옵션 길이 변환 실패", source))?;
+        // SAFETY: handle is valid and raw_value points to a DWORD option value for this call.
+        let ok = unsafe {
+            sys::WinHttpSetOption(
+                handle.as_ptr(),
+                option,
+                (&raw mut raw_value).cast::<c_void>(),
+                buffer_length,
+            )
+        };
+        if ok == 0_i32 {
+            Err(self.last_error_message(context).into())
+        } else {
+            Ok(())
+        }
+    }
+    fn set_optional_dword_option(
+        &self,
+        handle: &Handle,
+        option: u32,
+        value: u32,
+        operation: &str,
+    ) -> DownloadResult<()> {
+        let mut raw_value = value;
+        let buffer_length = u32::try_from(size_of::<u32>())
+            .map_err(|source| download_error_with_source("WinHTTP 옵션 길이 변환 실패", source))?;
+        // SAFETY: handle is a valid WinHTTP handle and raw_value points to a DWORD option value.
+        let ok = unsafe {
+            sys::WinHttpSetOption(
+                handle.as_ptr(),
+                option,
+                (&raw mut raw_value).cast::<c_void>(),
+                buffer_length,
+            )
+        };
+        if ok != 0_i32 {
+            return Ok(());
+        }
+        match Self::last_error_code() {
+            ERROR_WINHTTP_INVALID_OPTION | ERROR_WINHTTP_OPTION_NOT_SETTABLE => Ok(()),
+            _ => Err(self.last_error_message(operation).into()),
+        }
+    }
+    fn set_request_options(&self, request: &Handle) -> DownloadResult<()> {
+        self.set_dword_option(
+            request,
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP,
+            "WinHttpSetOption REDIRECT_POLICY",
+        )?;
+        self.set_dword_option(
+            request,
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            WINHTTP_DISABLE_COOKIES,
+            "WinHttpSetOption DISABLE_FEATURE",
+        )?;
+        self.set_dword_option(
+            request,
+            WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
+            u32::try_from(HTTP_MAX_HEADER_BYTES).map_err(|source| {
+                download_error_with_source("WinHTTP 헤더 한도 변환 실패", source)
+            })?,
+            "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
+        )
+    }
+    fn set_secure_protocols(&self, session: &Handle) -> DownloadResult<()> {
+        let mut raw_value = WINHTTP_SECURE_PROTOCOLS_MIN_TLS_1_2;
+        let buffer_length = u32::try_from(size_of::<u32>())
+            .map_err(|source| download_error_with_source("WinHTTP 옵션 길이 변환 실패", source))?;
+        // SAFETY: session is valid and raw_value points to a DWORD option value for this call.
+        let ok = unsafe {
+            sys::WinHttpSetOption(
+                session.as_ptr(),
+                WINHTTP_OPTION_SECURE_PROTOCOLS,
+                (&raw mut raw_value).cast::<c_void>(),
+                buffer_length,
+            )
+        };
+        if ok != 0_i32 {
+            return Ok(());
+        }
+        if matches!(
+            Self::last_error_code(),
+            ERROR_INVALID_PARAMETER | ERROR_WINHTTP_INVALID_OPTION
+        ) {
+            return self.set_dword_option(
+                session,
+                WINHTTP_OPTION_SECURE_PROTOCOLS,
+                WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2,
+                "WinHttpSetOption SECURE_PROTOCOLS",
+            );
+        }
+        Err(self.last_error_message("WinHttpSetOption SECURE_PROTOCOLS").into())
     }
 }
 impl Default for Client {

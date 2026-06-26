@@ -1,4 +1,4 @@
-use crate::diagnostic::{AppError, err, err_with_source, path_source_message};
+use crate::diagnostic::path_source_message;
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{error::Error, fmt, fmt::Display, result::Result as CoreResult};
 use std::{
@@ -104,14 +104,6 @@ impl Error for DownloadError {
             let source_ref: &(dyn Error + 'static) = source;
             source_ref
         })
-    }
-}
-impl DownloadError {
-    fn into_app_error(self) -> AppError {
-        match self.source {
-            Some(source) => err_with_source(self.message, source),
-            None => err(self.message),
-        }
     }
 }
 impl From<Cow<'static, str>> for DownloadError {

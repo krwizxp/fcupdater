@@ -1,7 +1,10 @@
 use crate::diagnostic::{Result, err, err_with_source, prefixed_message};
 use core::fmt::Display;
 use std::path::{Component, Path};
-pub(super) fn path_to_slashes(path: &Path, context: impl Display) -> Result<String> {
+pub(super) fn path_to_slashes<D>(path: &Path, context: D) -> Result<String>
+where
+    D: Display,
+{
     let mut out = String::new();
     for component in path.components() {
         let Component::Normal(part) = component else {

@@ -1,13 +1,14 @@
 use super::{
-    DownloadResult, HTTP_MAX_BODY_BYTES, HttpHeader, HttpResponse, HttpStreamResponse,
-    NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, OPINET_HOST, ReservedDownloadFile,
-    USER_AGENT, attach_remove_file_error, download_error_with_source,
+    DownloadError, DownloadResult, HTTP_MAX_BODY_BYTES, HttpHeader, HttpResponse,
+    HttpStreamResponse, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, OPINET_HOST,
+    ReservedDownloadFile, USER_AGENT, attach_remove_file_error, download_error_with_source,
     enforce_http_content_length_limit,
 };
 use crate::diagnostic::{path_context_message, prefixed_message};
 use alloc::{string::String, vec::Vec};
-use core::{fmt::Write as FmtWrite, time::Duration};
+use core::{fmt::Write as FmtWrite, mem, time::Duration};
 use std::{
+    fs::{File, remove_file},
     io::Write as IoWrite,
     path::PathBuf,
     thread::sleep,
@@ -32,14 +33,21 @@ pub(super) struct HttpClient {
     cookie_jars: Vec<CookieJar>,
     platform: PlatformHttpClient,
 }
-#[derive(Clone, Copy)]
 pub(super) enum PostHeaderProfile {
     Ajax,
     Standard,
 }
+pub(super) enum HttpMethod {
+    Get,
+    Post,
+}
 pub(super) struct DownloadedFileResponse {
     pub path: PathBuf,
     pub response: HttpStreamResponse,
+}
+struct ReservedDownloadGuard {
+    file: Option<File>,
+    path: PathBuf,
 }
 struct Cookie {
     name: String,
@@ -124,6 +132,36 @@ impl CookieJar {
         Ok(())
     }
 }
+impl ReservedDownloadGuard {
+    fn file_mut(&mut self) -> DownloadResult<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))
+    }
+    fn persist(mut self) -> DownloadResult<PathBuf> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))?;
+        drop(file);
+        Ok(mem::take(&mut self.path))
+    }
+    fn remove_after_error(mut self, error: DownloadError) -> DownloadError {
+        let file = self.file.take();
+        let path = mem::take(&mut self.path);
+        drop(file);
+        attach_remove_file_error(error, &path)
+    }
+}
+impl Drop for ReservedDownloadGuard {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            let file = self.file.take();
+            drop(file);
+            let _remove_result = remove_file(&self.path);
+        }
+    }
+}
 impl HttpClient {
     fn add_cookie_for_host(&mut self, host: &str, name: &str, value: &str) -> DownloadResult<()> {
         let index = self.ensure_cookie_jar_index(host)?;
@@ -180,7 +218,10 @@ impl HttpClient {
         })?;
         jar.host.push_str(host);
         self.cookie_jars.push(jar);
-        Ok(self.cookie_jars.len().saturating_sub(1))
+        self.cookie_jars
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| "Cookie jar index 계산 실패".into())
     }
     fn extract_netfunnel_key(result: &str) -> DownloadResult<String> {
         let Some((_, tail)) = result.split_once("key=") else {
@@ -214,12 +255,17 @@ impl HttpClient {
                 200 | 300 | 303 => return Self::extract_netfunnel_key(&result),
                 201 | 202 | 302 => {
                     current_key = Some(Self::extract_netfunnel_key(&result)?);
-                    let wait_secs = result
-                        .split_once("ttl=")
-                        .map(|(_, tail)| split_head_or_all(tail, '&'))
-                        .and_then(|ttl_text| ttl_text.parse::<u32>().ok())
-                        .unwrap_or(1)
-                        .clamp(1, 30);
+                    let wait_secs = if let Some((_, ttl_tail)) = result.split_once("ttl=") {
+                        let ttl_text = split_head_or_all(ttl_tail, '&');
+                        ttl_text
+                            .parse::<u32>()
+                            .map_err(|source| {
+                                download_error_with_source("NetFunnel ttl 파싱 실패", source)
+                            })?
+                            .clamp(1, 30)
+                    } else {
+                        1
+                    };
                     sleep(Duration::from_secs(u64::from(wait_secs)));
                 }
                 _ => return Err(prefixed_message("NetFunnel 응답 오류: ", result).into()),
@@ -244,7 +290,7 @@ impl HttpClient {
         if let Some(referer_value) = referer {
             headers.push(("Referer", referer_value));
         }
-        let response = self.request("GET", host, path, None, &headers)?;
+        let response = self.request(&HttpMethod::Get, host, path, None, &headers)?;
         String::from_utf8(response.body)
             .map_err(|source| download_error_with_source("HTTP 응답 UTF-8 변환 실패", source))
     }
@@ -268,58 +314,68 @@ impl HttpClient {
         path: &str,
         form: &[(&str, &str)],
         referer: Option<&str>,
-        profile: PostHeaderProfile,
+        profile: &PostHeaderProfile,
     ) -> DownloadResult<HttpResponse> {
         let body = Self::encoded_form_body(form)?;
         let headers = Self::post_headers(referer, profile)?;
-        self.request("POST", host, path, Some(body.as_bytes()), &headers)
+        self.request(
+            &HttpMethod::Post,
+            host,
+            path,
+            Some(body.as_bytes()),
+            &headers,
+        )
     }
-    pub(super) fn post_form_to_file(
+    pub(super) fn post_form_to_file<F>(
         &mut self,
         host: &str,
         path: &str,
         form: &[(&str, &str)],
         referer: Option<&str>,
-        profile: PostHeaderProfile,
-        target: ReservedDownloadFile,
-    ) -> DownloadResult<DownloadedFileResponse> {
-        let ReservedDownloadFile {
-            mut file,
-            path: target_path,
-        } = target;
+        profile: &PostHeaderProfile,
+        reserve_target: F,
+    ) -> DownloadResult<DownloadedFileResponse>
+    where
+        F: FnOnce() -> DownloadResult<ReservedDownloadFile>,
+    {
         let body = Self::encoded_form_body(form)?;
         let headers = Self::post_headers(referer, profile)?;
+        let target = reserve_target()?;
+        let ReservedDownloadFile {
+            file,
+            path: target_path,
+        } = target;
+        let mut guarded_target = ReservedDownloadGuard {
+            file: Some(file),
+            path: target_path,
+        };
         let response = match self.request_to_writer(
-            "POST",
+            &HttpMethod::Post,
             host,
             path,
             Some(body.as_bytes()),
             &headers,
-            &mut file,
+            guarded_target.file_mut()?,
         ) {
             Ok(response) => response,
-            Err(error) => {
-                drop(file);
-                return Err(attach_remove_file_error(error, &target_path));
-            }
+            Err(error) => return Err(guarded_target.remove_after_error(error)),
         };
-        if let Err(source) = IoWrite::flush(&mut file) {
-            drop(file);
+        if let Err(source) = IoWrite::flush(guarded_target.file_mut()?) {
             let error = download_error_with_source(
-                path_context_message("다운로드 임시 파일 flush 실패", &target_path),
+                path_context_message("다운로드 임시 파일 flush 실패", &guarded_target.path),
                 source,
             );
-            return Err(attach_remove_file_error(error, &target_path));
+            return Err(guarded_target.remove_after_error(error));
         }
         Ok(DownloadedFileResponse {
-            path: target_path,
+            path: guarded_target.persist()?,
             response,
         })
     }
-    fn post_headers(
-        referer: Option<&str>,
-        profile: PostHeaderProfile,
-    ) -> DownloadResult<Vec<(&str, &str)>> {
+    fn post_headers<'referer>(
+        referer: Option<&'referer str>,
+        profile: &PostHeaderProfile,
+    ) -> DownloadResult<Vec<(&'static str, &'referer str)>> {
         let mut headers = Vec::new();
         headers.try_reserve(6).map_err(|source| {
             download_error_with_source("HTTP POST header 메모리 확보 실패", source)
@@ -331,7 +387,7 @@ impl HttpClient {
             ),
             ("Accept", "text/html, */*; q=0.01"),
         ]);
-        if matches!(profile, PostHeaderProfile::Ajax) {
+        if matches!(profile, &PostHeaderProfile::Ajax) {
             headers.push(("X-Requested-With", "XMLHttpRequest"));
         }
         if let Some(referer_value) = referer {
@@ -361,7 +417,7 @@ impl HttpClient {
     }
     fn request(
         &mut self,
-        method: &str,
+        method: &HttpMethod,
         host: &str,
         path: &str,
         body: Option<&[u8]>,
@@ -405,8 +461,12 @@ impl HttpClient {
                     let body_len = body.map_or(0, <[u8]>::len);
                     let header_count = headers.len();
                     let merged_header_count = merged_headers.len();
+                    let method_name = match *method {
+                        HttpMethod::Get => "GET",
+                        HttpMethod::Post => "POST",
+                    };
                     Err(format!(
-                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
+                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
                     )
                     .into())
                 }
@@ -507,7 +567,7 @@ impl HttpClient {
             download_error_with_source("NetFunnel timestamp fragment 작성 실패", error)
         })?;
         let response = self.request(
-            "GET",
+            &HttpMethod::Get,
             NETFUNNEL_HOST,
             &path,
             None,
@@ -532,7 +592,7 @@ impl HttpClient {
     }
     fn request_to_writer(
         &mut self,
-        method: &str,
+        method: &HttpMethod,
         host: &str,
         path: &str,
         body: Option<&[u8]>,
@@ -592,8 +652,12 @@ impl HttpClient {
                     let header_count = headers.len();
                     let merged_header_count = merged_headers.len();
                     let writer_type = core::any::type_name_of_val(writer);
+                    let method_name = match *method {
+                        HttpMethod::Get => "GET",
+                        HttpMethod::Post => "POST",
+                    };
                     Err(format!(
-                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}, writer={writer_type}"
+                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}, writer={writer_type}"
                     )
                     .into())
                 }

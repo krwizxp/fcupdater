@@ -139,7 +139,7 @@ impl ChangeLogRowValues<'_> {
     }
 }
 impl ChangeLogUpdater<'_, '_, '_, '_> {
-    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<()> {
+    fn clear_existing_rows(&mut self, layout: &ChangeLogLayout) -> Result<RangeInclusive<u32>> {
         let cols = [
             layout.col_region,
             layout.col_name,
@@ -162,7 +162,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 break;
             }
         }
-        if let Some(last_data_row) = last_row {
+        let old_data_rows = if let Some(last_data_row) = last_row {
             self.worksheet.clear_cells_in_rows_through_col(
                 RangeInclusive {
                     start: layout.data_start_row,
@@ -170,8 +170,52 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 },
                 layout.max_col,
             );
-        }
-        Ok(())
+            RangeInclusive {
+                start: layout.data_start_row,
+                last: last_data_row,
+            }
+        } else {
+            RangeInclusive {
+                start: layout.data_start_row,
+                last: layout.data_start_row.checked_sub(1).ok_or_else(|| {
+                    err("변경내역 기존 데이터 범위 계산 중 overflow가 발생했습니다.")
+                })?,
+            }
+        };
+        Ok(old_data_rows)
+    }
+    fn extend_entry_conditional_formats(
+        &mut self,
+        layout: &ChangeLogLayout,
+        old_data_rows: RangeInclusive<u32>,
+        entry_count: usize,
+    ) -> Result<u32> {
+        let last_change_row = if entry_count == 0 {
+            layout.data_start_row
+        } else {
+            let last_entry_index = entry_count
+                .checked_sub(1)
+                .ok_or_else(|| err("변경내역 마지막 entry index 계산 실패"))?;
+            add_row_offset(
+                layout.data_start_row,
+                last_entry_index,
+                "변경내역 마지막 행 계산",
+            )?
+        };
+        let target_cols = [
+            layout.col_delta_gas,
+            layout.col_delta_premium,
+            layout.col_delta_diesel,
+        ];
+        self.worksheet.extend_conditional_formats(
+            old_data_rows,
+            RangeInclusive {
+                start: layout.data_start_row,
+                last: last_change_row,
+            },
+            &target_cols,
+        )?;
+        Ok(last_change_row)
     }
     fn find_layout(&self) -> Result<ChangeLogLayout> {
         self.validate_fixed_header()?;
@@ -211,15 +255,15 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         Ok((layout.data_start_row..end)
             .rev()
             .find(|row| self.worksheet.has_any_row_format(*row, layout.max_col))
-            .unwrap_or(layout.data_start_row))
+            .map_or(layout.data_start_row, |row| row))
     }
     pub fn update(&mut self) -> Result<()> {
         let date_text = format!("현행화 일자: {}", self.today);
         self.worksheet.set_string_at(1, 2, &date_text)?;
         let layout = self.find_layout()?;
         let style_template_row = self.select_style_template_row(&layout)?;
-        self.clear_existing_rows(&layout)?;
-        self.write_entries(&layout, style_template_row)?;
+        let old_data_rows = self.clear_existing_rows(&layout)?;
+        self.write_entries(&layout, style_template_row, old_data_rows)?;
         self.worksheet.update_dimension()?;
         Ok(())
     }
@@ -299,7 +343,12 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         }
         Ok(())
     }
-    fn write_entries(&mut self, layout: &ChangeLogLayout, style_template_row: u32) -> Result<()> {
+    fn write_entries(
+        &mut self,
+        layout: &ChangeLogLayout,
+        style_template_row: u32,
+        old_data_rows: RangeInclusive<u32>,
+    ) -> Result<()> {
         let entry_count = self
             .changes
             .len()
@@ -307,7 +356,11 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             .and_then(|count| count.checked_add(self.deleted.len()))
             .ok_or_else(|| err("변경내역 entry 수 계산 중 overflow가 발생했습니다."))?;
         if entry_count == 0 {
-            return Ok(());
+            let last_change_row =
+                self.extend_entry_conditional_formats(layout, old_data_rows, entry_count)?;
+            return self
+                .worksheet
+                .truncate_rows_after(last_change_row.max(style_template_row));
         }
         let change_entries = self.changes.iter().map(|change| ChangeLogRowValues {
             address: change.address,
@@ -380,25 +433,9 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             }
             values.write_to(self.worksheet, layout, row, &delta_columns)?;
         }
-        let last_entry_index = entry_count
-            .checked_sub(1)
-            .ok_or_else(|| err("변경내역 마지막 entry index 계산 실패"))?;
-        let last_change_row = add_row_offset(
-            layout.data_start_row,
-            last_entry_index,
-            "변경내역 마지막 행 계산",
-        )?;
-        let target_cols = [
-            layout.col_delta_gas,
-            layout.col_delta_premium,
-            layout.col_delta_diesel,
-        ];
-        self.worksheet.extend_conditional_formats(
-            RangeInclusive {
-                start: layout.data_start_row,
-                last: last_change_row,
-            },
-            &target_cols,
-        )
+        let last_change_row =
+            self.extend_entry_conditional_formats(layout, old_data_rows, entry_count)?;
+        self.worksheet
+            .truncate_rows_after(last_change_row.max(style_template_row))
     }
 }

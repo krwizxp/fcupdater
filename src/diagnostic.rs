@@ -20,15 +20,6 @@ impl AppError {
             source: None,
         }
     }
-    pub(super) fn prepend_context<M>(self, context: M) -> Self
-    where
-        M: Into<Cow<'static, str>>,
-    {
-        Self {
-            message: Cow::Owned(format!("{}: {}", context.into(), self.message)),
-            source: self.source,
-        }
-    }
 }
 impl Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

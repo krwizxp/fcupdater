@@ -76,7 +76,7 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     let col_end = col_prefix
         .rest
         .find(|ch: char| !ch.is_ascii_alphabetic())
-        .unwrap_or(col_prefix.rest.len());
+        .map_or(col_prefix.rest.len(), |index| index);
     if col_end == 0 {
         return None;
     }
@@ -85,7 +85,7 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     let row_part = row_prefix.rest;
     let row_end = row_part
         .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(row_part.len());
+        .map_or(row_part.len(), |index| index);
     if row_end == 0 || row_end != row_part.len() {
         return None;
     }

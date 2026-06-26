@@ -6,7 +6,7 @@ use super::{
     attach_remove_file_error, download_error_with_source,
     http_client::{self, PostHeaderProfile},
 };
-use crate::diagnostic::{Result, err_with_source, path_context_message, prefixed_message};
+use crate::diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message};
 use core::time::Duration;
 use std::{
     fs::{self, File},
@@ -15,7 +15,7 @@ use std::{
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
 };
-const AUTO_SOURCE_LEGACY_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
+const AUTO_SOURCE_OLD_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
 const AUTO_SOURCE_TEMP_FILE_PREFIX: &str = ".fcupdater-opinet-source.tmp_";
 struct SourceDownloadWorkflow<'out, W: Write + ?Sized> {
     canonical_dir: PathBuf,
@@ -104,14 +104,14 @@ where
                 ("opinet_key", opinet_key),
             ],
             Some(OPDOWNLOAD_URL),
-            PostHeaderProfile::Standard,
+            &PostHeaderProfile::Standard,
         )?;
         client.post_form(
             OPINET_HOST,
             OPDOWNLOAD_LAYOUT_PATH,
             &[("tarUrl", OIL_PRICE_DOWNLOAD_TAR_URL)],
             Some(OPDOWNLOAD_URL),
-            PostHeaderProfile::Ajax,
+            &PostHeaderProfile::Ajax,
         )?;
         let download_key = client.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
         let downloaded = client.post_form_to_file(
@@ -127,8 +127,8 @@ where
                 ("netfunnel_key", download_key.as_str()),
             ],
             Some(OPDOWNLOAD_URL),
-            PostHeaderProfile::Standard,
-            self.reserve_auto_source_temp_file()?,
+            &PostHeaderProfile::Standard,
+            || self.reserve_auto_source_temp_file(),
         )?;
         if !downloaded.response.body.starts_with(&OLE2_SIGNATURE) {
             let preview = downloaded.response.body.preview_lossy();
@@ -144,26 +144,28 @@ where
         Ok(downloaded.path)
     }
     fn refresh_source(&mut self) -> Result<PathBuf> {
-        let legacy_temp_path = self.canonical_dir.join(AUTO_SOURCE_LEGACY_TEMP_FILE_NAME);
-        let removed_legacy_temp = match fs::remove_file(&legacy_temp_path) {
+        let old_temp_path = self.canonical_dir.join(AUTO_SOURCE_OLD_TEMP_FILE_NAME);
+        let removed_old_temp = match fs::remove_file(&old_temp_path) {
             Ok(()) => true,
             Err(error) if error.kind() == ErrorKind::NotFound => false,
             Err(error) => {
                 return Err(err_with_source(
-                    path_context_message("기존 자동 소스 정리 실패", &legacy_temp_path),
+                    path_context_message("기존 자동 소스 정리 실패", &old_temp_path),
                     error,
                 ));
             }
         };
-        if removed_legacy_temp {
+        if removed_old_temp {
             match writeln!(self.out, "이전 임시 소스 파일 1개 정리") {
                 Ok(()) | Err(_) => {}
             }
         }
         self.download_nationwide_source_http().map_err(|error| {
-            error
-                .into_app_error()
-                .prepend_context("Opinet 자동 다운로드 실패")
+            let message = prefixed_message("Opinet 자동 다운로드 실패: ", error.message);
+            match error.source {
+                Some(source) => err_with_source(message, source),
+                None => err(message),
+            }
         })
     }
     fn reserve_auto_source_temp_file(&self) -> DownloadResult<ReservedDownloadFile> {

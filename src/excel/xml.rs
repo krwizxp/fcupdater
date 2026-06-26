@@ -1,22 +1,15 @@
 use alloc::borrow::Cow;
-use core::{
-    iter,
-    range::{Range, RangeInclusive},
-};
+use core::{iter, range::Range};
 
 use crate::diagnostic::{Result, err, err_with_source};
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum XmlTagKind {
-    End,
-    Start,
-}
-#[derive(Clone, Copy)]
 pub(super) struct XmlTag<'xml> {
-    kind: XmlTagKind,
-    name: &'xml str,
-    self_closing: bool,
-    span: RangeInclusive<usize>,
-    tag: &'xml str,
+    pub end: usize,
+    pub is_start: bool,
+    pub local_name: &'xml str,
+    pub name: &'xml str,
+    pub raw: &'xml str,
+    pub self_closing: bool,
+    pub start: usize,
 }
 pub(super) struct XmlScanner<'xml> {
     cursor: usize,
@@ -42,7 +35,7 @@ impl<'xml> XmlScanner<'xml> {
     }
     pub(super) fn next_start_named(&mut self, tag_name: &str) -> Option<XmlTag<'xml>> {
         let wanted = local_tag_name(tag_name);
-        self.find_tag_matching(|tag| tag.is_start() && tag.local_name() == wanted)
+        self.find_tag_matching(|tag| tag.is_start && tag.local_name == wanted)
     }
     fn next_tag(&mut self) -> Option<XmlTag<'xml>> {
         while let Some(rel) = self.xml.get(self.cursor..)?.find('<') {
@@ -53,13 +46,13 @@ impl<'xml> XmlScanner<'xml> {
             let mut name_start = inner_start;
             let bytes = self.xml.as_bytes();
             let first = *bytes.get(name_start)?;
-            let kind = if first == b'/' {
+            let is_start = if first == b'/' {
                 name_start = checked_offset_add(name_start, 1)?;
-                XmlTagKind::End
+                false
             } else if matches!(first, b'!' | b'?') {
                 continue;
             } else {
-                XmlTagKind::Start
+                true
             };
             while bytes.get(name_start).is_some_and(u8::is_ascii_whitespace) {
                 name_start = checked_offset_add(name_start, 1)?;
@@ -75,8 +68,10 @@ impl<'xml> XmlScanner<'xml> {
             if name.is_empty() {
                 continue;
             }
-            let span = RangeInclusive { start, last: end };
-            let tag = self.xml.get(span)?;
+            let raw = self.xml.get(Range {
+                start,
+                end: checked_offset_add(end, 1)?,
+            })?;
             let mut self_close_cursor = end;
             let mut self_closing = false;
             while self_close_cursor > start {
@@ -90,37 +85,16 @@ impl<'xml> XmlScanner<'xml> {
                 break;
             }
             return Some(XmlTag {
-                kind,
+                end,
+                is_start,
+                local_name: local_tag_name(name),
                 name,
+                raw,
                 self_closing,
-                span,
-                tag,
+                start,
             });
         }
         None
-    }
-}
-impl<'xml> XmlTag<'xml> {
-    pub(super) const fn end(&self) -> usize {
-        self.span.last
-    }
-    pub(super) const fn is_self_closing(&self) -> bool {
-        self.self_closing
-    }
-    pub(super) const fn is_start(&self) -> bool {
-        matches!(self.kind, XmlTagKind::Start)
-    }
-    pub(super) fn local_name(&self) -> &str {
-        local_tag_name(self.name)
-    }
-    pub(super) const fn name(&self) -> &'xml str {
-        self.name
-    }
-    pub(super) const fn start(&self) -> usize {
-        self.span.start
-    }
-    pub(super) const fn tag(&self) -> &'xml str {
-        self.tag
     }
 }
 const fn checked_offset_add(base: usize, add: usize) -> Option<usize> {
@@ -208,13 +182,13 @@ pub(super) fn extract_attr<'tag>(
 pub(super) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     XmlScanner::from(xml, from)
         .next_start_named(tag_name)
-        .map(|tag| tag.start())
+        .map(|tag| tag.start)
 }
 pub(super) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     let wanted = local_tag_name(tag_name);
     XmlScanner::from(xml, from)
-        .find_tag_matching(|tag| !tag.is_start() && tag.local_name() == wanted)
-        .map(|tag| tag.start())
+        .find_tag_matching(|tag| !tag.is_start && tag.local_name == wanted)
+        .map(|tag| tag.start)
 }
 pub(super) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
     let bytes = xml.as_bytes();
@@ -239,10 +213,10 @@ pub(super) fn extract_first_tag_text<'xml>(
     let Some(tag) = scanner.next_start_named(tag_name) else {
         return Ok(None);
     };
-    if tag.is_self_closing() {
+    if tag.self_closing {
         return Ok(Some(""));
     }
-    let open_end = tag.end();
+    let open_end = tag.end;
     let body_start = checked_offset_add(open_end, 1)
         .ok_or_else(|| err(format!("XML <{tag_name}> 본문 시작 계산에 실패했습니다.")))?;
     let body_end = find_end_tag(xml, tag_name, body_start)
@@ -265,10 +239,10 @@ pub(super) fn extract_all_tag_text<'xml>(
     let mut saw_text_tag = false;
     while let Some(tag) = scanner.next_start_named(tag_name) {
         saw_text_tag = true;
-        if tag.is_self_closing() {
+        if tag.self_closing {
             continue;
         }
-        let open_end = tag.end();
+        let open_end = tag.end;
         let body_start = checked_offset_add(open_end, 1)
             .ok_or_else(|| err(format!("XML <{tag_name}> 본문 시작 계산에 실패했습니다.")))?;
         let body_end = find_end_tag(xml, tag_name, body_start)

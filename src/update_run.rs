@@ -2,7 +2,7 @@ use crate::{
     change_log::ChangeLogUpdater,
     diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message},
     excel::SaveVerification,
-    excel::SourceReader,
+    excel::source_reader::SourceReader,
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::MasterSheetUpdater,
     region::{
@@ -25,6 +25,12 @@ const MAX_DELETED_RATIO_EXCLUSIVE_NUMERATOR: usize = 1;
 const MAX_DELETED_RATIO_DENOMINATOR: usize = 2;
 const MIN_REGION_RETAIN_DENOMINATOR: usize = 2;
 const MIN_REGION_RETAIN_NUMERATOR: usize = 1;
+const SOURCE_SAFETY_POLICY: SourceSafetyPolicy = SourceSafetyPolicy {
+    max_deleted_ratio_exclusive_numerator: MAX_DELETED_RATIO_EXCLUSIVE_NUMERATOR,
+    max_deleted_ratio_denominator: MAX_DELETED_RATIO_DENOMINATOR,
+    min_region_retain_denominator: MIN_REGION_RETAIN_DENOMINATOR,
+    min_region_retain_numerator: MIN_REGION_RETAIN_NUMERATOR,
+};
 const DAYS_PER_100_YEARS_I64: i64 = 36_524;
 const DAYS_PER_400_YEARS_I64: i64 = 146_097;
 const DAYS_PER_4_YEARS_I64: i64 = 1_460;
@@ -55,6 +61,63 @@ struct UpdatedWorkbook<'source> {
     book: StdWorkbook,
     master_update: MasterSheetUpdateResult<'source>,
 }
+struct SourceSafetyPolicy {
+    max_deleted_ratio_denominator: usize,
+    max_deleted_ratio_exclusive_numerator: usize,
+    min_region_retain_denominator: usize,
+    min_region_retain_numerator: usize,
+}
+impl SourceSafetyPolicy {
+    fn validate_deleted_ratio(&self, existing_count: usize, deleted_count: usize) -> Result<()> {
+        if existing_count == 0 {
+            return Err(err("현행화 대상 레코드를 찾지 못했습니다."));
+        }
+        let deleted_scaled = deleted_count
+            .checked_mul(self.max_deleted_ratio_denominator)
+            .ok_or_else(|| err("폐업 처리 비율 계산 중 overflow가 발생했습니다."))?;
+        let limit_scaled = existing_count
+            .checked_mul(self.max_deleted_ratio_exclusive_numerator)
+            .ok_or_else(|| err("폐업 처리 한도 계산 중 overflow가 발생했습니다."))?;
+        if deleted_scaled >= limit_scaled {
+            return Err(err(format!(
+                "폐업 처리 건수가 비정상적으로 많아 저장을 중단합니다: {deleted_count}건 / {existing_count}건"
+            )));
+        }
+        Ok(())
+    }
+    fn validate_region_counts(
+        &self,
+        existing_counts: &[usize; TARGET_REGION_COUNT],
+        source_counts: &[usize; TARGET_REGION_COUNT],
+    ) -> Result<()> {
+        for ((label, existing_count), source_count) in TARGET_REGION_LABELS
+            .iter()
+            .zip(existing_counts.iter())
+            .zip(source_counts.iter())
+        {
+            if *source_count == 0 {
+                return Err(err(format!(
+                    "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {label}"
+                )));
+            }
+            if *existing_count == 0 {
+                continue;
+            }
+            let retained_scaled = source_count
+                .checked_mul(self.min_region_retain_denominator)
+                .ok_or_else(|| err("지역별 소스 건수 감소율 계산 중 overflow가 발생했습니다."))?;
+            let required_scaled = existing_count
+                .checked_mul(self.min_region_retain_numerator)
+                .ok_or_else(|| err("지역별 기존 건수 감소율 계산 중 overflow가 발생했습니다."))?;
+            if retained_scaled < required_scaled {
+                return Err(err(format!(
+                    "대상 지역 소스 건수가 기존 마스터 대비 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing_count}건 / 소스 {source_count}건"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
 pub struct UpdateRun<'out> {
     pub master_path: &'out Path,
     pub out: &'out mut dyn Write,
@@ -79,10 +142,10 @@ impl UpdateRun<'_> {
                 }
                 .read_xls_source()
                 .map_err(|source_err| {
-                    source_err.prepend_context(path_context_message(
-                        "소스 xls 파일 읽기 실패",
-                        &source_path,
-                    ))
+                    err_with_source(
+                        path_context_message("소스 xls 파일 읽기 실패", &source_path),
+                        source_err,
+                    )
                 })?;
                 let mut map: HashMap<String, SourceRecord> = HashMap::new();
                 let mut target_record_count = 0_usize;
@@ -164,54 +227,12 @@ impl UpdateRun<'_> {
             &master_update.existing_region_counts,
             &loaded_source.region_counts,
         )?;
-        for ((label, existing_count), source_count) in TARGET_REGION_LABELS
-            .iter()
-            .zip(master_update.existing_region_counts.iter())
-            .zip(loaded_source.region_counts.iter())
-        {
-            if *source_count == 0 {
-                return Err(err(format!(
-                    "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {label}"
-                )));
-            }
-            if *existing_count == 0 {
-                continue;
-            }
-            let retained_scaled = source_count
-                .checked_mul(MIN_REGION_RETAIN_DENOMINATOR)
-                .ok_or_else(|| err("지역별 소스 건수 감소율 계산 중 overflow가 발생했습니다."))?;
-            let required_scaled = existing_count
-                .checked_mul(MIN_REGION_RETAIN_NUMERATOR)
-                .ok_or_else(|| err("지역별 기존 건수 감소율 계산 중 overflow가 발생했습니다."))?;
-            if retained_scaled < required_scaled {
-                return Err(err(format!(
-                    "대상 지역 소스 건수가 기존 마스터 대비 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing_count}건 / 소스 {source_count}건"
-                )));
-            }
-        }
-        let total_considered = loaded_source
-            .index
-            .len()
-            .checked_add(master_update.deleted.len())
-            .ok_or_else(|| err("현행화 대상 레코드 수 계산 중 overflow가 발생했습니다."))?;
-        if total_considered == 0 {
-            return Err(err("현행화 대상 레코드를 찾지 못했습니다."));
-        }
-        let deleted_scaled = master_update
-            .deleted
-            .len()
-            .checked_mul(MAX_DELETED_RATIO_DENOMINATOR)
-            .ok_or_else(|| err("폐업 처리 비율 계산 중 overflow가 발생했습니다."))?;
-        let limit_scaled = total_considered
-            .checked_mul(MAX_DELETED_RATIO_EXCLUSIVE_NUMERATOR)
-            .ok_or_else(|| err("폐업 처리 한도 계산 중 overflow가 발생했습니다."))?;
-        if deleted_scaled > limit_scaled {
-            return Err(err(format!(
-                "폐업 처리 건수가 비정상적으로 많아 저장을 중단합니다: {}건 / {}건",
-                master_update.deleted.len(),
-                total_considered
-            )));
-        }
+        SOURCE_SAFETY_POLICY.validate_region_counts(
+            &master_update.existing_region_counts,
+            &loaded_source.region_counts,
+        )?;
+        SOURCE_SAFETY_POLICY
+            .validate_deleted_ratio(master_update.existing_count, master_update.deleted.len())?;
         Ok(UpdatedWorkbook {
             book,
             master_update,
@@ -325,7 +346,7 @@ impl UpdateRun<'_> {
         write_line(self.out, format_args!("=====================\n"))?;
         Ok(())
     }
-    pub(super) fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self) -> Result<()> {
         let master_path = self.master_path;
         if !master_path.try_exists().map_err(|source_err| {
             err_with_source(
@@ -421,13 +442,6 @@ impl UpdateRun<'_> {
             &today,
         )
     }
-    const fn save_verification(&self) -> SaveVerification {
-        if self.verify_saved_archive {
-            SaveVerification::Verify
-        } else {
-            SaveVerification::Skip
-        }
-    }
     fn save_workbook_with_change_log(
         &mut self,
         loaded_source: &LoadedSource,
@@ -453,14 +467,25 @@ impl UpdateRun<'_> {
         };
         change_log_result?;
         write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
-        let save_verification = self.save_verification();
+        let save_verification = if self.verify_saved_archive {
+            SaveVerification::Verify
+        } else {
+            SaveVerification::Skip
+        };
         book.save(self.master_path, &save_verification)?;
-        self.print_update_summary(
+        if let Err(summary_err) = self.print_update_summary(
             &loaded_source.name,
             &master_update.changes,
             &master_update.added,
             &master_update.deleted,
-        )?;
+        ) {
+            write_line_best_effort(
+                self.out,
+                format_args!(
+                    "마스터 파일은 저장됐지만 실행 요약 출력에 실패했습니다: {summary_err}"
+                ),
+            );
+        }
         Ok(())
     }
 }
