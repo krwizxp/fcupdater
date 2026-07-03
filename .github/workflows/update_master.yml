@@ -16,7 +16,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: stable
       - name: Install native dependencies
@@ -37,6 +37,7 @@ jobs:
       - name: Upload result artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          name: fcupdater-result
           path: ${{ steps.run_updater.outputs.artifact_path }}
           archive: false
           if-no-files-found: error

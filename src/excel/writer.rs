@@ -2681,7 +2681,6 @@ fn row_only_error(prefix: &str, row_num: u32) -> String {
     out.push(')');
     out
 }
-
 fn row_col_error(prefix: &str, row_num: u32, col: u32) -> String {
     let row_text = row_num.to_string();
     let col_text = col.to_string();

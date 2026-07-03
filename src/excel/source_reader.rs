@@ -439,7 +439,6 @@ impl SourceReader<'_> {
         }
         Ok(data)
     }
-
     pub fn read_xls_source(&self) -> Result<Vec<SourceRecord>> {
         let cfb = self.open()?;
         let workbook = cfb.read_stream_by_name("Workbook")?;

@@ -284,6 +284,12 @@ impl StreamingZipWriter<'_> {
                 path_context_message("xlsx 압축 파일 flush 실패", self.archive_path),
                 source_err,
             )
+        })?;
+        self.file.get_ref().sync_all().map_err(|source_err| {
+            err_with_source(
+                path_context_message("xlsx 압축 파일 sync 실패", self.archive_path),
+                source_err,
+            )
         })
     }
     fn write_all(&mut self, bytes: &[u8], context: &str) -> Result<()> {

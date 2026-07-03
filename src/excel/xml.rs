@@ -1,7 +1,6 @@
+use crate::diagnostic::{Result, err, err_with_source};
 use alloc::borrow::Cow;
 use core::{iter, range::Range};
-
-use crate::diagnostic::{Result, err, err_with_source};
 pub(super) struct XmlTag<'xml> {
     pub end: usize,
     pub is_start: bool,

@@ -19,8 +19,13 @@ cfg_select! {
 mod http_client;
 mod workflow;
 const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
-const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
+cfg_select! {
+    any(target_os = "linux", target_os = "macos", windows) => {
+        const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
+        const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
+    }
+    _ => {}
+}
 const OLE2_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const OPINET_HOST: &str = "www.opinet.co.kr";
 const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
@@ -75,11 +80,16 @@ struct ReservedDownloadFile {
     file: File,
     path: PathBuf,
 }
-struct StreamingBodySink<'writer> {
-    error: Option<DownloadError>,
-    limit: usize,
-    summary: StreamedBodySummary,
-    writer: &'writer mut dyn Write,
+cfg_select! {
+    any(target_os = "linux", target_os = "macos", windows) => {
+        struct StreamingBodySink<'writer> {
+            error: Option<DownloadError>,
+            limit: usize,
+            summary: StreamedBodySummary,
+            writer: &'writer mut dyn Write,
+        }
+    }
+    _ => {}
 }
 impl StreamedBodySummary {
     fn preview_lossy(&self) -> Cow<'_, str> {
@@ -124,60 +134,65 @@ impl From<&'static str> for DownloadError {
         Self::from(Cow::Borrowed(value))
     }
 }
-impl StreamingBodySink<'_> {
-    fn append(&mut self, bytes: &[u8]) -> bool {
-        let Some(next_len) = self.summary.bytes_seen.checked_add(bytes.len()) else {
-            self.error = Some("HTTP 응답 본문 크기 계산 실패".into());
-            return false;
-        };
-        if next_len > self.limit {
-            self.error = Some(
-                format!(
-                    "HTTP 응답 본문 크기가 허용 한도({} bytes)를 초과했습니다.",
-                    self.limit
-                )
-                .into(),
-            );
-            return false;
+cfg_select! {
+    any(target_os = "linux", target_os = "macos", windows) => {
+        impl StreamingBodySink<'_> {
+            fn append(&mut self, bytes: &[u8]) -> bool {
+                let Some(next_len) = self.summary.bytes_seen.checked_add(bytes.len()) else {
+                    self.error = Some("HTTP 응답 본문 크기 계산 실패".into());
+                    return false;
+                };
+                if next_len > self.limit {
+                    self.error = Some(
+                        format!(
+                            "HTTP 응답 본문 크기가 허용 한도({} bytes)를 초과했습니다.",
+                            self.limit
+                        )
+                        .into(),
+                    );
+                    return false;
+                }
+                if !self.capture_preview(bytes) {
+                    return false;
+                }
+                if let Err(source) = self.writer.write_all(bytes) {
+                    self.error = Some(download_error_with_source(
+                        "HTTP 응답 본문 파일 쓰기 실패",
+                        source,
+                    ));
+                    return false;
+                }
+                self.summary.bytes_seen = next_len;
+                true
+            }
+            fn capture_preview(&mut self, bytes: &[u8]) -> bool {
+                let Some(remaining_preview) =
+                    HTTP_ERROR_PREVIEW_BYTES.checked_sub(self.summary.preview.len())
+                else {
+                    self.error = Some("HTTP 응답 본문 preview 상태가 손상되었습니다.".into());
+                    return false;
+                };
+                let take = remaining_preview.min(bytes.len());
+                if take == 0 {
+                    return true;
+                }
+                if let Err(source) = self.summary.preview.try_reserve(take) {
+                    self.error = Some(download_error_with_source(
+                        "HTTP 응답 본문 preview 메모리 확보 실패",
+                        source,
+                    ));
+                    return false;
+                }
+                let Some(preview) = bytes.get(..take) else {
+                    self.error = Some("HTTP 응답 본문 preview 범위 계산 실패".into());
+                    return false;
+                };
+                self.summary.preview.extend_from_slice(preview);
+                true
+            }
         }
-        if !self.capture_preview(bytes) {
-            return false;
-        }
-        if let Err(source) = self.writer.write_all(bytes) {
-            self.error = Some(download_error_with_source(
-                "HTTP 응답 본문 파일 쓰기 실패",
-                source,
-            ));
-            return false;
-        }
-        self.summary.bytes_seen = next_len;
-        true
     }
-    fn capture_preview(&mut self, bytes: &[u8]) -> bool {
-        let Some(remaining_preview) =
-            HTTP_ERROR_PREVIEW_BYTES.checked_sub(self.summary.preview.len())
-        else {
-            self.error = Some("HTTP 응답 본문 preview 상태가 손상되었습니다.".into());
-            return false;
-        };
-        let take = remaining_preview.min(bytes.len());
-        if take == 0 {
-            return true;
-        }
-        if let Err(source) = self.summary.preview.try_reserve(take) {
-            self.error = Some(download_error_with_source(
-                "HTTP 응답 본문 preview 메모리 확보 실패",
-                source,
-            ));
-            return false;
-        }
-        let Some(preview) = bytes.get(..take) else {
-            self.error = Some("HTTP 응답 본문 preview 범위 계산 실패".into());
-            return false;
-        };
-        self.summary.preview.extend_from_slice(preview);
-        true
-    }
+    _ => {}
 }
 fn download_error_with_source<M, E>(context: M, source: E) -> DownloadError
 where

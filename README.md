@@ -36,17 +36,25 @@ fcupdater
 - `-h`, `--help`: 도움말
 - `--verify`: 저장 후 임시 XLSX를 재열어 검증한 뒤 대상 파일로 승격
 - `--version`: 버전 표시
+- `--version --verbose`: target/rustc/git 등 빌드 메타데이터 표시
 ## GitHub Actions
-`.github/workflows/ci.yml`은 `ubuntu-latest`, `macos-latest`, `windows-latest`에서 `cargo build --release --locked`를 수행하고 실행 파일을 Artifact로 업로드합니다.
-- Linux Artifact 파일: `fcupdater-linux-x64.tar.gz`
+`.github/workflows/ci.yml`은 `ubuntu-latest`, `macos-26-intel`, `macos-26`, `windows-latest`에서 `cargo build --release --locked`를 수행하고 실행 파일을 Artifact로 업로드합니다.
+- Linux Artifact 이름: `fcupdater-linux-x64`
+  - 포함 파일: `fcupdater-linux-x64.tar.gz`
   - 내부 실행 파일: `fcupdater-linux-x64`
-- macOS Artifact 파일: `fcupdater-macos.tar.gz`
-  - 내부 실행 파일: `fcupdater-macos`
-- Windows Artifact 파일: `fcupdater-windows-x64.exe`
-Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어 업로드합니다. Windows는 빌드 결과를 `fcupdater-windows-x64.exe`로 이름만 바꿔 그대로 업로드합니다.
+- macOS x64 Artifact 이름: `fcupdater-macos-x64`
+  - 포함 파일: `fcupdater-macos-x64.tar.gz`
+  - 내부 실행 파일: `fcupdater-macos-x64`
+- macOS arm64 Artifact 이름: `fcupdater-macos-arm64`
+  - 포함 파일: `fcupdater-macos-arm64.tar.gz`
+  - 내부 실행 파일: `fcupdater-macos-arm64`
+- Windows Artifact 이름: `fcupdater-windows-x64`
+  - 포함 파일: `fcupdater-windows-x64.exe`
+Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어 업로드합니다. macOS 산출물은 x64/arm64를 구분해 업로드합니다. Windows는 빌드 결과를 `fcupdater-windows-x64.exe`로 이름만 바꿔 그대로 업로드합니다.
 `.github/workflows/update_master.yml`은 `ubuntu-latest`에서 고정 워크플로를 실행합니다.
 - 마스터: `fuel_cost_chungcheong.xlsx`
-- 업로드: `artifacts/fcupdater-result.xlsx`
+- 업로드 Artifact 이름: `fcupdater-result`
+- 포함 파일: `fcupdater-result.xlsx`
 ## 동작 기준
 - Opinet 자동 다운로드는 항상 수행합니다.
 - 소스 형식은 OLE2/BIFF `.xls` 기준입니다.

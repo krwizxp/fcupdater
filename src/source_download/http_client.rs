@@ -23,15 +23,22 @@ cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         type PlatformHttpClient = super::libcurl::Client;
     }
+    _ => {}
+}
+cfg_select! {
+    any(target_os = "linux", target_os = "macos", windows) => {
+        #[derive(Default)]
+        pub(super) struct HttpClient {
+            cookie_jars: Vec<CookieJar>,
+            platform: PlatformHttpClient,
+        }
+    }
     _ => {
         #[derive(Default)]
-        struct PlatformHttpClient;
+        pub(super) struct HttpClient {
+            cookie_jars: Vec<CookieJar>,
+        }
     }
-}
-#[derive(Default)]
-pub(super) struct HttpClient {
-    cookie_jars: Vec<CookieJar>,
-    platform: PlatformHttpClient,
 }
 pub(super) enum PostHeaderProfile {
     Ajax,
@@ -449,7 +456,7 @@ impl HttpClient {
         if let Some(cookie_text) = cookie_header {
             merged_headers.push(("Cookie", cookie_text));
         }
-        let response = {
+        let response: HttpResponse = {
             cfg_select! {
                 windows => {
                     self.platform.request(method, host, path, body, &merged_headers)
@@ -465,7 +472,7 @@ impl HttpClient {
                         HttpMethod::Get => "GET",
                         HttpMethod::Post => "POST",
                     };
-                    Err(format!(
+                    Err::<HttpResponse, DownloadError>(format!(
                         "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
                     )
                     .into())
@@ -597,7 +604,9 @@ impl HttpClient {
         path: &str,
         body: Option<&[u8]>,
         headers: &[(&str, &str)],
-        writer: &mut dyn IoWrite,
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))] writer: &mut dyn IoWrite,
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        _writer: &mut dyn IoWrite,
     ) -> DownloadResult<HttpStreamResponse> {
         let cookie_jar_index = self.cookie_jar_index(host);
         if let Some(index) = cookie_jar_index {
@@ -625,7 +634,7 @@ impl HttpClient {
         if let Some(cookie_text) = cookie_header {
             merged_headers.push(("Cookie", cookie_text));
         }
-        let response = {
+        let response: HttpStreamResponse = {
             cfg_select! {
                 windows => {
                     self.platform.request_to_writer(
@@ -651,13 +660,12 @@ impl HttpClient {
                     let body_len = body.map_or(0, <[u8]>::len);
                     let header_count = headers.len();
                     let merged_header_count = merged_headers.len();
-                    let writer_type = core::any::type_name_of_val(writer);
                     let method_name = match *method {
                         HttpMethod::Get => "GET",
                         HttpMethod::Post => "POST",
                     };
-                    Err(format!(
-                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}, writer={writer_type}"
+                    Err::<HttpStreamResponse, DownloadError>(format!(
+                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
                     )
                     .into())
                 }
