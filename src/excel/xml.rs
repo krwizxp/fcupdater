@@ -256,6 +256,18 @@ pub(super) fn extract_all_tag_text<'xml>(
         let decoded = decode_xml_entities(body)?;
         if !decoded.is_empty() {
             if let Some(out_text) = out.as_mut() {
+                let next_len = out_text
+                    .len()
+                    .checked_add(decoded.len())
+                    .ok_or_else(|| err(format!("XML <{tag_name}> text 용량 계산 실패")))?;
+                if out_text.capacity() < next_len {
+                    let additional = next_len
+                        .checked_sub(out_text.len())
+                        .ok_or_else(|| err(format!("XML <{tag_name}> text 용량 계산 실패")))?;
+                    out_text.try_reserve_exact(additional).map_err(|source| {
+                        err_with_source(format!("XML <{tag_name}> text 메모리 확보 실패"), source)
+                    })?;
+                }
                 out_text.push_str(decoded.as_ref());
             } else if let Some(previous) = first_text.take() {
                 let capacity = previous
@@ -263,7 +275,7 @@ pub(super) fn extract_all_tag_text<'xml>(
                     .checked_add(decoded.len())
                     .ok_or_else(|| err(format!("XML <{tag_name}> text 용량 계산 실패")))?;
                 let mut out_text = String::new();
-                out_text.try_reserve(capacity).map_err(|source| {
+                out_text.try_reserve_exact(capacity).map_err(|source| {
                     err_with_source(format!("XML <{tag_name}> text 메모리 확보 실패"), source)
                 })?;
                 out_text.push_str(previous.as_ref());
@@ -309,17 +321,6 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
             return Err(err("XML text에 raw '<' 문자가 포함되어 있습니다."));
         }
         if let Some(after_amp) = rest.strip_prefix('&') {
-            if out.is_none() {
-                let mut out_text = String::new();
-                out_text.try_reserve(text.len()).map_err(|source| {
-                    err_with_source("XML entity decode 메모리 확보 실패", source)
-                })?;
-                let prefix = text
-                    .get(..i)
-                    .ok_or_else(|| err("XML entity decode prefix 범위가 손상되었습니다."))?;
-                out_text.push_str(prefix);
-                out = Some(out_text);
-            }
             let Some((entity, _after_semi)) = after_amp.split_once(';') else {
                 return Err(err("XML entity 종료 세미콜론을 찾지 못했습니다."));
             };
@@ -337,13 +338,9 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                         return Err(err(format!("지원하지 않는 XML entity입니다: &{entity};")));
                     };
                     let value = if let Some(hex) = body.strip_prefix(['x', 'X']) {
-                        u32::from_str_radix(hex, 16).map_err(|source| {
-                            err_with_source("XML numeric hex entity 해석 실패", source)
-                        })?
+                        parse_xml_numeric_entity(hex, 16)?
                     } else {
-                        body.parse::<u32>().map_err(|source| {
-                            err_with_source("XML numeric entity 해석 실패", source)
-                        })?
+                        parse_xml_numeric_entity(body, 10)?
                     };
                     char::from_u32(value)
                 }
@@ -358,8 +355,18 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                     "XML numeric entity가 XML 1.0 유효 문자 범위를 벗어났습니다: &{entity};"
                 )));
             }
-            let Some(out_text) = out.as_mut() else {
-                return Err(err("XML entity decode output 상태가 손상되었습니다."));
+            let out_text = if let Some(out_text) = out.as_mut() {
+                out_text
+            } else {
+                let mut out_text = String::new();
+                out_text.try_reserve_exact(text.len()).map_err(|source| {
+                    err_with_source("XML entity decode 메모리 확보 실패", source)
+                })?;
+                let prefix = text
+                    .get(..i)
+                    .ok_or_else(|| err("XML entity decode prefix 범위가 손상되었습니다."))?;
+                out_text.push_str(prefix);
+                out.insert(out_text)
             };
             out_text.push(decoded_char);
             let consumed = checked_offset_add(entity.len(), 2)
@@ -376,18 +383,58 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
     }
     Ok(out.map_or(Cow::Borrowed(text), Cow::Owned))
 }
-pub(super) fn ensure_valid_xml_text(text: &str, context: &str) -> Result<()> {
-    for ch in text.chars() {
-        if !is_valid_xml_char(ch) {
-            return Err(err(format!(
-                "{context}: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{:04X}",
-                u32::from(ch)
-            )));
+fn parse_xml_numeric_entity(body: &str, radix: u32) -> Result<u32> {
+    let (format_error, parse_error) = match radix {
+        10 => (
+            "XML numeric entity가 10진수 형식이 아닙니다.",
+            "XML numeric entity 해석 실패",
+        ),
+        16 => (
+            "XML numeric hex entity가 16진수 형식이 아닙니다.",
+            "XML numeric hex entity 해석 실패",
+        ),
+        _ => {
+            return Err(err("XML numeric entity 진법이 지원되지 않습니다."));
         }
+    };
+    if body.is_empty() {
+        return Err(err(format_error));
     }
-    Ok(())
+    let mut parsed = 0_u32;
+    let mut overflowed = false;
+    for byte in body.bytes() {
+        let digit = if radix == 10 {
+            if !byte.is_ascii_digit() {
+                return Err(err(format_error));
+            }
+            u32::from(byte.wrapping_sub(b'0'))
+        } else if byte.is_ascii_digit() {
+            u32::from(byte.wrapping_sub(b'0'))
+        } else if byte.is_ascii_hexdigit() {
+            let upper = byte.to_ascii_uppercase();
+            u32::from(upper.wrapping_sub(b'A').wrapping_add(10))
+        } else {
+            return Err(err(format_error));
+        };
+        if overflowed {
+            continue;
+        }
+        let Some(next) = parsed
+            .checked_mul(radix)
+            .and_then(|scaled| scaled.checked_add(digit))
+        else {
+            overflowed = true;
+            continue;
+        };
+        parsed = next;
+    }
+    if overflowed {
+        return u32::from_str_radix(body, radix)
+            .map_err(|source| err_with_source(parse_error, source));
+    }
+    Ok(parsed)
 }
-fn is_valid_xml_char(ch: char) -> bool {
+pub(super) fn is_valid_xml_char(ch: char) -> bool {
     matches!(
         u32::from(ch),
         0x09 | 0x0A | 0x0D | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x0001_0000..=0x0010_FFFF

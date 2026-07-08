@@ -5,21 +5,42 @@ use super::{
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, ReservedDownloadFile, SourceDownload,
     attach_remove_file_error, download_error_with_source,
     http_client::{self, PostHeaderProfile},
+    push_decimal_fragment,
 };
 use crate::diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message};
 use core::time::Duration;
 use std::{
     fs::{self, File},
     io::{ErrorKind, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 const AUTO_SOURCE_OLD_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
 const AUTO_SOURCE_TEMP_FILE_PREFIX: &str = ".fcupdater-opinet-source.tmp_";
-struct SourceDownloadWorkflow<'out, W: Write + ?Sized> {
-    canonical_dir: PathBuf,
+const AUTO_SOURCE_TEMP_FILE_NAME_CAPACITY: usize = 128;
+const AUTO_SOURCE_TEMP_FILE_RESERVATION_ATTEMPTS: u32 = 1024;
+struct SourceDownloadWorkflow<'dir, 'out, W: Write + ?Sized> {
+    dir: &'dir Path,
     out: &'out mut W,
+}
+struct DownloadNetFunnelKey(String);
+struct EntryNetFunnelKey(String);
+struct OpinetKey<'page>(&'page str);
+impl DownloadNetFunnelKey {
+    const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+impl EntryNetFunnelKey {
+    const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+impl OpinetKey<'_> {
+    const fn as_str(&self) -> &str {
+        self.0
+    }
 }
 impl<W> SourceDownload<'_, '_, W>
 where
@@ -32,20 +53,14 @@ where
                 source_err,
             )
         })?;
-        let canonical_dir = self.dir.canonicalize().map_err(|source_err| {
-            err_with_source(
-                path_context_message("소스 폴더 경로 확인 실패", self.dir),
-                source_err,
-            )
-        })?;
         SourceDownloadWorkflow {
-            canonical_dir,
+            dir: self.dir,
             out: &mut *self.out,
         }
         .refresh_source()
     }
 }
-impl<W> SourceDownloadWorkflow<'_, W>
+impl<W> SourceDownloadWorkflow<'_, '_, W>
 where
     W: Write + ?Sized,
 {
@@ -82,7 +97,7 @@ where
                 return Err("Opinet key 값 quote 문자를 찾지 못했습니다.".into());
             };
             let value_tail = after_eq
-                .get(1..)
+                .strip_prefix(char::from(quote))
                 .ok_or("Opinet key 값 범위가 손상되었습니다.")?;
             let Some(value_end) = value_tail.find(char::from(quote)) else {
                 return Err("Opinet key 값 종료 quote를 찾지 못했습니다.".into());
@@ -93,27 +108,29 @@ where
             if value.is_empty() {
                 return Err("Opinet key 값이 비어 있습니다.".into());
             }
-            value
+            OpinetKey(value)
         };
-        let entry_key = client.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
+        let entry_key =
+            EntryNetFunnelKey(client.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?);
         client.post_form(
             OPINET_HOST,
             OPDOWNLOAD_PATH,
             &[
                 ("netfunnel_key", entry_key.as_str()),
-                ("opinet_key", opinet_key),
+                ("opinet_key", opinet_key.as_str()),
             ],
             Some(OPDOWNLOAD_URL),
-            &PostHeaderProfile::Standard,
+            PostHeaderProfile::Standard,
         )?;
         client.post_form(
             OPINET_HOST,
             OPDOWNLOAD_LAYOUT_PATH,
             &[("tarUrl", OIL_PRICE_DOWNLOAD_TAR_URL)],
             Some(OPDOWNLOAD_URL),
-            &PostHeaderProfile::Ajax,
+            PostHeaderProfile::Ajax,
         )?;
-        let download_key = client.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
+        let download_key =
+            DownloadNetFunnelKey(client.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?);
         let downloaded = client.post_form_to_file(
             OPINET_HOST,
             OPDOWNLOAD_EXCEL_PATH,
@@ -127,7 +144,7 @@ where
                 ("netfunnel_key", download_key.as_str()),
             ],
             Some(OPDOWNLOAD_URL),
-            &PostHeaderProfile::Standard,
+            PostHeaderProfile::Standard,
             || self.reserve_auto_source_temp_file(),
         )?;
         if !downloaded.response.body.starts_with(&OLE2_SIGNATURE) {
@@ -144,7 +161,7 @@ where
         Ok(downloaded.path)
     }
     fn refresh_source(&mut self) -> Result<PathBuf> {
-        let old_temp_path = self.canonical_dir.join(AUTO_SOURCE_OLD_TEMP_FILE_NAME);
+        let old_temp_path = self.dir.join(AUTO_SOURCE_OLD_TEMP_FILE_NAME);
         let removed_old_temp = match fs::remove_file(&old_temp_path) {
             Ok(()) => true,
             Err(error) if error.kind() == ErrorKind::NotFound => false,
@@ -161,28 +178,57 @@ where
             }
         }
         self.download_nationwide_source_http().map_err(|error| {
-            let message = prefixed_message("Opinet 자동 다운로드 실패: ", error.message);
-            match error.source {
-                Some(source) => err_with_source(message, source),
-                None => err(message),
+            let super::DownloadError {
+                message: error_message,
+                source: error_source,
+            } = error;
+            let app_message = prefixed_message("Opinet 자동 다운로드 실패: ", error_message);
+            match error_source {
+                Some(source_error) => err_with_source(app_message, source_error),
+                None => err(app_message),
             }
         })
     }
     fn reserve_auto_source_temp_file(&self) -> DownloadResult<ReservedDownloadFile> {
         let pid = process::id();
-        for seq in 0..1024_u32 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|source| {
-                    download_error_with_source("다운로드 임시 파일 시각 계산 실패", source)
-                })?
-                .as_nanos();
-            let path = self
-                .canonical_dir
-                .join(format!("{AUTO_SOURCE_TEMP_FILE_PREFIX}{pid}_{nanos}_{seq}"));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|source| {
+                download_error_with_source("다운로드 임시 파일 시각 계산 실패", source)
+            })?
+            .as_nanos();
+        let mut file_name = String::new();
+        file_name
+            .try_reserve_exact(AUTO_SOURCE_TEMP_FILE_NAME_CAPACITY)
+            .map_err(|source| {
+                download_error_with_source("다운로드 임시 파일명 메모리 확보 실패", source)
+            })?;
+        let mut path = self.dir.to_path_buf();
+        path.try_reserve(AUTO_SOURCE_TEMP_FILE_NAME_CAPACITY)
+            .map_err(|source| {
+                download_error_with_source("다운로드 임시 파일 경로 메모리 확보 실패", source)
+            })?;
+        for seq in 0..AUTO_SOURCE_TEMP_FILE_RESERVATION_ATTEMPTS {
+            file_name.clear();
+            file_name.push_str(AUTO_SOURCE_TEMP_FILE_PREFIX);
+            push_decimal_fragment(
+                &mut file_name,
+                u128::from(pid),
+                "다운로드 임시 파일명 작성 실패",
+            )?;
+            file_name.push('_');
+            push_decimal_fragment(&mut file_name, nanos, "다운로드 임시 파일명 작성 실패")?;
+            file_name.push('_');
+            push_decimal_fragment(
+                &mut file_name,
+                u128::from(seq),
+                "다운로드 임시 파일명 작성 실패",
+            )?;
+            path.push(file_name.as_str());
             match File::options().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok(ReservedDownloadFile { file, path }),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    path.pop();
                     thread::sleep(Duration::from_micros(50));
                 }
                 Err(error) => {

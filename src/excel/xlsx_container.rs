@@ -1,3 +1,4 @@
+use super::path_util::reject_windows_special_component;
 use super::{
     SaveVerification, SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
     path_util::path_to_slashes,
@@ -7,11 +8,11 @@ use super::{
     },
 };
 use crate::diagnostic::{
-    Result, err, err_with_source, path_context_message, path_pair_context_message,
-    path_source_message, prefixed_message,
+    AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
+    prefixed_message,
 };
 use alloc::borrow::Cow;
-use core::{mem, range::Range, time::Duration};
+use core::{num::NonZeroU32, range::Range, str, time::Duration};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry as HashEntry},
     env, fs,
@@ -22,12 +23,15 @@ use std::{
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
-        use std::io::{Write as IoWrite, stderr};
+        use std::io::{Write as _, stderr};
     }
     _ => {}
 }
 const TEMP_ARCHIVE_PROMOTION_ATTEMPTS: u32 = 5;
 const TEMP_ARCHIVE_PROMOTION_RETRY_DELAY: Duration = Duration::from_millis(50);
+const TEMP_ENTRY_DECIMAL_MAX_LEN: usize = 39;
+const TEMP_ENTRY_NAME_CAPACITY: usize = 128;
+const TEMP_ENTRY_RESERVATION_ATTEMPTS: u32 = 1024;
 const MAX_XLSX_TEXT_PART_BYTES: u64 = 64 * 1024 * 1024;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
 const FAR_ARTIFACT_MIN_COL: u32 = 16_382;
@@ -43,13 +47,64 @@ pub struct XlsxContainer {
 }
 #[derive(Debug)]
 struct WorkDirCleanup {
-    keep: bool,
-    path: PathBuf,
+    path: Option<PathBuf>,
+}
+struct ReservedTempArchive {
+    file: Option<fs::File>,
+    path: Option<PathBuf>,
+}
+impl WorkDirCleanup {
+    fn into_path(mut self) -> Result<PathBuf> {
+        self.path
+            .take()
+            .ok_or_else(|| err("임시 작업 폴더 cleanup 상태가 손상되었습니다."))
+    }
+    fn path(&self) -> Result<&Path> {
+        self.path
+            .as_deref()
+            .ok_or_else(|| err("임시 작업 폴더 cleanup 상태가 손상되었습니다."))
+    }
 }
 impl Drop for WorkDirCleanup {
     fn drop(&mut self) {
-        if !self.keep && !self.path.as_os_str().is_empty() {
-            match fs::remove_dir_all(&self.path) {
+        if let Some(path) = self.path.as_deref() {
+            match fs::remove_dir_all(path) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+}
+impl ReservedTempArchive {
+    fn disable_drop_cleanup(&mut self) {
+        self.path = None;
+    }
+    fn path(&self) -> Result<&Path> {
+        self.path
+            .as_deref()
+            .ok_or_else(|| err("xlsx 임시 저장 파일 cleanup 상태가 손상되었습니다."))
+    }
+    const fn take_cleanup_path(&mut self) -> Option<PathBuf> {
+        self.path.take()
+    }
+    fn write_archive_from(&mut self, root: &Path) -> Result<()> {
+        let Some(file) = self.file.take() else {
+            return Err(err("xlsx 임시 저장 파일 handle이 이미 닫혔습니다."));
+        };
+        ZipArchiveBuilder {
+            archive_path: self.path()?,
+            file,
+            root,
+        }
+        .create()
+    }
+}
+impl Drop for ReservedTempArchive {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            drop(file);
+        }
+        if let Some(path) = self.path.take() {
+            match fs::remove_file(path) {
                 Ok(()) | Err(_) => {}
             }
         }
@@ -92,11 +147,20 @@ struct WorkbookRelationship<'xml> {
     target_mode: Option<Cow<'xml, str>>,
     type_: Cow<'xml, str>,
 }
+#[repr(transparent)]
+struct InternalWorksheetTarget<'xml>(&'xml str);
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct RelationshipId<'xml>(&'xml str);
 impl WorkbookRelationship<'_> {
-    fn internal_worksheet_target(&self, rid: &str) -> Result<&str> {
+    fn internal_worksheet_target(
+        &self,
+        rid: RelationshipId<'_>,
+    ) -> Result<InternalWorksheetTarget<'_>> {
         if self.type_.as_ref() != WORKSHEET_REL_TYPE {
             return Err(err(format!(
-                "workbook.xml sheet 관계 Type이 worksheet가 아닙니다: rid={rid}, type={}",
+                "workbook.xml sheet 관계 Type이 worksheet가 아닙니다: rid={}, type={}",
+                rid.0,
                 self.type_.as_ref()
             )));
         }
@@ -106,33 +170,69 @@ impl WorkbookRelationship<'_> {
             .is_some_and(|mode| mode.as_ref() != "Internal")
         {
             return Err(err(format!(
-                "workbook.xml sheet 관계 TargetMode는 External일 수 없습니다: rid={rid}"
+                "workbook.xml sheet 관계 TargetMode는 External일 수 없습니다: rid={}",
+                rid.0
             )));
         }
-        Ok(self.target.as_ref())
+        if self.target.is_empty() {
+            return Err(err(format!(
+                "workbook.xml sheet 관계 Target이 비어 있습니다: rid={}",
+                rid.0
+            )));
+        }
+        let target = self.target.as_ref();
+        if target.contains('\\') {
+            return Err(err(format!(
+                "workbook.xml sheet 관계 Target에는 백슬래시를 사용할 수 없습니다: rid={}, target={target}",
+                rid.0
+            )));
+        }
+        if target.bytes().any(|byte| matches!(byte, b'?' | b'#')) {
+            return Err(err(format!(
+                "workbook.xml sheet 관계 Target에는 query/fragment를 사용할 수 없습니다: rid={}, target={target}",
+                rid.0
+            )));
+        }
+        if target
+            .split('/')
+            .next()
+            .is_some_and(|segment| segment.contains(':'))
+        {
+            return Err(err(format!(
+                "workbook.xml sheet 관계 Target에는 URI scheme을 사용할 수 없습니다: rid={}, target={target}",
+                rid.0
+            )));
+        }
+        Ok(InternalWorksheetTarget(target))
     }
 }
 impl SavedArchiveVerifier<'_> {
     fn trailing_row_num(cell_ref: &str) -> Result<u32> {
-        let digits_len = cell_ref
-            .bytes()
-            .rev()
-            .take_while(u8::is_ascii_digit)
-            .count();
-        if digits_len == 0 {
+        let mut row = 0_u64;
+        let mut place = 1_u64;
+        let mut saw_digit = false;
+        for byte in cell_ref.bytes().rev() {
+            if !byte.is_ascii_digit() {
+                break;
+            }
+            saw_digit = true;
+            let digit = u64::from(byte.wrapping_sub(b'0'));
+            let contribution = digit
+                .checked_mul(place)
+                .ok_or_else(|| err("저장 검증 실패: filter row 번호 해석 실패"))?;
+            row = row
+                .checked_add(contribution)
+                .ok_or_else(|| err("저장 검증 실패: filter row 번호 해석 실패"))?;
+            place = place
+                .checked_mul(10)
+                .ok_or_else(|| err("저장 검증 실패: filter row 번호 해석 실패"))?;
+        }
+        if !saw_digit {
             return Err(err(format!(
                 "저장 검증 실패: filter cell reference에 row 번호가 없습니다: {cell_ref}"
             )));
         }
-        let digit_start = cell_ref
-            .len()
-            .checked_sub(digits_len)
-            .ok_or_else(|| err("저장 검증 실패: filter row 번호 위치 계산 실패"))?;
-        let row_text = cell_ref
-            .get(digit_start..)
-            .ok_or_else(|| err("저장 검증 실패: filter row 번호 범위가 손상되었습니다."))?;
-        row_text
-            .parse::<u32>()
+        u32::try_from(row)
             .map_err(|source| err_with_source("저장 검증 실패: filter row 번호 해석 실패", source))
     }
     fn verify(&self) -> Result<()> {
@@ -234,7 +334,7 @@ impl ArchiveSemanticVerifier<'_> {
         }
         let mut quoted_sheet = String::new();
         quoted_sheet
-            .try_reserve("'유류비'!".len())
+            .try_reserve_exact("'유류비'!".len())
             .map_err(|source| {
                 err_with_source("저장 검증 실패: sheet 이름 메모리 확보 실패", source)
             })?;
@@ -308,21 +408,52 @@ impl ArchiveSemanticVerifier<'_> {
             validate_absolute(end_ref)?;
         }
         let mut normalized = String::new();
-        normalized.try_reserve(range_text.len()).map_err(|source| {
-            err_with_source(
-                "저장 검증 실패: filter 범위 정규화 메모리 확보 실패",
-                source,
-            )
-        })?;
+        normalized
+            .try_reserve_exact(range_text.len())
+            .map_err(|source| {
+                err_with_source(
+                    "저장 검증 실패: filter 범위 정규화 메모리 확보 실패",
+                    source,
+                )
+            })?;
         normalized.extend(range_text.chars().filter(|ch| *ch != '$' && *ch != '\''));
         Ok(normalized)
     }
     fn optional_usize_attr(tag: &str, attr_name: &str, context: &str) -> Result<Option<usize>> {
         extract_attr(tag, attr_name)?
             .map(|value| {
-                value.parse::<usize>().map_err(|source| {
-                    err_with_source(format!("{context}: {attr_name} 해석 실패"), source)
-                })
+                if value.is_empty() {
+                    return Err(err(format!(
+                        "{context}: {attr_name}가 음이 아닌 10진수 형식이 아닙니다."
+                    )));
+                }
+                let mut parsed = 0_usize;
+                let mut overflowed = false;
+                for byte in value.bytes() {
+                    if !byte.is_ascii_digit() {
+                        return Err(err(format!(
+                            "{context}: {attr_name}가 음이 아닌 10진수 형식이 아닙니다."
+                        )));
+                    }
+                    if overflowed {
+                        continue;
+                    }
+                    let digit_raw = byte.wrapping_sub(b'0');
+                    let Some(next) = parsed
+                        .checked_mul(10)
+                        .and_then(|scaled| scaled.checked_add(usize::from(digit_raw)))
+                    else {
+                        overflowed = true;
+                        continue;
+                    };
+                    parsed = next;
+                }
+                if overflowed {
+                    return value.parse::<usize>().map_err(|source| {
+                        err_with_source(format!("{context}: {attr_name} 해석 실패"), source)
+                    });
+                }
+                Ok(parsed)
             })
             .transpose()
     }
@@ -385,20 +516,70 @@ impl ArchiveSemanticVerifier<'_> {
         let row_text = cell_ref
             .get(cursor..)
             .ok_or_else(|| err(format!("{context}: row 범위가 손상되었습니다.")))?;
-        if row_text.is_empty() || !row_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        let mut row = 0_u32;
+        let mut saw_row = false;
+        for byte in row_text.bytes() {
+            if !byte.is_ascii_digit() {
+                return Err(err(format!(
+                    "{context}: cell reference에 row 번호가 없습니다."
+                )));
+            }
+            saw_row = true;
+            let digit = u32::from(byte.wrapping_sub(b'0'));
+            row = row
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(digit))
+                .ok_or_else(|| err(format!("{context}: row 번호 해석 실패")))?;
+        }
+        if !saw_row {
             return Err(err(format!(
                 "{context}: cell reference에 row 번호가 없습니다."
             )));
         }
-        let row = row_text
-            .parse::<u32>()
-            .map_err(|source| err_with_source(format!("{context}: row 번호 해석 실패"), source))?;
         if row == 0 || col == 0 {
             return Err(err(format!(
                 "{context}: cell reference는 1 이상이어야 합니다."
             )));
         }
         Ok(CellPosition { col, row })
+    }
+    fn parse_positive_u32(text: &str, context: &'static str) -> Result<u32> {
+        if text.is_empty() {
+            return Err(err(format!("{context}: 양의 10진수 형식이 아닙니다.")));
+        }
+        let mut parsed = 0_u32;
+        let mut overflowed = false;
+        for byte in text.bytes() {
+            if !byte.is_ascii_digit() {
+                return Err(err(format!("{context}: 양의 10진수 형식이 아닙니다.")));
+            }
+            if overflowed {
+                continue;
+            }
+            let digit_raw = byte.wrapping_sub(b'0');
+            let Some(next) = parsed
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u32::from(digit_raw)))
+            else {
+                overflowed = true;
+                continue;
+            };
+            parsed = next;
+        }
+        if overflowed {
+            parsed = text
+                .parse::<u32>()
+                .map_err(|source| err_with_source(context, source))?;
+        }
+        let Some(non_zero) = NonZeroU32::new(parsed) else {
+            return Err(err(format!("{context}는 1 이상이어야 합니다.")));
+        };
+        Ok(non_zero.get())
+    }
+    fn shared_string_index_format_error(sheet_name: &str, cell_ref: &str) -> AppError {
+        err(format!(
+            "저장 검증 실패: shared string index가 음이 아닌 정수가 아닙니다: {sheet_name}!{cell_ref}"
+        ))
     }
     fn shared_strings_summary(&self) -> Result<SharedStringsSummary> {
         let shared_strings_path = self
@@ -572,36 +753,36 @@ impl ArchiveSemanticVerifier<'_> {
                 let cell_body = sheet_xml
                     .get(body_span)
                     .ok_or_else(|| err("저장 검증 실패: cell 본문 범위가 손상되었습니다."))?;
-                let v_start = find_start_tag(cell_body, "v", 0).ok_or_else(|| {
-                    err(format!(
+                let Some(raw_index) = extract_first_tag_text(cell_body, "v")? else {
+                    return Err(err(format!(
                         "저장 검증 실패: shared string cell에 <v>가 없습니다: {sheet_name}!{}",
                         cell_ref.as_ref()
-                    ))
-                })?;
-                let v_open_end = find_tag_end(cell_body, v_start).ok_or_else(|| {
-                    err("저장 검증 실패: shared string <v> 태그가 손상되었습니다.")
-                })?;
-                let v_body_start = v_open_end
-                    .checked_add(1)
-                    .ok_or_else(|| err("저장 검증 실패: shared string <v> 본문 시작 계산 실패"))?;
-                let v_close = find_end_tag(cell_body, "v", v_body_start)
-                    .ok_or_else(|| err("저장 검증 실패: shared string </v> 태그가 없습니다."))?;
-                let raw_index = cell_body.get(v_body_start..v_close).ok_or_else(|| {
-                    err("저장 검증 실패: shared string index 범위가 손상되었습니다.")
-                })?;
+                    )));
+                };
                 let decoded_index = decode_xml_entities(raw_index)?;
                 let trimmed_index = decoded_index.trim();
-                if trimmed_index.is_empty()
-                    || trimmed_index.bytes().any(|byte| !byte.is_ascii_digit())
-                {
-                    return Err(err(format!(
-                        "저장 검증 실패: shared string index가 음이 아닌 정수가 아닙니다: {sheet_name}!{}",
-                        cell_ref.as_ref()
-                    )));
+                let mut index = 0_usize;
+                let mut saw_index_digit = false;
+                for byte in trimmed_index.bytes() {
+                    if !byte.is_ascii_digit() {
+                        return Err(Self::shared_string_index_format_error(
+                            sheet_name,
+                            cell_ref.as_ref(),
+                        ));
+                    }
+                    saw_index_digit = true;
+                    let digit = usize::from(byte.wrapping_sub(b'0'));
+                    index = index
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(digit))
+                        .ok_or_else(|| err("저장 검증 실패: shared string index 해석 실패"))?;
                 }
-                let index = trimmed_index.parse::<usize>().map_err(|source| {
-                    err_with_source("저장 검증 실패: shared string index 해석 실패", source)
-                })?;
+                if !saw_index_digit {
+                    return Err(Self::shared_string_index_format_error(
+                        sheet_name,
+                        cell_ref.as_ref(),
+                    ));
+                }
                 if index >= shared_count {
                     return Err(err(format!(
                         "저장 검증 실패: shared string index가 범위를 벗어났습니다: {sheet_name}!{} index={index}, uniqueCount={shared_count}",
@@ -639,6 +820,14 @@ impl ArchiveSemanticVerifier<'_> {
                 )));
             }
             let cell_key = (u64::from(cell.row) << 32_u32) | u64::from(cell.col);
+            if seen_cells.len() == seen_cells.capacity() {
+                seen_cells.try_reserve(1).map_err(|source| {
+                    err_with_source(
+                        "저장 검증 실패: cell reference 집합 메모리 확보 실패",
+                        source,
+                    )
+                })?;
+            }
             if !seen_cells.insert(cell_key) {
                 return Err(err(format!(
                     "저장 검증 실패: worksheet에 중복 cell reference가 있습니다: {sheet_name}!{}",
@@ -713,7 +902,7 @@ impl ArchiveSemanticVerifier<'_> {
         }
         let expected_last_row =
             Self::worksheet_meaningful_row_bound(sheet_xml, CHANGELOG_DATA_START_ROW, 13)?
-                .map_or(CHANGELOG_DATA_START_ROW, |row| row);
+                .unwrap_or(CHANGELOG_DATA_START_ROW);
         let mut delta_mask = 0_u8;
         let mut cursor = 0_usize;
         while let Some(cf_start) = find_start_tag(sheet_xml, "conditionalFormatting", cursor) {
@@ -793,7 +982,7 @@ impl ArchiveSemanticVerifier<'_> {
                     cursor = cursor_after_cell;
                     continue;
                 }
-                last_row = Some(last_row.map_or(cell.row, |row: u32| row.max(cell.row)));
+                last_row = Some(last_row.unwrap_or(cell.row).max(cell.row));
             }
             cursor = cursor_after_cell;
         }
@@ -904,9 +1093,18 @@ impl ArchiveSemanticVerifier<'_> {
                     "저장 검증 실패: worksheet row에 r 속성이 없습니다: {sheet_name}"
                 )));
             };
-            let row_num = row_ref.parse::<u32>().map_err(|source| {
-                err_with_source("저장 검증 실패: row reference 해석 실패", source)
-            })?;
+            let row_num = Self::parse_positive_u32(
+                row_ref.as_ref(),
+                "저장 검증 실패: row reference 해석 실패",
+            )?;
+            if seen_rows.len() == seen_rows.capacity() {
+                seen_rows.try_reserve(1).map_err(|source| {
+                    err_with_source(
+                        "저장 검증 실패: row reference 집합 메모리 확보 실패",
+                        source,
+                    )
+                })?;
+            }
             if !seen_rows.insert(row_num) {
                 return Err(err(format!(
                     "저장 검증 실패: worksheet에 중복 row reference가 있습니다: {sheet_name}!{row_num}"
@@ -929,12 +1127,14 @@ impl ArchiveSemanticVerifier<'_> {
             let Some(max_col_text) = extract_attr(col_tag, "max")? else {
                 return Err(err("저장 검증 실패: col max 속성이 없습니다."));
             };
-            let min_col = min_col_text.parse::<u32>().map_err(|source| {
-                err_with_source("저장 검증 실패: col min reference 해석 실패", source)
-            })?;
-            let max_col = max_col_text.parse::<u32>().map_err(|source| {
-                err_with_source("저장 검증 실패: col max reference 해석 실패", source)
-            })?;
+            let min_col = Self::parse_positive_u32(
+                min_col_text.as_ref(),
+                "저장 검증 실패: col min reference 해석 실패",
+            )?;
+            let max_col = Self::parse_positive_u32(
+                max_col_text.as_ref(),
+                "저장 검증 실패: col max reference 해석 실패",
+            )?;
             if max_col < min_col {
                 return Err(err(format!(
                     "저장 검증 실패: worksheet col 범위 순서가 올바르지 않습니다: {sheet_name}, min={min_col}, max={max_col}"
@@ -1022,19 +1222,17 @@ impl TempArchivePromotion<'_> {
                                 .open(self.target_xlsx)
                                 .and_then(|file| file.sync_all())
                             {
-                                let target_path = self.target_xlsx.display().to_string();
-                                write_durability_warning("파일", &target_path, &source_err);
+                                write_durability_warning("파일", self.target_xlsx, &source_err);
                             }
                             let parent = self
                                 .target_xlsx
                                 .parent()
                                 .filter(|path| !path.as_os_str().is_empty())
-                                .map_or_else(|| Path::new("."), |path| path);
+                                .unwrap_or_else(|| Path::new("."));
                             if let Err(source_err) =
                                 fs::File::open(parent).and_then(|dir| dir.sync_all())
                             {
-                                let parent_path = parent.display().to_string();
-                                write_durability_warning("폴더", &parent_path, &source_err);
+                                write_durability_warning("폴더", parent, &source_err);
                             }
                         }
                         _ => {}
@@ -1127,7 +1325,8 @@ impl XlsxContainer {
                     rid.as_ref()
                 )));
             };
-            let target_text = relationship.internal_worksheet_target(rid.as_ref())?;
+            let target = relationship.internal_worksheet_target(RelationshipId(rid.as_ref()))?;
+            let target_text = target.0;
             let resolved = if target_text.starts_with('/') {
                 return Err(err(format!(
                     "sheet 관계 target에 절대 경로는 허용되지 않습니다: {target_text}"
@@ -1160,36 +1359,27 @@ impl XlsxContainer {
         Ok(sheets)
     }
     pub fn open(source_xlsx: &Path) -> Result<Self> {
-        if !source_xlsx.try_exists().map_err(|source_err| {
-            err_with_source(
-                path_context_message("xlsx 파일 경로 확인 실패", source_xlsx),
-                source_err,
-            )
-        })? {
-            return Err(err(prefixed_message(
-                "xlsx 파일이 없습니다: ",
-                source_xlsx.display(),
-            )));
-        }
         let base = env::temp_dir();
-        let mut cleanup = WorkDirCleanup {
-            path: reserve_unique_temp_entry(
-                |pid, nanos, seq| base.join(format!("fcupdater_{pid}_{nanos}_{seq}")),
-                |path| fs::DirBuilder::new().create(path),
+        let cleanup = WorkDirCleanup {
+            path: Some(reserve_unique_temp_entry(
+                &base,
+                |file_name| file_name.push_str("fcupdater_"),
+                |path| {
+                    fs::DirBuilder::new().create(path)?;
+                    Ok(path.to_path_buf())
+                },
                 "임시 작업 폴더 생성 실패",
-                "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
-            )?,
-            keep: false,
+                || "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
+            )?),
         };
-        let unpack_dir = cleanup.path.join("unzipped");
+        let unpack_dir = cleanup.path()?.join("unzipped");
         create_dir_all_checked(&unpack_dir, "임시 폴더 생성 실패")?;
         ZipArchiveExtractor {
             archive_path: source_xlsx,
             unpack_dir: unpack_dir.as_path(),
         }
         .extract()?;
-        cleanup.keep = true;
-        let work_dir = mem::take(&mut cleanup.path);
+        let work_dir = cleanup.into_path()?;
         Ok(Self {
             unpack_dir,
             work_dir,
@@ -1251,6 +1441,12 @@ impl XlsxContainer {
                 path.display()
             )));
         }
+        if bytes.len() != data_len {
+            return Err(err(format!(
+                "xlsx XML part가 읽는 중 변경되었습니다: {}",
+                path.display()
+            )));
+        }
         String::from_utf8(bytes).map_err(|source| {
             err_with_source(path_context_message("파일 UTF-8 해석 실패", path), source)
         })
@@ -1270,58 +1466,75 @@ impl XlsxContainer {
         let path = normalize_safe_relative_path(Path::new(relative_path), relative_path)?;
         Ok(self.unpack_dir.join(path))
     }
-    pub fn save(&self, target_xlsx: &Path, verification: &SaveVerification) -> Result<()> {
+    pub fn save(&self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
         let parent = if let Some(parent) = target_xlsx.parent() {
             create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
             parent
         } else {
             Path::new(".")
         };
-        let file_name = target_xlsx
+        let target_file_name = target_xlsx
             .file_name()
             .and_then(|file_name_os| file_name_os.to_str())
-            .map_or("workbook.xlsx", |name| name);
-        let tmp_archive = reserve_unique_temp_entry(
-            |pid, nanos, seq| parent.join(format!(".{file_name}.tmp_{pid}_{nanos}_{seq}")),
+            .unwrap_or("workbook.xlsx");
+        let mut tmp_archive = reserve_unique_temp_entry(
+            parent,
+            |file_name| {
+                file_name.push('.');
+                file_name.push_str(target_file_name);
+                file_name.push_str(".tmp_");
+            },
             |path| {
-                fs::File::create_new(path)?;
-                Ok(())
+                let file = fs::File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                Ok(ReservedTempArchive {
+                    file: Some(file),
+                    path: Some(path.to_path_buf()),
+                })
             },
             "임시 저장 파일 생성 실패",
-            prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
+            || prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
         let result = (|| -> Result<()> {
-            ZipArchiveBuilder {
-                archive_path: tmp_archive.as_path(),
-                root: self.unpack_dir.as_path(),
-            }
-            .create()?;
-            match *verification {
+            tmp_archive.write_archive_from(self.unpack_dir.as_path())?;
+            match verification {
                 SaveVerification::Skip => {}
                 SaveVerification::Verify => {
                     SavedArchiveVerifier {
-                        saved_archive: &tmp_archive,
+                        saved_archive: tmp_archive.path()?,
                     }
                     .verify()?;
                 }
             }
             TempArchivePromotion {
                 target_xlsx,
-                temp_archive: &tmp_archive,
+                temp_archive: tmp_archive.path()?,
             }
-            .promote()?;
-            Ok(())
+            .promote()
         })();
         match result {
-            Ok(()) => Ok(()),
-            Err(source) => match fs::remove_file(&tmp_archive) {
-                Ok(()) => Err(source),
-                Err(error) if error.kind() == ErrorKind::NotFound => Err(source),
-                Err(error) => Err(err_with_source(
-                    path_source_message("xlsx 임시 저장 파일 삭제 실패", &tmp_archive, error),
-                    source,
-                )),
-            },
+            Ok(()) => {
+                tmp_archive.disable_drop_cleanup();
+                Ok(())
+            }
+            Err(source) => {
+                let Some(tmp_archive_path) = tmp_archive.take_cleanup_path() else {
+                    return Err(source);
+                };
+                match fs::remove_file(&tmp_archive_path) {
+                    Ok(()) => Err(source),
+                    Err(error) if error.kind() == ErrorKind::NotFound => Err(source),
+                    Err(error) => Err(err_with_source(
+                        format!(
+                            "xlsx 임시 저장 파일 삭제 실패: {} ({error})",
+                            tmp_archive_path.display(),
+                        ),
+                        source,
+                    )),
+                }
+            }
         }
     }
     pub fn write_text(&self, relative_path: &str, content: &str) -> Result<()> {
@@ -1343,11 +1556,12 @@ impl Drop for XlsxContainer {
 }
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
-        fn write_durability_warning(path_kind: &str, path_text: &str, source_err: &io::Error) {
+        fn write_durability_warning(path_kind: &str, path: &Path, source_err: &io::Error) {
             let mut err = stderr().lock();
-            match IoWrite::write_fmt(
+            match writeln!(
                 &mut err,
-                format_args!("경고: 저장 내구성 동기화 실패({path_kind}): {path_text} ({source_err})\n"),
+                "경고: 저장 내구성 동기화 실패({path_kind}): {} ({source_err})",
+                path.display(),
             ) {
                 Ok(()) | Err(_) => {}
             }
@@ -1365,49 +1579,69 @@ fn normalize_safe_relative_path(path: &Path, relative_path: &str) -> Result<Path
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::Normal(segment) => normalized.push(segment),
+            Component::Normal(segment) => {
+                let Some(text) = segment.to_str() else {
+                    return Err(err(format!(
+                        "상대 경로 component가 UTF-8이 아닙니다: {relative_path}"
+                    )));
+                };
+                reject_windows_special_component(text, &relative_path)?;
+                normalized.push(segment);
+            }
             Component::ParentDir => {
-                return Err(err(relative_path_policy_message(
-                    "상위 경로 탐색은 허용되지 않습니다: ",
-                    relative_path,
+                return Err(err(format!(
+                    "상위 경로 탐색은 허용되지 않습니다: {relative_path}"
                 )));
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(err(relative_path_policy_message(
-                    "절대 경로는 허용되지 않습니다: ",
-                    relative_path,
+                return Err(err(format!(
+                    "절대 경로는 허용되지 않습니다: {relative_path}"
                 )));
             }
         }
     }
     if normalized.as_os_str().is_empty() {
-        return Err(err(relative_path_policy_message(
-            "상대 경로가 비어 있습니다: ",
-            relative_path,
-        )));
+        return Err(err(format!("상대 경로가 비어 있습니다: {relative_path}")));
     }
     Ok(normalized)
 }
-fn reserve_unique_temp_entry<FBuild, FCreate>(
-    build_path: FBuild,
+fn reserve_unique_temp_entry<FName, FCreate, FExhausted, T>(
+    parent: &Path,
+    mut write_file_name_prefix: FName,
     mut create_entry: FCreate,
     create_failure_label: &str,
-    exhausted_message: String,
-) -> Result<PathBuf>
+    exhausted_message: FExhausted,
+) -> Result<T>
 where
-    FBuild: Fn(u32, u128, u32) -> PathBuf,
-    FCreate: FnMut(&Path) -> io::Result<()>,
+    FName: FnMut(&mut String),
+    FCreate: FnMut(&Path) -> io::Result<T>,
+    FExhausted: FnOnce() -> String,
 {
     let pid = process::id();
-    for seq in 0..1024_u32 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|source| err_with_source("임시 xlsx 경로 시각 계산 실패", source))?
-            .as_nanos();
-        let path = build_path(pid, nanos, seq);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|source| err_with_source("임시 xlsx 경로 시각 계산 실패", source))?
+        .as_nanos();
+    let mut file_name = String::new();
+    file_name
+        .try_reserve_exact(TEMP_ENTRY_NAME_CAPACITY)
+        .map_err(|source| err_with_source("임시 xlsx 파일명 메모리 확보 실패", source))?;
+    let mut path = parent.to_path_buf();
+    path.try_reserve(TEMP_ENTRY_NAME_CAPACITY)
+        .map_err(|source| err_with_source("임시 xlsx 경로 메모리 확보 실패", source))?;
+    for seq in 0..TEMP_ENTRY_RESERVATION_ATTEMPTS {
+        file_name.clear();
+        write_file_name_prefix(&mut file_name);
+        push_temp_entry_decimal(&mut file_name, u128::from(pid))?;
+        file_name.push('_');
+        push_temp_entry_decimal(&mut file_name, nanos)?;
+        file_name.push('_');
+        push_temp_entry_decimal(&mut file_name, u128::from(seq))?;
+        path.push(file_name.as_str());
         match create_entry(&path) {
-            Ok(()) => return Ok(path),
+            Ok(entry) => return Ok(entry),
             Err(io_err) if io_err.kind() == ErrorKind::AlreadyExists => {
+                path.pop();
                 thread::sleep(Duration::from_micros(50));
             }
             Err(io_err) => {
@@ -1418,8 +1652,34 @@ where
             }
         }
     }
-    Err(err(exhausted_message))
+    Err(err(exhausted_message()))
 }
-fn relative_path_policy_message(prefix: &str, relative_path: &str) -> String {
-    format!("{prefix}{relative_path}")
+fn push_temp_entry_decimal(out: &mut String, mut value: u128) -> Result<()> {
+    let mut buffer = [0_u8; TEMP_ENTRY_DECIMAL_MAX_LEN];
+    let mut index = buffer.len();
+    loop {
+        let digit = u8::try_from(value.rem_euclid(10))
+            .map_err(|source| err_with_source("임시 xlsx 파일명 숫자 변환 실패", source))?;
+        index = index
+            .checked_sub(1)
+            .ok_or_else(|| err("임시 xlsx 파일명 숫자 buffer 용량을 초과했습니다."))?;
+        let byte = b'0'
+            .checked_add(digit)
+            .ok_or_else(|| err("임시 xlsx 파일명 숫자 계산 중 overflow가 발생했습니다."))?;
+        let Some(slot) = buffer.get_mut(index) else {
+            return Err(err("임시 xlsx 파일명 숫자 buffer 범위 오류"));
+        };
+        *slot = byte;
+        value = value.div_euclid(10);
+        if value == 0 {
+            break;
+        }
+    }
+    let Some(bytes) = buffer.get(index..) else {
+        return Err(err("임시 xlsx 파일명 숫자 결과 범위 오류"));
+    };
+    let text = str::from_utf8(bytes)
+        .map_err(|source| err_with_source("임시 xlsx 파일명 숫자 UTF-8 변환 실패", source))?;
+    out.push_str(text);
+    Ok(())
 }

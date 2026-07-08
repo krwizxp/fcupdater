@@ -1,12 +1,12 @@
 use super::{
-    DownloadError, DownloadResult, HTTP_MAX_BODY_BYTES, HttpHeader, HttpResponse,
-    HttpStreamResponse, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, OPINET_HOST,
-    ReservedDownloadFile, USER_AGENT, attach_remove_file_error, download_error_with_source,
-    enforce_http_content_length_limit,
+    DownloadError, DownloadResult, HttpHeader, HttpHeaderKind, HttpResponse, HttpStreamResponse,
+    NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, OPINET_HOST, ReservedDownloadFile,
+    U128_DECIMAL_MAX_LEN, USER_AGENT, append_download_error_message, attach_remove_file_error,
+    download_error_with_source, push_decimal_fragment,
 };
-use crate::diagnostic::{path_context_message, prefixed_message};
+use crate::diagnostic::prefixed_message;
 use alloc::{string::String, vec::Vec};
-use core::{fmt::Write as FmtWrite, mem, time::Duration};
+use core::{mem, time::Duration};
 use std::{
     fs::{File, remove_file},
     io::Write as IoWrite,
@@ -15,7 +15,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 const U32_DECIMAL_MAX_LEN: usize = 10;
-const U128_DECIMAL_MAX_LEN: usize = 39;
+const HTTP_REQUEST_HEADER_CAPACITY: usize = 4;
+const HTTP_MERGED_HEADER_CAPACITY: usize = 2 + HTTP_REQUEST_HEADER_CAPACITY + 1;
 cfg_select! {
     windows => {
         type PlatformHttpClient = super::winhttp::Client;
@@ -30,6 +31,8 @@ cfg_select! {
         #[derive(Default)]
         pub(super) struct HttpClient {
             cookie_jars: Vec<CookieJar>,
+            form_body_buffer: String,
+            netfunnel_path_buffer: String,
             platform: PlatformHttpClient,
         }
     }
@@ -37,16 +40,43 @@ cfg_select! {
         #[derive(Default)]
         pub(super) struct HttpClient {
             cookie_jars: Vec<CookieJar>,
+            form_body_buffer: String,
+            netfunnel_path_buffer: String,
         }
     }
 }
+#[derive(Clone, Copy)]
 pub(super) enum PostHeaderProfile {
     Ajax,
     Standard,
 }
-pub(super) enum HttpMethod {
+#[derive(Clone, Copy)]
+pub(super) enum HttpMethod<'body> {
     Get,
-    Post,
+    Post(&'body [u8]),
+}
+cfg_select! {
+    any(windows, target_os = "linux", target_os = "macos") => {}
+    _ => {
+        impl HttpMethod<'_> {
+            const fn body_len(self) -> usize {
+                match self {
+                    Self::Get => 0,
+                    Self::Post(body) => body.len(),
+                }
+            }
+            const fn name(self) -> &'static str {
+                match self {
+                    Self::Get => "GET",
+                    Self::Post(_) => "POST",
+                }
+            }
+        }
+    }
+}
+struct HeaderStack<'header, const CAPACITY: usize> {
+    headers: [(&'header str, &'header str); CAPACITY],
+    len: usize,
 }
 pub(super) struct DownloadedFileResponse {
     pub path: PathBuf,
@@ -54,7 +84,7 @@ pub(super) struct DownloadedFileResponse {
 }
 struct ReservedDownloadGuard {
     file: Option<File>,
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 struct Cookie {
     name: String,
@@ -66,31 +96,75 @@ struct CookieJar {
     cookies: Vec<Cookie>,
     host: String,
 }
+impl<'header, const CAPACITY: usize> HeaderStack<'header, CAPACITY> {
+    fn as_slice(&self) -> DownloadResult<&[(&'header str, &'header str)]> {
+        self.headers
+            .get(..self.len)
+            .ok_or_else(|| DownloadError::from("HTTP header stack 상태가 손상되었습니다."))
+    }
+    fn extend_from_slice(
+        &mut self,
+        headers: &[(&'header str, &'header str)],
+    ) -> DownloadResult<()> {
+        for &(name, value) in headers {
+            self.push(name, value)?;
+        }
+        Ok(())
+    }
+    const fn new() -> Self {
+        Self {
+            headers: [("", ""); CAPACITY],
+            len: 0,
+        }
+    }
+    fn push(&mut self, name: &'header str, value: &'header str) -> DownloadResult<()> {
+        let Some(slot) = self.headers.get_mut(self.len) else {
+            return Err("HTTP header stack 용량을 초과했습니다.".into());
+        };
+        *slot = (name, value);
+        self.len = self
+            .len
+            .checked_add(1)
+            .ok_or("HTTP header stack 길이 계산 실패")?;
+        Ok(())
+    }
+}
 impl CookieJar {
     fn add_cookie(&mut self, name: &str, value: &str) -> DownloadResult<()> {
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
+            if cookie.value.capacity() < value.len() {
+                let additional = value
+                    .len()
+                    .checked_sub(cookie.value.len())
+                    .ok_or("Cookie 값 메모리 용량 계산 실패")?;
+                cookie
+                    .value
+                    .try_reserve_exact(additional)
+                    .map_err(|source| {
+                        download_error_with_source("Cookie 값 메모리 확보 실패", source)
+                    })?;
+            }
             cookie.value.clear();
-            cookie.value.try_reserve(value.len()).map_err(|source| {
-                download_error_with_source("Cookie 값 메모리 확보 실패", source)
-            })?;
             cookie.value.push_str(value);
             self.cookie_header_dirty = true;
             return Ok(());
         }
-        self.cookies
-            .try_reserve(1)
-            .map_err(|source| download_error_with_source("Cookie 목록 메모리 확보 실패", source))?;
+        if self.cookies.len() == self.cookies.capacity() {
+            self.cookies.try_reserve(1).map_err(|source| {
+                download_error_with_source("Cookie 목록 메모리 확보 실패", source)
+            })?;
+        }
         let mut cookie = Cookie {
             name: String::new(),
             value: String::new(),
         };
         cookie
             .name
-            .try_reserve(name.len())
+            .try_reserve_exact(name.len())
             .map_err(|source| download_error_with_source("Cookie 이름 메모리 확보 실패", source))?;
         cookie
             .value
-            .try_reserve(value.len())
+            .try_reserve_exact(value.len())
             .map_err(|source| download_error_with_source("Cookie 값 메모리 확보 실패", source))?;
         cookie.name.push_str(name);
         cookie.value.push_str(value);
@@ -122,10 +196,16 @@ impl CookieJar {
                     .checked_add(cookie.value.len())
             })
             .ok_or("Cookie header 용량 계산 실패")?;
-        let mut out = String::new();
-        out.try_reserve(capacity).map_err(|source| {
-            download_error_with_source("Cookie header 메모리 확보 실패", source)
-        })?;
+        let out = self.cookie_header_cache.get_or_insert_default();
+        if out.capacity() < capacity {
+            let additional = capacity
+                .checked_sub(out.len())
+                .ok_or("Cookie header 메모리 용량 계산 실패")?;
+            out.try_reserve_exact(additional).map_err(|source| {
+                download_error_with_source("Cookie header 메모리 확보 실패", source)
+            })?;
+        }
+        out.clear();
         for (index, cookie) in self.cookies.iter().enumerate() {
             if index != 0 {
                 out.push_str("; ");
@@ -134,7 +214,6 @@ impl CookieJar {
             out.push('=');
             out.push_str(&cookie.value);
         }
-        self.cookie_header_cache = Some(out);
         self.cookie_header_dirty = false;
         Ok(())
     }
@@ -151,36 +230,56 @@ impl ReservedDownloadGuard {
             .take()
             .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))?;
         drop(file);
-        Ok(mem::take(&mut self.path))
+        self.path
+            .take()
+            .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))
     }
-    fn remove_after_error(mut self, error: DownloadError) -> DownloadError {
+    fn remove_after_error(mut self, mut error: DownloadError) -> DownloadError {
         let file = self.file.take();
-        let path = mem::take(&mut self.path);
+        let Some(path) = self.path.take() else {
+            append_download_error_message(
+                &mut error,
+                "다운로드 임시 파일 상태가 손상되어 삭제 경로를 확인하지 못했습니다.",
+            );
+            return error;
+        };
         drop(file);
         attach_remove_file_error(error, &path)
     }
 }
 impl Drop for ReservedDownloadGuard {
     fn drop(&mut self) {
-        if self.file.is_some() {
-            let file = self.file.take();
+        if let (Some(file), Some(path)) = (self.file.take(), self.path.take()) {
             drop(file);
-            let _remove_result = remove_file(&self.path);
+            let _remove_result = remove_file(path);
         }
     }
 }
 impl HttpClient {
     fn add_cookie_for_host(&mut self, host: &str, name: &str, value: &str) -> DownloadResult<()> {
-        let index = self.ensure_cookie_jar_index(host)?;
-        self.cookie_jars
-            .get_mut(index)
-            .ok_or("Cookie jar 범위 오류")?
-            .add_cookie(name, value)
+        if let Some(jar) = self.cookie_jars.iter_mut().find(|jar| jar.host == host) {
+            return jar.add_cookie(name, value);
+        }
+        if self.cookie_jars.len() == self.cookie_jars.capacity() {
+            self.cookie_jars.try_reserve(1).map_err(|source| {
+                download_error_with_source("Cookie jar 목록 메모리 확보 실패", source)
+            })?;
+        }
+        let mut jar = CookieJar {
+            cookie_header_cache: None,
+            cookie_header_dirty: true,
+            cookies: Vec::new(),
+            host: String::new(),
+        };
+        jar.host.try_reserve_exact(host.len()).map_err(|source| {
+            download_error_with_source("Cookie jar host 메모리 확보 실패", source)
+        })?;
+        jar.host.push_str(host);
+        jar.add_cookie(name, value)?;
+        self.cookie_jars.push(jar);
+        Ok(())
     }
-    fn cookie_jar_index(&self, host: &str) -> Option<usize> {
-        self.cookie_jars.iter().position(|jar| jar.host == host)
-    }
-    fn encoded_form_body(form: &[(&str, &str)]) -> DownloadResult<String> {
+    fn encode_form_body_into(body: &mut String, form: &[(&str, &str)]) -> DownloadResult<()> {
         let body_capacity = form.iter().try_fold(0_usize, |sum, &(name, value)| {
             let encoded_capacity = Self::percent_encoded_len(name.as_bytes())?
                 .checked_add(Self::percent_encoded_len(value.as_bytes())?)?
@@ -192,58 +291,23 @@ impl HttpClient {
             };
             sum.checked_add(separated_capacity)
         });
-        let mut body = String::new();
-        body.try_reserve(body_capacity.ok_or("HTTP form body 메모리 용량 계산 실패")?)
-            .map_err(|source| {
-                download_error_with_source("HTTP form body 메모리 확보 실패", source)
-            })?;
+        body.clear();
+        let required_capacity = body_capacity.ok_or("HTTP form body 메모리 용량 계산 실패")?;
+        if body.capacity() < required_capacity {
+            body.try_reserve_exact(required_capacity)
+                .map_err(|source| {
+                    download_error_with_source("HTTP form body 메모리 확보 실패", source)
+                })?;
+        }
         for (index, &(name, value)) in form.iter().enumerate() {
             if index != 0 {
                 body.push('&');
             }
-            Self::push_percent_encoded(&mut body, name.as_bytes());
+            Self::push_percent_encoded(&mut *body, name.as_bytes());
             body.push('=');
-            Self::push_percent_encoded(&mut body, value.as_bytes());
+            Self::push_percent_encoded(&mut *body, value.as_bytes());
         }
-        Ok(body)
-    }
-    fn ensure_cookie_jar_index(&mut self, host: &str) -> DownloadResult<usize> {
-        if let Some(index) = self.cookie_jar_index(host) {
-            return Ok(index);
-        }
-        self.cookie_jars.try_reserve(1).map_err(|source| {
-            download_error_with_source("Cookie jar 목록 메모리 확보 실패", source)
-        })?;
-        let mut jar = CookieJar {
-            cookie_header_cache: None,
-            cookie_header_dirty: true,
-            cookies: Vec::new(),
-            host: String::new(),
-        };
-        jar.host.try_reserve(host.len()).map_err(|source| {
-            download_error_with_source("Cookie jar host 메모리 확보 실패", source)
-        })?;
-        jar.host.push_str(host);
-        self.cookie_jars.push(jar);
-        self.cookie_jars
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| "Cookie jar index 계산 실패".into())
-    }
-    fn extract_netfunnel_key(result: &str) -> DownloadResult<String> {
-        let Some((_, tail)) = result.split_once("key=") else {
-            return Err(prefixed_message("NetFunnel key 없음: ", result).into());
-        };
-        let value = split_head_or_all(tail, '&');
-        if value.is_empty() {
-            return Err(prefixed_message("NetFunnel key 비어 있음: ", result).into());
-        }
-        let mut out = String::new();
-        out.try_reserve(value.len()).map_err(|source| {
-            download_error_with_source("NetFunnel key 메모리 확보 실패", source)
-        })?;
-        out.push_str(value);
-        Ok(out)
+        Ok(())
     }
     pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> DownloadResult<String> {
         let mut current_key: Option<String> = None;
@@ -255,24 +319,21 @@ impl HttpClient {
                 return Err(prefixed_message("NetFunnel 코드 없음: ", result).into());
             };
             let code_text = split_head_or_all(code_tail, ':');
-            let code = code_text
-                .parse::<u32>()
-                .map_err(|source| download_error_with_source("NetFunnel 코드 파싱 실패", source))?;
+            let code = parse_netfunnel_u32(code_text, "NetFunnel 코드 파싱 실패")?;
             match code {
-                200 | 300 | 303 => return Self::extract_netfunnel_key(&result),
+                200 | 300 | 303 => {
+                    let (key_start, key_end) = netfunnel_key_range(&result)?;
+                    return Ok(take_netfunnel_key(result, key_start, key_end));
+                }
                 201 | 202 | 302 => {
-                    current_key = Some(Self::extract_netfunnel_key(&result)?);
+                    let (key_start, key_end) = netfunnel_key_range(&result)?;
                     let wait_secs = if let Some((_, ttl_tail)) = result.split_once("ttl=") {
                         let ttl_text = split_head_or_all(ttl_tail, '&');
-                        ttl_text
-                            .parse::<u32>()
-                            .map_err(|source| {
-                                download_error_with_source("NetFunnel ttl 파싱 실패", source)
-                            })?
-                            .clamp(1, 30)
+                        parse_netfunnel_u32(ttl_text, "NetFunnel ttl 파싱 실패")?.clamp(1, 30)
                     } else {
                         1
                     };
+                    current_key = Some(take_netfunnel_key(result, key_start, key_end));
                     sleep(Duration::from_secs(u64::from(wait_secs)));
                 }
                 _ => return Err(prefixed_message("NetFunnel 응답 오류: ", result).into()),
@@ -286,31 +347,44 @@ impl HttpClient {
         path: &str,
         referer: Option<&str>,
     ) -> DownloadResult<String> {
-        let mut headers = Vec::new();
-        headers.try_reserve(3).map_err(|source| {
-            download_error_with_source("HTTP GET header 메모리 확보 실패", source)
-        })?;
-        headers.push((
+        let mut headers = HeaderStack::<HTTP_REQUEST_HEADER_CAPACITY>::new();
+        headers.push(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        ));
+        )?;
         if let Some(referer_value) = referer {
-            headers.push(("Referer", referer_value));
+            headers.push("Referer", referer_value)?;
         }
-        let response = self.request(&HttpMethod::Get, host, path, None, &headers)?;
+        let response = self.request(HttpMethod::Get, host, path, headers.as_slice()?)?;
         String::from_utf8(response.body)
             .map_err(|source| download_error_with_source("HTTP 응답 UTF-8 변환 실패", source))
     }
+    fn merged_headers<'request>(
+        cookie_jars: &'request mut [CookieJar],
+        host: &str,
+        headers: &[(&'request str, &'request str)],
+    ) -> DownloadResult<HeaderStack<'request, HTTP_MERGED_HEADER_CAPACITY>> {
+        let cookie_header = if let Some(jar) = cookie_jars.iter_mut().find(|jar| jar.host == host) {
+            jar.refresh_cookie_header_cache()?;
+            jar.cookie_header_cache.as_deref()
+        } else {
+            None
+        };
+        let mut merged_headers = HeaderStack::<HTTP_MERGED_HEADER_CAPACITY>::new();
+        merged_headers.push("User-Agent", USER_AGENT)?;
+        merged_headers.push("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3")?;
+        merged_headers.extend_from_slice(headers)?;
+        if let Some(cookie_text) = cookie_header {
+            merged_headers.push("Cookie", cookie_text)?;
+        }
+        Ok(merged_headers)
+    }
     fn percent_encoded_len(bytes: &[u8]) -> Option<usize> {
         bytes.iter().try_fold(0_usize, |sum, byte| {
-            let byte_len = match *byte {
-                unreserved
-                    if unreserved.is_ascii_alphanumeric()
-                        || matches!(unreserved, b'-' | b'_' | b'.' | b'~' | b' ') =>
-                {
-                    1
-                }
-                _ => 3,
+            let byte_len = if is_url_form_literal(*byte) || *byte == b' ' {
+                1
+            } else {
+                3
             };
             sum.checked_add(byte_len)
         })
@@ -321,17 +395,21 @@ impl HttpClient {
         path: &str,
         form: &[(&str, &str)],
         referer: Option<&str>,
-        profile: &PostHeaderProfile,
+        profile: PostHeaderProfile,
     ) -> DownloadResult<HttpResponse> {
-        let body = Self::encoded_form_body(form)?;
-        let headers = Self::post_headers(referer, profile)?;
-        self.request(
-            &HttpMethod::Post,
-            host,
-            path,
-            Some(body.as_bytes()),
-            &headers,
-        )
+        let mut body = mem::take(&mut self.form_body_buffer);
+        let result = (|| {
+            Self::encode_form_body_into(&mut body, form)?;
+            let headers = Self::post_headers(referer, profile)?;
+            self.request(
+                HttpMethod::Post(body.as_bytes()),
+                host,
+                path,
+                headers.as_slice()?,
+            )
+        })();
+        self.form_body_buffer = body;
+        result
     }
     pub(super) fn post_form_to_file<F>(
         &mut self,
@@ -339,78 +417,65 @@ impl HttpClient {
         path: &str,
         form: &[(&str, &str)],
         referer: Option<&str>,
-        profile: &PostHeaderProfile,
+        profile: PostHeaderProfile,
         reserve_target: F,
     ) -> DownloadResult<DownloadedFileResponse>
     where
         F: FnOnce() -> DownloadResult<ReservedDownloadFile>,
     {
-        let body = Self::encoded_form_body(form)?;
-        let headers = Self::post_headers(referer, profile)?;
-        let target = reserve_target()?;
-        let ReservedDownloadFile {
-            file,
-            path: target_path,
-        } = target;
-        let mut guarded_target = ReservedDownloadGuard {
-            file: Some(file),
-            path: target_path,
-        };
-        let response = match self.request_to_writer(
-            &HttpMethod::Post,
-            host,
-            path,
-            Some(body.as_bytes()),
-            &headers,
-            guarded_target.file_mut()?,
-        ) {
-            Ok(response) => response,
-            Err(error) => return Err(guarded_target.remove_after_error(error)),
-        };
-        if let Err(source) = IoWrite::flush(guarded_target.file_mut()?) {
-            let error = download_error_with_source(
-                path_context_message("다운로드 임시 파일 flush 실패", &guarded_target.path),
-                source,
-            );
-            return Err(guarded_target.remove_after_error(error));
-        }
-        Ok(DownloadedFileResponse {
-            path: guarded_target.persist()?,
-            response,
-        })
+        let mut body = mem::take(&mut self.form_body_buffer);
+        let result = (|| {
+            Self::encode_form_body_into(&mut body, form)?;
+            let headers = Self::post_headers(referer, profile)?;
+            let target = reserve_target()?;
+            let ReservedDownloadFile {
+                file,
+                path: target_path,
+            } = target;
+            let mut guarded_target = ReservedDownloadGuard {
+                file: Some(file),
+                path: Some(target_path),
+            };
+            let response = match self.request_to_writer(
+                HttpMethod::Post(body.as_bytes()),
+                host,
+                path,
+                headers.as_slice()?,
+                guarded_target.file_mut()?,
+            ) {
+                Ok(response) => response,
+                Err(error) => return Err(guarded_target.remove_after_error(error)),
+            };
+            Ok(DownloadedFileResponse {
+                path: guarded_target.persist()?,
+                response,
+            })
+        })();
+        self.form_body_buffer = body;
+        result
     }
-    fn post_headers<'referer>(
-        referer: Option<&'referer str>,
-        profile: &PostHeaderProfile,
-    ) -> DownloadResult<Vec<(&'static str, &'referer str)>> {
-        let mut headers = Vec::new();
-        headers.try_reserve(6).map_err(|source| {
-            download_error_with_source("HTTP POST header 메모리 확보 실패", source)
-        })?;
-        headers.extend_from_slice(&[
-            (
-                "Content-Type",
-                "application/x-www-form-urlencoded; charset=UTF-8",
-            ),
-            ("Accept", "text/html, */*; q=0.01"),
-        ]);
-        if matches!(profile, &PostHeaderProfile::Ajax) {
-            headers.push(("X-Requested-With", "XMLHttpRequest"));
+    fn post_headers(
+        referer: Option<&str>,
+        profile: PostHeaderProfile,
+    ) -> DownloadResult<HeaderStack<'_, HTTP_REQUEST_HEADER_CAPACITY>> {
+        let mut headers = HeaderStack::<HTTP_REQUEST_HEADER_CAPACITY>::new();
+        headers.push(
+            "Content-Type",
+            "application/x-www-form-urlencoded; charset=UTF-8",
+        )?;
+        headers.push("Accept", "text/html, */*; q=0.01")?;
+        if matches!(profile, PostHeaderProfile::Ajax) {
+            headers.push("X-Requested-With", "XMLHttpRequest")?;
         }
         if let Some(referer_value) = referer {
-            headers.push(("Referer", referer_value));
+            headers.push("Referer", referer_value)?;
         }
         Ok(headers)
     }
     fn push_percent_encoded(out: &mut String, bytes: &[u8]) {
         for byte in bytes {
             match *byte {
-                unreserved
-                    if unreserved.is_ascii_alphanumeric()
-                        || matches!(unreserved, b'-' | b'_' | b'.' | b'~') =>
-                {
-                    out.push(char::from(unreserved));
-                }
+                literal if is_url_form_literal(literal) => out.push(char::from(literal)),
                 b' ' => out.push('+'),
                 other => {
                     let high = other >> 4_u8;
@@ -424,62 +489,32 @@ impl HttpClient {
     }
     fn request(
         &mut self,
-        method: &HttpMethod,
+        method: HttpMethod<'_>,
         host: &str,
         path: &str,
-        body: Option<&[u8]>,
         headers: &[(&str, &str)],
     ) -> DownloadResult<HttpResponse> {
-        let cookie_jar_index = self.cookie_jar_index(host);
-        if let Some(index) = cookie_jar_index {
-            self.cookie_jars
-                .get_mut(index)
-                .ok_or("Cookie jar 범위 오류")?
-                .refresh_cookie_header_cache()?;
-        }
-        let cookie_header = cookie_jar_index
-            .and_then(|index| self.cookie_jars.get(index))
-            .and_then(|jar| jar.cookie_header_cache.as_deref());
-        let mut merged_headers = Vec::new();
-        let merged_header_capacity = checked_capacity_sum(
-            &[headers.len(), 2, usize::from(cookie_header.is_some())],
-            "HTTP request header 용량 계산 실패",
-        )?;
-        merged_headers
-            .try_reserve(merged_header_capacity)
-            .map_err(|source| {
-                download_error_with_source("HTTP request header 메모리 확보 실패", source)
-            })?;
-        merged_headers.push(("User-Agent", USER_AGENT));
-        merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
-        merged_headers.extend_from_slice(headers);
-        if let Some(cookie_text) = cookie_header {
-            merged_headers.push(("Cookie", cookie_text));
-        }
         let response: HttpResponse = {
-            cfg_select! {
-                windows => {
-                    self.platform.request(method, host, path, body, &merged_headers)
+            let merged_headers = Self::merged_headers(&mut self.cookie_jars, host, headers)?;
+            let merged_header_slice = merged_headers.as_slice()?;
+            {
+                cfg_select! {
+                    any(windows, target_os = "linux", target_os = "macos") => {
+                        self.platform.request(method, host, path, merged_header_slice)
+                    }
+                    _ => {
+                        let body_len = method.body_len();
+                        let header_count = headers.len();
+                        let merged_header_count = merged_header_slice.len();
+                        let method_name = method.name();
+                        Err::<HttpResponse, DownloadError>(format!(
+                            "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
+                        )
+                        .into())
+                    }
                 }
-                any(target_os = "linux", target_os = "macos") => {
-                    self.platform.request(method, host, path, body, &merged_headers)
-                }
-                _ => {
-                    let body_len = body.map_or(0, <[u8]>::len);
-                    let header_count = headers.len();
-                    let merged_header_count = merged_headers.len();
-                    let method_name = match *method {
-                        HttpMethod::Get => "GET",
-                        HttpMethod::Post => "POST",
-                    };
-                    Err::<HttpResponse, DownloadError>(format!(
-                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
-                    )
-                    .into())
-                }
-            }
-        }?;
-        enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
+            }?
+        };
         self.store_response_cookies_from_headers(host, &response.headers)?;
         if !(200..300).contains(&response.status) {
             let preview_len = response.body.len().min(512);
@@ -502,183 +537,162 @@ impl HttpClient {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .map_err(|source| download_error_with_source("현재 시간 조회 실패", source))?;
-        let opcode = if key.is_some() { "5002" } else { "5101" };
-        let key_fragment = if let Some(key_value) = key {
-            let encoded_capacity = Self::percent_encoded_len(key_value.as_bytes())
-                .ok_or("NetFunnel key 인코딩 용량 계산 실패")?;
-            let capacity = encoded_capacity
-                .checked_add("&key=".len())
-                .ok_or("NetFunnel key fragment 용량 계산 실패")?;
-            let mut fragment = String::new();
-            fragment.try_reserve(capacity).map_err(|source| {
-                download_error_with_source("NetFunnel key fragment 메모리 확보 실패", source)
-            })?;
-            fragment.push_str("&key=");
-            Self::push_percent_encoded(&mut fragment, key_value.as_bytes());
-            fragment
+        let (opcode, maybe_key_value, key_fragment_capacity) = if let Some(key_value) = key {
+            (
+                "5002",
+                Some(key_value),
+                Self::percent_encoded_len(key_value.as_bytes())
+                    .and_then(|capacity| capacity.checked_add("&key=".len()))
+                    .ok_or("NetFunnel key fragment 용량 계산 실패")?,
+            )
         } else {
-            String::new()
+            ("5101", None, 0)
         };
-        let ttl_fragment = match ttl {
-            Some(ttl_value) => {
-                let capacity = U32_DECIMAL_MAX_LEN
+        let (maybe_ttl_value, ttl_fragment_capacity) = if let Some(ttl_value) = ttl {
+            (
+                Some(ttl_value),
+                U32_DECIMAL_MAX_LEN
                     .checked_add("&ttl=".len())
-                    .ok_or("NetFunnel ttl fragment 용량 계산 실패")?;
-                let mut fragment = String::new();
-                fragment.try_reserve(capacity).map_err(|source| {
-                    download_error_with_source("NetFunnel ttl fragment 메모리 확보 실패", source)
-                })?;
-                fragment.push_str("&ttl=");
-                FmtWrite::write_fmt(&mut fragment, format_args!("{ttl_value}")).map_err(
-                    |error| download_error_with_source("NetFunnel ttl fragment 작성 실패", error),
-                )?;
-                fragment
-            }
-            None => String::new(),
+                    .ok_or("NetFunnel ttl fragment 용량 계산 실패")?,
+            )
+        } else {
+            (None, 0)
         };
-        let path_capacity = checked_capacity_sum(
-            &[
-                "/ts.wseq?opcode=".len(),
-                opcode.len(),
-                key_fragment.len(),
-                "&nfid=0&prefix=NetFunnel.gRtype%3D".len(),
-                opcode.len(),
-                "%3B".len(),
-                ttl_fragment.len(),
-                "&sid=".len(),
-                NETFUNNEL_SERVICE_ID.len(),
-                "&aid=".len(),
-                action_id.len(),
-                "&js=yes&".len(),
-                U128_DECIMAL_MAX_LEN,
-            ],
-            "NetFunnel path 용량 계산 실패",
-        )?;
-        let mut path = String::new();
-        path.try_reserve(path_capacity).map_err(|source| {
-            download_error_with_source("NetFunnel path 메모리 확보 실패", source)
-        })?;
-        path.push_str("/ts.wseq?opcode=");
-        path.push_str(opcode);
-        path.push_str(&key_fragment);
-        path.push_str("&nfid=0&prefix=NetFunnel.gRtype%3D");
-        path.push_str(opcode);
-        path.push_str("%3B");
-        path.push_str(&ttl_fragment);
-        path.push_str("&sid=");
-        path.push_str(NETFUNNEL_SERVICE_ID);
-        path.push_str("&aid=");
-        path.push_str(action_id);
-        path.push_str("&js=yes&");
-        FmtWrite::write_fmt(&mut path, format_args!("{timestamp}")).map_err(|error| {
-            download_error_with_source("NetFunnel timestamp fragment 작성 실패", error)
-        })?;
-        let response = self.request(
-            &HttpMethod::Get,
-            NETFUNNEL_HOST,
-            &path,
-            None,
-            &[("Accept", "application/javascript,*/*;q=0.8")],
-        )?;
-        let text = String::from_utf8(response.body).map_err(|source| {
+        let Some(path_capacity) = [
+            "/ts.wseq?opcode=".len(),
+            opcode.len(),
+            key_fragment_capacity,
+            "&nfid=0&prefix=NetFunnel.gRtype%3D".len(),
+            opcode.len(),
+            "%3B".len(),
+            ttl_fragment_capacity,
+            "&sid=".len(),
+            NETFUNNEL_SERVICE_ID.len(),
+            "&aid=".len(),
+            action_id.len(),
+            "&js=yes&".len(),
+            U128_DECIMAL_MAX_LEN,
+        ]
+        .iter()
+        .try_fold(0_usize, |sum, &part| sum.checked_add(part)) else {
+            return Err("NetFunnel path 용량 계산 실패".into());
+        };
+        let mut path = mem::take(&mut self.netfunnel_path_buffer);
+        let response_result = (|| {
+            path.clear();
+            if path.capacity() < path_capacity {
+                path.try_reserve_exact(path_capacity).map_err(|source| {
+                    download_error_with_source("NetFunnel path 메모리 확보 실패", source)
+                })?;
+            }
+            path.push_str("/ts.wseq?opcode=");
+            path.push_str(opcode);
+            if let Some(key_text) = maybe_key_value {
+                path.push_str("&key=");
+                Self::push_percent_encoded(&mut path, key_text.as_bytes());
+            }
+            path.push_str("&nfid=0&prefix=NetFunnel.gRtype%3D");
+            path.push_str(opcode);
+            path.push_str("%3B");
+            if let Some(ttl_secs) = maybe_ttl_value {
+                path.push_str("&ttl=");
+                push_decimal_fragment(
+                    &mut path,
+                    u128::from(ttl_secs),
+                    "NetFunnel ttl fragment 작성 실패",
+                )?;
+            }
+            path.push_str("&sid=");
+            path.push_str(NETFUNNEL_SERVICE_ID);
+            path.push_str("&aid=");
+            path.push_str(action_id);
+            path.push_str("&js=yes&");
+            push_decimal_fragment(
+                &mut path,
+                timestamp,
+                "NetFunnel timestamp fragment 작성 실패",
+            )?;
+            self.request(
+                HttpMethod::Get,
+                NETFUNNEL_HOST,
+                &path,
+                &[("Accept", "application/javascript,*/*;q=0.8")],
+            )
+        })();
+        self.netfunnel_path_buffer = path;
+        let response = response_result?;
+        let mut text = String::from_utf8(response.body).map_err(|source| {
             download_error_with_source("NetFunnel 응답 UTF-8 변환 실패", source)
         })?;
-        let result = text
-            .split_once("result='")
-            .and_then(|(_, rest)| rest.split_once('\''))
-            .map(|(value, _)| value);
-        let Some(value) = result else {
+        let Some(value_start) = text
+            .find("result='")
+            .and_then(|prefix_start| prefix_start.checked_add("result='".len()))
+        else {
             return Err(prefixed_message("NetFunnel result 파싱 실패: ", text).into());
         };
-        let mut out = String::new();
-        out.try_reserve(value.len()).map_err(|source| {
-            download_error_with_source("NetFunnel result 메모리 확보 실패", source)
-        })?;
-        out.push_str(value);
-        Ok(out)
+        let Some(value_tail) = text.get(value_start..) else {
+            return Err(prefixed_message("NetFunnel result 파싱 실패: ", text).into());
+        };
+        let Some(value_end) = value_tail
+            .find('\'')
+            .and_then(|value_len| value_start.checked_add(value_len))
+        else {
+            return Err(prefixed_message("NetFunnel result 파싱 실패: ", text).into());
+        };
+        text_range_to_owned_value(&mut text, value_start, value_end);
+        Ok(text)
     }
-    fn request_to_writer(
-        &mut self,
-        method: &HttpMethod,
-        host: &str,
-        path: &str,
-        body: Option<&[u8]>,
-        headers: &[(&str, &str)],
-        #[cfg(any(target_os = "linux", target_os = "macos", windows))] writer: &mut dyn IoWrite,
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-        _writer: &mut dyn IoWrite,
-    ) -> DownloadResult<HttpStreamResponse> {
-        let cookie_jar_index = self.cookie_jar_index(host);
-        if let Some(index) = cookie_jar_index {
-            self.cookie_jars
-                .get_mut(index)
-                .ok_or("Cookie jar 범위 오류")?
-                .refresh_cookie_header_cache()?;
-        }
-        let cookie_header = cookie_jar_index
-            .and_then(|index| self.cookie_jars.get(index))
-            .and_then(|jar| jar.cookie_header_cache.as_deref());
-        let mut merged_headers = Vec::new();
-        let merged_header_capacity = checked_capacity_sum(
-            &[headers.len(), 2, usize::from(cookie_header.is_some())],
-            "HTTP request header 용량 계산 실패",
-        )?;
-        merged_headers
-            .try_reserve(merged_header_capacity)
-            .map_err(|source| {
-                download_error_with_source("HTTP request header 메모리 확보 실패", source)
-            })?;
-        merged_headers.push(("User-Agent", USER_AGENT));
-        merged_headers.push(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3"));
-        merged_headers.extend_from_slice(headers);
-        if let Some(cookie_text) = cookie_header {
-            merged_headers.push(("Cookie", cookie_text));
-        }
-        let response: HttpStreamResponse = {
-            cfg_select! {
-                windows => {
+    cfg_select! {
+        any(windows, target_os = "linux", target_os = "macos") => {
+            fn request_to_writer(
+                &mut self,
+                method: HttpMethod<'_>,
+                host: &str,
+                path: &str,
+                headers: &[(&str, &str)],
+                writer: &mut dyn IoWrite,
+            ) -> DownloadResult<HttpStreamResponse> {
+                let response = {
+                    let merged_headers = Self::merged_headers(&mut self.cookie_jars, host, headers)?;
+                    let merged_header_slice = merged_headers.as_slice()?;
                     self.platform.request_to_writer(
                         method,
                         host,
                         path,
-                        body,
-                        &merged_headers,
+                        merged_header_slice,
                         writer,
-                    )
+                    )?
+                };
+                self.store_response_cookies_from_headers(host, &response.headers)?;
+                if !(200..300).contains(&response.status) {
+                    let body_preview = response.body.preview_lossy();
+                    let status = response.status;
+                    return Err(format!("HTTP {status}: {body_preview}").into());
                 }
-                any(target_os = "linux", target_os = "macos") => {
-                    self.platform.request_to_writer(
-                        method,
-                        host,
-                        path,
-                        body,
-                        &merged_headers,
-                        writer,
-                    )
-                }
-                _ => {
-                    let body_len = body.map_or(0, <[u8]>::len);
-                    let header_count = headers.len();
-                    let merged_header_count = merged_headers.len();
-                    let method_name = match *method {
-                        HttpMethod::Get => "GET",
-                        HttpMethod::Post => "POST",
-                    };
-                    Err::<HttpStreamResponse, DownloadError>(format!(
-                        "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
-                    )
-                    .into())
-                }
+                Ok(response)
             }
-        }?;
-        enforce_http_content_length_limit(&response.headers, HTTP_MAX_BODY_BYTES)?;
-        self.store_response_cookies_from_headers(host, &response.headers)?;
-        if !(200..300).contains(&response.status) {
-            let body_preview = response.body.preview_lossy();
-            let status = response.status;
-            return Err(format!("HTTP {status}: {body_preview}").into());
         }
-        Ok(response)
+        _ => {
+            fn request_to_writer(
+                &mut self,
+                method: HttpMethod<'_>,
+                host: &str,
+                path: &str,
+                headers: &[(&str, &str)],
+                _writer: &mut dyn IoWrite,
+            ) -> DownloadResult<HttpStreamResponse> {
+                let merged_headers = Self::merged_headers(&mut self.cookie_jars, host, headers)?;
+                let merged_header_slice = merged_headers.as_slice()?;
+                let body_len = method.body_len();
+                let header_count = headers.len();
+                let merged_header_count = merged_header_slice.len();
+                let method_name = method.name();
+                Err(format!(
+                    "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
+                )
+                .into())
+            }
+        }
     }
     fn store_response_cookies_from_headers(
         &mut self,
@@ -687,22 +701,13 @@ impl HttpClient {
     ) -> DownloadResult<()> {
         for (cookie_name, cookie_value) in headers
             .iter()
-            .filter(|header| header.name.eq_ignore_ascii_case("set-cookie"))
+            .filter(|header| header.kind == HttpHeaderKind::SetCookie)
             .filter_map(|header| split_head_or_all(&header.value, ';').split_once('='))
         {
             self.add_cookie_for_host(host, cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
         }
         Ok(())
     }
-}
-fn checked_capacity_sum(parts: &[usize], context: &'static str) -> DownloadResult<usize> {
-    let Some(capacity) = parts
-        .iter()
-        .try_fold(0_usize, |sum, &part| sum.checked_add(part))
-    else {
-        return Err(context.into());
-    };
-    Ok(capacity)
 }
 const fn hex_digit(nibble: u8) -> char {
     match nibble {
@@ -725,6 +730,52 @@ const fn hex_digit(nibble: u8) -> char {
         _ => '?',
     }
 }
+const fn is_url_form_literal(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+}
+fn netfunnel_key_range(result: &str) -> DownloadResult<(usize, usize)> {
+    let Some(value_start) = result
+        .find("key=")
+        .and_then(|prefix_start| prefix_start.checked_add("key=".len()))
+    else {
+        return Err(prefixed_message("NetFunnel key 없음: ", result).into());
+    };
+    let Some(value_tail) = result.get(value_start..) else {
+        return Err(prefixed_message("NetFunnel key 없음: ", result).into());
+    };
+    let value_len = value_tail.find('&').unwrap_or(value_tail.len());
+    if value_len == 0 {
+        return Err(prefixed_message("NetFunnel key 비어 있음: ", result).into());
+    }
+    let value_end = value_start
+        .checked_add(value_len)
+        .ok_or("NetFunnel key 범위 계산 실패")?;
+    Ok((value_start, value_end))
+}
+fn take_netfunnel_key(mut result: String, value_start: usize, value_end: usize) -> String {
+    text_range_to_owned_value(&mut result, value_start, value_end);
+    result
+}
 fn split_head_or_all(value: &str, separator: char) -> &str {
     value.split_once(separator).map_or(value, |(head, _)| head)
+}
+fn text_range_to_owned_value(text: &mut String, value_start: usize, value_end: usize) {
+    text.truncate(value_end);
+    drop(text.drain(..value_start));
+}
+fn parse_netfunnel_u32(value: &str, context: &'static str) -> DownloadResult<u32> {
+    if value.is_empty() {
+        return Err(format!("{context}: 음이 아닌 10진수 형식이 아닙니다.").into());
+    }
+    value.bytes().try_fold(0_u32, |current, byte| {
+        if !byte.is_ascii_digit() {
+            return Err(format!("{context}: 음이 아닌 10진수 형식이 아닙니다.").into());
+        }
+        let digit_raw = byte.wrapping_sub(b'0');
+        let digit = u32::from(digit_raw);
+        current
+            .checked_mul(10)
+            .and_then(|scaled| scaled.checked_add(digit))
+            .ok_or_else(|| format!("{context} 해석 실패").into())
+    })
 }

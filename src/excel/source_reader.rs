@@ -18,6 +18,8 @@ const CFB_OBJECT_ROOT_STORAGE: u8 = 5;
 const MAX_XLS_FILE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_ROW: u32 = 50_000;
 const MAX_SOURCE_COL: usize = 64;
+const MAX_UTF8_BYTES_PER_COMPRESSED_XL_CHAR: usize = 2;
+const MAX_UTF8_BYTES_PER_UTF16_CODE_UNIT: usize = 3;
 const EXPECTED_BIFF_CODE_PAGE: u16 = 1200;
 const SOURCE_HEADER_ROW: usize = 4;
 const SOURCE_FIRST_DATA_ROW: usize = 5;
@@ -77,6 +79,7 @@ pub struct SourceReader<'path> {
 struct SourceHeaderValidator<'rows, 'strings> {
     rows: &'rows [SourceRowEntry<'strings>],
 }
+#[derive(Default)]
 struct SourceRow<'strings> {
     cells: [Option<&'strings str>; SOURCE_COLUMN_COUNT],
 }
@@ -120,7 +123,7 @@ impl<'strings> SourceRow<'strings> {
         *cell = Some(value);
         Ok(())
     }
-    fn text(&self, idx: usize) -> Option<&str> {
+    fn text(&self, idx: usize) -> Option<&'strings str> {
         self.cells.get(idx).copied().flatten()
     }
 }
@@ -144,7 +147,10 @@ impl CfbDataParser<'_, '_> {
             )
         })?;
         for sid in fat_sector_ids {
-            let sector = get_sector_slice(self.data, sector_size, *sid)?;
+            let sector_idx = sector_id_to_index(*sid, || {
+                prefixed_display_message("CFB sector id 변환 실패: ", *sid)
+            })?;
+            let sector = get_sector_slice_at_index(self.data, sector_size, sector_idx, *sid)?;
             let (chunks, &[]) = sector.as_chunks::<4>() else {
                 return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
             };
@@ -309,7 +315,7 @@ impl CfbDirectoryParser<'_> {
                     .checked_mul(3)
                     .ok_or_else(|| err("UTF-16 문자열 용량 계산 실패"))?;
                 let mut decoded = String::new();
-                decoded.try_reserve(capacity).map_err(|source| {
+                decoded.try_reserve_exact(capacity).map_err(|source| {
                     err_with_source(
                         format!(
                             "UTF-16 문자열 메모리 확보 실패: {} code units",
@@ -437,6 +443,12 @@ impl SourceReader<'_> {
                 self.path.display()
             )));
         }
+        if data.len() != data_len {
+            return Err(err(format!(
+                "xls 파일이 읽는 중 변경되었습니다: {}",
+                self.path.display()
+            )));
+        }
         Ok(data)
     }
     pub fn read_xls_source(&self) -> Result<Vec<SourceRecord>> {
@@ -470,23 +482,23 @@ impl SourceReader<'_> {
                 continue;
             }
             let row = entry.row;
-            let address_text = row.text(COL_ADDRESS).map_or("", str::trim);
+            let address_text = row_text_trimmed(&row, COL_ADDRESS);
             if address_text.is_empty() {
                 continue;
             }
-            let address = address_text.to_owned();
+            let address = copy_text(address_text, "소스 주소 메모리 확보 실패")?;
             let diesel = normalize_fuel_price(row_i32(&row, COL_DIESEL));
             let gasoline = normalize_fuel_price(row_i32(&row, COL_GASOLINE));
             let premium = normalize_fuel_price(row_i32(&row, COL_PREMIUM));
             records.push(SourceRecord {
                 address,
-                brand: row_text_owned(&row, COL_BRAND),
+                brand: row_text_owned(&row, COL_BRAND, "소스 브랜드 메모리 확보 실패")?,
                 diesel,
                 gasoline,
-                name: row_text_owned(&row, COL_NAME),
+                name: row_text_owned(&row, COL_NAME, "소스 상호명 메모리 확보 실패")?,
                 premium,
-                region: row_text_owned(&row, COL_REGION),
-                self_yn: row_text_owned(&row, COL_SELF_YN),
+                region: row_text_owned(&row, COL_REGION, "소스 지역 메모리 확보 실패")?,
+                self_yn: row_text_owned(&row, COL_SELF_YN, "소스 셀프 여부 메모리 확보 실패")?,
             });
         }
         if records.is_empty() {
@@ -502,7 +514,7 @@ impl CfbFile {
             .iter()
             .find(|entry| entry.object_type == CFB_OBJECT_STREAM && entry.name == name)
             .ok_or_else(|| {
-                err(prefixed_name_message(
+                err(prefixed_display_message(
                     "CFB stream을 찾지 못했습니다: ",
                     name,
                 ))
@@ -510,7 +522,7 @@ impl CfbFile {
         if entry.stream_size < u64::from(self.mini_stream_cutoff_size)
             && is_regular_sector_id(entry.start_sector)
         {
-            return Err(err(prefixed_name_message(
+            return Err(err(prefixed_display_message(
                 "Opinet 고정 소스에서 예상하지 않은 mini stream입니다: ",
                 name,
             )));
@@ -584,16 +596,7 @@ impl SstChunkReader<'_, '_> {
         Ok(value)
     }
     fn read_xl_unicode_chars(&mut self, char_count: usize, mut high_byte: bool) -> Result<String> {
-        let capacity = char_count
-            .checked_mul(3)
-            .ok_or_else(|| err("SST 문자열 용량 계산 중 overflow가 발생했습니다."))?;
         let mut out = String::new();
-        out.try_reserve_exact(capacity).map_err(|source| {
-            err_with_source(
-                format!("SST 문자열 메모리 확보 실패: {capacity} bytes"),
-                source,
-            )
-        })?;
         let mut remaining = char_count;
         let mut continuation = false;
         while remaining > 0 {
@@ -638,6 +641,29 @@ impl SstChunkReader<'_, '_> {
             let Some(bytes) = chunk.get(Range { start, end }) else {
                 return Err(err("SST 문자열 slice 길이 오류"));
             };
+            let max_utf8_bytes_per_unit = if high_byte {
+                MAX_UTF8_BYTES_PER_UTF16_CODE_UNIT
+            } else {
+                MAX_UTF8_BYTES_PER_COMPRESSED_XL_CHAR
+            };
+            let additional_capacity = chars_here
+                .checked_mul(max_utf8_bytes_per_unit)
+                .ok_or_else(|| err("SST 문자열 용량 계산 중 overflow가 발생했습니다."))?;
+            let required_capacity = out
+                .len()
+                .checked_add(additional_capacity)
+                .ok_or_else(|| err("SST 문자열 용량 계산 중 overflow가 발생했습니다."))?;
+            if out.capacity() < required_capacity {
+                let additional = required_capacity
+                    .checked_sub(out.len())
+                    .ok_or_else(|| err("SST 문자열 용량 계산 중 overflow가 발생했습니다."))?;
+                out.try_reserve_exact(additional).map_err(|source| {
+                    err_with_source(
+                        format!("SST 문자열 메모리 확보 실패: {required_capacity} bytes"),
+                        source,
+                    )
+                })?;
+            }
             if high_byte {
                 let (chunks, &[]) = bytes.as_chunks::<2>() else {
                     return Err(err("SST UTF-16 문자열 길이가 홀수입니다."));
@@ -741,12 +767,14 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             let chunk = record_tail
                 .get(..next_len)
                 .ok_or_else(|| err("xls SST Continue 레코드 범위 오류"))?;
-            chunks.try_reserve(1).map_err(|source| {
-                err_with_source(
-                    "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
-                    source,
-                )
-            })?;
+            if chunks.len() == chunks.capacity() {
+                chunks.try_reserve(1).map_err(|source| {
+                    err_with_source(
+                        "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
+                        source,
+                    )
+                })?;
+            }
             chunks.push(chunk);
             next = next_data.end;
         }
@@ -784,28 +812,24 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             let data = record_tail
                 .get(..record_len)
                 .ok_or_else(|| err("xls BIFF globals 레코드 범위 오류"))?;
-            let record = BiffRecord {
-                data,
-                id: record_id,
-            };
-            match record.id {
+            match record_id {
                 0x0085 => {
-                    let header = record
-                        .data
+                    let header = data
                         .first_chunk::<8>()
                         .ok_or_else(|| err("xls BoundSheet record가 예상보다 짧습니다."))?;
-                    if boundsheet.is_some() {
-                        return Err(err("Opinet 고정 소스와 다른 worksheet 개수입니다."));
-                    }
                     let offset = usize::try_from(read_u32_le(header, 0)?).map_err(|source| {
                         err_with_source("xls BoundSheet offset 변환에 실패했습니다.", source)
                     })?;
                     let sheet_type = header[5];
-                    boundsheet = Some(BiffBoundSheet { offset, sheet_type });
+                    if boundsheet
+                        .replace(BiffBoundSheet { offset, sheet_type })
+                        .is_some()
+                    {
+                        return Err(err("Opinet 고정 소스와 다른 worksheet 개수입니다."));
+                    }
                 }
                 0x0042 => {
-                    let header = record
-                        .data
+                    let header = data
                         .first_chunk::<2>()
                         .ok_or_else(|| err("xls CodePage record가 예상보다 짧습니다."))?;
                     code_page = Some(read_u16_le(header, 0)?);
@@ -816,7 +840,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     }
                 }
                 0x00FC => {
-                    let sst_chunks = self.collect_sst_chunks(record.data, data_end)?;
+                    let sst_chunks = self.collect_sst_chunks(data, data_end)?;
                     if code_page != Some(EXPECTED_BIFF_CODE_PAGE) {
                         return Err(err(format!(
                             "Opinet 고정 소스의 BIFF code page가 예상과 다릅니다: {code_page:?}"
@@ -832,7 +856,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 _ => {}
             }
             pos = data_end;
-            if record.id == 0x000A {
+            if record_id == 0x000A {
                 saw_eof = true;
                 break;
             }
@@ -924,7 +948,7 @@ impl SourceHeaderValidator<'_, '_> {
                 text: "경유",
             },
         ] {
-            let actual = header.text(expected_header.col).map_or("", str::trim);
+            let actual = row_text_trimmed(header, expected_header.col);
             if actual != expected_header.text {
                 let col = expected_header
                     .col
@@ -1081,12 +1105,7 @@ impl<'workbook, 'strings> WorksheetCellsParser<'workbook, 'strings> {
                     "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
                 ))
             })?;
-        self.rows_map
-            .entry(row)
-            .or_insert_with(|| SourceRow {
-                cells: [None; SOURCE_COLUMN_COUNT],
-            })
-            .set(col, value)?;
+        self.rows_map.entry(row).or_default().set(col, value)?;
         Ok(())
     }
     fn handle_record(&mut self, record_id: u16, data: &[u8]) -> Result<bool> {
@@ -1160,8 +1179,18 @@ fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
 fn row_i32(row: &SourceRow<'_>, idx: usize) -> Option<i32> {
     parse_i32_str(row.text(idx)?)
 }
-fn row_text_owned(row: &SourceRow<'_>, idx: usize) -> String {
-    row.text(idx).map_or("", str::trim).to_owned()
+fn row_text_trimmed<'strings>(row: &SourceRow<'strings>, idx: usize) -> &'strings str {
+    row.text(idx).map_or("", str::trim)
+}
+fn copy_text(text: &str, context: &'static str) -> Result<String> {
+    let mut out = String::new();
+    out.try_reserve_exact(text.len())
+        .map_err(|source| err_with_source(context, source))?;
+    out.push_str(text);
+    Ok(out)
+}
+fn row_text_owned(row: &SourceRow<'_>, idx: usize, context: &'static str) -> Result<String> {
+    copy_text(row_text_trimmed(row, idx), context)
 }
 fn checked_pow2_from_shift(shift: u16, context: &str) -> Result<usize> {
     let shift_u32 = u32::from(shift);
@@ -1184,10 +1213,12 @@ const fn is_regular_sector_id(sector_id: u32) -> bool {
 fn sector_id_to_index(sector_id: u32, message: impl FnOnce() -> String) -> Result<usize> {
     usize::try_from(sector_id).map_err(|source| err_with_source(message(), source))
 }
-fn get_sector_slice(data: &[u8], sector_size: usize, sector_id: u32) -> Result<&[u8]> {
-    let sector_idx = sector_id_to_index(sector_id, || {
-        prefixed_display_message("CFB sector id 변환 실패: ", sector_id)
-    })?;
+fn get_sector_slice_at_index(
+    data: &[u8],
+    sector_size: usize,
+    sector_idx: usize,
+    sector_id: u32,
+) -> Result<&[u8]> {
     let start = sector_idx
         .checked_add(1)
         .and_then(|value| value.checked_mul(sector_size))
@@ -1244,15 +1275,31 @@ fn read_stream_from_fat_chain(
         })
         .transpose()?;
     let mut out = Vec::new();
-    out.try_reserve_exact(remaining.map_or(sector_size, |bytes| bytes))
+    out.try_reserve_exact(remaining.unwrap_or(sector_size))
         .map_err(|source| err_with_source("FAT stream 메모리 확보 실패", source))?;
-    let mut seen = Vec::new();
-    reserve_vec_entries_exact(
-        &mut seen,
-        fat.len(),
-        "FAT chain 방문 플래그 메모리 확보 실패",
-    )?;
-    seen.resize(fat.len(), false);
+    if remaining.is_none() {
+        let mut tortoise = start_sector;
+        let mut hare = start_sector;
+        loop {
+            tortoise = next_fat_sector(fat, tortoise, stream_name)?;
+            if tortoise == CFB_END_OF_CHAIN {
+                break;
+            }
+            hare = next_fat_sector(fat, hare, stream_name)?;
+            if hare == CFB_END_OF_CHAIN {
+                break;
+            }
+            hare = next_fat_sector(fat, hare, stream_name)?;
+            if hare == CFB_END_OF_CHAIN {
+                break;
+            }
+            if tortoise == hare {
+                return Err(err(format!(
+                    "FAT chain 순환 감지: {stream_name} (sector={hare})"
+                )));
+            }
+        }
+    }
     let mut sid = start_sector;
     while sid != CFB_END_OF_CHAIN {
         if remaining == Some(0) {
@@ -1260,27 +1307,8 @@ fn read_stream_from_fat_chain(
                 "FAT stream이 선언 크기 이후에도 계속됩니다: {stream_name} (sector={sid})"
             )));
         }
-        if !is_regular_sector_id(sid) {
-            return Err(err(format!(
-                "FAT chain에 잘못된 sector id가 있습니다: {stream_name} ({sid:#x})"
-            )));
-        }
-        let sid_usize = sector_id_to_index(sid, || {
-            format!("FAT sector 변환 실패: {stream_name} (sector={sid})")
-        })?;
-        let seen_flag = seen.get_mut(sid_usize).ok_or_else(|| {
-            err(prefixed_display_message(
-                "FAT 인덱스 범위 오류: sector=",
-                sid,
-            ))
-        })?;
-        if *seen_flag {
-            return Err(err(format!(
-                "FAT chain 순환 감지: {stream_name} (sector={sid})"
-            )));
-        }
-        *seen_flag = true;
-        let sector = get_sector_slice(data, sector_size, sid)?;
+        let (sid_usize, next_sid) = next_fat_sector_indexed(fat, sid, stream_name)?;
+        let sector = get_sector_slice_at_index(data, sector_size, sid_usize, sid)?;
         if let Some(remain) = remaining.as_mut() {
             let take = (*remain).min(sector.len());
             let prefix = sector
@@ -1295,18 +1323,7 @@ fn read_stream_from_fat_chain(
                 .map_err(|source| err_with_source("FAT stream 추가 메모리 확보 실패", source))?;
             out.extend_from_slice(sector);
         }
-        let next = *fat.get(sid_usize).ok_or_else(|| {
-            err(prefixed_display_message(
-                "FAT 인덱스 범위 오류: sector=",
-                sid,
-            ))
-        })?;
-        if next == CFB_FREE_SECT {
-            return Err(err(format!(
-                "FAT chain이 free sector를 참조합니다: {stream_name} (sector={next})"
-            )));
-        }
-        sid = next;
+        sid = next_sid;
     }
     if let Some(remaining_bytes) = remaining.filter(|bytes| *bytes != 0) {
         return Err(err(format!(
@@ -1314,6 +1331,32 @@ fn read_stream_from_fat_chain(
         )));
     }
     Ok(out)
+}
+fn next_fat_sector(fat: &[u32], sector_id: u32, stream_name: &str) -> Result<u32> {
+    let (_index, next) = next_fat_sector_indexed(fat, sector_id, stream_name)?;
+    Ok(next)
+}
+fn next_fat_sector_indexed(fat: &[u32], sector_id: u32, stream_name: &str) -> Result<(usize, u32)> {
+    if !is_regular_sector_id(sector_id) {
+        return Err(err(format!(
+            "FAT chain에 잘못된 sector id가 있습니다: {stream_name} ({sector_id:#x})"
+        )));
+    }
+    let index = sector_id_to_index(sector_id, || {
+        format!("FAT sector 변환 실패: {stream_name} (sector={sector_id})")
+    })?;
+    let next = *fat.get(index).ok_or_else(|| {
+        err(prefixed_display_message(
+            "FAT 인덱스 범위 오류: sector=",
+            sector_id,
+        ))
+    })?;
+    if next == CFB_FREE_SECT {
+        return Err(err(format!(
+            "FAT chain이 free sector를 참조합니다: {stream_name} (sector={next})"
+        )));
+    }
+    Ok((index, next))
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
     let arr = read_le_array::<2>(bytes, offset, "u16 read out of range at ")?;
@@ -1343,9 +1386,6 @@ fn display_limit_message(
     limit: impl Display,
 ) -> String {
     format!("{prefix}{value} ({limit_label}{limit})")
-}
-fn prefixed_name_message(prefix: &str, name: &str) -> String {
-    format!("{prefix}{name}")
 }
 fn sector_size_message(prefix: &str, sector_id: u32, sector_size: usize) -> String {
     format!("{prefix}{sector_id}, size={sector_size}")

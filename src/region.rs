@@ -61,7 +61,7 @@ pub fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     let mut rest = addr.trim();
     let capacity = rest.len();
     out.clear();
-    out.try_reserve(capacity)
+    out.try_reserve_exact(capacity)
         .map_err(|source| err_with_source("주소 key 정규화 메모리 확보 실패", source))?;
     while !rest.is_empty() {
         let mut replaced = false;

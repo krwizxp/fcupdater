@@ -1,13 +1,14 @@
+use super::path_util::reject_windows_special_component;
 use super::{ZipArchiveExtractor, path_util::path_to_slashes};
 use crate::diagnostic::{
     AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
 };
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, string::String, vec::Vec};
 use core::{error::Error, fmt, range::Range, result::Result as CoreResult, str};
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::Read as _,
+    io::{Read as _, Write as IoWrite},
     path::{Path, PathBuf},
 };
 mod deflate;
@@ -347,7 +348,10 @@ const _: () = assert!(
 );
 type ZipResult<T> = CoreResult<T, ZipError>;
 #[derive(Debug)]
-struct ZipError(Cow<'static, str>);
+struct ZipError {
+    message: Cow<'static, str>,
+    source: Option<Box<dyn Error + Send + Sync>>,
+}
 struct ZipEntry<'zip> {
     compressed_size: u32,
     crc32: u32,
@@ -368,28 +372,51 @@ struct HeaderSplit<'bytes, const LEN: usize> {
 }
 impl fmt::Display for ZipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.as_ref())
+        f.write_str(self.message.as_ref())
     }
 }
-impl Error for ZipError {}
+impl Error for ZipError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_deref().map(|source| {
+            let source_ref: &(dyn Error + 'static) = source;
+            source_ref
+        })
+    }
+}
 impl From<Cow<'static, str>> for ZipError {
     fn from(value: Cow<'static, str>) -> Self {
-        Self(value)
+        Self {
+            message: value,
+            source: None,
+        }
     }
 }
 impl From<String> for ZipError {
     fn from(value: String) -> Self {
-        Self(Cow::Owned(value))
+        Self {
+            message: Cow::Owned(value),
+            source: None,
+        }
     }
 }
 impl From<&'static str> for ZipError {
     fn from(value: &'static str) -> Self {
-        Self(Cow::Borrowed(value))
+        Self {
+            message: Cow::Borrowed(value),
+            source: None,
+        }
     }
 }
 impl From<ZipError> for AppError {
     fn from(value: ZipError) -> Self {
-        Self::from(value.0)
+        let ZipError {
+            message,
+            source: source_error,
+        } = value;
+        match source_error {
+            Some(source) => err_with_source(message, source),
+            None => Self::from(message),
+        }
     }
 }
 impl ZipEntry<'_> {
@@ -401,7 +428,7 @@ impl ZipEntry<'_> {
             local_offset,
             ZIP_BAD_LOCAL_HEADER_MESSAGE,
         )
-        .map_err(|source| err(zip_entry_message(source.0.as_ref(), self.name)))?;
+        .map_err(|source| err(zip_entry_message(source.message.as_ref(), self.name)))?;
         let local_header = local_split.header;
         let local_tail = local_split.tail;
         if read_u32(local_header, 0)? != LOCAL_FILE_HEADER_SIGNATURE {
@@ -477,6 +504,7 @@ impl ZipEntry<'_> {
             if part == ".." {
                 return Err(zip_entry_message(ZIP_UNSAFE_PATH_MESSAGE, self.name).into());
             }
+            reject_windows_special_component(part, &self.name)?;
             relative_path.push(part);
         }
         if relative_path.as_os_str().is_empty() {
@@ -630,15 +658,15 @@ impl ZipArchiveExtractor<'_> {
             })?;
         while let Some(entry) = central_directory.next_entry()? {
             let relative_path = entry.relative_path()?;
-            if seen_paths.contains(&relative_path) {
+            let entry_path = self.unpack_dir.join(&relative_path);
+            if !seen_paths.insert(relative_path) {
                 return Err(err(format!(
                     "ZIP 중복 entry 경로가 있습니다: {}",
                     entry.name
                 )));
             }
             total_uncompressed =
-                self.extract_entry(bytes.as_slice(), &entry, &relative_path, total_uncompressed)?;
-            seen_paths.insert(relative_path);
+                self.extract_entry(bytes.as_slice(), &entry, &entry_path, total_uncompressed)?;
         }
         Ok(())
     }
@@ -646,17 +674,15 @@ impl ZipArchiveExtractor<'_> {
         &self,
         bytes: &[u8],
         entry: &ZipEntry<'_>,
-        relative_path: &Path,
+        entry_path: &Path,
         total_uncompressed: usize,
     ) -> Result<usize> {
         let entry_name = entry.name;
         let is_dir = entry_name.ends_with('/');
         if is_dir {
-            let dir_path = self.unpack_dir.join(relative_path);
-            create_zip_dir(&dir_path, "xlsx 압축 폴더 생성 실패")?;
+            create_zip_dir(entry_path, "xlsx 압축 폴더 생성 실패")?;
             return Ok(total_uncompressed);
         }
-        let entry_path = self.unpack_dir.join(relative_path);
         if let Some(parent) = entry_path.parent() {
             create_zip_dir(parent, "xlsx 압축 해제 폴더 생성 실패")?;
         }
@@ -678,12 +704,26 @@ impl ZipArchiveExtractor<'_> {
             entry_name,
         )?;
         let data = entry.data(bytes, expected_len)?;
-        fs::write(&entry_path, data.as_ref()).map_err(|source_err| {
+        let mut output = File::options()
+            .write(true)
+            .create_new(true)
+            .open(entry_path)
+            .map_err(|source_err| {
+                err_with_source(
+                    path_pair_context_message(
+                        "xlsx 압축 해제 파일 생성 실패",
+                        self.archive_path,
+                        entry_path,
+                    ),
+                    source_err,
+                )
+            })?;
+        IoWrite::write_all(&mut output, data.as_ref()).map_err(|source_err| {
             err_with_source(
                 path_pair_context_message(
                     "xlsx 압축 해제 파일 쓰기 실패",
                     self.archive_path,
-                    &entry_path,
+                    entry_path,
                 ),
                 source_err,
             )
@@ -736,6 +776,12 @@ impl ZipArchiveExtractor<'_> {
                 self.archive_path.display()
             )));
         }
+        if bytes.len() != archive_len {
+            return Err(err(format!(
+                "xlsx 압축 파일이 읽는 중 변경되었습니다: {}",
+                self.archive_path.display()
+            )));
+        }
         Ok(bytes)
     }
 }
@@ -744,7 +790,19 @@ struct PendingFile {
     path: PathBuf,
 }
 const fn zip_static(message: &'static str) -> ZipError {
-    ZipError(Cow::Borrowed(message))
+    ZipError {
+        message: Cow::Borrowed(message),
+        source: None,
+    }
+}
+fn zip_with_source<E>(message: impl Into<Cow<'static, str>>, source: E) -> ZipError
+where
+    E: Error + Send + Sync + 'static,
+{
+    ZipError {
+        message: message.into(),
+        source: Some(Box::new(source)),
+    }
 }
 fn create_zip_dir(path: &Path, context: &str) -> Result<()> {
     fs::create_dir_all(path)
@@ -794,6 +852,11 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<PendingFile>) -> Resul
                     .strip_prefix(root)
                     .map_err(|source| err_with_source("xlsx 상대 경로 계산 실패", source))?;
                 let name = path_to_slashes(rel, rel.display())?;
+                if files.len() == files.capacity() {
+                    files.try_reserve(1).map_err(|source| {
+                        err_with_source("xlsx 파트 목록 메모리 확보 실패", source)
+                    })?;
+                }
                 files.push(PendingFile { name, path });
             }
             (false, false) => {}

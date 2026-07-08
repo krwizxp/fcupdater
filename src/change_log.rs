@@ -1,10 +1,10 @@
 use crate::{
-    diagnostic::{Result, err},
+    diagnostic::{Result, err, err_with_source},
     excel::writer::{Worksheet, col_to_name},
     rows::{AddedStoreRow, ChangeRow, StoreRow},
     sheet_util::add_row_offset,
 };
-use core::range::RangeInclusive;
+use core::{fmt::Write as _, range::RangeInclusive};
 const CHANGELOG_HEADER_ROW: u32 = 3;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
 const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
@@ -21,6 +21,7 @@ const CHANGELOG_COL_DELTA_PREMIUM: u32 = 10;
 const CHANGELOG_COL_OLD_DIESEL: u32 = 11;
 const CHANGELOG_COL_NEW_DIESEL: u32 = 12;
 const CHANGELOG_COL_DELTA_DIESEL: u32 = 13;
+const ROW_DECIMAL_TEXT_MAX_LEN: usize = 10;
 pub struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
     pub added: &'data [AddedStoreRow<'source>],
     pub changes: &'data [ChangeRow<'source>],
@@ -59,6 +60,7 @@ struct ChangeLogRowValues<'row> {
     region: &'row str,
 }
 struct DeltaFormulaColumn<'col> {
+    formula_capacity: usize,
     new_ref: &'col str,
     old_ref: &'col str,
     target_col: u32,
@@ -71,6 +73,33 @@ struct TextCell<'text> {
     col: u32,
     value: &'text str,
 }
+impl<'col> DeltaFormulaColumn<'col> {
+    fn new(new_ref: &'col str, old_ref: &'col str, target_col: u32) -> Result<Self> {
+        let Some(formula_capacity) = "IF(OR("
+            .len()
+            .checked_add(old_ref.len())
+            .and_then(|len| len.checked_add(ROW_DECIMAL_TEXT_MAX_LEN))
+            .and_then(|len| len.checked_add("=\"\",".len()))
+            .and_then(|len| len.checked_add(new_ref.len()))
+            .and_then(|len| len.checked_add(ROW_DECIMAL_TEXT_MAX_LEN))
+            .and_then(|len| len.checked_add("=\"\"),\"\",".len()))
+            .and_then(|len| len.checked_add(new_ref.len()))
+            .and_then(|len| len.checked_add(ROW_DECIMAL_TEXT_MAX_LEN))
+            .and_then(|len| len.checked_add("-".len()))
+            .and_then(|len| len.checked_add(old_ref.len()))
+            .and_then(|len| len.checked_add(ROW_DECIMAL_TEXT_MAX_LEN))
+            .and_then(|len| len.checked_add(")".len()))
+        else {
+            return Err(err("변경내역 delta formula 용량 계산 실패"));
+        };
+        Ok(Self {
+            formula_capacity,
+            new_ref,
+            old_ref,
+            target_col,
+        })
+    }
+}
 impl ChangeLogRowValues<'_> {
     fn write_to(
         &self,
@@ -78,6 +107,7 @@ impl ChangeLogRowValues<'_> {
         layout: &ChangeLogLayout,
         row: u32,
         delta_columns: &[DeltaFormulaColumn<'_>],
+        formula_buffer: &mut String,
     ) -> Result<()> {
         for cell in [
             TextCell {
@@ -130,10 +160,13 @@ impl ChangeLogRowValues<'_> {
         for column in delta_columns {
             let old_col = column.old_ref;
             let new_col = column.new_ref;
-            let formula = format!(
+            formula_buffer.clear();
+            write!(
+                formula_buffer,
                 "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
-            );
-            worksheet.set_formula_at(column.target_col, row, &formula)?;
+            )
+            .map_err(|source| err_with_source("변경내역 delta formula 작성 실패", source))?;
+            worksheet.set_formula_at(column.target_col, row, formula_buffer)?;
         }
         Ok(())
     }
@@ -255,7 +288,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         Ok((layout.data_start_row..end)
             .rev()
             .find(|row| self.worksheet.has_any_row_format(*row, layout.max_col))
-            .map_or(layout.data_start_row, |row| row))
+            .unwrap_or(layout.data_start_row))
     }
     pub fn update(&mut self) -> Result<()> {
         let date_text = format!("현행화 일자: {}", self.today);
@@ -371,8 +404,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             old_diesel: change.old_diesel,
             old_gasoline: change.old_gasoline,
             old_premium: change.old_premium,
-            reason: change.reason.as_str(),
-            region: change.region.as_str(),
+            reason: change.reason,
+            region: change.region.as_ref(),
         });
         let added_entries = self.added.iter().map(|item| ChangeLogRowValues {
             address: item.record.address.as_str(),
@@ -405,22 +438,30 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         let old_diesel_col = col_to_name(layout.col_old_diesel)?;
         let new_diesel_col = col_to_name(layout.col_new_diesel)?;
         let delta_columns = [
-            DeltaFormulaColumn {
-                new_ref: new_gas_col.as_str(),
-                old_ref: old_gas_col.as_str(),
-                target_col: layout.col_delta_gas,
-            },
-            DeltaFormulaColumn {
-                new_ref: new_premium_col.as_str(),
-                old_ref: old_premium_col.as_str(),
-                target_col: layout.col_delta_premium,
-            },
-            DeltaFormulaColumn {
-                new_ref: new_diesel_col.as_str(),
-                old_ref: old_diesel_col.as_str(),
-                target_col: layout.col_delta_diesel,
-            },
+            DeltaFormulaColumn::new(
+                new_gas_col.as_str(),
+                old_gas_col.as_str(),
+                layout.col_delta_gas,
+            )?,
+            DeltaFormulaColumn::new(
+                new_premium_col.as_str(),
+                old_premium_col.as_str(),
+                layout.col_delta_premium,
+            )?,
+            DeltaFormulaColumn::new(
+                new_diesel_col.as_str(),
+                old_diesel_col.as_str(),
+                layout.col_delta_diesel,
+            )?,
         ];
+        let mut formula_buffer = String::new();
+        let formula_capacity = delta_columns.iter().fold(0_usize, |max_capacity, column| {
+            max_capacity.max(column.formula_capacity)
+        });
+        formula_buffer
+            .try_reserve_exact(formula_capacity)
+            .map_err(|source| err_with_source("변경내역 delta formula 메모리 확보 실패", source))?;
+        let worksheet = &mut *self.worksheet;
         for (index, values) in change_entries
             .chain(added_entries)
             .chain(deleted_entries)
@@ -428,10 +469,9 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         {
             let row = add_row_offset(layout.data_start_row, index, "변경내역 데이터 쓰기")?;
             if row > style_template_row {
-                self.worksheet
-                    .copy_row_style(style_template_row, row, layout.max_col)?;
+                worksheet.copy_row_style(style_template_row, row, layout.max_col)?;
             }
-            values.write_to(self.worksheet, layout, row, &delta_columns)?;
+            values.write_to(worksheet, layout, row, &delta_columns, &mut formula_buffer)?;
         }
         let last_change_row =
             self.extend_entry_conditional_formats(layout, old_data_rows, entry_count)?;

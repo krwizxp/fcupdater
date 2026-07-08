@@ -30,19 +30,12 @@ fn main() -> Result<()> {
     let mut raw_args = env::args_os().skip(1);
     let first_arg = raw_args.next();
     let second_arg = raw_args.next();
-    let has_extra = raw_args.next().is_some();
+    let third_arg = raw_args.next();
     let action = match first_arg {
         None => ParseAction::Run {
             verify_saved_archive: false,
         },
         Some(token) => {
-            if has_extra {
-                let usage = usage_text();
-                return Err(err(format!(
-                    "알 수 없는 옵션: {}\n\n{usage}",
-                    token.to_string_lossy()
-                )));
-            }
             if token == OsStr::new("-h") || token == OsStr::new("--help") {
                 if let Some(extra) = second_arg {
                     let usage = usage_text();
@@ -55,7 +48,16 @@ fn main() -> Result<()> {
             } else if token == OsStr::new("--version") {
                 let verbose = match second_arg {
                     None => false,
-                    Some(flag) if flag == OsStr::new("--verbose") => true,
+                    Some(flag) if flag == OsStr::new("--verbose") => {
+                        if let Some(extra) = third_arg {
+                            let usage = usage_text();
+                            return Err(err(format!(
+                                "알 수 없는 --version 옵션: {}\n\n{usage}",
+                                extra.to_string_lossy()
+                            )));
+                        }
+                        true
+                    }
                     Some(flag) => {
                         let usage = usage_text();
                         return Err(err(format!(
@@ -116,6 +118,10 @@ fn main() -> Result<()> {
                 )?;
                 write_line(&mut out, format_args!("rustc: {}", build_info::BUILD_RUSTC))?;
                 write_line(&mut out, format_args!("git: {}", build_info::BUILD_GIT_SHA))?;
+                write_line(
+                    &mut out,
+                    format_args!("dirty: {}", build_info::BUILD_GIT_DIRTY),
+                )?;
             }
             Ok(())
         }

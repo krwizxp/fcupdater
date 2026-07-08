@@ -1,4 +1,5 @@
 use crate::region::TARGET_REGION_COUNT;
+use alloc::borrow::Cow;
 #[derive(Debug)]
 pub struct SourceRecord {
     pub address: String,
@@ -25,8 +26,8 @@ pub struct ChangeRow<'source> {
     pub old_diesel: Option<i32>,
     pub old_gasoline: Option<i32>,
     pub old_premium: Option<i32>,
-    pub reason: String,
-    pub region: String,
+    pub reason: &'static str,
+    pub region: Cow<'source, str>,
 }
 #[derive(Debug)]
 pub struct StoreRow {

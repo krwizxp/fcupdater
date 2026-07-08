@@ -1,6 +1,6 @@
 use crate::{
     change_log::ChangeLogUpdater,
-    diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message},
+    diagnostic::{Result, err, err_with_source, path_context_message},
     excel::SaveVerification,
     excel::source_reader::SourceReader,
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
@@ -165,9 +165,11 @@ impl UpdateRun<'_> {
                             region_index,
                             "소스 지역별 건수",
                         )?;
-                        map.try_reserve(1).map_err(|source| {
-                            err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
-                        })?;
+                        if map.len() == map.capacity() {
+                            map.try_reserve(1).map_err(|source| {
+                                err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
+                            })?;
+                        }
                         let key = normalize_address_key(&record.address)?;
                         match map.entry(key) {
                             Entry::Vacant(vacant_entry) => {
@@ -347,18 +349,6 @@ impl UpdateRun<'_> {
         Ok(())
     }
     pub fn run(&mut self) -> Result<()> {
-        let master_path = self.master_path;
-        if !master_path.try_exists().map_err(|source_err| {
-            err_with_source(
-                path_context_message("마스터 파일 경로 확인 실패", master_path),
-                source_err,
-            )
-        })? {
-            return Err(err(prefixed_message(
-                "마스터 파일이 없습니다: ",
-                master_path.display(),
-            )));
-        }
         let loaded_source = self.load_source()?;
         let updated = self.open_updated_workbook(&loaded_source)?;
         let since_epoch = SystemTime::now()
@@ -449,7 +439,7 @@ impl UpdateRun<'_> {
         mut book: StdWorkbook,
         today: &str,
     ) -> Result<()> {
-        let Some(change_log_result) = book.with_sheet_mut(
+        let Some(()) = book.with_sheet_mut(
             "변경내역",
             |worksheet, shared_string_table| -> Result<()> {
                 let mut updater = ChangeLogUpdater {
@@ -462,17 +452,17 @@ impl UpdateRun<'_> {
                 };
                 updater.update()
             },
-        ) else {
+        )?
+        else {
             return Err(err("마스터 파일에 '변경내역' 시트가 없습니다"));
         };
-        change_log_result?;
         write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
         let save_verification = if self.verify_saved_archive {
             SaveVerification::Verify
         } else {
             SaveVerification::Skip
         };
-        book.save(self.master_path, &save_verification)?;
+        book.save(self.master_path, save_verification)?;
         if let Err(summary_err) = self.print_update_summary(
             &loaded_source.name,
             &master_update.changes,

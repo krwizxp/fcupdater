@@ -1,18 +1,20 @@
 use crate::diagnostic::{Result, err, err_with_source};
 use core::range::Range;
-use std::path::Path;
+use std::{fs::File, path::Path};
 mod path_util;
 pub mod source_reader;
 pub mod writer;
 pub mod xlsx_container;
 mod xml;
 mod zip_archive;
+#[derive(Clone, Copy)]
 pub enum SaveVerification {
     Skip,
     Verify,
 }
 struct ZipArchiveBuilder<'path> {
     archive_path: &'path Path,
+    file: File,
     root: &'path Path,
 }
 struct ZipArchiveExtractor<'path> {
@@ -30,6 +32,8 @@ fn workbook_defined_name_content_span(
     quoted_sheet: &str,
     plain_sheet: &str,
 ) -> Result<Range<usize>> {
+    let sheet_index_u32 = u32::try_from(sheet_index)
+        .map_err(|source| err_with_source("workbook.xml sheet index 변환 실패", source))?;
     let mut matched_span = None;
     let mut scanner = xml::XmlScanner::new(workbook_xml);
     while let Some(tag) = scanner.next_start_named("definedName") {
@@ -52,24 +56,53 @@ fn workbook_defined_name_content_span(
         if xml::extract_attr(open_tag, "name")?.as_deref() == Some(defined_name) {
             let local_sheet_id = xml::extract_attr(open_tag, "localSheetId")?
                 .map(|value| {
-                    value.parse::<usize>().map_err(|source| {
-                        err_with_source("workbook.xml localSheetId 해석 실패", source)
-                    })
+                    if value.is_empty() {
+                        return Err(err(
+                            "workbook.xml localSheetId가 음이 아닌 10진수 형식이 아닙니다.",
+                        ));
+                    }
+                    let mut parsed = 0_u32;
+                    let mut overflowed = false;
+                    for byte in value.bytes() {
+                        if !byte.is_ascii_digit() {
+                            return Err(err(
+                                "workbook.xml localSheetId가 음이 아닌 10진수 형식이 아닙니다.",
+                            ));
+                        }
+                        if overflowed {
+                            continue;
+                        }
+                        let digit_raw = byte.wrapping_sub(b'0');
+                        let Some(next) = parsed
+                            .checked_mul(10)
+                            .and_then(|scaled| scaled.checked_add(u32::from(digit_raw)))
+                        else {
+                            overflowed = true;
+                            continue;
+                        };
+                        parsed = next;
+                    }
+                    if overflowed {
+                        return value.parse::<u32>().map_err(|source| {
+                            err_with_source("workbook.xml localSheetId 해석 실패", source)
+                        });
+                    }
+                    Ok(parsed)
                 })
                 .transpose()?;
             let references_sheet = decoded_reference.starts_with(quoted_sheet)
                 || decoded_reference.starts_with(plain_sheet);
-            if references_sheet && local_sheet_id != Some(sheet_index) {
+            if references_sheet && local_sheet_id != Some(sheet_index_u32) {
                 return Err(err(
                     "유류비 _FilterDatabase의 localSheetId가 유류비 시트 index와 다릅니다.",
                 ));
             }
-            if local_sheet_id == Some(sheet_index) && !references_sheet {
+            if local_sheet_id == Some(sheet_index_u32) && !references_sheet {
                 return Err(err(
                     "유류비 localSheetId의 _FilterDatabase가 유류비 시트를 참조하지 않습니다.",
                 ));
             }
-            if local_sheet_id == Some(sheet_index)
+            if local_sheet_id == Some(sheet_index_u32)
                 && references_sheet
                 && matched_span
                     .replace(Range {

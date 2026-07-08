@@ -1,12 +1,16 @@
 use super::{
-    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpHeader,
-    HttpResponse, HttpStreamResponse, StreamedBodySummary, StreamingBodySink,
-    checked_http_buffer_len, download_error_with_source, enforce_http_content_length_limit,
+    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpHeader, HttpHeaderKind,
+    HttpResponse, HttpStreamResponse, RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE,
+    StreamedBodySummary, StreamingBodySink,
+    checked_http_buffer_len, download_error_with_source, enforce_http_body_length,
+    validated_http_content_length,
     http_client::HttpMethod,
 };
 use alloc::{string::String, vec::Vec};
 use core::{
+    array::from_fn,
     ffi::c_void,
+    mem,
     ptr::{NonNull, null, null_mut},
 };
 use std::{
@@ -113,12 +117,16 @@ const WINHTTP_RECEIVE_TIMEOUT_MS: i32 = 60_000;
 const WINHTTP_RESOLVE_TIMEOUT_MS: i32 = 30_000;
 const WINHTTP_SEND_TIMEOUT_MS: i32 = 60_000;
 const WINHTTP_READ_BUFFER_BYTES: usize = 64 * 1024;
+const HEADER_SEPARATOR_WIDE: [u16; 2] = [0x3A, 0x20];
+const HEADER_TERMINATOR_WIDE: [u16; 2] = [0x0D, 0x0A];
 const METHOD_GET_WIDE: [u16; 4] = [0x47, 0x45, 0x54, 0];
 const METHOD_POST_WIDE: [u16; 5] = [0x50, 0x4F, 0x53, 0x54, 0];
 type HInternet = *mut c_void;
 pub(super) struct Client {
     default_https_port: u16,
     error_code_label: &'static str,
+    header_buffer: Vec<u16>,
+    read_buffer: Vec<u8>,
     session_cache: Option<SessionCache>,
 }
 struct Handle(NonNull<c_void>);
@@ -127,8 +135,13 @@ struct CachedConnect {
     host: String,
     port: u16,
 }
+struct ConnectCache {
+    entries: [Option<CachedConnect>; WINHTTP_CONNECT_CACHE_LIMIT],
+    len: usize,
+    start: usize,
+}
 struct SessionCache {
-    connects: Vec<CachedConnect>,
+    connects: ConnectCache,
     session: Handle,
 }
 impl Drop for Handle {
@@ -144,6 +157,33 @@ impl Handle {
         self.0.as_ptr()
     }
 }
+impl ConnectCache {
+    fn find(&self, host: &str, port: u16) -> Option<&CachedConnect> {
+        self.entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .find(|entry| entry.port == port && entry.host.as_str() == host)
+    }
+    fn push_back(&mut self, entry: CachedConnect) -> Option<()> {
+        let slot = if self.len < WINHTTP_CONNECT_CACHE_LIMIT {
+            let slot = self.len;
+            self.len = self.len.checked_add(1)?;
+            slot
+        } else {
+            let slot = self.start;
+            let next_start = self.start.checked_add(1)?;
+            self.start = if next_start == WINHTTP_CONNECT_CACHE_LIMIT {
+                0
+            } else {
+                next_start
+            };
+            slot
+        };
+        let target = self.entries.get_mut(slot)?;
+        *target = Some(entry);
+        Some(())
+    }
+}
 impl Client {
     fn cached_connect_ptr(
         &mut self,
@@ -154,7 +194,11 @@ impl Client {
         if self.session_cache.is_none() {
             let user_agent = wide(super::USER_AGENT)?;
             self.session_cache = Some(SessionCache {
-                connects: Vec::new(),
+                connects: ConnectCache {
+                    entries: from_fn(|_| None),
+                    len: 0,
+                    start: 0,
+                },
                 session: self.open_session(&user_agent)?,
             });
         }
@@ -163,17 +207,8 @@ impl Client {
             .session_cache
             .as_mut()
             .ok_or("WinHTTP session cache 상태 오류")?;
-        if let Some(index) = cache
-            .connects
-            .iter()
-            .position(|entry| entry.port == port && entry.host.as_str() == host)
-        {
-            return Ok(cache
-                .connects
-                .get(index)
-                .map(|entry| &entry.handle)
-                .ok_or("WinHTTP connect cache 범위 오류")?
-                .as_ptr());
+        if let Some(entry) = cache.connects.find(host, port) {
+            return Ok(entry.handle.as_ptr());
         }
         // SAFETY: host_wide is NUL-terminated and cache.session is a valid session handle.
         let raw_connect =
@@ -182,27 +217,20 @@ impl Client {
             .map(Handle)
             .ok_or_else(|| Self::last_error_message_for(error_code_label, "WinHttpConnect"))?;
         let mut host_key = String::new();
-        host_key
-            .try_reserve(host.len())
-            .map_err(|source| {
+        host_key.try_reserve_exact(host.len()).map_err(|source| {
                 download_error_with_source("WinHTTP connect host key 메모리 확보 실패", source)
             })?;
         host_key.push_str(host);
-        if cache.connects.len() >= WINHTTP_CONNECT_CACHE_LIMIT {
-            cache.connects.remove(0);
-        }
+        let connect = handle.as_ptr();
         cache
             .connects
-            .try_reserve(1)
-            .map_err(|source| {
-                download_error_with_source("WinHTTP connect cache 메모리 확보 실패", source)
-            })?;
-        let entry = cache.connects.push_mut(CachedConnect {
-            handle,
-            host: host_key,
-            port,
-        });
-        Ok(entry.handle.as_ptr())
+            .push_back(CachedConnect {
+                handle,
+                host: host_key,
+                port,
+            })
+            .ok_or("WinHTTP connect cache 상태 오류")?;
+        Ok(connect)
     }
     fn clear_session_cache(&mut self) {
         self.session_cache = None;
@@ -226,10 +254,10 @@ impl Client {
     fn open_request(
         &self,
         connect: HInternet,
-        method: &HttpMethod,
+        method: HttpMethod<'_>,
         path: &[u16],
     ) -> DownloadResult<Handle> {
-        let method_wide: &[u16] = if matches!(method, HttpMethod::Post) {
+        let method_wide: &[u16] = if matches!(method, HttpMethod::Post(_)) {
             &METHOD_POST_WIDE
         } else {
             &METHOD_GET_WIDE
@@ -296,7 +324,11 @@ impl Client {
         )?;
         Ok(session)
     }
-    fn query_headers(&self, request: &Handle) -> DownloadResult<Vec<HttpHeader>> {
+    fn query_headers(
+        &self,
+        request: &Handle,
+        buffer: &mut Vec<u16>,
+    ) -> DownloadResult<Vec<HttpHeader>> {
         let mut bytes = 0_u32;
         let mut index = 0_u32;
         // SAFETY: request is valid; this first call probes the required buffer size.
@@ -326,12 +358,12 @@ impl Client {
         let units = header_bytes
             .checked_div(2)
             .ok_or("응답 헤더 길이 계산 실패")?;
-        let mut buffer = Vec::new();
-        buffer
-            .try_reserve(units)
-            .map_err(|source| {
+        buffer.clear();
+        if buffer.capacity() < units {
+            buffer.try_reserve_exact(units).map_err(|source| {
                 download_error_with_source("응답 헤더 버퍼 메모리 확보 실패", source)
             })?;
+        }
         buffer.resize(units, 0_u16);
         index = 0;
         // SAFETY: buffer has the size requested by WinHTTP and request is valid.
@@ -349,31 +381,42 @@ impl Client {
             return Err(self.last_error_message("WinHttpQueryHeaders").into());
         }
         while buffer.pop_if(|value| *value == 0).is_some() {}
-        let raw = String::from_utf16(&buffer)
-            .map_err(|source| download_error_with_source("응답 헤더 UTF-16 변환 실패", source))?;
         let mut parsed = Vec::new();
-        for (raw_name, raw_value) in raw.lines().skip(1).filter_map(|line| line.split_once(':')) {
-            parsed.try_reserve(1).map_err(|source| {
-                download_error_with_source("응답 header 목록 메모리 확보 실패", source)
+        for raw_line in buffer.split(|unit| *unit == u16::from(b'\n')).skip(1) {
+            let trimmed_line = trim_ascii_utf16(
+                raw_line
+                    .strip_suffix(&[u16::from(b'\r')])
+                    .unwrap_or(raw_line),
+            );
+            let Some(colon) = trimmed_line
+                .iter()
+                .position(|unit| *unit == u16::from(b':'))
+            else {
+                continue;
+            };
+            let (raw_name, tail) = trimmed_line.split_at(colon);
+            let Some((_, raw_value)) = tail.split_first() else {
+                continue;
+            };
+            let name = trim_ascii_utf16(raw_name);
+            let value = trim_ascii_utf16(raw_value);
+            let kind = if header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH) {
+                HttpHeaderKind::ContentLength
+            } else if header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_SET_COOKIE) {
+                HttpHeaderKind::SetCookie
+            } else {
+                continue;
+            };
+            if parsed.len() == parsed.capacity() {
+                parsed.try_reserve(1).map_err(|source| {
+                    download_error_with_source("응답 header 목록 메모리 확보 실패", source)
+                })?;
+            }
+            let header_value = String::from_utf16(value).map_err(|source| {
+                download_error_with_source("응답 header 값 UTF-16 변환 실패", source)
             })?;
-            let name = raw_name.trim_ascii();
-            let value = raw_value.trim_ascii();
-            let mut header_name = String::new();
-            header_name
-                .try_reserve(name.len())
-                .map_err(|source| {
-                    download_error_with_source("응답 header 이름 메모리 확보 실패", source)
-                })?;
-            header_name.push_str(name);
-            let mut header_value = String::new();
-            header_value
-                .try_reserve(value.len())
-                .map_err(|source| {
-                    download_error_with_source("응답 header 값 메모리 확보 실패", source)
-                })?;
-            header_value.push_str(value);
             parsed.push(HttpHeader {
-                name: header_name,
+                kind,
                 value: header_value,
             });
         }
@@ -402,45 +445,51 @@ impl Client {
             Ok(status)
         }
     }
-    fn read_body(&self, request: &Handle) -> DownloadResult<Vec<u8>> {
+    fn read_body(&mut self, request: &Handle, expected_len: Option<usize>) -> DownloadResult<Vec<u8>> {
         let mut body = Vec::new();
-        let mut chunk_buffer = Vec::new();
-        chunk_buffer
-            .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
-            .map_err(|source| {
-                download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
+        if let Some(capacity) = expected_len {
+            body.try_reserve_exact(capacity).map_err(|source| {
+                download_error_with_source("응답 본문 메모리 선확보 실패", source)
             })?;
-        chunk_buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
-        loop {
-            let read = self.read_chunk(request, &mut chunk_buffer)?;
-            let read_len = usize::try_from(read)
-                .map_err(|source| download_error_with_source("응답 read 길이 변환 실패", source))?;
-            if read_len == 0 {
-                break;
-            }
-            let old_len = body.len();
-            let buffered_len =
-                checked_http_buffer_len("본문", old_len, read_len, HTTP_MAX_BODY_BYTES)?;
-            body.try_reserve(read_len)
-                .map_err(|source| download_error_with_source("응답 본문 메모리 확보 실패", source))?;
-            body.resize(buffered_len, 0);
-            let chunk = body
-                .get_mut(old_len..buffered_len)
-                .ok_or("응답 본문 chunk 범위 계산 실패")?;
-            let read_chunk = chunk_buffer
-                .get(..read_len)
-                .ok_or("응답 본문 chunk 범위 계산 실패")?;
-            chunk.copy_from_slice(read_chunk);
         }
-        Ok(body)
+        let mut chunk_buffer = mem::take(&mut self.read_buffer);
+        let result = (|| {
+            ensure_read_buffer(&mut chunk_buffer)?;
+            loop {
+                let read = self.read_chunk(request, &mut chunk_buffer)?;
+                let read_len = usize::try_from(read).map_err(|source| {
+                    download_error_with_source("응답 read 길이 변환 실패", source)
+                })?;
+                if read_len == 0 {
+                    break;
+                }
+                let read_chunk = chunk_buffer
+                    .get(..read_len)
+                    .ok_or("응답 본문 chunk 범위 계산 실패")?;
+                let next_len = checked_http_buffer_len(
+                    "본문",
+                    body.len(),
+                    read_chunk.len(),
+                    HTTP_MAX_BODY_BYTES,
+                )?;
+                if body.capacity() < next_len {
+                    body.try_reserve(read_chunk.len()).map_err(|source| {
+                        download_error_with_source("응답 본문 메모리 확보 실패", source)
+                    })?;
+                }
+                body.extend_from_slice(read_chunk);
+            }
+            Ok(body)
+        })();
+        self.read_buffer = chunk_buffer;
+        result
     }
     fn read_body_to_writer(
-        &self,
+        &mut self,
         request: &Handle,
         writer: &mut dyn IoWrite,
     ) -> DownloadResult<StreamedBodySummary> {
         let mut sink = StreamingBodySink {
-            error: None,
             limit: HTTP_MAX_BODY_BYTES,
             summary: StreamedBodySummary {
                 bytes_seen: 0,
@@ -448,32 +497,26 @@ impl Client {
             },
             writer,
         };
-        let mut chunk_buffer = Vec::new();
-        chunk_buffer
-            .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
-            .map_err(|source| {
-                download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
-            })?;
-        chunk_buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
-        loop {
-            let read = self.read_chunk(request, &mut chunk_buffer)?;
-            let read_len = usize::try_from(read)
-                .map_err(|source| download_error_with_source("응답 read 길이 변환 실패", source))?;
-            if read_len == 0 {
-                break;
-            }
-            checked_http_buffer_len("본문", 0, read_len, HTTP_MAX_BODY_BYTES)?;
-            let read_chunk = chunk_buffer
-                .get(..read_len)
-                .ok_or("응답 본문 chunk 범위 계산 실패")?;
-            if !sink.append(read_chunk) {
-                if let Some(error) = sink.error.take() {
-                    return Err(error);
+        let mut chunk_buffer = mem::take(&mut self.read_buffer);
+        let result = (|| {
+            ensure_read_buffer(&mut chunk_buffer)?;
+            loop {
+                let read = self.read_chunk(request, &mut chunk_buffer)?;
+                let read_len = usize::try_from(read).map_err(|source| {
+                    download_error_with_source("응답 read 길이 변환 실패", source)
+                })?;
+                if read_len == 0 {
+                    break;
                 }
-                return Err("응답 본문 파일 쓰기 실패".into());
+                let read_chunk = chunk_buffer
+                    .get(..read_len)
+                    .ok_or("응답 본문 chunk 범위 계산 실패")?;
+                sink.append(read_chunk)?;
             }
-        }
-        Ok(sink.summary)
+            Ok(sink.summary)
+        })();
+        self.read_buffer = chunk_buffer;
+        result
     }
     fn read_chunk(
         &self,
@@ -509,100 +552,138 @@ impl Client {
     }
     pub(super) fn request(
         &mut self,
-        method: &HttpMethod,
+        method: HttpMethod<'_>,
         host: &str,
         path: &str,
-        request_body: Option<&[u8]>,
         headers: &[(&str, &str)],
     ) -> DownloadResult<HttpResponse> {
         let host_wide = wide(host)?;
         let path_wide = wide(path)?;
-        let headers_wide = Self::request_headers_wide(headers)?;
-        let body_slice = if matches!(method, HttpMethod::Post) {
-            request_body.ok_or("POST 요청 본문이 비어 있습니다.")?
-        } else {
-            request_body.map_or(&[][..], |body| body)
+        let mut headers_wide = mem::take(&mut self.header_buffer);
+        if let Err(error) = Self::request_headers_wide(&mut headers_wide, headers) {
+            self.header_buffer = headers_wide;
+            return Err(error);
+        }
+        let body_slice = match method {
+            HttpMethod::Get => &[],
+            HttpMethod::Post(body) => body,
         };
-        let body_len = u32::try_from(body_slice.len())
-            .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
-        let connect = self.cached_connect_ptr(host, &host_wide, self.default_https_port)?;
+        let body_len = match u32::try_from(body_slice.len()) {
+            Ok(body_len) => body_len,
+            Err(source) => {
+                self.header_buffer = headers_wide;
+                return Err(download_error_with_source(
+                    "요청 본문 길이 변환 실패",
+                    source,
+                ));
+            }
+        };
+        let connect = match self.cached_connect_ptr(host, &host_wide, self.default_https_port) {
+            Ok(connect) => connect,
+            Err(error) => {
+                self.header_buffer = headers_wide;
+                return Err(error);
+            }
+        };
         let response = (|| {
             let request = self.open_request(connect, method, &path_wide)?;
             self.send_request(&request, &headers_wide, body_slice, body_len)?;
             self.receive_response(&request)?;
             let status = self.query_status(&request)?;
-            let response_headers = self.query_headers(&request)?;
-            enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
-            let response_body = self.read_body(&request)?;
+            let response_headers = self.query_headers(&request, &mut headers_wide)?;
+            let content_length =
+                validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
+            let response_body = self.read_body(&request, content_length)?;
+            enforce_http_body_length(response_body.len(), content_length)?;
             Ok(HttpResponse {
                 body: response_body,
                 headers: response_headers,
                 status,
             })
-        })();
-        if response.is_err() {
-            self.clear_session_cache();
-        }
+        })()
+        .inspect_err(|_| self.clear_session_cache());
+        self.header_buffer = headers_wide;
         response
     }
-    fn request_headers_wide(headers: &[(&str, &str)]) -> DownloadResult<Vec<u16>> {
+    fn request_headers_wide(out: &mut Vec<u16>, headers: &[(&str, &str)]) -> DownloadResult<()> {
         let header_capacity = headers
             .iter()
             .try_fold(0_usize, |acc, &(name, value)| {
-                acc.checked_add(name.len())?
-                    .checked_add(value.len())?
+                acc.checked_add(name.encode_utf16().count())?
+                    .checked_add(value.encode_utf16().count())?
                     .checked_add(4)
             })
+            .and_then(|capacity| capacity.checked_add(1))
             .ok_or("요청 헤더 용량 계산 실패")?;
-        let mut headers_text = String::new();
-        headers_text
-            .try_reserve(header_capacity)
-            .map_err(|source| download_error_with_source("요청 헤더 메모리 확보 실패", source))?;
-        for &(name, value) in headers {
-            headers_text.push_str(name);
-            headers_text.push_str(": ");
-            headers_text.push_str(value);
-            headers_text.push_str("\r\n");
+        out.clear();
+        if out.capacity() < header_capacity {
+            out.try_reserve_exact(header_capacity).map_err(|source| {
+                download_error_with_source("요청 헤더 메모리 확보 실패", source)
+            })?;
         }
-        wide(&headers_text)
+        for &(name, value) in headers {
+            out.extend(name.encode_utf16());
+            out.extend_from_slice(&HEADER_SEPARATOR_WIDE);
+            out.extend(value.encode_utf16());
+            out.extend_from_slice(&HEADER_TERMINATOR_WIDE);
+        }
+        out.push(0);
+        Ok(())
     }
     pub(super) fn request_to_writer(
         &mut self,
-        method: &HttpMethod,
+        method: HttpMethod<'_>,
         host: &str,
         path: &str,
-        request_body: Option<&[u8]>,
         headers: &[(&str, &str)],
         writer: &mut dyn IoWrite,
     ) -> DownloadResult<HttpStreamResponse> {
         let host_wide = wide(host)?;
         let path_wide = wide(path)?;
-        let headers_wide = Self::request_headers_wide(headers)?;
-        let body_slice = if matches!(method, HttpMethod::Post) {
-            request_body.ok_or("POST 요청 본문이 비어 있습니다.")?
-        } else {
-            request_body.map_or(&[][..], |body| body)
+        let mut headers_wide = mem::take(&mut self.header_buffer);
+        if let Err(error) = Self::request_headers_wide(&mut headers_wide, headers) {
+            self.header_buffer = headers_wide;
+            return Err(error);
+        }
+        let body_slice = match method {
+            HttpMethod::Get => &[],
+            HttpMethod::Post(body) => body,
         };
-        let body_len = u32::try_from(body_slice.len())
-            .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
-        let connect = self.cached_connect_ptr(host, &host_wide, self.default_https_port)?;
+        let body_len = match u32::try_from(body_slice.len()) {
+            Ok(body_len) => body_len,
+            Err(source) => {
+                self.header_buffer = headers_wide;
+                return Err(download_error_with_source(
+                    "요청 본문 길이 변환 실패",
+                    source,
+                ));
+            }
+        };
+        let connect = match self.cached_connect_ptr(host, &host_wide, self.default_https_port) {
+            Ok(connect) => connect,
+            Err(error) => {
+                self.header_buffer = headers_wide;
+                return Err(error);
+            }
+        };
         let response = (|| {
             let request = self.open_request(connect, method, &path_wide)?;
             self.send_request(&request, &headers_wide, body_slice, body_len)?;
             self.receive_response(&request)?;
             let status = self.query_status(&request)?;
-            let response_headers = self.query_headers(&request)?;
-            enforce_http_content_length_limit(&response_headers, HTTP_MAX_BODY_BYTES)?;
+            let response_headers = self.query_headers(&request, &mut headers_wide)?;
+            let content_length =
+                validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
             let response_body = self.read_body_to_writer(&request, writer)?;
+            enforce_http_body_length(response_body.bytes_seen, content_length)?;
             Ok(HttpStreamResponse {
                 body: response_body,
                 headers: response_headers,
                 status,
             })
-        })();
-        if response.is_err() {
-            self.clear_session_cache();
-        }
+        })()
+        .inspect_err(|_| self.clear_session_cache());
+        self.header_buffer = headers_wide;
         response
     }
     fn send_request(
@@ -750,9 +831,44 @@ impl Default for Client {
         Self {
             default_https_port: INTERNET_DEFAULT_HTTPS_PORT,
             error_code_label: "Windows error",
+            header_buffer: Vec::new(),
+            read_buffer: Vec::new(),
             session_cache: None,
         }
     }
+}
+fn ensure_read_buffer(buffer: &mut Vec<u8>) -> DownloadResult<()> {
+    if buffer.capacity() < WINHTTP_READ_BUFFER_BYTES {
+        buffer
+            .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
+            .map_err(|source| {
+                download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
+            })?;
+    }
+    buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
+    Ok(())
+}
+const fn trim_ascii_utf16(mut value: &[u16]) -> &[u16] {
+    while let Some((first, rest)) = value.split_first()
+        && is_ascii_whitespace_utf16(*first)
+    {
+        value = rest;
+    }
+    while let Some((last, rest)) = value.split_last()
+        && is_ascii_whitespace_utf16(*last)
+    {
+        value = rest;
+    }
+    value
+}
+const fn is_ascii_whitespace_utf16(value: u16) -> bool {
+    matches!(value, 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+}
+fn header_name_eq_ignore_ascii_case(name: &[u16], expected: &[u8]) -> bool {
+    name.len() == expected.len()
+        && name.iter().zip(expected).all(|(&unit, &byte)| {
+            u8::try_from(unit).is_ok_and(|unit_byte| unit_byte.eq_ignore_ascii_case(&byte))
+        })
 }
 fn wide(value: &str) -> DownloadResult<Vec<u16>> {
     let capacity = value
@@ -760,7 +876,7 @@ fn wide(value: &str) -> DownloadResult<Vec<u16>> {
         .checked_add(1)
         .ok_or("wide 문자열 용량 계산 실패")?;
     let mut out = Vec::new();
-    out.try_reserve(capacity)
+    out.try_reserve_exact(capacity)
         .map_err(|source| download_error_with_source("wide 문자열 메모리 확보 실패", source))?;
     out.extend(<OsStr as WindowsOsStrExt>::encode_wide(OsStr::new(value)));
     out.push(0);

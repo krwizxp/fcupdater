@@ -1,5 +1,9 @@
 use alloc::borrow::Cow;
-use core::{error::Error, fmt, fmt::Display, result::Result as CoreResult};
+use core::{
+    error::Error,
+    fmt::{self, Display, Write as _},
+    result::Result as CoreResult,
+};
 use std::{io::Error as IoError, path::Path};
 type BoxError = Box<dyn Error + Send + Sync>;
 pub type Result<T> = CoreResult<T, AppError>;
@@ -80,83 +84,53 @@ pub fn prefixed_message<D>(prefix: &str, detail: D) -> String
 where
     D: Display,
 {
-    let detail_text = detail.to_string();
-    let Some(capacity) = prefix.len().checked_add(detail_text.len()) else {
-        return format!("{prefix}{detail_text}");
-    };
     let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("{prefix}{detail_text}");
+    if out.try_reserve_exact(prefix.len()).is_err() {
+        return format!("{prefix}{detail}");
     }
     out.push_str(prefix);
-    out.push_str(&detail_text);
+    if write!(&mut out, "{detail}").is_err() {
+        return out;
+    }
     out
 }
 pub fn path_context_message(label: &str, path: &Path) -> String {
-    let path_text = path.display().to_string();
-    let Some(capacity) = label
-        .len()
-        .checked_add(": ".len())
-        .and_then(|value| value.checked_add(path_text.len()))
-    else {
-        return format!("{label}: {path_text}");
+    let fallback = || format!("{label}: {}", path.display());
+    let Some(capacity) = label.len().checked_add(": ".len()) else {
+        return fallback();
     };
     let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("{label}: {path_text}");
+    if out.try_reserve_exact(capacity).is_err() {
+        return fallback();
     }
     out.push_str(label);
     out.push_str(": ");
-    out.push_str(&path_text);
+    if write!(&mut out, "{}", path.display()).is_err() {
+        return out;
+    }
     out
 }
 pub fn path_pair_context_message(label: &str, from: &Path, to: &Path) -> String {
-    let from_text = from.display().to_string();
-    let to_text = to.display().to_string();
+    let fallback = || format!("{label}: {} -> {}", from.display(), to.display());
     let Some(capacity) = label
         .len()
         .checked_add(": ".len())
-        .and_then(|value| value.checked_add(from_text.len()))
         .and_then(|value| value.checked_add(" -> ".len()))
-        .and_then(|value| value.checked_add(to_text.len()))
     else {
-        return format!("{label}: {from_text} -> {to_text}");
+        return fallback();
     };
     let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("{label}: {from_text} -> {to_text}");
+    if out.try_reserve_exact(capacity).is_err() {
+        return fallback();
     }
     out.push_str(label);
     out.push_str(": ");
-    out.push_str(&from_text);
+    if write!(&mut out, "{}", from.display()).is_err() {
+        return out;
+    }
     out.push_str(" -> ");
-    out.push_str(&to_text);
-    out
-}
-pub fn path_source_message<D>(label: &str, path: &Path, source: D) -> String
-where
-    D: Display,
-{
-    let path_text = path.display().to_string();
-    let source_text = source.to_string();
-    let Some(capacity) = label
-        .len()
-        .checked_add(": ".len())
-        .and_then(|value| value.checked_add(path_text.len()))
-        .and_then(|value| value.checked_add(" ()".len()))
-        .and_then(|value| value.checked_add(source_text.len()))
-    else {
-        return format!("{label}: {path_text} ({source_text})");
-    };
-    let mut out = String::new();
-    if out.try_reserve(capacity).is_err() {
-        return format!("{label}: {path_text} ({source_text})");
+    if write!(&mut out, "{}", to.display()).is_err() {
+        return out;
     }
-    out.push_str(label);
-    out.push_str(": ");
-    out.push_str(&path_text);
-    out.push_str(" (");
-    out.push_str(&source_text);
-    out.push(')');
     out
 }
