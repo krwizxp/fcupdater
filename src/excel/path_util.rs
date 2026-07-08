@@ -1,7 +1,6 @@
 use crate::diagnostic::{Result, err, err_with_source, prefixed_message};
 use core::fmt::Display;
 use std::path::{Component, Path};
-
 pub(super) fn reject_windows_special_component<D>(component: &str, context: &D) -> Result<()>
 where
     D: Display,
@@ -46,7 +45,6 @@ where
     }
     Ok(())
 }
-
 pub(super) fn path_to_slashes<D>(path: &Path, context: D) -> Result<String>
 where
     D: Display,

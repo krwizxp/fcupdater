@@ -794,10 +794,16 @@ impl RankFormulaRangeRewriter<'_> {
         let Some(second_tail) = self.formula.get(second_col_pos..) else {
             return Ok(None);
         };
-        let Some(end_digits_start) = second_col_pos.checked_add(range_marker.len()) else {
+        let second_tail_without_col_lock = second_tail.strip_prefix('$').unwrap_or(second_tail);
+        let Some(end_digits_tail) = second_tail_without_col_lock
+            .strip_prefix(sort_key_col_name.as_str())
+            .and_then(|tail| tail.strip_prefix('$'))
+        else {
             return Ok(None);
         };
-        let Some(end_digits_tail) = second_tail.strip_prefix(range_marker.as_str()) else {
+        let Some(end_digits_start) =
+            second_col_pos.checked_add(second_tail.len().saturating_sub(end_digits_tail.len()))
+        else {
             return Ok(None);
         };
         let end_digits_len = end_digits_tail
@@ -818,15 +824,18 @@ impl RankFormulaRangeRewriter<'_> {
         };
         let data_start_row = self.data_rows.start;
         let data_end_row = self.data_rows.last;
-        let Some(sort_key_cols_capacity) = sort_key_col_name.len().checked_mul(2) else {
+        let Some(range_capacity) = range_marker
+            .len()
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+        else {
             return Err(err("지역화폐 순위 formula 열 이름 용량 계산 실패"));
         };
         let Some(updated_capacity) = prefix
             .len()
             .checked_add(suffix.len())
-            .and_then(|value| value.checked_add(sort_key_cols_capacity))
+            .and_then(|value| value.checked_add(range_capacity))
             .and_then(|value| value.checked_add(USIZE_DECIMAL_TEXT_MAX_LEN * 2))
-            .and_then(|value| value.checked_add(4))
         else {
             return Err(err("지역화폐 순위 formula 범위 치환 용량 계산 실패"));
         };
@@ -837,14 +846,12 @@ impl RankFormulaRangeRewriter<'_> {
                 err_with_source("지역화폐 순위 formula 범위 치환 메모리 확보 실패", source)
             })?;
         updated.push_str(prefix);
-        updated.push('$');
-        updated.push_str(&sort_key_col_name);
-        updated.push('$');
+        updated.push_str(&range_marker);
         write!(&mut updated, "{data_start_row}:").map_err(|source| {
             err_with_source("지역화폐 순위 formula 범위 치환 작성 실패", source)
         })?;
-        updated.push_str(&sort_key_col_name);
-        write!(&mut updated, "${data_end_row}{suffix}").map_err(|source| {
+        updated.push_str(&range_marker);
+        write!(&mut updated, "{data_end_row}{suffix}").map_err(|source| {
             err_with_source("지역화폐 순위 formula 범위 치환 작성 실패", source)
         })?;
         Ok((updated != self.formula).then_some(updated))
