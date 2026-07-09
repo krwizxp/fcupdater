@@ -4,7 +4,6 @@ use super::{
     HASH_SIZE, LENGTH_BASES, LENGTH_EXTRA_BITS, LITERAL_LENGTH_SYMBOLS, MAX_CHAIN, MAX_MATCH,
     MIN_MATCH, ZipResult, read_u16, zip_static, zip_with_source,
 };
-use alloc::vec::Vec;
 use core::{array::from_fn, cmp::Ordering, iter::repeat_n, range::Range};
 use std::io::Write as IoWrite;
 const TOO_FAR_MATCH_DISTANCE: usize = 4096;
@@ -58,8 +57,13 @@ struct HuffmanCode {
 }
 #[derive(Clone, Copy)]
 enum DeflateToken {
-    Literal(u8),
-    Match { distance: usize, length: usize },
+    Literal(u16),
+    Match { distance: u16, length: u16 },
+}
+impl DeflateToken {
+    fn literal(byte: u8) -> Self {
+        Self::Literal(u16::from(byte))
+    }
 }
 #[derive(Clone, Copy)]
 struct CodeLengthToken {
@@ -969,9 +973,7 @@ impl DynamicFrequencyCounter<'_> {
 impl<O: BitOutput> DynamicTokenWriter<'_, '_, O> {
     fn write(&mut self, token: DeflateToken) -> ZipResult<()> {
         match token {
-            DeflateToken::Literal(byte) => self
-                .literal_huffman
-                .write_symbol(self.writer, u16::from(byte)),
+            DeflateToken::Literal(byte) => self.literal_huffman.write_symbol(self.writer, byte),
             DeflateToken::Match { distance, length } => {
                 let Some(length_code) = DeflateWriter::length_symbol(length) else {
                     return Err(zip_static("deflate length 범위 오류"));
@@ -1018,7 +1020,7 @@ impl FixedDeflateWriter<'_> {
     }
 }
 impl<O: BitOutput> FixedTokenWriter<'_, O> {
-    fn write_distance(&mut self, distance: usize) -> ZipResult<()> {
+    fn write_distance(&mut self, distance: u16) -> ZipResult<()> {
         let Some(distance_code) = DeflateWriter::distance_symbol(distance) else {
             return Err(zip_static("deflate distance 범위 오류"));
         };
@@ -1030,7 +1032,7 @@ impl<O: BitOutput> FixedTokenWriter<'_, O> {
         }
         Ok(())
     }
-    fn write_length(&mut self, length: usize) -> ZipResult<()> {
+    fn write_length(&mut self, length: u16) -> ZipResult<()> {
         let Some(length_code) = DeflateWriter::length_symbol(length) else {
             return Err(zip_static("deflate length 범위 오류"));
         };
@@ -1068,7 +1070,7 @@ impl<O: BitOutput> FixedTokenWriter<'_, O> {
     }
     fn write_token(&mut self, token: DeflateToken) -> ZipResult<()> {
         match token {
-            DeflateToken::Literal(byte) => self.write_symbol(u16::from(byte)),
+            DeflateToken::Literal(byte) => self.write_symbol(byte),
             DeflateToken::Match { distance, length } => {
                 self.write_length(length)?;
                 self.write_distance(distance)
@@ -1402,13 +1404,14 @@ impl DeflateWriter<'_> {
             length: best_len,
         })
     }
-    fn distance_symbol(distance: usize) -> Option<DeflateSymbol> {
+    fn distance_symbol(distance: u16) -> Option<DeflateSymbol> {
+        let distance_value = usize::from(distance);
         for (index, &base) in DISTANCE_BASES.iter().enumerate().rev() {
-            if distance < base {
+            if distance_value < base {
                 continue;
             }
             let &extra_bits = DISTANCE_EXTRA_BITS.get(index)?;
-            let extra = distance.checked_sub(base)?;
+            let extra = distance_value.checked_sub(base)?;
             let extra_u16 = u16::try_from(extra).ok()?;
             let symbol = u16::try_from(index).ok()?;
             return Some(DeflateSymbol {
@@ -1432,13 +1435,14 @@ impl DeflateWriter<'_> {
         *slot = *head_slot;
         *head_slot = position;
     }
-    fn length_symbol(length: usize) -> Option<DeflateSymbol> {
+    fn length_symbol(length: u16) -> Option<DeflateSymbol> {
+        let length_value = usize::from(length);
         for (index, &base) in LENGTH_BASES.iter().enumerate().rev() {
-            if length < base {
+            if length_value < base {
                 continue;
             }
             let &extra_bits = LENGTH_EXTRA_BITS.get(index)?;
-            let extra = length.checked_sub(base)?;
+            let extra = length_value.checked_sub(base)?;
             let extra_u16 = u16::try_from(extra).ok()?;
             let index_u16 = u16::try_from(index).ok()?;
             let symbol = 257_u16.checked_add(index_u16)?;
@@ -1514,7 +1518,7 @@ impl DeflateWriter<'_> {
                     let Some(&byte) = self.bytes.get(position) else {
                         return Err(zip_static("deflate literal 범위 오류"));
                     };
-                    tokens.push(DeflateToken::Literal(byte));
+                    tokens.push(DeflateToken::literal(byte));
                     Self::insert_position(self.bytes, position, &mut head, &mut previous);
                     position = position
                         .checked_add(1)
@@ -1537,15 +1541,15 @@ impl DeflateWriter<'_> {
                     let Some(&byte) = self.bytes.get(position) else {
                         return Err(zip_static("deflate literal 범위 오류"));
                     };
-                    tokens.push(DeflateToken::Literal(byte));
+                    tokens.push(DeflateToken::literal(byte));
                     position = position
                         .checked_add(1)
                         .ok_or_else(|| zip_static("deflate 위치 계산 실패"))?;
                     continue;
                 }
                 tokens.push(DeflateToken::Match {
-                    distance: best_match.distance,
-                    length: best_match.length,
+                    distance: deflate_u16(best_match.distance, "deflate match distance 변환 실패")?,
+                    length: deflate_u16(best_match.length, "deflate match length 변환 실패")?,
                 });
                 let next_position = position
                     .checked_add(best_match.length)
@@ -1565,13 +1569,16 @@ impl DeflateWriter<'_> {
                 let Some(&byte) = self.bytes.get(position) else {
                     return Err(zip_static("deflate literal 범위 오류"));
                 };
-                tokens.push(DeflateToken::Literal(byte));
+                tokens.push(DeflateToken::literal(byte));
                 Self::insert_position(self.bytes, position, &mut head, &mut previous);
                 position = position.saturating_add(1);
             }
         }
         Ok(tokens)
     }
+}
+fn deflate_u16(value: usize, context: &'static str) -> ZipResult<u16> {
+    u16::try_from(value).map_err(|source| zip_with_source(context, source))
 }
 fn ensure_deflate_output_len(
     current_len: usize,

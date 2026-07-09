@@ -1,5 +1,4 @@
 use crate::diagnostic::{Result, err, err_with_source};
-use alloc::string::String;
 pub(super) const TARGET_REGION_COUNT: usize = 11;
 const TARGET_REGION_KEYS: [&str; TARGET_REGION_COUNT] = [
     "대전대덕구",

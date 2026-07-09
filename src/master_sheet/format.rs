@@ -1,6 +1,5 @@
 use super::{DECIMAL_SCALE, DECIMAL_SCALE_SQUARED, ScaledDecimal, ScaledSortKey};
 use crate::diagnostic::{AppError, Result, err, err_with_source};
-use alloc::string::String;
 use core::str;
 const U128_DECIMAL_MAX_LEN: usize = 39;
 const UNIT_PRICE_MAX_FRAC_DIGITS: usize = 15;

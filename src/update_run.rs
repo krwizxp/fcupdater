@@ -248,12 +248,12 @@ impl UpdateRun<'_> {
     fn print_added_rows(&mut self, title: &str, rows: &[AddedStoreRow<'_>]) -> Result<()> {
         self.print_summary_rows(
             title,
-            rows.len(),
-            rows.iter().map(|item| SummaryRowDisplay {
+            rows,
+            |item| SummaryRowDisplay {
                 address: item.record.address.as_str(),
                 name: item.record.name.as_str(),
                 region: item.region,
-            }),
+            },
             "신규 업체 표시 번호 계산 실패",
         )
     }
@@ -278,30 +278,34 @@ impl UpdateRun<'_> {
     fn print_store_rows(&mut self, title: &str, rows: &[StoreRow]) -> Result<()> {
         self.print_summary_rows(
             title,
-            rows.len(),
-            rows.iter().map(|item| SummaryRowDisplay {
+            rows,
+            |item| SummaryRowDisplay {
                 address: item.address.as_str(),
                 name: item.name.as_str(),
                 region: item.region.as_str(),
-            }),
+            },
             "폐업 업체 표시 번호 계산 실패",
         )
     }
-    fn print_summary_rows<'row>(
+    fn print_summary_rows<T, F>(
         &mut self,
         title: &str,
-        row_count: usize,
-        rows: impl IntoIterator<Item = SummaryRowDisplay<'row>>,
+        rows: &[T],
+        display_row: F,
         display_number_error: &'static str,
-    ) -> Result<()> {
-        if row_count == 0 {
+    ) -> Result<()>
+    where
+        F: for<'row> Fn(&'row T) -> SummaryRowDisplay<'row>,
+    {
+        if rows.is_empty() {
             return Ok(());
         }
         write_line(self.out, format_args!("\n{title}"))?;
-        for (item_index, item) in rows.into_iter().take(20).enumerate() {
+        for (item_index, row) in rows.iter().take(20).enumerate() {
             let Some(display_index) = item_index.checked_add(1) else {
                 return Err(err(display_number_error));
             };
+            let item = display_row(row);
             write_line(
                 self.out,
                 format_args!(
@@ -312,10 +316,10 @@ impl UpdateRun<'_> {
                 ),
             )?;
         }
-        if row_count > 20 {
+        if rows.len() > 20 {
             write_line(
                 self.out,
-                format_args!("  ... ({row_count}개 중 20개만 표시)"),
+                format_args!("  ... ({}개 중 20개만 표시)", rows.len()),
             )?;
         }
         Ok(())

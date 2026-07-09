@@ -5,7 +5,6 @@ use super::{
     download_error_with_source, push_decimal_fragment,
 };
 use crate::diagnostic::prefixed_message;
-use alloc::{string::String, vec::Vec};
 use core::{mem, time::Duration};
 use std::{
     fs::{File, remove_file},

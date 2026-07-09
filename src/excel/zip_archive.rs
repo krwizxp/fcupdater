@@ -3,7 +3,7 @@ use super::{ZipArchiveExtractor, path_util::path_to_slashes};
 use crate::diagnostic::{
     AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
 };
-use alloc::{borrow::Cow, boxed::Box, string::String, vec::Vec};
+use alloc::borrow::Cow;
 use core::{error::Error, fmt, range::Range, result::Result as CoreResult, str};
 use std::{
     collections::HashSet,

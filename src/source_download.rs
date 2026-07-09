@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloc::borrow::Cow;
 use core::{error::Error, fmt, fmt::Display, mem::replace, result::Result as CoreResult, str};
 use std::{
     fs,
