@@ -1,6 +1,5 @@
 use crate::{
     diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message},
-    rows::SourceRecord,
     sheet_util::parse_i32_str,
 };
 use alloc::collections::BTreeMap;
@@ -32,6 +31,17 @@ const COL_PREMIUM: usize = 6;
 const COL_GASOLINE: usize = 7;
 const COL_DIESEL: usize = 8;
 const SOURCE_COLUMN_COUNT: usize = COL_DIESEL + 1;
+#[derive(Debug)]
+pub(crate) struct SourceRecord {
+    pub address: String,
+    pub brand: String,
+    pub diesel: Option<i32>,
+    pub gasoline: Option<i32>,
+    pub name: String,
+    pub premium: Option<i32>,
+    pub region: String,
+    pub self_yn: String,
+}
 #[derive(Debug)]
 struct CfbDirectoryEntry {
     name: String,
@@ -73,7 +83,7 @@ struct CfbDataParser<'data, 'path> {
 struct CfbDirectoryParser<'stream> {
     dir_stream: &'stream [u8],
 }
-pub struct SourceReader<'path> {
+pub(crate) struct SourceReader<'path> {
     pub path: &'path Path,
 }
 struct SourceHeaderValidator<'rows, 'strings> {
@@ -451,7 +461,7 @@ impl SourceReader<'_> {
         }
         Ok(data)
     }
-    pub fn read_xls_source(&self) -> Result<Vec<SourceRecord>> {
+    pub(crate) fn read_xls_source(&self) -> Result<Vec<SourceRecord>> {
         let cfb = self.open()?;
         let workbook = cfb.read_stream_by_name("Workbook")?;
         let biff = BiffWorkbookReader {

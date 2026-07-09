@@ -10,7 +10,15 @@ keywords = ["excel", "xlsx", "xls", "cli", "sync"]
 categories = ["command-line-utilities", "encoding"]
 
 [lints.rust]
+dead_code_pub_in_binary = "warn"
+future_incompatible = { level = "deny", priority = -1 }
+let_underscore_drop = "deny"
+non_ascii_idents = "deny"
+unit_bindings = "deny"
+unreachable_pub = "deny"
 unsafe_op_in_unsafe_fn = "deny"
+unused_extern_crates = "deny"
+unused_lifetimes = "deny"
 unused_unsafe = "deny"
 
 [lints.clippy]
@@ -19,6 +27,7 @@ blanket_clippy_restriction_lints = "allow"
 cargo = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
 correctness = { level = "deny", priority = -1 }
+expect_used = "deny"
 implicit_return = "allow"
 little_endian_bytes = "allow"
 missing_docs_in_private_items = "allow"
@@ -29,8 +38,8 @@ pedantic = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 pub_with_shorthand = "allow"
 question_mark_used = "allow"
-expect_used = "deny"
 redundant_clone = "warn"
+redundant_pub_crate = "allow"
 restriction = { level = "warn", priority = -1 }
 self_named_module_files = "allow"
 semicolon_outside_block = "allow"

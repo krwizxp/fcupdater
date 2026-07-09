@@ -61,7 +61,7 @@ struct DownloadError {
     source: Option<BoxError>,
 }
 type DownloadResult<T> = CoreResult<T, DownloadError>;
-pub struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
+pub(super) struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
     pub dir: &'dir Path,
     pub out: &'out mut W,
 }

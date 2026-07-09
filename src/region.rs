@@ -1,6 +1,6 @@
 use crate::diagnostic::{Result, err, err_with_source};
 use alloc::string::String;
-pub const TARGET_REGION_COUNT: usize = 11;
+pub(super) const TARGET_REGION_COUNT: usize = 11;
 const TARGET_REGION_KEYS: [&str; TARGET_REGION_COUNT] = [
     "대전대덕구",
     "대전동구",
@@ -14,7 +14,7 @@ const TARGET_REGION_KEYS: [&str; TARGET_REGION_COUNT] = [
     "충남아산시",
     "충남천안시",
 ];
-pub const TARGET_REGION_LABELS: [&str; TARGET_REGION_COUNT] = [
+pub(super) const TARGET_REGION_LABELS: [&str; TARGET_REGION_COUNT] = [
     "대전 대덕구",
     "대전 동구",
     "대전 서구",
@@ -52,12 +52,12 @@ struct AddressKeyReplacement {
 const fn ignored_address_key_char(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
 }
-pub fn normalize_address_key(addr: &str) -> Result<String> {
+pub(super) fn normalize_address_key(addr: &str) -> Result<String> {
     let mut out = String::new();
     normalize_address_key_into(addr, &mut out)?;
     Ok(out)
 }
-pub fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
+fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     let mut rest = addr.trim();
     let capacity = rest.len();
     out.clear();
@@ -107,7 +107,7 @@ pub fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     }
     Ok(())
 }
-pub fn target_region_index(
+pub(super) fn target_region_index(
     region: &str,
     address: &str,
     scratch: &mut String,
@@ -126,7 +126,7 @@ pub fn target_region_index(
     }
     Ok(None)
 }
-pub fn increment_target_region_count(
+pub(super) fn increment_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],
     region_index: usize,
     context: &'static str,

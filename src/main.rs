@@ -14,7 +14,6 @@ mod diagnostic;
 mod excel;
 mod master_sheet;
 mod region;
-mod rows;
 mod sheet_util;
 mod source_download;
 mod update_run;

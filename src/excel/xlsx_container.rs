@@ -41,7 +41,7 @@ const MASTER_FILTER_START_COL: u32 = 1;
 const WORKSHEET_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
 #[derive(Debug)]
-pub struct XlsxContainer {
+pub(crate) struct XlsxContainer {
     unpack_dir: PathBuf,
     work_dir: PathBuf,
 }
@@ -1358,7 +1358,7 @@ impl XlsxContainer {
         }
         Ok(sheets)
     }
-    pub fn open(source_xlsx: &Path) -> Result<Self> {
+    pub(crate) fn open(source_xlsx: &Path) -> Result<Self> {
         let base = env::temp_dir();
         let cleanup = WorkDirCleanup {
             path: Some(reserve_unique_temp_entry(
@@ -1399,7 +1399,7 @@ impl XlsxContainer {
         };
         Self::read_text_from_file(&path, file).map(Some)
     }
-    pub fn read_text(&self, relative_path: &str) -> Result<String> {
+    pub(super) fn read_text(&self, relative_path: &str) -> Result<String> {
         let path = self.resolve_relative_path(relative_path)?;
         let file = fs::File::open(&path).map_err(|source_err| {
             err_with_source(path_context_message("파일 열기 실패", &path), source_err)
@@ -1466,7 +1466,7 @@ impl XlsxContainer {
         let path = normalize_safe_relative_path(Path::new(relative_path), relative_path)?;
         Ok(self.unpack_dir.join(path))
     }
-    pub fn save(&self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
+    pub(super) fn save(&self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
         let parent = if let Some(parent) = target_xlsx.parent() {
             create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
             parent
@@ -1537,7 +1537,7 @@ impl XlsxContainer {
             }
         }
     }
-    pub fn write_text(&self, relative_path: &str, content: &str) -> Result<()> {
+    pub(super) fn write_text(&self, relative_path: &str, content: &str) -> Result<()> {
         let path = self.resolve_relative_path(relative_path)?;
         if let Some(parent) = path.parent() {
             create_dir_all_checked(parent, "폴더 생성 실패")?;

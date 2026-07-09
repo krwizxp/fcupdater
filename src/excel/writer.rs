@@ -31,7 +31,7 @@ const RICH_INLINE_STRING_MARKERS: [&str; 4] = ["<r", "<rPr", "<rPh", "<phoneticP
 const MAX_DECIMAL_TEXT_LEN: usize = 39;
 const U32_DECIMAL_TEXT_MAX_LEN: usize = 10;
 #[derive(Debug)]
-pub struct Workbook {
+pub(crate) struct Workbook {
     container: XlsxContainer,
     shared_strings: Vec<String>,
     shared_strings_dirty: bool,
@@ -46,7 +46,7 @@ struct SheetEntry {
     worksheet: Worksheet,
 }
 #[derive(Debug, Default)]
-pub struct Worksheet {
+pub(crate) struct Worksheet {
     formula_cells: BTreeSet<(u32, u32)>,
     locations: WorksheetXmlLocations,
     prefix: String,
@@ -65,7 +65,7 @@ struct XmlTagLocation {
     span: Range<usize>,
 }
 #[derive(Debug, Default)]
-pub struct Row {
+pub(crate) struct Row {
     attrs: Vec<XmlAttr>,
     cells: BTreeMap<u32, Cell>,
 }
@@ -145,7 +145,7 @@ struct RangeTokenParts<'token> {
     start_ref: &'token str,
 }
 impl Workbook {
-    pub fn from_container(container: XlsxContainer) -> Result<Self> {
+    pub(crate) fn from_container(container: XlsxContainer) -> Result<Self> {
         let workbook_xml = container.read_text("xl/workbook.xml")?;
         let sheet_catalog = container.load_sheet_catalog(&workbook_xml)?;
         let shared_strings_xml_text = container.read_shared_strings_text()?;
@@ -321,9 +321,9 @@ impl Workbook {
         let out = &mut self.xml_text;
         let mut scanner = XmlScanner::new(out);
         if let Some(calc_pr_tag) = scanner.next_start_named("calcPr") {
-            let calc_pr_start = calc_pr_tag.start;
-            let calc_pr_tag_end = calc_pr_tag.end;
-            let calc_pr_name = calc_pr_tag.name;
+            let calc_pr_start = calc_pr_tag.start();
+            let calc_pr_tag_end = calc_pr_tag.end();
+            let calc_pr_name = calc_pr_tag.name();
             let calc_pr_open_span = RangeInclusive {
                 start: calc_pr_start,
                 last: calc_pr_tag_end,
@@ -377,7 +377,10 @@ impl Workbook {
                 return Err(err("workbook.xml의 workbook 시작 태그를 찾지 못했습니다."));
             };
             let calc_pr_name = qualified_name_with_prefix(
-                workbook_tag.name.rsplit_once(':').map(|(prefix, _)| prefix),
+                workbook_tag
+                    .name()
+                    .rsplit_once(':')
+                    .map(|(prefix, _)| prefix),
                 "calcPr",
                 "calcPr qualified name",
             )?;
@@ -397,7 +400,11 @@ impl Workbook {
         }
         Ok(())
     }
-    pub fn save(&mut self, target_path: &Path, verification: SaveVerification) -> Result<()> {
+    pub(crate) fn save(
+        &mut self,
+        target_path: &Path,
+        verification: SaveVerification,
+    ) -> Result<()> {
         self.promote_safe_inline_strings_to_shared()?;
         self.request_full_recalculation()?;
         self.remove_excel_recovery_artifacts()?;
@@ -433,7 +440,7 @@ impl Workbook {
         }
         Ok(count)
     }
-    pub fn update_filter_database_defined_name(
+    pub(crate) fn update_filter_database_defined_name(
         &mut self,
         sheet_name: &str,
         header_row: u32,
@@ -539,7 +546,7 @@ impl Workbook {
         let Some(sst_tag) = scanner.next_start_named("sst") else {
             return Err(err("sharedStrings XML에 <sst>가 없습니다."));
         };
-        let (open_start, open_end, sst_name) = (sst_tag.start, sst_tag.end, sst_tag.name);
+        let (open_start, open_end, sst_name) = (sst_tag.start(), sst_tag.end(), sst_tag.name());
         let open_tag_span = RangeInclusive {
             start: open_start,
             last: open_end,
@@ -672,7 +679,7 @@ impl Workbook {
         }
         Ok(())
     }
-    pub fn with_sheet_mut<R, F>(&mut self, name: &str, mutator: F) -> Result<Option<R>>
+    pub(crate) fn with_sheet_mut<R, F>(&mut self, name: &str, mutator: F) -> Result<Option<R>>
     where
         F: FnOnce(&mut Worksheet, &[String]) -> Result<R>,
     {
@@ -695,11 +702,11 @@ impl SharedStringsXmlParser<'_> {
                     err_with_source("sharedStrings entry 메모리 확보 실패", source)
                 })?;
             }
-            if si_tag.self_closing {
+            if si_tag.self_closing() {
                 out.push(String::new());
                 continue;
             }
-            let si_tag_end = si_tag.end;
+            let si_tag_end = si_tag.end();
             let Some(body_start) = si_tag_end.checked_add(1) else {
                 return Err(err(
                     "sharedStrings.xml의 <si> 본문 시작 계산에 실패했습니다.",
@@ -736,8 +743,8 @@ impl WorksheetRowParser<'_> {
         let mut scanner = XmlScanner::new(self.row_body);
         let mut next_col = 1_u32;
         while let Some(cell_info) = scanner.next_start_named("c") {
-            let cell_tag_end = cell_info.end;
-            let cell_tag = cell_info.raw;
+            let cell_tag_end = cell_info.end();
+            let cell_tag = cell_info.raw();
             let mut attrs = parse_tag_attrs(cell_tag)?;
             let col = if let Some(reference_text) = get_attr(&attrs, "r") {
                 let reference = parse_ref_with_locks(reference_text).ok_or_else(|| {
@@ -767,7 +774,7 @@ impl WorksheetRowParser<'_> {
                 "r",
                 ref_with_locks(CellReference::unlocked(col, self.row_num))?,
             );
-            if cell_info.self_closing {
+            if cell_info.self_closing() {
                 insert_cell(
                     row,
                     self.row_num,
@@ -830,8 +837,8 @@ impl WorksheetRowsParser<'_> {
         let mut formula_cells = BTreeSet::new();
         let mut scanner = XmlScanner::new(self.body);
         while let Some(row_info) = scanner.next_start_named("row") {
-            let row_tag_end = row_info.end;
-            let row_tag = row_info.raw;
+            let row_tag_end = row_info.end();
+            let row_tag = row_info.raw();
             let mut row_attrs = parse_tag_attrs(row_tag)?;
             let row_num = if let Some(row_num_text) = get_attr(&row_attrs, "r") {
                 parse_positive_u32_decimal(
@@ -859,7 +866,7 @@ impl WorksheetRowsParser<'_> {
                 "r",
                 u32_text_value(row_num, "row 번호 속성 메모리 확보 실패")?,
             );
-            if row_info.self_closing {
+            if row_info.self_closing() {
                 if rows
                     .insert(
                         row_num,
@@ -925,13 +932,13 @@ impl WorksheetXmlParser<'_> {
         let Some(sheet_data_tag) = scanner.next_start_named("sheetData") else {
             return Err(err("worksheet XML에 <sheetData>가 없습니다."));
         };
-        let sheet_data_open = sheet_data_tag.start;
-        let sheet_data_open_end = sheet_data_tag.end;
-        if sheet_data_tag.self_closing {
+        let sheet_data_open = sheet_data_tag.start();
+        let sheet_data_open_end = sheet_data_tag.end();
+        if sheet_data_tag.self_closing() {
             return self.parse_self_closing_sheet_data(
                 sheet_data_open,
                 sheet_data_open_end,
-                sheet_data_tag.name,
+                sheet_data_tag.name(),
             );
         }
         let sheet_data_body_start =
@@ -1057,7 +1064,11 @@ impl WorksheetXmlLocations {
     }
 }
 impl Worksheet {
-    pub fn clear_cells_in_rows_through_col(&mut self, rows: RangeInclusive<u32>, max_col: u32) {
+    pub(crate) fn clear_cells_in_rows_through_col(
+        &mut self,
+        rows: RangeInclusive<u32>,
+        max_col: u32,
+    ) {
         let clear_start = rows.start;
         let clear_last = rows.last;
         for (_, row_obj) in self.rows.range_mut(rows) {
@@ -1076,7 +1087,7 @@ impl Worksheet {
             )
             .for_each(drop);
     }
-    pub fn clear_formula_cached_values_in_range(
+    pub(crate) fn clear_formula_cached_values_in_range(
         &mut self,
         rows: RangeInclusive<u32>,
     ) -> Result<()> {
@@ -1133,13 +1144,18 @@ impl Worksheet {
             )
             .for_each(drop);
     }
-    pub fn cols_in_row(&self, row: u32) -> impl Iterator<Item = u32> + '_ {
+    fn cols_in_row(&self, row: u32) -> impl Iterator<Item = u32> + '_ {
         self.rows
             .get(&row)
             .into_iter()
             .flat_map(|row_obj| row_obj.cells.keys().copied())
     }
-    pub fn copy_row_style(&mut self, source_row: u32, target_row: u32, max_col: u32) -> Result<()> {
+    pub(crate) fn copy_row_style(
+        &mut self,
+        source_row: u32,
+        target_row: u32,
+        max_col: u32,
+    ) -> Result<()> {
         let Some(src) = self.rows.get(&source_row) else {
             return Ok(());
         };
@@ -1175,7 +1191,7 @@ impl Worksheet {
         self.reindex_formula_row(target_row);
         Ok(())
     }
-    pub fn extend_conditional_formats(
+    pub(crate) fn extend_conditional_formats(
         &mut self,
         old_data_rows: RangeInclusive<u32>,
         data_rows: RangeInclusive<u32>,
@@ -1280,7 +1296,12 @@ impl Worksheet {
         }
         Ok(())
     }
-    pub fn get_i32_at(&self, col: u32, row: u32, shared_strings: &[String]) -> Result<Option<i32>> {
+    pub(crate) fn get_i32_at(
+        &self,
+        col: u32,
+        row: u32,
+        shared_strings: &[String],
+    ) -> Result<Option<i32>> {
         let text = self.try_get_display_at(col, row, shared_strings)?;
         Ok(parse_i32_str(&text))
     }
@@ -1316,13 +1337,13 @@ impl Worksheet {
             }
         })
     }
-    pub fn has_any_row_format(&self, row: u32, max_col: u32) -> bool {
+    pub(crate) fn has_any_row_format(&self, row: u32, max_col: u32) -> bool {
         self.rows.get(&row).is_some_and(|row_obj| {
             !row_obj.attrs.is_empty()
                 || (max_col > 0 && row_obj.cells.range(1..=max_col).next().is_some())
         })
     }
-    pub fn has_row(&self, row: u32) -> bool {
+    pub(crate) fn has_row(&self, row: u32) -> bool {
         self.rows.contains_key(&row)
     }
     fn mark_cell_formula_state(&mut self, col: u32, row: u32) {
@@ -1337,7 +1358,7 @@ impl Worksheet {
             self.formula_cells.remove(&(row, col));
         }
     }
-    pub fn max_cell_col(&self) -> u32 {
+    pub(crate) fn max_cell_col(&self) -> u32 {
         self.rows
             .values()
             .filter_map(|row| row.cells.last_key_value().map(|(&col, _)| col))
@@ -1487,7 +1508,7 @@ impl Worksheet {
         }
         Ok(())
     }
-    pub fn prune_empty_style_artifacts_after_col(&mut self, max_col: u32) -> Result<()> {
+    pub(crate) fn prune_empty_style_artifacts_after_col(&mut self, max_col: u32) -> Result<()> {
         let mut cols_to_remove = Vec::new();
         for row in self.rows.values_mut() {
             cols_to_remove.clear();
@@ -1533,14 +1554,14 @@ impl Worksheet {
             }
         }
     }
-    pub fn replace_rows(&mut self, rows: BTreeMap<u32, Row>) {
+    pub(crate) fn replace_rows(&mut self, rows: BTreeMap<u32, Row>) {
         self.formula_cells = formula_cells_from_rows(&rows);
         self.rows = rows;
     }
-    pub fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         self.rows.len()
     }
-    pub fn row_has_any_data(
+    pub(crate) fn row_has_any_data(
         &self,
         row: u32,
         cols: &[u32],
@@ -1557,10 +1578,10 @@ impl Worksheet {
         }
         Ok(false)
     }
-    pub fn row_numbers_from(&self, start: u32) -> impl DoubleEndedIterator<Item = u32> + '_ {
+    pub(crate) fn row_numbers_from(&self, start: u32) -> impl DoubleEndedIterator<Item = u32> + '_ {
         self.rows.range(start..).map(|(&row, _)| row)
     }
-    pub fn set_formula_at(&mut self, col: u32, row: u32, formula: &str) -> Result<()> {
+    pub(crate) fn set_formula_at(&mut self, col: u32, row: u32, formula: &str) -> Result<()> {
         let cell = self.get_or_create_cell_mut(col, row)?;
         if let Some(inner) = cell.inner_xml.as_mut() {
             if find_start_tag(inner, "f", 0).is_some() {
@@ -1583,7 +1604,7 @@ impl Worksheet {
         self.formula_cells.insert((row, col));
         Ok(())
     }
-    pub fn set_formula_cached_value_at(
+    pub(crate) fn set_formula_cached_value_at(
         &mut self,
         col: u32,
         row: u32,
@@ -1614,7 +1635,7 @@ impl Worksheet {
         self.mark_cell_formula_state(col, row);
         Ok(())
     }
-    pub fn set_i32_at(&mut self, col: u32, row: u32, value: Option<i32>) -> Result<()> {
+    pub(crate) fn set_i32_at(&mut self, col: u32, row: u32, value: Option<i32>) -> Result<()> {
         let cell = self.get_or_create_cell_mut(col, row)?;
         remove_attr(&mut cell.attrs, "t");
         if let Some(numeric_value) = value {
@@ -1629,7 +1650,7 @@ impl Worksheet {
         self.formula_cells.remove(&(row, col));
         Ok(())
     }
-    pub fn set_string_at(&mut self, col: u32, row: u32, value: &str) -> Result<()> {
+    pub(crate) fn set_string_at(&mut self, col: u32, row: u32, value: &str) -> Result<()> {
         let cell = self.get_or_create_cell_mut(col, row)?;
         set_attr(&mut cell.attrs, "t", "inlineStr");
         let mut inner = String::new();
@@ -1638,7 +1659,7 @@ impl Worksheet {
         self.formula_cells.remove(&(row, col));
         Ok(())
     }
-    pub fn take_rows(&mut self) -> BTreeMap<u32, Row> {
+    pub(crate) fn take_rows(&mut self) -> BTreeMap<u32, Row> {
         self.formula_cells.clear();
         mem::take(&mut self.rows)
     }
@@ -1716,7 +1737,7 @@ impl Worksheet {
         out.push_str(&self.suffix);
         Ok(out)
     }
-    pub fn truncate_rows_after(&mut self, last_row_to_keep: u32) -> Result<()> {
+    pub(crate) fn truncate_rows_after(&mut self, last_row_to_keep: u32) -> Result<()> {
         let remove_start = last_row_to_keep
             .checked_add(1)
             .ok_or_else(|| err("worksheet row 제거 시작 행 계산 중 overflow가 발생했습니다."))?;
@@ -1726,7 +1747,7 @@ impl Worksheet {
         self.formula_cells = formula_cells_from_rows(&self.rows);
         Ok(())
     }
-    pub fn try_get_display_at<'text>(
+    pub(crate) fn try_get_display_at<'text>(
         &'text self,
         col: u32,
         row: u32,
@@ -1769,7 +1790,7 @@ impl Worksheet {
             },
         }
     }
-    pub fn try_get_formula_at(&self, col: u32, row: u32) -> Result<Option<Cow<'_, str>>> {
+    pub(crate) fn try_get_formula_at(&self, col: u32, row: u32) -> Result<Option<Cow<'_, str>>> {
         let Some(inner) = self
             .rows
             .get(&row)
@@ -1783,7 +1804,10 @@ impl Worksheet {
         };
         decode_xml_entities(text).map(Some)
     }
-    pub fn update_auto_filter_ref(&mut self, filter_rows: RangeInclusive<u32>) -> Result<u32> {
+    pub(crate) fn update_auto_filter_ref(
+        &mut self,
+        filter_rows: RangeInclusive<u32>,
+    ) -> Result<u32> {
         let out = &mut self.suffix;
         let mut cursor = 0_usize;
         let header_row = filter_rows.start;
@@ -1845,7 +1869,7 @@ impl Worksheet {
         }
         updated_end_col.ok_or_else(|| err("worksheet XML의 autoFilter 태그를 찾지 못했습니다."))
     }
-    pub fn update_dimension(&mut self) -> Result<()> {
+    pub(crate) fn update_dimension(&mut self) -> Result<()> {
         let mut max_row = 1_u32;
         let mut max_col = 1_u32;
         for (&row_num, row) in &self.rows {
@@ -1890,7 +1914,7 @@ impl Worksheet {
     }
 }
 impl Row {
-    pub fn copy_for_row(
+    pub(crate) fn copy_for_row(
         &self,
         target_row: u32,
         resolver: &dyn Fn(u32) -> Result<u32>,
@@ -1916,7 +1940,7 @@ impl Row {
         remap_row_numbers(&mut row, target_row, resolver)?;
         Ok(row)
     }
-    pub fn numbered(row_num: u32) -> Result<Self> {
+    pub(crate) fn numbered(row_num: u32) -> Result<Self> {
         let mut attrs = Vec::new();
         attrs
             .try_reserve_exact(1)
@@ -2075,17 +2099,17 @@ fn find_start_tag_location(
     let Some(tag) = scanner.next_start_named(tag_name) else {
         return Ok(None);
     };
-    let tag_end = checked_usize_add(tag.end, 1, context)?;
+    let tag_end = checked_usize_add(tag.end(), 1, context)?;
     Ok(Some(XmlTagLocation {
-        name: copy_text(tag.name, context)?,
-        self_closing: tag.self_closing,
+        name: copy_text(tag.name(), context)?,
+        self_closing: tag.self_closing(),
         span: Range {
-            start: tag.start,
+            start: tag.start(),
             end: tag_end,
         },
     }))
 }
-pub fn remap_row_numbers(
+pub(crate) fn remap_row_numbers(
     row: &mut Row,
     new_row: u32,
     resolver: &dyn Fn(u32) -> Result<u32>,
@@ -2130,7 +2154,7 @@ pub fn remap_row_numbers(
     }
     Ok(())
 }
-pub fn col_to_name(col: u32) -> Result<String> {
+pub(crate) fn col_to_name(col: u32) -> Result<String> {
     cell_ref::col_to_name(col)
 }
 fn attr_sort_rank(name: &str) -> u8 {
@@ -2424,9 +2448,9 @@ fn replace_formula_tag_with_plain_formula(inner_xml: &str, formula: &str) -> Res
     let Some(f_tag) = scanner.next_start_named("f") else {
         return Err(err("cell formula 태그를 찾지 못했습니다."));
     };
-    let f_start = f_tag.start;
-    let f_end = f_tag.end;
-    let f_name = f_tag.name;
+    let f_start = f_tag.start();
+    let f_end = f_tag.end();
+    let f_name = f_tag.name();
     let formula_open_span = RangeInclusive {
         start: f_start,
         last: f_end,
@@ -2626,7 +2650,7 @@ fn append_peer_text_tag(
             )));
         };
         qualified_name_with_prefix(
-            anchor_tag.name.rsplit_once(':').map(|(prefix, _)| prefix),
+            anchor_tag.name().rsplit_once(':').map(|(prefix, _)| prefix),
             tag_name,
             &tag_error_message(tag_name, " qualified name"),
         )?
@@ -2657,9 +2681,9 @@ fn replace_first_tag_text(xml: &mut String, tag_name: &str, new_text: &str) -> R
     let Some(tag) = scanner.next_start_named(tag_name) else {
         return Ok(false);
     };
-    let open_start = tag.start;
-    let open_qualified_name = tag.name;
-    let open_end = tag.end;
+    let open_start = tag.start();
+    let open_qualified_name = tag.name();
+    let open_end = tag.end();
     let open_end_exclusive = checked_usize_add(open_end, 1, "XML 시작 태그 끝")?;
     let open_tag = xml
         .get(Range {

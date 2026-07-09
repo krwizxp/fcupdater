@@ -1,5 +1,5 @@
 use crate::diagnostic::{Result, err, err_with_source};
-pub fn parse_i32_str(text: &str) -> Option<i32> {
+pub(super) fn parse_i32_str(text: &str) -> Option<i32> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -56,13 +56,13 @@ pub fn parse_i32_str(text: &str) -> Option<i32> {
     };
     i32::try_from(signed).ok()
 }
-pub fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
+pub(super) fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
     u32::try_from(value).map_err(|source| {
         let out = format!("{context} 값이 너무 큽니다. (value={value})");
         err_with_source(out, source)
     })
 }
-pub fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
+pub(super) fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
     let offset_u32 = usize_to_u32(offset, context)?;
     base_row.checked_add(offset_u32).ok_or_else(|| {
         err(format!(

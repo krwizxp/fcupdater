@@ -5,12 +5,12 @@ use self::format::{
 use crate::{
     diagnostic::{Result, err, err_with_source},
     excel,
+    excel::SourceRecord,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
     region::{
         TARGET_REGION_COUNT, increment_target_region_count, normalize_address_key,
         target_region_index,
     },
-    rows::{AddedStoreRow, ChangeRow, MasterSheetUpdateResult, SourceRecord, StoreRow},
     sheet_util::{add_row_offset, usize_to_u32},
 };
 use alloc::{borrow::Cow, collections::BTreeMap};
@@ -64,8 +64,42 @@ const DECIMAL_SCALE: ScaledDecimal = ScaledDecimal(1_000_000);
 const DECIMAL_SCALE_SQUARED: ScaledSortKey = ScaledSortKey(1_000_000_000_000);
 const DECIMAL_SCALE_CUBED: ScaledSortKey = ScaledSortKey(1_000_000_000_000_000_000);
 type RowRange = RangeInclusive<u32>;
-pub struct MasterSheetUpdater<'source> {
+pub(super) struct MasterSheetUpdater<'source> {
     pub source_index: &'source HashMap<String, SourceRecord>,
+}
+#[derive(Debug)]
+pub(super) struct AddedStoreRow<'source> {
+    pub record: &'source SourceRecord,
+    pub region: &'source str,
+}
+#[derive(Debug)]
+pub(super) struct ChangeRow<'source> {
+    pub address: &'source str,
+    pub name: &'source str,
+    pub new_diesel: Option<i32>,
+    pub new_gasoline: Option<i32>,
+    pub new_premium: Option<i32>,
+    pub old_diesel: Option<i32>,
+    pub old_gasoline: Option<i32>,
+    pub old_premium: Option<i32>,
+    pub reason: &'static str,
+    pub region: Cow<'source, str>,
+}
+#[derive(Debug)]
+pub(super) struct StoreRow {
+    pub address: String,
+    pub diesel: Option<i32>,
+    pub gasoline: Option<i32>,
+    pub name: String,
+    pub premium: Option<i32>,
+    pub region: String,
+}
+pub(super) struct MasterSheetUpdateResult<'source> {
+    pub added: Vec<AddedStoreRow<'source>>,
+    pub changes: Vec<ChangeRow<'source>>,
+    pub deleted: Vec<StoreRow>,
+    pub existing_count: usize,
+    pub existing_region_counts: [usize; TARGET_REGION_COUNT],
 }
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ScaledDecimal(i64);
@@ -424,20 +458,20 @@ impl<'source> ChangeRowBuilder<'_, 'source> {
                 }
                 let reason = CHANGE_REASON_TEXTS.get(reason_index).copied().unwrap_or("");
                 ChangeRow {
+                    address: &self.src.address,
+                    name: &self.src.name,
+                    new_diesel: self.src.diesel,
+                    new_gasoline: self.src.gasoline,
+                    new_premium: self.src.premium,
+                    old_diesel: self.old.diesel,
+                    old_gasoline: self.old.gasoline,
+                    old_premium: self.old.premium,
                     reason,
                     region: if source_region.is_empty() {
                         Cow::Owned(self.old.region.to_owned())
                     } else {
                         Cow::Borrowed(source_region)
                     },
-                    name: &self.src.name,
-                    address: &self.src.address,
-                    old_gasoline: self.old.gasoline,
-                    new_gasoline: self.src.gasoline,
-                    old_premium: self.old.premium,
-                    new_premium: self.src.premium,
-                    old_diesel: self.old.diesel,
-                    new_diesel: self.src.diesel,
                 }
             })
     }
@@ -577,12 +611,12 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
                 matched_key: None,
                 change: None,
                 deleted: Some(StoreRow {
-                    region: region.into_owned(),
-                    name: name.into_owned(),
                     address: address.into_owned(),
-                    gasoline: row.gasoline,
-                    premium: row.premium,
                     diesel: row.diesel,
+                    gasoline: row.gasoline,
+                    name: name.into_owned(),
+                    premium: row.premium,
+                    region: region.into_owned(),
                 }),
             });
         };
@@ -1741,8 +1775,8 @@ impl<'source> MasterSheetUpdater<'source> {
                 .iter()
                 .filter(|&(key, _rec)| !matched_source_keys.contains(key.as_str()))
                 .map(|(_key, rec)| AddedStoreRow {
-                    region: source_display_region(rec),
                     record: rec,
+                    region: source_display_region(rec),
                 }),
         );
         new_sources.sort_unstable_by(|left, right| {
@@ -1979,7 +2013,10 @@ impl<'source> MasterSheetUpdater<'source> {
     fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
         value.filter(|price| *price > 0_i32)
     }
-    pub fn update(&self, book: &mut StdWorkbook) -> Result<MasterSheetUpdateResult<'source>> {
+    pub(super) fn update(
+        &self,
+        book: &mut StdWorkbook,
+    ) -> Result<MasterSheetUpdateResult<'source>> {
         let Some(outcome) =
             book.with_sheet_mut(MASTER_SHEET_NAME, |ws, shared_strings| -> Result<_> {
                 let plan = MasterSheetLayoutFinder { shared_strings, ws }.find()?;

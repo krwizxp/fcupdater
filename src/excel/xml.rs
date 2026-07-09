@@ -2,13 +2,30 @@ use crate::diagnostic::{Result, err, err_with_source};
 use alloc::borrow::Cow;
 use core::{iter, range::Range};
 pub(super) struct XmlTag<'xml> {
-    pub end: usize,
-    pub is_start: bool,
-    pub local_name: &'xml str,
-    pub name: &'xml str,
-    pub raw: &'xml str,
-    pub self_closing: bool,
-    pub start: usize,
+    end: usize,
+    is_start: bool,
+    local_name: &'xml str,
+    name: &'xml str,
+    raw: &'xml str,
+    self_closing: bool,
+    start: usize,
+}
+impl XmlTag<'_> {
+    pub(super) const fn end(&self) -> usize {
+        self.end
+    }
+    pub(super) const fn name(&self) -> &str {
+        self.name
+    }
+    pub(super) const fn raw(&self) -> &str {
+        self.raw
+    }
+    pub(super) const fn self_closing(&self) -> bool {
+        self.self_closing
+    }
+    pub(super) const fn start(&self) -> usize {
+        self.start
+    }
 }
 pub(super) struct XmlScanner<'xml> {
     cursor: usize,

@@ -1,15 +1,15 @@
 use crate::{
     change_log::ChangeLogUpdater,
     diagnostic::{Result, err, err_with_source, path_context_message},
-    excel::SaveVerification,
-    excel::source_reader::SourceReader,
+    excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
-    master_sheet::MasterSheetUpdater,
+    master_sheet::{
+        AddedStoreRow, ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, StoreRow,
+    },
     region::{
         TARGET_REGION_COUNT, TARGET_REGION_LABELS, increment_target_region_count,
         normalize_address_key, target_region_index,
     },
-    rows::{AddedStoreRow, ChangeRow, MasterSheetUpdateResult, SourceRecord, StoreRow},
     source_download::SourceDownload,
     write_line, write_line_best_effort,
 };
@@ -67,6 +67,11 @@ struct SourceSafetyPolicy {
     min_region_retain_denominator: usize,
     min_region_retain_numerator: usize,
 }
+struct SummaryRowDisplay<'row> {
+    address: &'row str,
+    name: &'row str,
+    region: &'row str,
+}
 impl SourceSafetyPolicy {
     fn validate_deleted_ratio(&self, existing_count: usize, deleted_count: usize) -> Result<()> {
         if existing_count == 0 {
@@ -118,7 +123,7 @@ impl SourceSafetyPolicy {
         Ok(())
     }
 }
-pub struct UpdateRun<'out> {
+pub(super) struct UpdateRun<'out> {
     pub master_path: &'out Path,
     pub out: &'out mut dyn Write,
     pub verify_saved_archive: bool,
@@ -241,31 +246,16 @@ impl UpdateRun<'_> {
         })
     }
     fn print_added_rows(&mut self, title: &str, rows: &[AddedStoreRow<'_>]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        write_line(self.out, format_args!("\n{title}"))?;
-        for (item_index, item) in rows.iter().take(20).enumerate() {
-            let Some(display_index) = item_index.checked_add(1) else {
-                return Err(err("신규 업체 표시 번호 계산 실패"));
-            };
-            write_line(
-                self.out,
-                format_args!(
-                    "  {display_index}. {region} / {name} / {address}",
-                    region = item.region,
-                    name = item.record.name,
-                    address = item.record.address
-                ),
-            )?;
-        }
-        if rows.len() > 20 {
-            write_line(
-                self.out,
-                format_args!("  ... ({}개 중 20개만 표시)", rows.len()),
-            )?;
-        }
-        Ok(())
+        self.print_summary_rows(
+            title,
+            rows.len(),
+            rows.iter().map(|item| SummaryRowDisplay {
+                address: item.record.address.as_str(),
+                name: item.record.name.as_str(),
+                region: item.region,
+            }),
+            "신규 업체 표시 번호 계산 실패",
+        )
     }
     fn print_region_count_summary(
         &mut self,
@@ -286,13 +276,31 @@ impl UpdateRun<'_> {
         Ok(())
     }
     fn print_store_rows(&mut self, title: &str, rows: &[StoreRow]) -> Result<()> {
-        if rows.is_empty() {
+        self.print_summary_rows(
+            title,
+            rows.len(),
+            rows.iter().map(|item| SummaryRowDisplay {
+                address: item.address.as_str(),
+                name: item.name.as_str(),
+                region: item.region.as_str(),
+            }),
+            "폐업 업체 표시 번호 계산 실패",
+        )
+    }
+    fn print_summary_rows<'row>(
+        &mut self,
+        title: &str,
+        row_count: usize,
+        rows: impl IntoIterator<Item = SummaryRowDisplay<'row>>,
+        display_number_error: &'static str,
+    ) -> Result<()> {
+        if row_count == 0 {
             return Ok(());
         }
         write_line(self.out, format_args!("\n{title}"))?;
-        for (item_index, item) in rows.iter().take(20).enumerate() {
+        for (item_index, item) in rows.into_iter().take(20).enumerate() {
             let Some(display_index) = item_index.checked_add(1) else {
-                return Err(err("폐업 업체 표시 번호 계산 실패"));
+                return Err(err(display_number_error));
             };
             write_line(
                 self.out,
@@ -304,10 +312,10 @@ impl UpdateRun<'_> {
                 ),
             )?;
         }
-        if rows.len() > 20 {
+        if row_count > 20 {
             write_line(
                 self.out,
-                format_args!("  ... ({}개 중 20개만 표시)", rows.len()),
+                format_args!("  ... ({row_count}개 중 20개만 표시)"),
             )?;
         }
         Ok(())
@@ -348,7 +356,7 @@ impl UpdateRun<'_> {
         write_line(self.out, format_args!("=====================\n"))?;
         Ok(())
     }
-    pub fn run(&mut self) -> Result<()> {
+    pub(super) fn run(&mut self) -> Result<()> {
         let loaded_source = self.load_source()?;
         let updated = self.open_updated_workbook(&loaded_source)?;
         let since_epoch = SystemTime::now()

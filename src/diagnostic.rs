@@ -6,8 +6,8 @@ use core::{
 };
 use std::{io::Error as IoError, path::Path};
 type BoxError = Box<dyn Error + Send + Sync>;
-pub type Result<T> = CoreResult<T, AppError>;
-pub struct AppError {
+pub(super) type Result<T> = CoreResult<T, AppError>;
+pub(super) struct AppError {
     message: Cow<'static, str>,
     source: Option<BoxError>,
 }
@@ -67,20 +67,20 @@ impl From<IoError> for AppError {
         Self::context("I/O 오류", value)
     }
 }
-pub fn err<M>(msg: M) -> AppError
+pub(super) fn err<M>(msg: M) -> AppError
 where
     M: Into<Cow<'static, str>>,
 {
     AppError::message(msg)
 }
-pub fn err_with_source<M, E>(context: M, source: E) -> AppError
+pub(super) fn err_with_source<M, E>(context: M, source: E) -> AppError
 where
     M: Into<Cow<'static, str>>,
     E: Into<BoxError>,
 {
     AppError::context(context, source)
 }
-pub fn prefixed_message<D>(prefix: &str, detail: D) -> String
+pub(super) fn prefixed_message<D>(prefix: &str, detail: D) -> String
 where
     D: Display,
 {
@@ -94,7 +94,7 @@ where
     }
     out
 }
-pub fn path_context_message(label: &str, path: &Path) -> String {
+pub(super) fn path_context_message(label: &str, path: &Path) -> String {
     let fallback = || format!("{label}: {}", path.display());
     let Some(capacity) = label.len().checked_add(": ".len()) else {
         return fallback();
@@ -110,7 +110,7 @@ pub fn path_context_message(label: &str, path: &Path) -> String {
     }
     out
 }
-pub fn path_pair_context_message(label: &str, from: &Path, to: &Path) -> String {
+pub(super) fn path_pair_context_message(label: &str, from: &Path, to: &Path) -> String {
     let fallback = || format!("{label}: {} -> {}", from.display(), to.display());
     let Some(capacity) = label
         .len()

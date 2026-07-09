@@ -1,7 +1,7 @@
 use crate::{
     diagnostic::{Result, err, err_with_source},
     excel::writer::{Worksheet, col_to_name},
-    rows::{AddedStoreRow, ChangeRow, StoreRow},
+    master_sheet::{AddedStoreRow, ChangeRow, StoreRow},
     sheet_util::add_row_offset,
 };
 use core::{fmt::Write as _, range::RangeInclusive};
@@ -22,7 +22,7 @@ const CHANGELOG_COL_OLD_DIESEL: u32 = 11;
 const CHANGELOG_COL_NEW_DIESEL: u32 = 12;
 const CHANGELOG_COL_DELTA_DIESEL: u32 = 13;
 const ROW_DECIMAL_TEXT_MAX_LEN: usize = 10;
-pub struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
+pub(super) struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
     pub added: &'data [AddedStoreRow<'source>],
     pub changes: &'data [ChangeRow<'source>],
     pub deleted: &'data [StoreRow],
@@ -290,7 +290,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             .find(|row| self.worksheet.has_any_row_format(*row, layout.max_col))
             .unwrap_or(layout.data_start_row))
     }
-    pub fn update(&mut self) -> Result<()> {
+    pub(super) fn update(&mut self) -> Result<()> {
         let date_text = format!("현행화 일자: {}", self.today);
         self.worksheet.set_string_at(1, 2, &date_text)?;
         let layout = self.find_layout()?;
@@ -408,8 +408,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             region: change.region.as_ref(),
         });
         let added_entries = self.added.iter().map(|item| ChangeLogRowValues {
-            address: item.record.address.as_str(),
-            name: item.record.name.as_str(),
+            address: &item.record.address,
+            name: &item.record.name,
             new_diesel: item.record.diesel,
             new_gasoline: item.record.gasoline,
             new_premium: item.record.premium,
@@ -420,8 +420,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             region: item.region,
         });
         let deleted_entries = self.deleted.iter().map(|item| ChangeLogRowValues {
-            address: item.address.as_str(),
-            name: item.name.as_str(),
+            address: &item.address,
+            name: &item.name,
             new_diesel: None,
             new_gasoline: None,
             new_premium: None,
@@ -429,7 +429,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             old_gasoline: item.gasoline,
             old_premium: item.premium,
             reason: "폐업",
-            region: item.region.as_str(),
+            region: &item.region,
         });
         let old_gas_col = col_to_name(layout.col_old_gas)?;
         let new_gas_col = col_to_name(layout.col_new_gas)?;

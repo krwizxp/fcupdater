@@ -46,7 +46,7 @@ impl<W> SourceDownload<'_, '_, W>
 where
     W: Write + ?Sized,
 {
-    pub fn refresh_source(&mut self) -> Result<PathBuf> {
+    pub(crate) fn refresh_source(&mut self) -> Result<PathBuf> {
         fs::create_dir_all(self.dir).map_err(|source_err| {
             err_with_source(
                 path_context_message("소스 폴더 생성 실패", self.dir),

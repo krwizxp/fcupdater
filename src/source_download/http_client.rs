@@ -38,7 +38,7 @@ cfg_select! {
     }
     _ => {
         #[derive(Default)]
-        pub(super) struct HttpClient {
+        struct HttpClient {
             cookie_jars: Vec<CookieJar>,
             form_body_buffer: String,
             netfunnel_path_buffer: String,
