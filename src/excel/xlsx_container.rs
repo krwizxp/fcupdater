@@ -1,37 +1,44 @@
 use super::path_util::reject_windows_special_component;
 use super::{
-    SaveVerification, SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
+    ArchiveFingerprint, SaveVerification, SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
     path_util::path_to_slashes,
     xml::{
         decode_xml_entities, extract_all_tag_text, extract_attr, extract_first_tag_text,
         find_end_tag, find_start_tag, find_tag_end,
     },
+    zip_archive::read_archive_bytes,
 };
 use crate::diagnostic::{
     AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
     prefixed_message,
+};
+use crate::temp_entry::{
+    STALE_TEMP_ENTRY_AGE, TEMP_ENTRY_NAME_CAPACITY, TEMP_ENTRY_RESERVATION_ATTEMPTS,
+    temp_entry_age_nanos, write_temp_entry_name,
 };
 use alloc::borrow::Cow;
 use core::{num::NonZeroU32, range::Range, str, time::Duration};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry as HashEntry},
     env, fs,
-    io::{self, ErrorKind, Read as _},
+    io::{self, Read as _},
     path::{Component, Path, PathBuf},
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
-        use std::io::{Write as _, stderr};
+        use std::{
+            io::{Write as _, stderr},
+            os::unix::fs::DirBuilderExt as _,
+        };
     }
     _ => {}
 }
+mod atomic_replace;
 const TEMP_ARCHIVE_PROMOTION_ATTEMPTS: u32 = 5;
 const TEMP_ARCHIVE_PROMOTION_RETRY_DELAY: Duration = Duration::from_millis(50);
-const TEMP_ENTRY_DECIMAL_MAX_LEN: usize = 39;
-const TEMP_ENTRY_NAME_CAPACITY: usize = 128;
-const TEMP_ENTRY_RESERVATION_ATTEMPTS: u32 = 1024;
+const WORK_DIR_PREFIX: &str = "fcupdater_";
 const MAX_XLSX_TEXT_PART_BYTES: u64 = 64 * 1024 * 1024;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
 const FAR_ARTIFACT_MIN_COL: u32 = 16_382;
@@ -42,6 +49,7 @@ const WORKSHEET_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
 #[derive(Debug)]
 pub(crate) struct XlsxContainer {
+    source_fingerprint: ArchiveFingerprint,
     unpack_dir: PathBuf,
     work_dir: PathBuf,
 }
@@ -75,6 +83,9 @@ impl Drop for WorkDirCleanup {
     }
 }
 impl ReservedTempArchive {
+    fn close_file(&mut self) {
+        self.file = None;
+    }
     fn disable_drop_cleanup(&mut self) {
         self.path = None;
     }
@@ -131,6 +142,11 @@ struct CellBounds {
 enum FilterRefPolicy {
     AnyA1,
     RequireAbsolute,
+}
+#[derive(Clone, Copy)]
+enum StaleTempEntryKind {
+    Directory,
+    File,
 }
 struct SharedStringsSummary {
     declared_total: Option<usize>,
@@ -1206,54 +1222,178 @@ impl ArchiveSemanticVerifier<'_> {
     }
 }
 struct TempArchivePromotion<'path> {
+    backup_archive: &'path mut ReservedTempArchive,
+    expected_fingerprint: ArchiveFingerprint,
     target_xlsx: &'path Path,
-    temp_archive: &'path Path,
+    temp_archive: &'path mut ReservedTempArchive,
 }
 impl TempArchivePromotion<'_> {
-    fn promote(&self) -> Result<()> {
-        let mut last_error = None;
-        for attempt in 1..=TEMP_ARCHIVE_PROMOTION_ATTEMPTS {
-            match fs::rename(self.temp_archive, self.target_xlsx) {
-                Ok(()) => {
-                    cfg_select! {
-                        any(target_os = "linux", target_os = "macos") => {
-                            if let Err(source_err) = fs::OpenOptions::new()
-                                .read(true)
-                                .open(self.target_xlsx)
-                                .and_then(|file| file.sync_all())
-                            {
-                                write_durability_warning("파일", self.target_xlsx, &source_err);
-                            }
-                            let parent = self
-                                .target_xlsx
-                                .parent()
-                                .filter(|path| !path.as_os_str().is_empty())
-                                .unwrap_or_else(|| Path::new("."));
-                            if let Err(source_err) =
-                                fs::File::open(parent).and_then(|dir| dir.sync_all())
-                            {
-                                write_durability_warning("폴더", parent, &source_err);
-                            }
-                        }
-                        _ => {}
-                    }
-                    return Ok(());
+    fn cleanup_displaced_original(
+        &self,
+        displaced_file: atomic_replace::DisplacedFile,
+    ) -> Result<()> {
+        let captured_original = self.displaced_path(displaced_file)?;
+        fs::remove_file(captured_original).map_err(|source| {
+            err_with_source(
+                path_context_message("교체된 원본 xlsx 정리 실패", captured_original),
+                source,
+            )
+        })?;
+        if matches!(displaced_file, atomic_replace::DisplacedFile::Replacement) {
+            let backup_archive_path = self.backup_archive.path()?;
+            fs::remove_file(backup_archive_path).map_err(|source| {
+                err_with_source(
+                    path_context_message("xlsx 교체 예약 파일 정리 실패", backup_archive_path),
+                    source,
+                )
+            })?;
+        }
+        Ok(())
+    }
+    fn displaced_path(&self, displaced: atomic_replace::DisplacedFile) -> Result<&Path> {
+        match displaced {
+            #[cfg(target_os = "windows")]
+            atomic_replace::DisplacedFile::Backup => self.backup_archive.path(),
+            atomic_replace::DisplacedFile::Replacement => self.temp_archive.path(),
+        }
+    }
+    fn preserve_recovery_archives(
+        &mut self,
+        context: &str,
+        source: atomic_replace::ReplaceFailure,
+    ) -> Result<()> {
+        let message = format!(
+            "{context}; 수동 복구용 파일을 보존했습니다: replacement={}, backup={}",
+            self.temp_archive.path()?.display(),
+            self.backup_archive.path()?.display(),
+        );
+        self.temp_archive.disable_drop_cleanup();
+        self.backup_archive.disable_drop_cleanup();
+        Err(err_with_source(message, source))
+    }
+    fn promote(&mut self) -> Result<()> {
+        let replace_result = {
+            let temp_archive = self.temp_archive.path()?;
+            let backup_archive = self.backup_archive.path()?;
+            let mut result = atomic_replace::replace_files(
+                self.target_xlsx,
+                temp_archive,
+                backup_archive,
+                false,
+            );
+            for _ in 1..TEMP_ARCHIVE_PROMOTION_ATTEMPTS {
+                if !matches!(
+                    &result,
+                    Err(atomic_replace::ReplaceFilesError::Retryable(_))
+                ) {
+                    break;
                 }
-                Err(source_err) => {
-                    last_error = Some(source_err);
-                    if attempt < TEMP_ARCHIVE_PROMOTION_ATTEMPTS {
-                        thread::sleep(TEMP_ARCHIVE_PROMOTION_RETRY_DELAY);
-                    }
+                thread::sleep(TEMP_ARCHIVE_PROMOTION_RETRY_DELAY);
+                result = atomic_replace::replace_files(
+                    self.target_xlsx,
+                    temp_archive,
+                    backup_archive,
+                    false,
+                );
+            }
+            result
+        };
+        let displaced_file = match replace_result {
+            Ok(displaced) => displaced,
+            Err(atomic_replace::ReplaceFilesError::Retryable(source)) => {
+                return Err(err_with_source(
+                    path_pair_context_message(
+                        "xlsx 저장 실패",
+                        self.temp_archive.path()?,
+                        self.target_xlsx,
+                    ),
+                    source,
+                ));
+            }
+            #[cfg(target_os = "windows")]
+            Err(atomic_replace::ReplaceFilesError::Restored(source)) => {
+                return Err(err_with_source(
+                    path_pair_context_message(
+                        "xlsx 저장 실패 후 원본 대상 파일 자동 복원 완료",
+                        self.temp_archive.path()?,
+                        self.target_xlsx,
+                    ),
+                    source,
+                ));
+            }
+            #[cfg(target_os = "windows")]
+            Err(atomic_replace::ReplaceFilesError::RecoveryRequired(source)) => {
+                let context = path_pair_context_message(
+                    "xlsx 저장 중 원본 대상 파일 자동 복구 실패",
+                    self.temp_archive.path()?,
+                    self.target_xlsx,
+                );
+                return self.preserve_recovery_archives(&context, source);
+            }
+        };
+        if let Err(validation_error) = self.validate_displaced_original(displaced_file) {
+            return self.rollback_after_validation_failure(validation_error);
+        }
+        self.cleanup_displaced_original(displaced_file)?;
+        cfg_select! {
+            any(target_os = "linux", target_os = "macos") => {
+                if let Err(source_err) = fs::OpenOptions::new()
+                    .read(true)
+                    .open(self.target_xlsx)
+                    .and_then(|file| file.sync_all())
+                {
+                    write_durability_warning("파일", self.target_xlsx, &source_err);
+                }
+                let parent = self
+                    .target_xlsx
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+                    write_durability_warning("폴더", parent, &source_err);
                 }
             }
+            _ => {}
         }
-        let Some(source_err) = last_error else {
-            return Err(err("xlsx 저장 시도 횟수가 비정상적으로 비어 있습니다."));
+        Ok(())
+    }
+    fn rollback_after_validation_failure(&mut self, validation_error: AppError) -> Result<()> {
+        let rollback_error = match atomic_replace::replace_files(
+            self.target_xlsx,
+            self.temp_archive.path()?,
+            self.backup_archive.path()?,
+            true,
+        ) {
+            Ok(_) => return Err(validation_error),
+            #[cfg(target_os = "windows")]
+            Err(atomic_replace::ReplaceFilesError::Restored(_)) => return Err(validation_error),
+            #[cfg(target_os = "windows")]
+            Err(atomic_replace::ReplaceFilesError::RecoveryRequired(source)) => source,
+            Err(atomic_replace::ReplaceFilesError::Retryable(source)) => source,
         };
-        Err(err_with_source(
-            path_pair_context_message("xlsx 저장 실패", self.temp_archive, self.target_xlsx),
-            source_err,
-        ))
+        let context = format!("원본 xlsx 검증 실패 후 복구 실패 ({validation_error})");
+        self.preserve_recovery_archives(&context, rollback_error)
+    }
+    fn validate_displaced_original(
+        &self,
+        displaced_file: atomic_replace::DisplacedFile,
+    ) -> Result<()> {
+        let captured_original = self.displaced_path(displaced_file)?;
+        let fingerprint = read_archive_bytes(captured_original)
+            .and_then(|bytes| ArchiveFingerprint::from_bytes(bytes.as_slice()))
+            .map_err(|source| {
+                err_with_source(
+                    path_context_message("교체된 원본 xlsx 검증 실패", captured_original),
+                    source,
+                )
+            })?;
+        if fingerprint != self.expected_fingerprint {
+            return Err(err(format!(
+                "원본 xlsx가 실행 중 변경되어 저장을 중단했습니다: {}",
+                self.target_xlsx.display()
+            )));
+        }
+        Ok(())
     }
 }
 impl XlsxContainer {
@@ -1360,12 +1500,22 @@ impl XlsxContainer {
     }
     pub(crate) fn open(source_xlsx: &Path) -> Result<Self> {
         let base = env::temp_dir();
+        cleanup_stale_temp_entries(&base, WORK_DIR_PREFIX, StaleTempEntryKind::Directory);
         let cleanup = WorkDirCleanup {
             path: Some(reserve_unique_temp_entry(
                 &base,
-                |file_name| file_name.push_str("fcupdater_"),
+                WORK_DIR_PREFIX,
                 |path| {
-                    fs::DirBuilder::new().create(path)?;
+                    cfg_select! {
+                        any(target_os = "linux", target_os = "macos") => {
+                            let mut builder = fs::DirBuilder::new();
+                            builder.mode(0o700);
+                            builder.create(path)?;
+                        }
+                        _ => {
+                            fs::DirBuilder::new().create(path)?;
+                        }
+                    }
                     Ok(path.to_path_buf())
                 },
                 "임시 작업 폴더 생성 실패",
@@ -1374,13 +1524,14 @@ impl XlsxContainer {
         };
         let unpack_dir = cleanup.path()?.join("unzipped");
         create_dir_all_checked(&unpack_dir, "임시 폴더 생성 실패")?;
-        ZipArchiveExtractor {
+        let source_fingerprint = ZipArchiveExtractor {
             archive_path: source_xlsx,
             unpack_dir: unpack_dir.as_path(),
         }
         .extract()?;
         let work_dir = cleanup.into_path()?;
         Ok(Self {
+            source_fingerprint,
             unpack_dir,
             work_dir,
         })
@@ -1389,7 +1540,7 @@ impl XlsxContainer {
         let path = self.resolve_relative_path("xl/sharedStrings.xml")?;
         let file = match fs::File::open(&path) {
             Ok(file) => file,
-            Err(io_err) if io_err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(io_err) if io_err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(io_err) => {
                 return Err(err_with_source(
                     path_context_message("파일 열기 실패", &path),
@@ -1455,7 +1606,7 @@ impl XlsxContainer {
         let path = self.resolve_relative_path("xl/calcChain.xml")?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
-            Err(io_err) if io_err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(io_err) if io_err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(io_err) => Err(err_with_source(
                 path_context_message("파일 삭제 실패", &path),
                 io_err,
@@ -1467,23 +1618,26 @@ impl XlsxContainer {
         Ok(self.unpack_dir.join(path))
     }
     pub(super) fn save(&self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
-        let parent = if let Some(parent) = target_xlsx.parent() {
-            create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
-            parent
-        } else {
-            Path::new(".")
-        };
+        let parent = target_xlsx
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        create_dir_all_checked(parent, "저장 폴더 생성 실패")?;
         let target_file_name = target_xlsx
             .file_name()
             .and_then(|file_name_os| file_name_os.to_str())
             .unwrap_or("workbook.xlsx");
+        let mut temp_archive_prefix = String::from(".");
+        temp_archive_prefix.push_str(target_file_name);
+        temp_archive_prefix.push_str(".tmp_");
+        let mut backup_archive_prefix = String::from(".");
+        backup_archive_prefix.push_str(target_file_name);
+        backup_archive_prefix.push_str(".backup_");
+        cleanup_stale_temp_entries(parent, &temp_archive_prefix, StaleTempEntryKind::File);
+        cleanup_stale_temp_entries(parent, &backup_archive_prefix, StaleTempEntryKind::File);
         let mut tmp_archive = reserve_unique_temp_entry(
             parent,
-            |file_name| {
-                file_name.push('.');
-                file_name.push_str(target_file_name);
-                file_name.push_str(".tmp_");
-            },
+            &temp_archive_prefix,
             |path| {
                 let file = fs::File::options()
                     .write(true)
@@ -1497,6 +1651,23 @@ impl XlsxContainer {
             "임시 저장 파일 생성 실패",
             || prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
+        let mut backup_archive = reserve_unique_temp_entry(
+            parent,
+            &backup_archive_prefix,
+            |path| {
+                let file = fs::File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                Ok(ReservedTempArchive {
+                    file: Some(file),
+                    path: Some(path.to_path_buf()),
+                })
+            },
+            "교체 예약 파일 생성 실패",
+            || prefixed_message("교체 예약 파일 경로 생성 실패: ", target_xlsx.display()),
+        )?;
+        backup_archive.close_file();
         let result = (|| -> Result<()> {
             tmp_archive.write_archive_from(self.unpack_dir.as_path())?;
             match verification {
@@ -1509,13 +1680,16 @@ impl XlsxContainer {
                 }
             }
             TempArchivePromotion {
+                backup_archive: &mut backup_archive,
+                expected_fingerprint: self.source_fingerprint,
                 target_xlsx,
-                temp_archive: tmp_archive.path()?,
+                temp_archive: &mut tmp_archive,
             }
             .promote()
         })();
         match result {
             Ok(()) => {
+                backup_archive.disable_drop_cleanup();
                 tmp_archive.disable_drop_cleanup();
                 Ok(())
             }
@@ -1525,7 +1699,7 @@ impl XlsxContainer {
                 };
                 match fs::remove_file(&tmp_archive_path) {
                     Ok(()) => Err(source),
-                    Err(error) if error.kind() == ErrorKind::NotFound => Err(source),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Err(source),
                     Err(error) => Err(err_with_source(
                         format!(
                             "xlsx 임시 저장 파일 삭제 실패: {} ({error})",
@@ -1605,15 +1779,50 @@ fn normalize_safe_relative_path(path: &Path, relative_path: &str) -> Result<Path
     }
     Ok(normalized)
 }
-fn reserve_unique_temp_entry<FName, FCreate, FExhausted, T>(
+fn cleanup_stale_temp_entries(parent: &Path, prefix: &str, kind: StaleTempEntryKind) {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry_result in entries {
+        let Ok(entry) = entry_result else {
+            continue;
+        };
+        let file_name_os = entry.file_name();
+        let Some(file_name) = file_name_os.to_str() else {
+            continue;
+        };
+        let Some(age_nanos) = temp_entry_age_nanos(file_name, prefix, now.as_nanos()) else {
+            continue;
+        };
+        if age_nanos < STALE_TEMP_ENTRY_AGE.as_nanos() {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        match kind {
+            StaleTempEntryKind::Directory if file_type.is_dir() => match fs::remove_dir_all(path) {
+                Ok(()) | Err(_) => {}
+            },
+            StaleTempEntryKind::File if !file_type.is_dir() => match fs::remove_file(path) {
+                Ok(()) | Err(_) => {}
+            },
+            StaleTempEntryKind::Directory | StaleTempEntryKind::File => {}
+        }
+    }
+}
+fn reserve_unique_temp_entry<FCreate, FExhausted, T>(
     parent: &Path,
-    mut write_file_name_prefix: FName,
+    prefix: &str,
     mut create_entry: FCreate,
     create_failure_label: &str,
     exhausted_message: FExhausted,
 ) -> Result<T>
 where
-    FName: FnMut(&mut String),
     FCreate: FnMut(&Path) -> io::Result<T>,
     FExhausted: FnOnce() -> String,
 {
@@ -1630,17 +1839,12 @@ where
     path.try_reserve(TEMP_ENTRY_NAME_CAPACITY)
         .map_err(|source| err_with_source("임시 xlsx 경로 메모리 확보 실패", source))?;
     for seq in 0..TEMP_ENTRY_RESERVATION_ATTEMPTS {
-        file_name.clear();
-        write_file_name_prefix(&mut file_name);
-        push_temp_entry_decimal(&mut file_name, u128::from(pid))?;
-        file_name.push('_');
-        push_temp_entry_decimal(&mut file_name, nanos)?;
-        file_name.push('_');
-        push_temp_entry_decimal(&mut file_name, u128::from(seq))?;
+        write_temp_entry_name(&mut file_name, prefix, pid, nanos, seq)
+            .ok_or_else(|| err("임시 xlsx 파일명 작성 실패"))?;
         path.push(file_name.as_str());
         match create_entry(&path) {
             Ok(entry) => return Ok(entry),
-            Err(io_err) if io_err.kind() == ErrorKind::AlreadyExists => {
+            Err(io_err) if io_err.kind() == io::ErrorKind::AlreadyExists => {
                 path.pop();
                 thread::sleep(Duration::from_micros(50));
             }
@@ -1653,33 +1857,4 @@ where
         }
     }
     Err(err(exhausted_message()))
-}
-fn push_temp_entry_decimal(out: &mut String, mut value: u128) -> Result<()> {
-    let mut buffer = [0_u8; TEMP_ENTRY_DECIMAL_MAX_LEN];
-    let mut index = buffer.len();
-    loop {
-        let digit = u8::try_from(value.rem_euclid(10))
-            .map_err(|source| err_with_source("임시 xlsx 파일명 숫자 변환 실패", source))?;
-        index = index
-            .checked_sub(1)
-            .ok_or_else(|| err("임시 xlsx 파일명 숫자 buffer 용량을 초과했습니다."))?;
-        let byte = b'0'
-            .checked_add(digit)
-            .ok_or_else(|| err("임시 xlsx 파일명 숫자 계산 중 overflow가 발생했습니다."))?;
-        let Some(slot) = buffer.get_mut(index) else {
-            return Err(err("임시 xlsx 파일명 숫자 buffer 범위 오류"));
-        };
-        *slot = byte;
-        value = value.div_euclid(10);
-        if value == 0 {
-            break;
-        }
-    }
-    let Some(bytes) = buffer.get(index..) else {
-        return Err(err("임시 xlsx 파일명 숫자 결과 범위 오류"));
-    };
-    let text = str::from_utf8(bytes)
-        .map_err(|source| err_with_source("임시 xlsx 파일명 숫자 UTF-8 변환 실패", source))?;
-    out.push_str(text);
-    Ok(())
 }

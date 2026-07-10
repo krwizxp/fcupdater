@@ -45,6 +45,7 @@ enum ZipFileHeader<'entry> {
 struct StreamingZipWriter<'path> {
     archive_path: &'path Path,
     bytes_written: u64,
+    deflate_workspace: deflate::DeflateWorkspace,
     entries: Vec<WriteEntry>,
     file: BufWriter<File>,
     header_buffer: Vec<u8>,
@@ -58,6 +59,7 @@ impl ZipArchiveBuilder<'_> {
         StreamingZipWriter {
             archive_path: self.archive_path,
             bytes_written: 0,
+            deflate_workspace: deflate::DeflateWorkspace::default(),
             entries: Vec::new(),
             file: BufWriter::with_capacity(ZIP_OUTPUT_BUFFER_CAPACITY, self.file),
             header_buffer: Vec::new(),
@@ -131,22 +133,28 @@ impl StreamingZipWriter<'_> {
                 .get(file.name.len().saturating_sub(extension.len())..)
                 .is_some_and(|tail| tail.eq_ignore_ascii_case(extension))
         });
-        let mut deflate_plan = if uncompressed_size == 0 || store_without_deflate {
+        let deflate_plan = if uncompressed_size == 0 || store_without_deflate {
             None
         } else {
             Some(
-                deflate::DeflateWriter {
+                (deflate::DeflateWriter {
                     bytes: &self.part_buffer,
-                }
+                    workspace: &mut self.deflate_workspace,
+                })
                 .plan()?,
             )
         };
-        let selected_deflate_plan = deflate_plan.take_if(|plan| plan.len() < uncompressed_size);
-        let (compressed_size, method) = selected_deflate_plan
+        let use_deflate = deflate_plan
             .as_ref()
-            .map_or((uncompressed_size, METHOD_STORE), |plan| {
-                (plan.len(), METHOD_DEFLATE)
-            });
+            .is_some_and(|plan| plan.len() < uncompressed_size);
+        let (compressed_size, method) = if use_deflate {
+            let plan = deflate_plan
+                .as_ref()
+                .ok_or_else(|| err("ZIP deflate 계획 상태가 손상되었습니다."))?;
+            (plan.len(), METHOD_DEFLATE)
+        } else {
+            (uncompressed_size, METHOD_STORE)
+        };
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
         let local_header_capacity = LOCAL_FILE_HEADER_LEN
@@ -164,7 +172,10 @@ impl StreamingZipWriter<'_> {
             },
         )?;
         self.write_header_buffer("xlsx 압축 local header 쓰기 실패")?;
-        if let Some(plan) = selected_deflate_plan {
+        if use_deflate {
+            let plan = deflate_plan
+                .as_ref()
+                .ok_or_else(|| err("ZIP deflate 계획 상태가 손상되었습니다."))?;
             let actual_written = plan.write_to(&mut self.file)?;
             if actual_written != compressed_size {
                 return Err(err(format!(
@@ -182,6 +193,9 @@ impl StreamingZipWriter<'_> {
             })?;
             self.bytes_written =
                 self.add_bytes_written(compressed_size, "ZIP stored byte count 계산")?;
+        }
+        if let Some(plan) = deflate_plan {
+            self.deflate_workspace.recycle(plan);
         }
         self.entries.push(WriteEntry {
             compressed_size,

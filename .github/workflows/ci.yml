@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
-    name: ${{ matrix.os }} / rust-stable
+    name: ${{ matrix.os }} / rust-1.97.0
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -38,9 +38,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
-          toolchain: stable
+          toolchain: 1.97.0
       - name: Install Linux native dependencies
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev

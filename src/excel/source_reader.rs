@@ -3,7 +3,7 @@ use crate::{
     sheet_util::parse_i32_str,
 };
 use alloc::collections::BTreeMap;
-use core::{char::decode_utf16, fmt::Display, range::Range};
+use core::{fmt::Display, range::Range};
 use std::{fs::File, io::Read as _, path::Path};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
@@ -334,7 +334,8 @@ impl CfbDirectoryParser<'_> {
                         source,
                     )
                 })?;
-                for item in decode_utf16(name_units.iter().map(|chunk| u16::from_le_bytes(*chunk)))
+                for item in
+                    char::decode_utf16(name_units.iter().map(|chunk| u16::from_le_bytes(*chunk)))
                 {
                     decoded.push(item.map_err(|source| {
                         err_with_source("CFB UTF-16 문자열 해석 실패", source)
@@ -678,7 +679,9 @@ impl SstChunkReader<'_, '_> {
                 let (chunks, &[]) = bytes.as_chunks::<2>() else {
                     return Err(err("SST UTF-16 문자열 길이가 홀수입니다."));
                 };
-                for decoded in decode_utf16(chunks.iter().map(|unit| u16::from_le_bytes(*unit))) {
+                for decoded in
+                    char::decode_utf16(chunks.iter().map(|unit| u16::from_le_bytes(*unit)))
+                {
                     out.push(decoded.map_err(|source| {
                         err_with_source("SST UTF-16 문자열 해석 실패", source)
                     })?);

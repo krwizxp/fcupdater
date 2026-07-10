@@ -7,36 +7,15 @@ use super::{
 };
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{
-    ffi::{CStr, c_char, c_int, c_long, c_uint, c_void},
+    ffi::{CStr, c_char, c_long, c_uint, c_void},
+    marker::{PhantomData, PhantomPinned},
     mem::{self, align_of, offset_of, size_of},
-    ptr::{NonNull, null, null_mut},
+    ptr::{NonNull, null_mut},
     slice,
     str,
 };
 use std::{io::Write as IoWrite, sync::LazyLock};
-mod sys {
-    use super::{
-        Curl, CurlCode, CurlInfo, CurlOption, CurlSlist, CurlVersion, CurlVersionInfoData, c_char,
-        c_long,
-    };
-    #[link(name = "curl")]
-    unsafe extern "C" {
-        pub(super) fn curl_easy_cleanup(curl: *mut Curl);
-        pub(super) fn curl_easy_getinfo(curl: *mut Curl, info: CurlInfo, ...) -> CurlCode;
-        pub(super) fn curl_easy_init() -> *mut Curl;
-        pub(super) fn curl_easy_perform(curl: *mut Curl) -> CurlCode;
-        pub(super) fn curl_easy_reset(curl: *mut Curl);
-        pub(super) fn curl_easy_setopt(curl: *mut Curl, option: CurlOption, ...) -> CurlCode;
-        pub(super) fn curl_easy_strerror(code: CurlCode) -> *const c_char;
-        pub(super) fn curl_global_init(flags: c_long) -> CurlCode;
-        pub(super) fn curl_version_info(age: CurlVersion) -> *const CurlVersionInfoData;
-        pub(super) fn curl_slist_append(
-            list: *mut CurlSlist,
-            string: *const c_char,
-        ) -> *mut CurlSlist;
-        pub(super) fn curl_slist_free_all(list: *mut CurlSlist);
-    }
-}
+mod sys;
 const CURLE_OK: CurlCode = 0;
 const CURL_ERROR_SIZE: usize = 256;
 const CURL_GLOBAL_DEFAULT: c_long = 3;
@@ -46,11 +25,13 @@ const CURL_MIN_PROTOCOLS_STR_VERSION: c_uint = 0x07_55_00;
 const CURLVERSION_NOW: CurlVersion = 11;
 const CURLOPT_CONNECTTIMEOUT_MS: CurlOption = 156;
 const CURLOPT_ERRORBUFFER: CurlOption = 10_010;
+const CURLOPT_FOLLOWLOCATION: CurlOption = 52;
 const CURLOPT_HEADERDATA: CurlOption = 10_029;
 const CURLOPT_HEADERFUNCTION: CurlOption = 20_079;
 const CURLOPT_HTTPHEADER: CurlOption = 10_023;
 const CURLOPT_HTTPGET: CurlOption = 80;
 const CURLOPT_MAXFILESIZE_LARGE: CurlOption = 30_117;
+const CURLOPT_MAXREDIRS: CurlOption = 68;
 const CURLOPT_NOSIGNAL: CurlOption = 99;
 const CURLOPT_POST: CurlOption = 47;
 const CURLOPT_POSTFIELDS: CurlOption = 10_015;
@@ -66,6 +47,7 @@ const CURL_SSLVERSION_MAX_DEFAULT: c_long = 1 << 16;
 const CURL_SSLVERSION_TLSV1_2: c_long = 6;
 const HTTPS_SCHEME_PREFIX: &str = "https://";
 const HTTPS_PROTOCOL: &CStr = c"https";
+const MAX_HTTP_REDIRECTS: c_long = 5;
 static CURL_INIT: LazyLock<CurlCode> = LazyLock::new(|| {
     // SAFETY: LazyLock runs this initializer once before any easy handles are used.
     unsafe { sys::curl_global_init(CURL_GLOBAL_DEFAULT) }
@@ -74,7 +56,7 @@ static CURL_PROTOCOLS_STR_UNSUPPORTED_VERSION: LazyLock<Option<Cow<'static, str>
     LazyLock::new(|| {
         // SAFETY: callers force this after curl_global_init has completed, and libcurl returns a
         // process-wide immutable version info pointer.
-        NonNull::new(unsafe { sys::curl_version_info(CURLVERSION_NOW).cast_mut() }).map_or(
+        NonNull::new(unsafe { sys::curl_version_info(CURLVERSION_NOW) }).map_or(
             Some(Cow::Borrowed("unknown")),
             |version_info| {
                 // SAFETY: version_info is non-null and points to libcurl's version info.
@@ -82,27 +64,32 @@ static CURL_PROTOCOLS_STR_UNSUPPORTED_VERSION: LazyLock<Option<Cow<'static, str>
                 if version_info_ref.version_num >= CURL_MIN_PROTOCOLS_STR_VERSION {
                     None
                 } else {
-                    Some(NonNull::new(version_info_ref.version.cast_mut()).map_or_else(
-                        || Cow::Borrowed("unknown"),
-                        |version_ptr| {
-                            // SAFETY: libcurl documents version as an ASCII NUL-terminated string.
-                            Cow::Owned(
-                                unsafe { CStr::from_ptr(version_ptr.as_ptr()) }
-                                    .to_string_lossy()
-                                    .into_owned(),
-                            )
-                        },
-                    ))
+                    let version_ptr = version_info_ref.version;
+                    let version = if version_ptr.is_null() {
+                        Cow::Borrowed("unknown")
+                    } else {
+                        // SAFETY: libcurl documents version as an ASCII NUL-terminated string.
+                        Cow::Owned(
+                            unsafe { CStr::from_ptr(version_ptr) }
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    };
+                    Some(version)
                 }
             },
         )
     });
-type Curl = c_void;
-type CurlCode = c_int;
-type CurlInfo = c_int;
+#[repr(C)]
+struct Curl {
+    _data: (),
+    _marker: PhantomData<(*mut u8, PhantomPinned)>,
+}
+type CurlCode = c_uint;
+type CurlInfo = c_uint;
 type CurlOffT = i64;
-type CurlOption = c_int;
-type CurlVersion = c_int;
+type CurlOption = c_uint;
+type CurlVersion = c_uint;
 type CurlWriteCallback = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize;
 #[repr(C)]
 struct CurlVersionInfoData {
@@ -227,14 +214,14 @@ impl EasyHandle {
         self.0.as_ptr()
     }
     fn ensure_https_scheme(&self) -> DownloadResult<()> {
-        let mut scheme = null::<c_char>();
+        let mut scheme = null_mut::<c_char>();
         // SAFETY: scheme is a valid output pointer for CURLINFO_SCHEME.
         let status_code =
             unsafe { sys::curl_easy_getinfo(self.as_ptr(), CURLINFO_SCHEME, &raw mut scheme) };
         if status_code != CURLE_OK {
             return Err(curl_error("curl_easy_getinfo scheme", status_code).into());
         }
-        let Some(scheme_ptr) = NonNull::new(scheme.cast_mut()) else {
+        let Some(scheme_ptr) = NonNull::new(scheme) else {
             return Err("curl 최종 scheme이 비어 있습니다.".into());
         };
         // SAFETY: libcurl returns a NUL-terminated scheme string owned by the easy handle.
@@ -390,6 +377,14 @@ impl Client {
             CurlLongOption {
                 option: CURLOPT_TIMEOUT_MS,
                 value: 60_000,
+            },
+            CurlLongOption {
+                option: CURLOPT_FOLLOWLOCATION,
+                value: 1,
+            },
+            CurlLongOption {
+                option: CURLOPT_MAXREDIRS,
+                value: MAX_HTTP_REDIRECTS,
             },
             CurlLongOption {
                 option: CURLOPT_NOSIGNAL,

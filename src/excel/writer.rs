@@ -11,6 +11,7 @@ use super::{
     },
 };
 use crate::{
+    decimal::U128DecimalDigits,
     diagnostic::{Result, err, err_with_source},
     sheet_util::parse_i32_str,
 };
@@ -20,7 +21,6 @@ use core::{
     cmp::Ordering,
     mem,
     range::{Range, RangeFrom, RangeInclusive},
-    str,
 };
 use std::collections::{HashMap, hash_map::Entry as HashEntry};
 use std::path::Path;
@@ -28,7 +28,6 @@ mod cell_ref;
 const XML_SPACE_PRESERVE_ATTR: &str = " xml:space=\"preserve\"";
 const FILTER_DATABASE_NAME: &str = "_xlnm._FilterDatabase";
 const RICH_INLINE_STRING_MARKERS: [&str; 4] = ["<r", "<rPr", "<rPh", "<phoneticPr"];
-const MAX_DECIMAL_TEXT_LEN: usize = 39;
 const U32_DECIMAL_TEXT_MAX_LEN: usize = 10;
 #[derive(Debug)]
 pub(crate) struct Workbook {
@@ -2011,9 +2010,12 @@ const fn u32_decimal_text_len(value: u32) -> usize {
     }
 }
 fn usize_attr_value(value: usize, context: &'static str) -> Result<String> {
-    let mut buffer = [0_u8; MAX_DECIMAL_TEXT_LEN];
-    let value_u64 = u64::try_from(value).map_err(|source| err_with_source(context, source))?;
-    let text = decimal_text(value_u64, &mut buffer, context)?;
+    let value_u128 = u128::try_from(value).map_err(|source| err_with_source(context, source))?;
+    let digits = U128DecimalDigits::new(value_u128)
+        .ok_or_else(|| err(format!("{context} 숫자 변환 실패")))?;
+    let text = digits
+        .as_str()
+        .ok_or_else(|| err(format!("{context} 문자열 변환 실패")))?;
     let mut out = String::new();
     out.try_reserve_exact(text.len())
         .map_err(|source| err_with_source(context, source))?;
@@ -2021,8 +2023,11 @@ fn usize_attr_value(value: usize, context: &'static str) -> Result<String> {
     Ok(out)
 }
 fn u32_text_value(value: u32, context: &'static str) -> Result<String> {
-    let mut buffer = [0_u8; U32_DECIMAL_TEXT_MAX_LEN];
-    let text = decimal_text(u64::from(value), &mut buffer, context)?;
+    let digits = U128DecimalDigits::new(u128::from(value))
+        .ok_or_else(|| err(format!("{context} 숫자 변환 실패")))?;
+    let text = digits
+        .as_str()
+        .ok_or_else(|| err(format!("{context} 문자열 변환 실패")))?;
     let mut out = String::new();
     out.try_reserve_exact(text.len())
         .map_err(|source| err_with_source(context, source))?;
@@ -2030,39 +2035,9 @@ fn u32_text_value(value: u32, context: &'static str) -> Result<String> {
     Ok(out)
 }
 fn push_u32_decimal_text(out: &mut String, value: u32, context: &'static str) -> Result<()> {
-    let mut buffer = [0_u8; U32_DECIMAL_TEXT_MAX_LEN];
-    let text = decimal_text(u64::from(value), &mut buffer, context)?;
-    out.push_str(text);
-    Ok(())
-}
-fn decimal_text<'buffer>(
-    mut value: u64,
-    buffer: &'buffer mut [u8],
-    context: &'static str,
-) -> Result<&'buffer str> {
-    let mut index = buffer.len();
-    loop {
-        let digit = u8::try_from(value.rem_euclid(10))
-            .map_err(|source| err_with_source(context, source))?;
-        index = index
-            .checked_sub(1)
-            .ok_or_else(|| err(format!("{context} buffer index 계산 실패")))?;
-        let byte = b'0'
-            .checked_add(digit)
-            .ok_or_else(|| err(format!("{context} 문자 계산 실패")))?;
-        let slot = buffer
-            .get_mut(index)
-            .ok_or_else(|| err(format!("{context} buffer 범위가 손상되었습니다.")))?;
-        *slot = byte;
-        value = value.div_euclid(10);
-        if value == 0 {
-            break;
-        }
-    }
-    let bytes = buffer
-        .get(index..)
-        .ok_or_else(|| err(format!("{context} 결과 범위가 손상되었습니다.")))?;
-    str::from_utf8(bytes).map_err(|source| err_with_source(context, source))
+    U128DecimalDigits::new(u128::from(value))
+        .and_then(|digits| digits.push_to(out))
+        .ok_or_else(|| err(format!("{context} 숫자 작성 실패")))
 }
 fn cell_has_formula(cell: &Cell) -> bool {
     cell.inner_xml
@@ -2874,8 +2849,11 @@ fn build_decimal_display_text_tag(
     sign: Option<char>,
     magnitude: u64,
 ) -> Result<String> {
-    let mut buffer = [0_u8; MAX_DECIMAL_TEXT_LEN];
-    let text = decimal_text(magnitude, &mut buffer, "XML 표시값 작성 실패")?;
+    let digits = U128DecimalDigits::new(u128::from(magnitude))
+        .ok_or_else(|| err("XML 표시값 숫자 변환 실패"))?;
+    let text = digits
+        .as_str()
+        .ok_or_else(|| err("XML 표시값 문자열 변환 실패"))?;
     let tag_name_len = name
         .len()
         .checked_mul(2)

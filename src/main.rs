@@ -1,28 +1,59 @@
 extern crate alloc;
 use core::fmt::Arguments;
-use diagnostic::{Result, err};
+use diagnostic::{AppError, Result, err, err_with_source};
 use std::{
     env,
     ffi::OsStr,
+    fs::{File, TryLockError},
     io::{self, Write, stdout},
     path::Path,
 };
 use update_run::UpdateRun;
 mod build_info;
 mod change_log;
+mod decimal;
 mod diagnostic;
 mod excel;
 mod master_sheet;
 mod region;
 mod sheet_util;
 mod source_download;
+mod temp_entry;
 mod update_run;
 const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
+const RUN_LOCK_PATH: &str = ".fcupdater.lock";
 #[derive(Debug)]
 enum ParseAction {
     Help(String),
     Run { verify_saved_archive: bool },
     Version { verbose: bool },
+}
+struct RunLock {
+    file: File,
+}
+impl TryFrom<&Path> for RunLock {
+    type Error = AppError;
+    fn try_from(path: &Path) -> Result<Self> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|source| err_with_source("실행 잠금 파일 열기 실패", source))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => Err(err("다른 fcupdater 실행이 진행 중입니다.")),
+            Err(TryLockError::Error(source)) => Err(err_with_source("실행 잠금 획득 실패", source)),
+        }
+    }
+}
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        match self.file.unlock() {
+            Ok(()) | Err(_) => {}
+        }
+    }
 }
 fn main() -> Result<()> {
     let mut out = stdout();
@@ -90,12 +121,15 @@ fn main() -> Result<()> {
         ParseAction::Run {
             verify_saved_archive,
         } => {
+            let run_lock = RunLock::try_from(Path::new(RUN_LOCK_PATH))?;
             let mut update = UpdateRun {
                 master_path: Path::new(MASTER_PATH),
                 out: &mut out,
                 verify_saved_archive,
             };
-            update.run()
+            let result = update.run();
+            drop(run_lock);
+            result
         }
         ParseAction::Help(text) => {
             write_line(&mut out, format_args!("{text}"))?;
@@ -107,20 +141,15 @@ fn main() -> Result<()> {
                 format_args!("{} {}", build_info::APP_NAME, build_info::APP_VERSION),
             )?;
             if verbose {
-                write_line(
-                    &mut out,
-                    format_args!("target: {}", build_info::BUILD_TARGET),
-                )?;
-                write_line(
-                    &mut out,
-                    format_args!("profile: {}", build_info::BUILD_PROFILE),
-                )?;
-                write_line(&mut out, format_args!("rustc: {}", build_info::BUILD_RUSTC))?;
-                write_line(&mut out, format_args!("git: {}", build_info::BUILD_GIT_SHA))?;
-                write_line(
-                    &mut out,
-                    format_args!("dirty: {}", build_info::BUILD_GIT_DIRTY),
-                )?;
+                for (label, value) in [
+                    ("target", build_info::BUILD_TARGET),
+                    ("profile", build_info::BUILD_PROFILE),
+                    ("rustc", build_info::BUILD_RUSTC),
+                    ("git", build_info::BUILD_GIT_SHA),
+                    ("dirty", build_info::BUILD_GIT_DIRTY),
+                ] {
+                    write_line(&mut out, format_args!("{label}: {value}"))?;
+                }
             }
             Ok(())
         }

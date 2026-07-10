@@ -1,9 +1,10 @@
+use crate::decimal::U128DecimalDigits;
 use alloc::borrow::Cow;
-use core::{error::Error, fmt, fmt::Display, mem::replace, result::Result as CoreResult, str};
+use core::{error::Error, fmt, fmt::Display, mem::replace, result::Result as CoreResult};
 use std::{
     fs,
     fs::File,
-    io::{ErrorKind, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 cfg_select! {
@@ -17,9 +18,9 @@ cfg_select! {
 }
 mod http_client;
 mod workflow;
-const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 cfg_select! {
     any(target_os = "linux", target_os = "macos", windows) => {
+        const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
         const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
         const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
         const RESPONSE_HEADER_CONTENT_LENGTH: &[u8] = b"Content-Length";
@@ -53,7 +54,6 @@ const GAS_STATION_API_GBN: &str = "A";
 const DEFAULT_REGION_LABEL: &str = "선택하세요.";
 const USER_AGENT: &str = concat!("fcupdater/", env!("CARGO_PKG_VERSION"));
 const NETFUNNEL_POLL_LIMIT: usize = 20;
-const U128_DECIMAL_MAX_LEN: usize = 39;
 type BoxError = Box<dyn Error + Send + Sync>;
 #[derive(Debug)]
 struct DownloadError {
@@ -67,11 +67,13 @@ pub(super) struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
 }
 #[derive(Debug)]
 struct StreamedBodySummary {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     bytes_seen: usize,
     preview: Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HttpHeaderKind {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     ContentLength,
     SetCookie,
 }
@@ -89,7 +91,9 @@ struct HttpResponse {
 #[derive(Debug)]
 struct HttpStreamResponse {
     body: StreamedBodySummary,
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     headers: Vec<HttpHeader>,
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     status: u32,
 }
 struct ReservedDownloadFile {
@@ -211,31 +215,11 @@ where
 }
 fn push_decimal_fragment(
     out: &mut String,
-    mut value: u128,
+    value: u128,
     context: &'static str,
 ) -> DownloadResult<()> {
-    let mut buffer = [0_u8; U128_DECIMAL_MAX_LEN];
-    let mut index = buffer.len();
-    loop {
-        let digit = u8::try_from(value.rem_euclid(10))
-            .map_err(|source| download_error_with_source(context, source))?;
-        index = index.checked_sub(1).ok_or(context)?;
-        let byte = b'0'.checked_add(digit).ok_or(context)?;
-        let Some(slot) = buffer.get_mut(index) else {
-            return Err(context.into());
-        };
-        *slot = byte;
-        value = value.div_euclid(10);
-        if value == 0 {
-            break;
-        }
-    }
-    let Some(bytes) = buffer.get(index..) else {
-        return Err(context.into());
-    };
-    let fragment =
-        str::from_utf8(bytes).map_err(|source| download_error_with_source(context, source))?;
-    out.push_str(fragment);
+    let digits = U128DecimalDigits::new(value).ok_or(context)?;
+    digits.push_to(out).ok_or(context)?;
     Ok(())
 }
 cfg_select! {
@@ -261,6 +245,7 @@ cfg_select! {
     }
     _ => {}
 }
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn enforce_http_body_length(actual: usize, expected: Option<usize>) -> DownloadResult<()> {
     if let Some(expected_len) = expected
         && actual != expected_len
@@ -272,6 +257,7 @@ fn enforce_http_body_length(actual: usize, expected: Option<usize>) -> DownloadR
     }
     Ok(())
 }
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn validated_http_content_length(
     headers: &[HttpHeader],
     limit: usize,
@@ -322,7 +308,7 @@ fn validated_http_content_length(
 fn attach_remove_file_error(mut error: DownloadError, path: &Path) -> DownloadError {
     match fs::remove_file(path) {
         Ok(()) => error,
-        Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => error,
+        Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => error,
         Err(remove_error) => {
             let cleanup_text = format!(
                 "다운로드 임시 파일 삭제 실패: {} ({remove_error})",

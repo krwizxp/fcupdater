@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -7,34 +9,36 @@ const UNKNOWN: &str = "unknown";
 fn main() {
     let dot_git = Path::new(".git");
     let has_git_metadata = fs::exists(dot_git).is_ok_and(|exists| exists);
-    let git_dir = if dot_git.is_dir() {
-        dot_git.to_path_buf()
-    } else if let Ok(text) = fs::read_to_string(dot_git) {
-        text.trim().strip_prefix("gitdir: ").map_or_else(
-            || dot_git.to_path_buf(),
-            |raw_path| {
-                let git_path = PathBuf::from(raw_path);
-                if git_path.is_absolute() {
-                    git_path
-                } else {
-                    dot_git
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(git_path)
-                }
-            },
-        )
-    } else {
-        dot_git.to_path_buf()
-    };
-    let git_head = git_dir.join("HEAD");
-    emit_rerun_if_changed(git_head.as_path());
-    emit_rerun_if_changed(git_dir.join("packed-refs").as_path());
-    emit_rerun_if_changed(git_dir.join("index").as_path());
-    if let Ok(head) = fs::read_to_string(&git_head)
-        && let Some(ref_name) = head.trim().strip_prefix("ref: ")
+    if has_git_metadata {
+        let git_head = git_path("HEAD");
+        if let Some(path) = git_head.as_deref() {
+            emit_rerun_if_changed(path);
+            if let Ok(head) = fs::read_to_string(path)
+                && let Some(ref_name) = head.trim().strip_prefix("ref: ")
+                && let Some(ref_path) = git_path(ref_name)
+            {
+                emit_rerun_if_changed(ref_path.as_path());
+            }
+        }
+        for name in ["packed-refs", "index"] {
+            if let Some(path) = git_path(name) {
+                emit_rerun_if_changed(path.as_path());
+            }
+        }
+    }
+    if has_git_metadata
+        && let Some(paths) = git_command_stdout(&[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ])
     {
-        emit_rerun_if_changed(git_dir.join(ref_name).as_path());
+        for path in paths.split_terminator('\0') {
+            println!("cargo::rerun-if-changed={path}");
+        }
     }
     println!("cargo::rerun-if-env-changed=GITHUB_SHA");
     let git_sha = env::var("GITHUB_SHA")
@@ -70,9 +74,14 @@ fn main() {
         "cargo::rustc-env=BUILD_PROFILE={}",
         env::var("PROFILE").unwrap_or_else(|_| UNKNOWN.to_owned()),
     );
+    let rustc = env::var_os("RUSTC");
     println!(
         "cargo::rustc-env=BUILD_RUSTC={}",
-        command_stdout("rustc", &["--version"]).map_or_else(
+        command_stdout(
+            rustc.as_deref().unwrap_or_else(|| OsStr::new("rustc")),
+            &["--version"],
+        )
+        .map_or_else(
             || UNKNOWN.to_owned(),
             |text| {
                 let trimmed = text.trim();
@@ -95,17 +104,27 @@ fn short_git_sha(raw: &str) -> Option<String> {
     Some(trimmed.bytes().take(12).map(char::from).collect())
 }
 fn git_command_stdout(args: &[&str]) -> Option<String> {
-    command_stdout("git", args).or_else(|| {
+    command_stdout(OsStr::new("git"), args).or_else(|| {
         [
             r"C:\Program Files\Git\cmd\git.exe",
             r"C:\Program Files\Git\bin\git.exe",
             r"C:\Program Files (x86)\Git\cmd\git.exe",
         ]
         .into_iter()
-        .find_map(|candidate| command_stdout(candidate, args))
+        .find_map(|candidate| command_stdout(OsStr::new(candidate), args))
     })
 }
-fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+fn git_path(name: &str) -> Option<PathBuf> {
+    let raw_path =
+        git_command_stdout(&["rev-parse", "--path-format=absolute", "--git-path", name])?;
+    let trimmed_path = raw_path.trim();
+    if trimmed_path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed_path))
+    }
+}
+fn command_stdout(program: &OsStr, args: &[&str]) -> Option<String> {
     let Ok(output) = Command::new(program).args(args).output() else {
         return None;
     };

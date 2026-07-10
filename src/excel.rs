@@ -13,6 +13,11 @@ pub(super) enum SaveVerification {
     Skip,
     Verify,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArchiveFingerprint {
+    crc32: u32,
+    len: usize,
+}
 struct ZipArchiveBuilder<'path> {
     archive_path: &'path Path,
     file: File,

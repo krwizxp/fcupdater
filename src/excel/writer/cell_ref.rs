@@ -1,7 +1,8 @@
-use super::{
-    CellReference, RangeTokenParts, RewrittenCellReference, U32_DECIMAL_TEXT_MAX_LEN, decimal_text,
+use super::{CellReference, RangeTokenParts, RewrittenCellReference};
+use crate::{
+    decimal::U128DecimalDigits,
+    diagnostic::{AppError, Result, err, err_with_source},
 };
-use crate::diagnostic::{Result, err, err_with_source};
 use core::str;
 const COL_NAME_BUF_LEN: usize = 8;
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
@@ -11,9 +12,72 @@ pub(super) struct FormulaRewrite {
     end_index: usize,
     replacement: String,
 }
+struct FormulaBracket<'formula> {
+    end_index: usize,
+    expression: &'formula str,
+}
 struct LockPrefix<'reference> {
     locked: bool,
     rest: &'reference str,
+}
+impl<'formula> TryFrom<(&'formula str, usize)> for FormulaBracket<'formula> {
+    type Error = AppError;
+    fn try_from((formula, start): (&'formula str, usize)) -> Result<Self> {
+        let mut depth = 0_usize;
+        let mut index = start;
+        while let Some(tail) = formula.get(index..) {
+            let Some(ch) = tail.chars().next() else {
+                break;
+            };
+            let ch_len = ch.len_utf8();
+            if ch == '\'' {
+                let escaped_index = index.checked_add(ch_len).ok_or_else(|| {
+                    err("formula structured reference cursor 계산에 실패했습니다.")
+                })?;
+                if formula
+                    .get(escaped_index..)
+                    .and_then(|escaped_tail| escaped_tail.chars().next())
+                    .is_some_and(|escaped| matches!(escaped, '[' | ']' | '#' | '\'' | '@'))
+                {
+                    index = escaped_index.checked_add(1).ok_or_else(|| {
+                        err("formula structured reference cursor 계산에 실패했습니다.")
+                    })?;
+                    continue;
+                }
+            }
+            match ch {
+                '[' => {
+                    depth = depth.checked_add(1).ok_or_else(|| {
+                        err("formula structured reference bracket 깊이 계산에 실패했습니다.")
+                    })?;
+                }
+                ']' => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        err("formula structured reference bracket 깊이가 손상되었습니다.")
+                    })?;
+                    if depth == 0 {
+                        index = index.checked_add(ch_len).ok_or_else(|| {
+                            err("formula structured reference 종료 계산에 실패했습니다.")
+                        })?;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            advance_index(
+                &mut index,
+                ch_len,
+                "formula structured reference cursor 계산에 실패했습니다.",
+            )?;
+        }
+        let expression = formula
+            .get(start..index)
+            .ok_or_else(|| err("formula bracket 표현식 범위가 손상되었습니다."))?;
+        Ok(Self {
+            end_index: index,
+            expression,
+        })
+    }
 }
 impl CellReference {
     pub(super) const fn unlocked(col: u32, row: u32) -> Self {
@@ -134,12 +198,11 @@ pub(super) fn ref_with_locks(reference: CellReference) -> Result<String> {
     }
     let col_prefix = if reference.col_locked { "$" } else { "" };
     let row_prefix = if reference.row_locked { "$" } else { "" };
-    let mut row_buffer = [0_u8; U32_DECIMAL_TEXT_MAX_LEN];
-    let row_text = decimal_text(
-        u64::from(reference.row),
-        &mut row_buffer,
-        "Excel row decimal 변환 실패",
-    )?;
+    let row_digits = U128DecimalDigits::new(u128::from(reference.row))
+        .ok_or_else(|| err("Excel row decimal 변환 실패"))?;
+    let row_text = row_digits
+        .as_str()
+        .ok_or_else(|| err("Excel row decimal 문자열 변환 실패"))?;
     let Some(capacity) = col_prefix
         .len()
         .checked_add(col_name.len())
@@ -241,6 +304,12 @@ where
                 i = next_idx;
                 continue;
             }
+        }
+        if ch == '[' {
+            let bracket = FormulaBracket::try_from((formula, i))?;
+            out.push_str(bracket.expression);
+            i = bracket.end_index;
+            continue;
         }
         if (ch == '$' || ch.is_ascii_alphabetic())
             && let Some(rewrite) = try_rewrite_cell_ref(formula, i)?

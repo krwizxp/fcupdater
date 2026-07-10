@@ -10,7 +10,7 @@
 - `변경내역` 시트 항상 갱신
 - 기본 저장은 빠른 승격 사용, `--verify` 실행 시 저장 후 OOXML 필수 파트 무결성 검증
 ## 요구사항
-- MSRV: Rust 1.96
+- MSRV: Rust 1.97
 - 자동 다운로드: Windows는 WinHTTP, Linux/macOS는 native libcurl 사용
 - Linux/macOS native libcurl은 HTTPS protocol allowlist 설정을 위해 7.85.0 이상이 필요합니다.
 - Linux 빌드 환경: `libcurl4-openssl-dev`

@@ -4,7 +4,7 @@ use super::{
     HASH_SIZE, LENGTH_BASES, LENGTH_EXTRA_BITS, LITERAL_LENGTH_SYMBOLS, MAX_CHAIN, MAX_MATCH,
     MIN_MATCH, ZipResult, read_u16, zip_static, zip_with_source,
 };
-use core::{array::from_fn, cmp::Ordering, iter::repeat_n, range::Range};
+use core::{array::from_fn, cmp::Ordering, iter::repeat_n, mem, range::Range};
 use std::io::Write as IoWrite;
 const TOO_FAR_MATCH_DISTANCE: usize = 4096;
 const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
@@ -84,8 +84,15 @@ pub(super) struct DeflateInflater<'bytes> {
     pub bytes: &'bytes [u8],
     pub expected_len: usize,
 }
-pub(super) struct DeflateWriter<'bytes> {
+#[derive(Default)]
+pub(super) struct DeflateWorkspace {
+    head: Vec<usize>,
+    previous: Vec<usize>,
+    tokens: Vec<DeflateToken>,
+}
+pub(super) struct DeflateWriter<'bytes, 'workspace> {
     pub bytes: &'bytes [u8],
+    pub workspace: &'workspace mut DeflateWorkspace,
 }
 pub(super) struct DeflatePlan {
     compressed_len: usize,
@@ -433,7 +440,10 @@ impl WriteHuffman {
         }
         Ok(Self { codes, lengths })
     }
-    fn write_symbol<O: BitOutput>(&self, writer: &mut BitWriter<O>, symbol: u16) -> ZipResult<()> {
+    fn write_symbol<O>(&self, writer: &mut BitWriter<O>, symbol: u16) -> ZipResult<()>
+    where
+        O: BitOutput,
+    {
         let index = usize::from(symbol);
         let Some(&len) = self.lengths.get(index) else {
             return Err(zip_static("deflate 출력 Huffman symbol 길이 범위 오류"));
@@ -864,11 +874,10 @@ impl DynamicDeflatePlan {
         self.write(tokens, &mut writer)?;
         Ok(writer.finish()?.byte_len())
     }
-    fn write<O: BitOutput>(
-        &self,
-        tokens: &[DeflateToken],
-        writer: &mut BitWriter<O>,
-    ) -> ZipResult<()> {
+    fn write<O>(&self, tokens: &[DeflateToken], writer: &mut BitWriter<O>) -> ZipResult<()>
+    where
+        O: BitOutput,
+    {
         DynamicBlockHeaderWriter {
             code_length_count: self.code_length_count,
             code_lengths: &self.code_huffman.lengths,
@@ -1004,7 +1013,10 @@ impl FixedDeflateWriter<'_> {
         self.write_into(&mut writer)?;
         Ok(writer.finish()?.byte_len())
     }
-    fn write_into<O: BitOutput>(&self, writer: &mut BitWriter<O>) -> ZipResult<()> {
+    fn write_into<O>(&self, writer: &mut BitWriter<O>) -> ZipResult<()>
+    where
+        O: BitOutput,
+    {
         writer.write_bits(1, 1)?;
         writer.write_bits(1, 2)?;
         let mut token_writer = FixedTokenWriter { writer };
@@ -1356,7 +1368,12 @@ impl DeflatePlan {
         .write_to(writer)
     }
 }
-impl DeflateWriter<'_> {
+impl DeflateWorkspace {
+    pub(super) fn recycle(&mut self, plan: DeflatePlan) {
+        self.tokens = plan.tokens;
+    }
+}
+impl DeflateWriter<'_, '_> {
     fn best_match(
         bytes: &[u8],
         position: usize,
@@ -1454,8 +1471,27 @@ impl DeflateWriter<'_> {
         }
         None
     }
-    pub(super) fn plan(&self) -> ZipResult<DeflatePlan> {
-        let tokens = self.tokens()?;
+    pub(super) fn plan(&mut self) -> ZipResult<DeflatePlan> {
+        let xml_probe = self
+            .bytes
+            .strip_prefix(UTF8_BOM)
+            .unwrap_or(self.bytes)
+            .trim_ascii_start();
+        let looks_like_xlsx_xml = (xml_probe.starts_with(b"<?xml") || xml_probe.starts_with(b"<"))
+            && XLSX_XML_NEEDLES.iter().any(|needle| {
+                xml_probe
+                    .windows(needle.len())
+                    .any(|window| window == *needle)
+            });
+        let nice_match_len = if looks_like_xlsx_xml {
+            XML_NICE_MATCH_LEN
+        } else {
+            MAX_MATCH
+        };
+        let tokens = self.tokens(DeflateProfile {
+            max_chain: MAX_CHAIN,
+            nice_match_len,
+        })?;
         let fixed_writer = FixedDeflateWriter { tokens: &tokens };
         let fixed_len = fixed_writer.deflated_len()?;
         let dynamic_writer = DynamicDeflateWriter { tokens: &tokens };
@@ -1475,51 +1511,45 @@ impl DeflateWriter<'_> {
             tokens,
         })
     }
-    fn tokens(&self) -> ZipResult<Vec<DeflateToken>> {
-        let xml_probe = self
-            .bytes
-            .strip_prefix(UTF8_BOM)
-            .unwrap_or(self.bytes)
-            .trim_ascii_start();
-        let looks_like_xlsx_xml = (xml_probe.starts_with(b"<?xml") || xml_probe.starts_with(b"<"))
-            && XLSX_XML_NEEDLES.iter().any(|needle| {
-                xml_probe
-                    .windows(needle.len())
-                    .any(|window| window == *needle)
-            });
-        let nice_match_len = if looks_like_xlsx_xml {
-            XML_NICE_MATCH_LEN
-        } else {
-            MAX_MATCH
-        };
-        let profile = DeflateProfile {
-            max_chain: MAX_CHAIN,
-            nice_match_len,
-        };
-        let mut tokens = Vec::new();
-        tokens
-            .try_reserve_exact(self.bytes.len())
-            .map_err(|source| zip_with_source("deflate token 메모리 확보 실패", source))?;
-        let mut head = Vec::new();
-        head.try_reserve_exact(HASH_SIZE)
-            .map_err(|source| zip_with_source("deflate hash head 메모리 확보 실패", source))?;
-        head.resize(HASH_SIZE, usize::MAX);
-        let mut previous = Vec::new();
-        previous
-            .try_reserve_exact(self.bytes.len())
-            .map_err(|source| zip_with_source("deflate hash previous 메모리 확보 실패", source))?;
-        previous.resize(self.bytes.len(), usize::MAX);
+    fn tokens(&mut self, profile: DeflateProfile) -> ZipResult<Vec<DeflateToken>> {
+        let bytes = self.bytes;
+        let workspace = &mut *self.workspace;
+        let mut tokens = mem::take(&mut workspace.tokens);
+        tokens.clear();
+        if tokens.capacity() < bytes.len() {
+            tokens
+                .try_reserve_exact(bytes.len())
+                .map_err(|source| zip_with_source("deflate token 메모리 확보 실패", source))?;
+        }
+        workspace.head.clear();
+        if workspace.head.capacity() < HASH_SIZE {
+            workspace
+                .head
+                .try_reserve_exact(HASH_SIZE)
+                .map_err(|source| zip_with_source("deflate hash head 메모리 확보 실패", source))?;
+        }
+        workspace.head.resize(HASH_SIZE, usize::MAX);
+        workspace.previous.clear();
+        if workspace.previous.capacity() < bytes.len() {
+            workspace
+                .previous
+                .try_reserve_exact(bytes.len())
+                .map_err(|source| {
+                    zip_with_source("deflate hash previous 메모리 확보 실패", source)
+                })?;
+        }
+        workspace.previous.resize(bytes.len(), usize::MAX);
+        let head = &mut workspace.head;
+        let previous = &mut workspace.previous;
         let mut position = 0_usize;
-        while position < self.bytes.len() {
-            if let Some(best_match) =
-                Self::best_match(self.bytes, position, &head, &previous, profile)
-            {
+        while position < bytes.len() {
+            if let Some(best_match) = Self::best_match(bytes, position, head, previous, profile) {
                 if best_match.length == MIN_MATCH && best_match.distance > TOO_FAR_MATCH_DISTANCE {
-                    let Some(&byte) = self.bytes.get(position) else {
+                    let Some(&byte) = bytes.get(position) else {
                         return Err(zip_static("deflate literal 범위 오류"));
                     };
                     tokens.push(DeflateToken::literal(byte));
-                    Self::insert_position(self.bytes, position, &mut head, &mut previous);
+                    Self::insert_position(bytes, position, head, previous);
                     position = position
                         .checked_add(1)
                         .ok_or_else(|| zip_static("deflate 위치 계산 실패"))?;
@@ -1528,17 +1558,17 @@ impl DeflateWriter<'_> {
                 let mut inserted_current = false;
                 let lazy_literal = if best_match.length < MAX_MATCH
                     && let Some(next_position) = position.checked_add(1)
-                    && next_position < self.bytes.len()
+                    && next_position < bytes.len()
                 {
-                    Self::insert_position(self.bytes, position, &mut head, &mut previous);
+                    Self::insert_position(bytes, position, head, previous);
                     inserted_current = true;
-                    Self::best_match(self.bytes, next_position, &head, &previous, profile)
+                    Self::best_match(bytes, next_position, head, previous, profile)
                         .is_some_and(|next_match| next_match.length > best_match.length)
                 } else {
                     false
                 };
                 if lazy_literal {
-                    let Some(&byte) = self.bytes.get(position) else {
+                    let Some(&byte) = bytes.get(position) else {
                         return Err(zip_static("deflate literal 범위 오류"));
                     };
                     tokens.push(DeflateToken::literal(byte));
@@ -1562,15 +1592,15 @@ impl DeflateWriter<'_> {
                     position
                 };
                 for insert_position in insert_start..next_position {
-                    Self::insert_position(self.bytes, insert_position, &mut head, &mut previous);
+                    Self::insert_position(bytes, insert_position, head, previous);
                 }
                 position = next_position;
             } else {
-                let Some(&byte) = self.bytes.get(position) else {
+                let Some(&byte) = bytes.get(position) else {
                     return Err(zip_static("deflate literal 범위 오류"));
                 };
                 tokens.push(DeflateToken::literal(byte));
-                Self::insert_position(self.bytes, position, &mut head, &mut previous);
+                Self::insert_position(bytes, position, head, previous);
                 position = position.saturating_add(1);
             }
         }

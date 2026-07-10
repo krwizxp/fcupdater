@@ -5,21 +5,24 @@ use super::{
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, ReservedDownloadFile, SourceDownload,
     attach_remove_file_error, download_error_with_source,
     http_client::{self, PostHeaderProfile},
-    push_decimal_fragment,
 };
-use crate::diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message};
+use crate::{
+    diagnostic::{Result, err, err_with_source, path_context_message, prefixed_message},
+    temp_entry::{
+        STALE_TEMP_ENTRY_AGE, TEMP_ENTRY_NAME_CAPACITY, TEMP_ENTRY_RESERVATION_ATTEMPTS,
+        temp_entry_age_nanos, write_temp_entry_name,
+    },
+};
 use core::time::Duration;
 use std::{
     fs::{self, File},
-    io::{ErrorKind, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 const AUTO_SOURCE_OLD_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
 const AUTO_SOURCE_TEMP_FILE_PREFIX: &str = ".fcupdater-opinet-source.tmp_";
-const AUTO_SOURCE_TEMP_FILE_NAME_CAPACITY: usize = 128;
-const AUTO_SOURCE_TEMP_FILE_RESERVATION_ATTEMPTS: u32 = 1024;
 struct SourceDownloadWorkflow<'dir, 'out, W: Write + ?Sized> {
     dir: &'dir Path,
     out: &'out mut W,
@@ -161,19 +164,9 @@ where
         Ok(downloaded.path)
     }
     fn refresh_source(&mut self) -> Result<PathBuf> {
-        let old_temp_path = self.dir.join(AUTO_SOURCE_OLD_TEMP_FILE_NAME);
-        let removed_old_temp = match fs::remove_file(&old_temp_path) {
-            Ok(()) => true,
-            Err(error) if error.kind() == ErrorKind::NotFound => false,
-            Err(error) => {
-                return Err(err_with_source(
-                    path_context_message("기존 자동 소스 정리 실패", &old_temp_path),
-                    error,
-                ));
-            }
-        };
-        if removed_old_temp {
-            match writeln!(self.out, "이전 임시 소스 파일 1개 정리") {
+        let removed_temp_count = self.remove_stale_auto_source_temp_files()?;
+        if removed_temp_count != 0 {
+            match writeln!(self.out, "이전 임시 소스 파일 {removed_temp_count}개 정리") {
                 Ok(()) | Err(_) => {}
             }
         }
@@ -189,6 +182,65 @@ where
             }
         })
     }
+    fn remove_stale_auto_source_temp_files(&self) -> Result<u32> {
+        let old_temp_path = self.dir.join(AUTO_SOURCE_OLD_TEMP_FILE_NAME);
+        let mut removed_count = match fs::remove_file(&old_temp_path) {
+            Ok(()) => 1_u32,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(err_with_source(
+                    path_context_message("기존 자동 소스 정리 실패", &old_temp_path),
+                    error,
+                ));
+            }
+        };
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|source| err_with_source("임시 소스 정리 시각 계산 실패", source))?
+            .as_nanos();
+        let entries = fs::read_dir(self.dir).map_err(|source| {
+            err_with_source(
+                path_context_message("임시 소스 폴더 조회 실패", self.dir),
+                source,
+            )
+        })?;
+        for entry_result in entries {
+            let entry = entry_result.map_err(|source| {
+                err_with_source(
+                    path_context_message("임시 소스 항목 조회 실패", self.dir),
+                    source,
+                )
+            })?;
+            let file_name_os = entry.file_name();
+            let Some(file_name) = file_name_os.to_str() else {
+                continue;
+            };
+            let Some(age_nanos) =
+                temp_entry_age_nanos(file_name, AUTO_SOURCE_TEMP_FILE_PREFIX, now_nanos)
+            else {
+                continue;
+            };
+            if age_nanos < STALE_TEMP_ENTRY_AGE.as_nanos() {
+                continue;
+            }
+            let path = entry.path();
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    removed_count = removed_count.checked_add(1).ok_or_else(|| {
+                        err("정리한 임시 소스 파일 수 계산 중 overflow가 발생했습니다.")
+                    })?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(err_with_source(
+                        path_context_message("이전 임시 소스 정리 실패", &path),
+                        error,
+                    ));
+                }
+            }
+        }
+        Ok(removed_count)
+    }
     fn reserve_auto_source_temp_file(&self) -> DownloadResult<ReservedDownloadFile> {
         let pid = process::id();
         let nanos = SystemTime::now()
@@ -199,35 +251,28 @@ where
             .as_nanos();
         let mut file_name = String::new();
         file_name
-            .try_reserve_exact(AUTO_SOURCE_TEMP_FILE_NAME_CAPACITY)
+            .try_reserve_exact(TEMP_ENTRY_NAME_CAPACITY)
             .map_err(|source| {
                 download_error_with_source("다운로드 임시 파일명 메모리 확보 실패", source)
             })?;
         let mut path = self.dir.to_path_buf();
-        path.try_reserve(AUTO_SOURCE_TEMP_FILE_NAME_CAPACITY)
+        path.try_reserve(TEMP_ENTRY_NAME_CAPACITY)
             .map_err(|source| {
                 download_error_with_source("다운로드 임시 파일 경로 메모리 확보 실패", source)
             })?;
-        for seq in 0..AUTO_SOURCE_TEMP_FILE_RESERVATION_ATTEMPTS {
-            file_name.clear();
-            file_name.push_str(AUTO_SOURCE_TEMP_FILE_PREFIX);
-            push_decimal_fragment(
+        for seq in 0..TEMP_ENTRY_RESERVATION_ATTEMPTS {
+            write_temp_entry_name(
                 &mut file_name,
-                u128::from(pid),
-                "다운로드 임시 파일명 작성 실패",
-            )?;
-            file_name.push('_');
-            push_decimal_fragment(&mut file_name, nanos, "다운로드 임시 파일명 작성 실패")?;
-            file_name.push('_');
-            push_decimal_fragment(
-                &mut file_name,
-                u128::from(seq),
-                "다운로드 임시 파일명 작성 실패",
-            )?;
+                AUTO_SOURCE_TEMP_FILE_PREFIX,
+                pid,
+                nanos,
+                seq,
+            )
+            .ok_or("다운로드 임시 파일명 작성 실패")?;
             path.push(file_name.as_str());
             match File::options().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok(ReservedDownloadFile { file, path }),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     path.pop();
                     thread::sleep(Duration::from_micros(50));
                 }

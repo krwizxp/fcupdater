@@ -1,47 +1,22 @@
 use super::{DECIMAL_SCALE, DECIMAL_SCALE_SQUARED, ScaledDecimal, ScaledSortKey};
-use crate::diagnostic::{AppError, Result, err, err_with_source};
+use crate::{
+    decimal::U128DecimalDigits,
+    diagnostic::{AppError, Result, err, err_with_source},
+};
 use core::str;
-const U128_DECIMAL_MAX_LEN: usize = 39;
 const UNIT_PRICE_MAX_FRAC_DIGITS: usize = 15;
-struct U128DecimalDigits {
-    bytes: [u8; U128_DECIMAL_MAX_LEN],
-    start: usize,
+fn decimal_digits(value: u128) -> Result<U128DecimalDigits> {
+    U128DecimalDigits::new(value).ok_or_else(|| err("decimal digit buffer 상태가 손상되었습니다."))
 }
-impl U128DecimalDigits {
-    fn as_bytes(&self) -> Result<&[u8]> {
-        self.bytes
-            .get(self.start..)
-            .ok_or_else(|| err("decimal digit buffer 상태가 손상되었습니다."))
-    }
-    fn new(mut value: u128) -> Result<Self> {
-        let mut bytes = [0_u8; U128_DECIMAL_MAX_LEN];
-        let mut start = U128_DECIMAL_MAX_LEN;
-        loop {
-            let digit = value.rem_euclid(10);
-            let digit_u8 = u8::try_from(digit)
-                .map_err(|source| err_with_source("decimal digit 변환 실패", source))?;
-            start = start
-                .checked_sub(1)
-                .ok_or_else(|| err("decimal digit buffer 용량을 초과했습니다."))?;
-            let Some(slot) = bytes.get_mut(start) else {
-                return Err(err("decimal digit buffer 범위 오류"));
-            };
-            *slot = b'0'
-                .checked_add(digit_u8)
-                .ok_or_else(|| err("decimal digit 계산 중 overflow가 발생했습니다."))?;
-            value = value.div_euclid(10);
-            if value == 0 {
-                break;
-            }
-        }
-        Ok(Self { bytes, start })
-    }
-    fn push_to(&self, out: &mut String) -> Result<()> {
-        let text = str::from_utf8(self.as_bytes()?)
-            .map_err(|source| err_with_source("decimal digit UTF-8 변환 실패", source))?;
-        out.push_str(text);
-        Ok(())
-    }
+fn decimal_digit_bytes(digits: &U128DecimalDigits) -> Result<&[u8]> {
+    digits
+        .as_bytes()
+        .ok_or_else(|| err("decimal digit buffer 상태가 손상되었습니다."))
+}
+fn push_decimal_digits(digits: &U128DecimalDigits, out: &mut String) -> Result<()> {
+    digits
+        .push_to(out)
+        .ok_or_else(|| err("decimal digit UTF-8 변환 실패"))
 }
 pub(super) fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> Result<String> {
     let half_scale = ScaledSortKey(DECIMAL_SCALE_SQUARED.as_i128().div_euclid(2));
@@ -51,8 +26,8 @@ pub(super) fn format_fuel_price_text(label: &str, total: ScaledSortKey) -> Resul
         .as_i128()
         .div_euclid(DECIMAL_SCALE_SQUARED.as_i128());
     let sign = if rounded < 0 { "-" } else { "" };
-    let digits = U128DecimalDigits::new(rounded.unsigned_abs())?;
-    let digit_bytes = digits.as_bytes()?;
+    let digits = decimal_digits(rounded.unsigned_abs())?;
+    let digit_bytes = decimal_digit_bytes(&digits)?;
     let groups = digit_bytes.len().saturating_sub(1).div_euclid(3);
     let amount_capacity = sign
         .len()
@@ -94,22 +69,22 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> Result<String> {
     let abs = value.unsigned_abs();
     let scale_abs = scale.unsigned_abs();
     if scale_abs == 0 {
-        let decimal_digits = U128DecimalDigits::new(abs)?;
+        let integer_digits = decimal_digits(abs)?;
         let mut out = String::new();
         out.try_reserve_exact(
             sign.len()
-                .checked_add(decimal_digits.as_bytes()?.len())
+                .checked_add(decimal_digit_bytes(&integer_digits)?.len())
                 .ok_or_else(|| err("정수 표시 문자열 용량 계산 실패"))?,
         )
         .map_err(|source| err_with_source("정수 표시 문자열 메모리 확보 실패", source))?;
         out.push_str(sign);
-        decimal_digits.push_to(&mut out)?;
+        push_decimal_digits(&integer_digits, &mut out)?;
         return Ok(out);
     }
     let whole = abs.div_euclid(scale_abs);
     let frac = abs.rem_euclid(scale_abs);
-    let whole_digits = U128DecimalDigits::new(whole)?;
-    let whole_bytes = whole_digits.as_bytes()?;
+    let whole_digits = decimal_digits(whole)?;
+    let whole_bytes = decimal_digit_bytes(&whole_digits)?;
     if frac == 0 {
         let mut out = String::new();
         let capacity = sign
@@ -119,11 +94,11 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> Result<String> {
         out.try_reserve_exact(capacity)
             .map_err(|source| err_with_source("소수 표시 문자열 메모리 확보 실패", source))?;
         out.push_str(sign);
-        whole_digits.push_to(&mut out)?;
+        push_decimal_digits(&whole_digits, &mut out)?;
         return Ok(out);
     }
-    let frac_digits = U128DecimalDigits::new(frac)?;
-    let frac_bytes = frac_digits.as_bytes()?;
+    let frac_digits = decimal_digits(frac)?;
+    let frac_bytes = decimal_digit_bytes(&frac_digits)?;
     let width = usize::try_from(scale_abs.ilog10())
         .map_err(|source| err_with_source("소수 표시 폭 변환 실패", source))?;
     let zero_padding = width
@@ -158,7 +133,7 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> Result<String> {
     out.try_reserve_exact(capacity)
         .map_err(|source| err_with_source("소수 표시 문자열 메모리 확보 실패", source))?;
     out.push_str(sign);
-    whole_digits.push_to(&mut out)?;
+    push_decimal_digits(&whole_digits, &mut out)?;
     out.push('.');
     for _ in 0..kept_padding {
         out.push('0');
@@ -189,8 +164,8 @@ pub(super) fn format_unit_price_text(
     let denominator = denominator_raw.unsigned_abs();
     let whole = abs.div_euclid(denominator);
     let mut remainder = abs.rem_euclid(denominator);
-    let whole_digits = U128DecimalDigits::new(whole)?;
-    let whole_bytes = whole_digits.as_bytes()?;
+    let whole_digits = decimal_digits(whole)?;
+    let whole_bytes = decimal_digit_bytes(&whole_digits)?;
     if remainder == 0 {
         let mut out = String::new();
         let capacity = sign
@@ -200,7 +175,7 @@ pub(super) fn format_unit_price_text(
         out.try_reserve_exact(capacity)
             .map_err(|source| err_with_source("단가 표시 문자열 메모리 확보 실패", source))?;
         out.push_str(sign);
-        whole_digits.push_to(&mut out)?;
+        push_decimal_digits(&whole_digits, &mut out)?;
         return Ok(Some(out));
     }
     let mut frac_bytes = [0_u8; UNIT_PRICE_MAX_FRAC_DIGITS];
@@ -250,7 +225,7 @@ pub(super) fn format_unit_price_text(
     out.try_reserve_exact(capacity)
         .map_err(|source| err_with_source("단가 표시 문자열 메모리 확보 실패", source))?;
     out.push_str(visible_sign);
-    whole_digits.push_to(&mut out)?;
+    push_decimal_digits(&whole_digits, &mut out)?;
     if !trimmed_frac.is_empty() {
         out.push('.');
         let trimmed_frac_text = str::from_utf8(trimmed_frac)

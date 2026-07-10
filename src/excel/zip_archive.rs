@@ -1,5 +1,5 @@
 use super::path_util::reject_windows_special_component;
-use super::{ZipArchiveExtractor, path_util::path_to_slashes};
+use super::{ArchiveFingerprint, ZipArchiveExtractor, path_util::path_to_slashes};
 use crate::diagnostic::{
     AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
 };
@@ -370,6 +370,10 @@ struct HeaderSplit<'bytes, const LEN: usize> {
     header: &'bytes [u8; LEN],
     tail: &'bytes [u8],
 }
+struct PendingFile {
+    name: String,
+    path: PathBuf,
+}
 impl fmt::Display for ZipError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.message.as_ref())
@@ -576,8 +580,9 @@ impl ZipCentralDirectory<'_> {
     }
 }
 impl ZipArchiveExtractor<'_> {
-    pub(super) fn extract(&self) -> Result<()> {
-        let bytes = self.read_archive_bytes()?;
+    pub(super) fn extract(&self) -> Result<ArchiveFingerprint> {
+        let bytes = read_archive_bytes(self.archive_path)?;
+        let fingerprint = ArchiveFingerprint::from_bytes(bytes.as_slice())?;
         if bytes.len() < END_OF_CENTRAL_DIRECTORY_LEN {
             return Err(zip_static("ZIP 파일이 너무 짧습니다.").into());
         }
@@ -668,7 +673,7 @@ impl ZipArchiveExtractor<'_> {
             total_uncompressed =
                 self.extract_entry(bytes.as_slice(), &entry, &entry_path, total_uncompressed)?;
         }
-        Ok(())
+        Ok(fingerprint)
     }
     fn extract_entry(
         &self,
@@ -730,64 +735,68 @@ impl ZipArchiveExtractor<'_> {
         })?;
         Ok(next_total_uncompressed)
     }
-    fn read_archive_bytes(&self) -> Result<Vec<u8>> {
-        let file = File::open(self.archive_path).map_err(|source_err| {
-            err_with_source(
-                path_context_message("xlsx 압축 파일 열기 실패", self.archive_path),
-                source_err,
-            )
-        })?;
-        let metadata = file.metadata().map_err(|source_err| {
-            err_with_source(
-                path_context_message("xlsx 압축 파일 정보 확인 실패", self.archive_path),
-                source_err,
-            )
-        })?;
-        let archive_len = usize::try_from(metadata.len()).map_err(|source| {
-            err(format!(
-                "xlsx 압축 파일 크기 변환 실패({}): {source}",
-                self.archive_path.display()
-            ))
-        })?;
-        if archive_len > ZIP_MAX_ARCHIVE_BYTES {
-            return Err(err(format!(
-                "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
-                self.archive_path.display()
-            )));
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(archive_len)
-            .map_err(|source| err_with_source("xlsx 압축 파일 메모리 확보 실패", source))?;
-        let read_limit = u64::try_from(ZIP_MAX_ARCHIVE_BYTES)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| err("xlsx 압축 파일 읽기 한도 계산 실패"))?;
-        let mut limited = file.take(read_limit);
-        limited.read_to_end(&mut bytes).map_err(|source_err| {
-            err_with_source(
-                path_context_message("xlsx 압축 파일 읽기 실패", self.archive_path),
-                source_err,
-            )
-        })?;
-        if bytes.len() > ZIP_MAX_ARCHIVE_BYTES {
-            return Err(err(format!(
-                "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
-                self.archive_path.display()
-            )));
-        }
-        if bytes.len() != archive_len {
-            return Err(err(format!(
-                "xlsx 압축 파일이 읽는 중 변경되었습니다: {}",
-                self.archive_path.display()
-            )));
-        }
-        Ok(bytes)
+}
+impl ArchiveFingerprint {
+    pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            crc32: crc32(bytes)?,
+            len: bytes.len(),
+        })
     }
 }
-struct PendingFile {
-    name: String,
-    path: PathBuf,
+pub(super) fn read_archive_bytes(archive_path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(archive_path).map_err(|source_err| {
+        err_with_source(
+            path_context_message("xlsx 압축 파일 열기 실패", archive_path),
+            source_err,
+        )
+    })?;
+    let metadata = file.metadata().map_err(|source_err| {
+        err_with_source(
+            path_context_message("xlsx 압축 파일 정보 확인 실패", archive_path),
+            source_err,
+        )
+    })?;
+    let archive_len = usize::try_from(metadata.len()).map_err(|source| {
+        err(format!(
+            "xlsx 압축 파일 크기 변환 실패({}): {source}",
+            archive_path.display()
+        ))
+    })?;
+    if archive_len > ZIP_MAX_ARCHIVE_BYTES {
+        return Err(err(format!(
+            "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
+            archive_path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(archive_len)
+        .map_err(|source| err_with_source("xlsx 압축 파일 메모리 확보 실패", source))?;
+    let read_limit = u64::try_from(ZIP_MAX_ARCHIVE_BYTES)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| err("xlsx 압축 파일 읽기 한도 계산 실패"))?;
+    let mut limited = file.take(read_limit);
+    limited.read_to_end(&mut bytes).map_err(|source_err| {
+        err_with_source(
+            path_context_message("xlsx 압축 파일 읽기 실패", archive_path),
+            source_err,
+        )
+    })?;
+    if bytes.len() > ZIP_MAX_ARCHIVE_BYTES {
+        return Err(err(format!(
+            "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
+            archive_path.display()
+        )));
+    }
+    if bytes.len() != archive_len {
+        return Err(err(format!(
+            "xlsx 압축 파일이 읽는 중 변경되었습니다: {}",
+            archive_path.display()
+        )));
+    }
+    Ok(bytes)
 }
 const fn zip_static(message: &'static str) -> ZipError {
     ZipError {

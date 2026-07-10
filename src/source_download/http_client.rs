@@ -1,10 +1,10 @@
 use super::{
     DownloadError, DownloadResult, HttpHeader, HttpHeaderKind, HttpResponse, HttpStreamResponse,
     NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, OPINET_HOST, ReservedDownloadFile,
-    U128_DECIMAL_MAX_LEN, USER_AGENT, append_download_error_message, attach_remove_file_error,
+    USER_AGENT, append_download_error_message, attach_remove_file_error,
     download_error_with_source, push_decimal_fragment,
 };
-use crate::diagnostic::prefixed_message;
+use crate::{decimal::U128_DECIMAL_MAX_LEN, diagnostic::prefixed_message};
 use core::{mem, time::Duration};
 use std::{
     fs::{File, remove_file},
@@ -25,24 +25,13 @@ cfg_select! {
     }
     _ => {}
 }
-cfg_select! {
-    any(target_os = "linux", target_os = "macos", windows) => {
-        #[derive(Default)]
-        pub(super) struct HttpClient {
-            cookie_jars: Vec<CookieJar>,
-            form_body_buffer: String,
-            netfunnel_path_buffer: String,
-            platform: PlatformHttpClient,
-        }
-    }
-    _ => {
-        #[derive(Default)]
-        struct HttpClient {
-            cookie_jars: Vec<CookieJar>,
-            form_body_buffer: String,
-            netfunnel_path_buffer: String,
-        }
-    }
+#[derive(Default)]
+pub(super) struct HttpClient {
+    cookie_jars: Vec<CookieJar>,
+    form_body_buffer: String,
+    netfunnel_path_buffer: String,
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    platform: PlatformHttpClient,
 }
 #[derive(Clone, Copy)]
 pub(super) enum PostHeaderProfile {
@@ -310,8 +299,9 @@ impl HttpClient {
     }
     pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> DownloadResult<String> {
         let mut current_key: Option<String> = None;
+        let mut current_ttl: Option<u32> = None;
         for _ in 0..NETFUNNEL_POLL_LIMIT {
-            let result = self.request_netfunnel(action_id, current_key.as_deref(), None)?;
+            let result = self.request_netfunnel(action_id, current_key.as_deref(), current_ttl)?;
             self.add_cookie_for_host(NETFUNNEL_HOST, "NetFunnel_ID", &result)?;
             self.add_cookie_for_host(OPINET_HOST, "NetFunnel_ID", &result)?;
             let Some((_opcode, code_tail)) = result.split_once(':') else {
@@ -324,17 +314,20 @@ impl HttpClient {
                     let (key_start, key_end) = netfunnel_key_range(&result)?;
                     return Ok(take_netfunnel_key(result, key_start, key_end));
                 }
-                201 | 202 | 302 => {
+                201 | 202 => {
                     let (key_start, key_end) = netfunnel_key_range(&result)?;
-                    let wait_secs = if let Some((_, ttl_tail)) = result.split_once("ttl=") {
-                        let ttl_text = split_head_or_all(ttl_tail, '&');
-                        parse_netfunnel_u32(ttl_text, "NetFunnel ttl 파싱 실패")?.clamp(1, 30)
-                    } else {
-                        1
-                    };
+                    current_ttl = result
+                        .split_once("ttl=")
+                        .map(|(_, ttl_tail)| {
+                            let ttl_text = split_head_or_all(ttl_tail, '&');
+                            parse_netfunnel_u32(ttl_text, "NetFunnel ttl 파싱 실패")
+                        })
+                        .transpose()?;
+                    let wait_secs = current_ttl.unwrap_or(1).clamp(1, 30);
                     current_key = Some(take_netfunnel_key(result, key_start, key_end));
                     sleep(Duration::from_secs(u64::from(wait_secs)));
                 }
+                302 => return Err(prefixed_message("NetFunnel IP 차단: ", result).into()),
                 _ => return Err(prefixed_message("NetFunnel 응답 오류: ", result).into()),
             }
         }

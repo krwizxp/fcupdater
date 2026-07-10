@@ -15,7 +15,7 @@ use crate::{
 };
 use alloc::{borrow::Cow, collections::BTreeMap};
 use core::{fmt::Write as _, range::RangeInclusive};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 mod format;
 const MASTER_SHEET_NAME: &str = "유류비";
 const MASTER_HEADER_SCAN_ROWS: u32 = 200;
@@ -143,8 +143,10 @@ struct MasterRowDecision<'source> {
     change: Option<ChangeRow<'source>>,
     deleted: Option<StoreRow>,
     matched_key: Option<&'source str>,
+    normalized_address: Option<String>,
     src: Option<&'source SourceRecord>,
 }
+struct MasterAddressRows(HashMap<String, u32>);
 struct ChangeRowBuilder<'row, 'source> {
     old: &'row ExistingMasterRow<'row>,
     source_region: &'source str,
@@ -580,6 +582,21 @@ impl RankRowBase {
             .checked_mul(DECIMAL_SCALE_SQUARED)
     }
 }
+impl MasterAddressRows {
+    fn insert(&mut self, key: String, row: u32) -> Result<()> {
+        match self.0.entry(key) {
+            Entry::Occupied(entry) => Err(err(format!(
+                "마스터 주소 중복: normalized_address={}, first_row={}, duplicate_row={row}",
+                entry.key(),
+                entry.get(),
+            ))),
+            Entry::Vacant(entry) => {
+                entry.insert(row);
+                Ok(())
+            }
+        }
+    }
+}
 impl<'source> MasterRowEvaluator<'_, '_, 'source> {
     fn evaluate(self) -> Result<MasterRowDecision<'source>> {
         let identity = self.identity;
@@ -588,6 +605,7 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
             return Ok(MasterRowDecision {
                 src: None,
                 matched_key: None,
+                normalized_address: None,
                 change: None,
                 deleted: None,
             });
@@ -609,6 +627,7 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
             return Ok(MasterRowDecision {
                 src: None,
                 matched_key: None,
+                normalized_address: Some(key),
                 change: None,
                 deleted: Some(StoreRow {
                     address: address.into_owned(),
@@ -651,6 +670,7 @@ impl<'source> MasterRowEvaluator<'_, '_, 'source> {
         Ok(MasterRowDecision {
             src: Some(src),
             matched_key: Some(matched_key.as_str()),
+            normalized_address: Some(key),
             change,
             deleted: None,
         })
@@ -821,7 +841,8 @@ impl RankFormulaRangeRewriter<'_> {
         }
         let Some(second_col_pos) = start_digits_start
             .checked_add(start_digits_len)
-            .and_then(|value| value.checked_add(1))
+            .filter(|&pos| self.formula.as_bytes().get(pos) == Some(&b':'))
+            .and_then(|pos| pos.checked_add(1))
         else {
             return Ok(None);
         };
@@ -1649,19 +1670,16 @@ impl RankSortKeyBuilder<'_, '_, '_> {
             if total_qty == ScaledDecimal::ZERO {
                 None
             } else {
-                MasterSheetUpdater::compute_total_price(
+                let total_price = MasterSheetUpdater::compute_total_price(
                     self.sort_context.gasoline_qty,
                     adjusted.gasoline,
                     self.sort_context.premium_qty,
                     adjusted.premium,
                     self.sort_context.diesel_qty,
                     adjusted.diesel,
-                )
-                .and_then(|total_price| {
-                    let discount = RankRowBase::regional_discount(total_price, region_rate)?;
-                    total_price.checked_sub(discount)
-                })
-                .filter(|value| *value != ScaledSortKey::ZERO)
+                )?;
+                let discount = RankRowBase::regional_discount(total_price, region_rate)?;
+                total_price.checked_sub(discount)
             }
         });
         Ok(RankSortKey {
@@ -1852,6 +1870,16 @@ impl<'source> MasterSheetUpdater<'source> {
                     source,
                 )
             })?;
+        let mut master_address_map = HashMap::new();
+        master_address_map
+            .try_reserve(row_count)
+            .map_err(|source| {
+                err_with_source(
+                    format!("마스터 주소 행 맵 메모리 확보 실패: {row_count} entries"),
+                    source,
+                )
+            })?;
+        let mut master_address_rows = MasterAddressRows(master_address_map);
         let mut kept_source_rows: Vec<KeptSourceRow<'source>> = Vec::new();
         reserve_row_vec(&mut kept_source_rows, row_count, "유지 행 목록")?;
         let mut changes: Vec<ChangeRow<'source>> = Vec::new();
@@ -1886,6 +1914,7 @@ impl<'source> MasterSheetUpdater<'source> {
             let MasterRowDecision {
                 src,
                 matched_key,
+                normalized_address,
                 change,
                 deleted: deleted_row,
             } = MasterRowEvaluator {
@@ -1897,6 +1926,9 @@ impl<'source> MasterSheetUpdater<'source> {
                 ws,
             }
             .evaluate()?;
+            if let Some(key) = normalized_address {
+                master_address_rows.insert(key, old_row)?;
+            }
             if let Some(row) = deleted_row {
                 deleted.push(row);
                 deleted_rows.push(old_row);
