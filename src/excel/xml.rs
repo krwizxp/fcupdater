@@ -10,14 +10,20 @@ pub(super) struct XmlTag<'xml> {
     self_closing: bool,
     start: usize,
 }
-impl XmlTag<'_> {
+impl<'xml> XmlTag<'xml> {
     pub(super) const fn end(&self) -> usize {
         self.end
     }
-    pub(super) const fn name(&self) -> &str {
+    pub(super) const fn is_start(&self) -> bool {
+        self.is_start
+    }
+    pub(super) const fn local_name(&self) -> &'xml str {
+        self.local_name
+    }
+    pub(super) const fn name(&self) -> &'xml str {
         self.name
     }
-    pub(super) const fn raw(&self) -> &str {
+    pub(super) const fn raw(&self) -> &'xml str {
         self.raw
     }
     pub(super) const fn self_closing(&self) -> bool {
@@ -30,6 +36,10 @@ impl XmlTag<'_> {
 pub(super) struct XmlScanner<'xml> {
     cursor: usize,
     xml: &'xml str,
+}
+pub(super) struct XmlAttrScanner<'tag> {
+    cursor: usize,
+    tag: &'tag str,
 }
 impl XmlScanner<'_> {
     pub(super) fn skip_to(&mut self, cursor: usize) {
@@ -53,7 +63,7 @@ impl<'xml> XmlScanner<'xml> {
         let wanted = local_tag_name(tag_name);
         self.find_tag_matching(|tag| tag.is_start && tag.local_name == wanted)
     }
-    fn next_tag(&mut self) -> Option<XmlTag<'xml>> {
+    pub(super) fn next_tag(&mut self) -> Option<XmlTag<'xml>> {
         while let Some(rel) = self.xml.get(self.cursor..)?.find('<') {
             let start = checked_offset_add(self.cursor, rel)?;
             let end = find_tag_end(self.xml, start)?;
@@ -113,6 +123,87 @@ impl<'xml> XmlScanner<'xml> {
         None
     }
 }
+impl<'tag> XmlAttrScanner<'tag> {
+    pub(super) fn new(tag: &'tag str) -> Result<Self> {
+        let bytes = tag.as_bytes();
+        let Some(tag_start) = tag.find('<') else {
+            return Err(err("XML 태그 시작 문자를 찾지 못했습니다."));
+        };
+        let mut cursor = checked_offset_add(tag_start, 1)
+            .ok_or_else(|| err("XML 태그 속성 cursor 계산에 실패했습니다."))?;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor = checked_offset_add(cursor, 1)
+                .ok_or_else(|| err("XML 태그 이름 cursor 계산에 실패했습니다."))?;
+        }
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/' && *byte != b'>')
+        {
+            cursor = checked_offset_add(cursor, 1)
+                .ok_or_else(|| err("XML 태그 이름 cursor 계산에 실패했습니다."))?;
+        }
+        Ok(Self { cursor, tag })
+    }
+    pub(super) fn next(&mut self) -> Result<Option<(&'tag str, Cow<'tag, str>)>> {
+        let bytes = self.tag.as_bytes();
+        while bytes.get(self.cursor).is_some_and(u8::is_ascii_whitespace) {
+            self.cursor = checked_offset_add(self.cursor, 1)
+                .ok_or_else(|| err("XML 속성 공백 cursor 계산에 실패했습니다."))?;
+        }
+        match bytes.get(self.cursor).copied() {
+            Some(b'/' | b'>') | None => return Ok(None),
+            Some(_) => {}
+        }
+        let name_start = self.cursor;
+        while bytes.get(self.cursor).is_some_and(|byte| {
+            !byte.is_ascii_whitespace() && *byte != b'=' && *byte != b'/' && *byte != b'>'
+        }) {
+            self.cursor = checked_offset_add(self.cursor, 1)
+                .ok_or_else(|| err("XML 속성 이름 cursor 계산에 실패했습니다."))?;
+        }
+        let name_end = self.cursor;
+        while bytes.get(self.cursor).is_some_and(u8::is_ascii_whitespace) {
+            self.cursor = checked_offset_add(self.cursor, 1)
+                .ok_or_else(|| err("XML 속성 이름 뒤 공백 cursor 계산에 실패했습니다."))?;
+        }
+        if bytes.get(self.cursor) != Some(&b'=') {
+            return Err(err("XML 속성의 '=' 문자를 찾지 못했습니다."));
+        }
+        self.cursor = checked_offset_add(self.cursor, 1)
+            .ok_or_else(|| err("XML 속성 값 cursor 계산에 실패했습니다."))?;
+        while bytes.get(self.cursor).is_some_and(u8::is_ascii_whitespace) {
+            self.cursor = checked_offset_add(self.cursor, 1)
+                .ok_or_else(|| err("XML 속성 값 앞 공백 cursor 계산에 실패했습니다."))?;
+        }
+        let Some(&quote) = bytes.get(self.cursor) else {
+            return Err(err("XML 속성 값 quote 문자를 찾지 못했습니다."));
+        };
+        if quote != b'"' && quote != b'\'' {
+            return Err(err("XML 속성 값 quote 문자가 올바르지 않습니다."));
+        }
+        let value_start = checked_offset_add(self.cursor, 1)
+            .ok_or_else(|| err("XML 속성 값 시작 위치 계산에 실패했습니다."))?;
+        let Some(value_tail) = self.tag.get(value_start..) else {
+            return Err(err("XML 속성 값 범위가 손상되었습니다."));
+        };
+        let Some(value_end_rel) = value_tail.find(char::from(quote)) else {
+            return Err(err("XML 속성 값 종료 quote를 찾지 못했습니다."));
+        };
+        let value_end = checked_offset_add(value_start, value_end_rel)
+            .ok_or_else(|| err("XML 속성 값 종료 위치 계산에 실패했습니다."))?;
+        let name = self
+            .tag
+            .get(name_start..name_end)
+            .ok_or_else(|| err("XML 속성 이름 범위가 손상되었습니다."))?;
+        let value = self
+            .tag
+            .get(value_start..value_end)
+            .ok_or_else(|| err("XML 속성 값 범위가 손상되었습니다."))?;
+        self.cursor = checked_offset_add(value_end, 1)
+            .ok_or_else(|| err("XML 다음 속성 cursor 계산에 실패했습니다."))?;
+        Ok(Some((name, decode_xml_entities(value)?)))
+    }
+}
 const fn checked_offset_add(base: usize, add: usize) -> Option<usize> {
     base.checked_add(add)
 }
@@ -123,77 +214,13 @@ pub(super) fn extract_attr<'tag>(
     if attr_name.is_empty() {
         return Ok(None);
     }
-    let bytes = tag.as_bytes();
-    let Some(tag_start) = tag.find('<') else {
-        return Err(err("XML 태그 시작 문자를 찾지 못했습니다."));
-    };
-    let mut cursor = checked_offset_add(tag_start, 1)
-        .ok_or_else(|| err("XML 태그 속성 cursor 계산에 실패했습니다."))?;
-    while bytes
-        .get(cursor)
-        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/' && *byte != b'>')
-    {
-        cursor = checked_offset_add(cursor, 1)
-            .ok_or_else(|| err("XML 태그 이름 cursor 계산에 실패했습니다."))?;
-    }
-    loop {
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor = checked_offset_add(cursor, 1)
-                .ok_or_else(|| err("XML 속성 공백 cursor 계산에 실패했습니다."))?;
-        }
-        match bytes.get(cursor).copied() {
-            Some(b'/' | b'>') | None => return Ok(None),
-            Some(_) => {}
-        }
-        let name_start = cursor;
-        while bytes.get(cursor).is_some_and(|byte| {
-            !byte.is_ascii_whitespace() && *byte != b'=' && *byte != b'/' && *byte != b'>'
-        }) {
-            cursor = checked_offset_add(cursor, 1)
-                .ok_or_else(|| err("XML 속성 이름 cursor 계산에 실패했습니다."))?;
-        }
-        let name_end = cursor;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor = checked_offset_add(cursor, 1)
-                .ok_or_else(|| err("XML 속성 이름 뒤 공백 cursor 계산에 실패했습니다."))?;
-        }
-        if bytes.get(cursor) != Some(&b'=') {
-            return Err(err("XML 속성의 '=' 문자를 찾지 못했습니다."));
-        }
-        cursor = checked_offset_add(cursor, 1)
-            .ok_or_else(|| err("XML 속성 값 cursor 계산에 실패했습니다."))?;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor = checked_offset_add(cursor, 1)
-                .ok_or_else(|| err("XML 속성 값 앞 공백 cursor 계산에 실패했습니다."))?;
-        }
-        let Some(&quote) = bytes.get(cursor) else {
-            return Err(err("XML 속성 값 quote 문자를 찾지 못했습니다."));
-        };
-        if quote != b'"' && quote != b'\'' {
-            return Err(err("XML 속성 값 quote 문자가 올바르지 않습니다."));
-        }
-        let value_start = checked_offset_add(cursor, 1)
-            .ok_or_else(|| err("XML 속성 값 시작 위치 계산에 실패했습니다."))?;
-        let Some(value_tail) = tag.get(value_start..) else {
-            return Err(err("XML 속성 값 범위가 손상되었습니다."));
-        };
-        let Some(value_end_rel) = value_tail.find(char::from(quote)) else {
-            return Err(err("XML 속성 값 종료 quote를 찾지 못했습니다."));
-        };
-        let value_end = checked_offset_add(value_start, value_end_rel)
-            .ok_or_else(|| err("XML 속성 값 종료 위치 계산에 실패했습니다."))?;
-        let Some(name) = tag.get(name_start..name_end) else {
-            return Err(err("XML 속성 이름 범위가 손상되었습니다."));
-        };
+    let mut scanner = XmlAttrScanner::new(tag)?;
+    while let Some((name, value)) = scanner.next()? {
         if name == attr_name {
-            let Some(value) = tag.get(value_start..value_end) else {
-                return Err(err("XML 속성 값 범위가 손상되었습니다."));
-            };
-            return decode_xml_entities(value).map(Some);
+            return Ok(Some(value));
         }
-        cursor = checked_offset_add(value_end, 1)
-            .ok_or_else(|| err("XML 다음 속성 cursor 계산에 실패했습니다."))?;
     }
+    Ok(None)
 }
 pub(super) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
     XmlScanner::from(xml, from)
@@ -207,19 +234,80 @@ pub(super) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usi
         .map(|tag| tag.start)
 }
 pub(super) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
+    let tail = xml.get(tag_start..)?;
+    if tail.starts_with("<!--") {
+        return find_delimited_markup_end(xml, tag_start, 4, "-->");
+    }
+    if tail.starts_with("<![CDATA[") {
+        return find_delimited_markup_end(xml, tag_start, 9, "]]>");
+    }
+    if tail.starts_with("<?") {
+        return find_delimited_markup_end(xml, tag_start, 2, "?>");
+    }
+    if !tail.starts_with('<') {
+        return None;
+    }
+    let is_declaration = tail.starts_with("<!");
     let bytes = xml.as_bytes();
-    let mut cursor = tag_start;
+    let mut cursor = if is_declaration {
+        tag_start.checked_add(2)?
+    } else {
+        tag_start
+    };
+    let mut in_comment = false;
     let mut quote = None;
+    let mut subset_depth = 0_usize;
     while let Some(&byte) = bytes.get(cursor) {
+        if in_comment {
+            if bytes
+                .get(cursor..)
+                .is_some_and(|remaining| remaining.starts_with(b"-->"))
+            {
+                in_comment = false;
+                cursor = cursor.checked_add(3)?;
+            } else {
+                cursor = checked_offset_add(cursor, 1)?;
+            }
+            continue;
+        }
+        if is_declaration
+            && quote.is_none()
+            && bytes
+                .get(cursor..)
+                .is_some_and(|remaining| remaining.starts_with(b"<!--"))
+        {
+            in_comment = true;
+            cursor = cursor.checked_add(4)?;
+            continue;
+        }
         match quote {
             Some(active_quote) if byte == active_quote => quote = None,
             None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
-            None if byte == b'>' => return Some(cursor),
+            None if is_declaration && byte == b'[' => {
+                subset_depth = subset_depth.checked_add(1)?;
+            }
+            None if is_declaration && byte == b']' && subset_depth != 0 => {
+                subset_depth = subset_depth.checked_sub(1)?;
+            }
+            None if byte == b'>' && subset_depth == 0 => return Some(cursor),
             Some(_) | None => {}
         }
         cursor = checked_offset_add(cursor, 1)?;
     }
     None
+}
+fn find_delimited_markup_end(
+    xml: &str,
+    tag_start: usize,
+    opener_len: usize,
+    terminator: &str,
+) -> Option<usize> {
+    let search_start = tag_start.checked_add(opener_len)?;
+    let relative_end = xml.get(search_start..)?.find(terminator)?;
+    search_start
+        .checked_add(relative_end)?
+        .checked_add(terminator.len())?
+        .checked_sub(1)
 }
 pub(super) fn extract_first_tag_text<'xml>(
     xml: &'xml str,

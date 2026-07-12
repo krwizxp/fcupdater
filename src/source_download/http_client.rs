@@ -16,6 +16,8 @@ use std::{
 const U32_DECIMAL_MAX_LEN: usize = 10;
 const HTTP_REQUEST_HEADER_CAPACITY: usize = 4;
 const HTTP_MERGED_HEADER_CAPACITY: usize = 2 + HTTP_REQUEST_HEADER_CAPACITY + 1;
+const MAX_COOKIE_PAIR_BYTES: usize = 4096;
+const MAX_COOKIES_PER_HOST: usize = 64;
 cfg_select! {
     windows => {
         type PlatformHttpClient = super::winhttp::Client;
@@ -23,14 +25,15 @@ cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         type PlatformHttpClient = super::libcurl::Client;
     }
-    _ => {}
+    _ => {
+        compile_error!("fcupdater HTTP supports only Windows, Linux, and macOS.");
+    }
 }
 #[derive(Default)]
 pub(super) struct HttpClient {
     cookie_jars: Vec<CookieJar>,
     form_body_buffer: String,
     netfunnel_path_buffer: String,
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     platform: PlatformHttpClient,
 }
 #[derive(Clone, Copy)]
@@ -43,32 +46,13 @@ pub(super) enum HttpMethod<'body> {
     Get,
     Post(&'body [u8]),
 }
-cfg_select! {
-    any(windows, target_os = "linux", target_os = "macos") => {}
-    _ => {
-        impl HttpMethod<'_> {
-            const fn body_len(self) -> usize {
-                match self {
-                    Self::Get => 0,
-                    Self::Post(body) => body.len(),
-                }
-            }
-            const fn name(self) -> &'static str {
-                match self {
-                    Self::Get => "GET",
-                    Self::Post(_) => "POST",
-                }
-            }
-        }
-    }
-}
 struct HeaderStack<'header, const CAPACITY: usize> {
     headers: [(&'header str, &'header str); CAPACITY],
     len: usize,
 }
 pub(super) struct DownloadedFileResponse {
-    pub path: PathBuf,
     pub response: HttpStreamResponse,
+    pub target: ReservedDownloadFile,
 }
 struct ReservedDownloadGuard {
     file: Option<File>,
@@ -106,6 +90,15 @@ impl<'header, const CAPACITY: usize> HeaderStack<'header, CAPACITY> {
         }
     }
     fn push(&mut self, name: &'header str, value: &'header str) -> DownloadResult<()> {
+        if name.is_empty() || name.bytes().any(|byte| !is_http_token_byte(byte)) {
+            return Err("HTTP header 이름에 허용되지 않는 문자가 포함되어 있습니다.".into());
+        }
+        if value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return Err("HTTP header 값에 허용되지 않는 제어 문자가 포함되어 있습니다.".into());
+        }
         let Some(slot) = self.headers.get_mut(self.len) else {
             return Err("HTTP header stack 용량을 초과했습니다.".into());
         };
@@ -119,6 +112,35 @@ impl<'header, const CAPACITY: usize> HeaderStack<'header, CAPACITY> {
 }
 impl CookieJar {
     fn add_cookie(&mut self, name: &str, value: &str) -> DownloadResult<()> {
+        if name.is_empty() || name.bytes().any(|byte| !is_http_token_byte(byte)) {
+            return Err("Cookie 이름에 허용되지 않는 문자가 포함되어 있습니다.".into());
+        }
+        let value_body = if let Some(unquoted) = value.strip_prefix('"') {
+            unquoted
+                .strip_suffix('"')
+                .ok_or("Cookie 값의 quote 형식이 올바르지 않습니다.")?
+        } else {
+            value
+        };
+        if value_body.bytes().any(|byte| {
+            !matches!(
+                byte,
+                b'!' | b'#'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~'
+            )
+        }) {
+            return Err("Cookie 값에 허용되지 않는 문자가 포함되어 있습니다.".into());
+        }
+        let pair_len = name
+            .len()
+            .checked_add(1)
+            .and_then(|length| length.checked_add(value.len()))
+            .ok_or("Cookie 이름과 값의 길이 계산 실패")?;
+        if pair_len > MAX_COOKIE_PAIR_BYTES {
+            return Err(format!(
+                "Cookie 이름과 값이 허용 한도({MAX_COOKIE_PAIR_BYTES} bytes)를 초과했습니다."
+            )
+            .into());
+        }
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
             if cookie.value.capacity() < value.len() {
                 let additional = value
@@ -136,6 +158,12 @@ impl CookieJar {
             cookie.value.push_str(value);
             self.cookie_header_dirty = true;
             return Ok(());
+        }
+        if self.cookies.len() >= MAX_COOKIES_PER_HOST {
+            return Err(format!(
+                "호스트별 Cookie 수가 허용 한도({MAX_COOKIES_PER_HOST}개)를 초과했습니다."
+            )
+            .into());
         }
         if self.cookies.len() == self.cookies.capacity() {
             self.cookies.try_reserve(1).map_err(|source| {
@@ -212,15 +240,16 @@ impl ReservedDownloadGuard {
             .as_mut()
             .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))
     }
-    fn persist(mut self) -> DownloadResult<PathBuf> {
+    fn persist(mut self) -> DownloadResult<ReservedDownloadFile> {
         let file = self
             .file
             .take()
             .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))?;
-        drop(file);
-        self.path
+        let path = self
+            .path
             .take()
-            .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))
+            .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))?;
+        Ok(ReservedDownloadFile { file, path })
     }
     fn remove_after_error(mut self, mut error: DownloadError) -> DownloadError {
         let file = self.file.take();
@@ -239,7 +268,9 @@ impl Drop for ReservedDownloadGuard {
     fn drop(&mut self) {
         if let (Some(file), Some(path)) = (self.file.take(), self.path.take()) {
             drop(file);
-            let _remove_result = remove_file(path);
+            match remove_file(path) {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
 }
@@ -439,8 +470,8 @@ impl HttpClient {
                 Err(error) => return Err(guarded_target.remove_after_error(error)),
             };
             Ok(DownloadedFileResponse {
-                path: guarded_target.persist()?,
                 response,
+                target: guarded_target.persist()?,
             })
         })();
         self.form_body_buffer = body;
@@ -489,23 +520,8 @@ impl HttpClient {
         let response: HttpResponse = {
             let merged_headers = Self::merged_headers(&mut self.cookie_jars, host, headers)?;
             let merged_header_slice = merged_headers.as_slice()?;
-            {
-                cfg_select! {
-                    any(windows, target_os = "linux", target_os = "macos") => {
-                        self.platform.request(method, host, path, merged_header_slice)
-                    }
-                    _ => {
-                        let body_len = method.body_len();
-                        let header_count = headers.len();
-                        let merged_header_count = merged_header_slice.len();
-                        let method_name = method.name();
-                        Err::<HttpResponse, DownloadError>(format!(
-                            "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
-                        )
-                        .into())
-                    }
-                }
-            }?
+            self.platform
+                .request(method, host, path, merged_header_slice)?
         };
         self.store_response_cookies_from_headers(host, &response.headers)?;
         if !(200..300).contains(&response.status) {
@@ -634,57 +650,27 @@ impl HttpClient {
         text_range_to_owned_value(&mut text, value_start, value_end);
         Ok(text)
     }
-    cfg_select! {
-        any(windows, target_os = "linux", target_os = "macos") => {
-            fn request_to_writer(
-                &mut self,
-                method: HttpMethod<'_>,
-                host: &str,
-                path: &str,
-                headers: &[(&str, &str)],
-                writer: &mut dyn IoWrite,
-            ) -> DownloadResult<HttpStreamResponse> {
-                let response = {
-                    let merged_headers = Self::merged_headers(&mut self.cookie_jars, host, headers)?;
-                    let merged_header_slice = merged_headers.as_slice()?;
-                    self.platform.request_to_writer(
-                        method,
-                        host,
-                        path,
-                        merged_header_slice,
-                        writer,
-                    )?
-                };
-                self.store_response_cookies_from_headers(host, &response.headers)?;
-                if !(200..300).contains(&response.status) {
-                    let body_preview = response.body.preview_lossy();
-                    let status = response.status;
-                    return Err(format!("HTTP {status}: {body_preview}").into());
-                }
-                Ok(response)
-            }
+    fn request_to_writer(
+        &mut self,
+        method: HttpMethod<'_>,
+        host: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        writer: &mut dyn IoWrite,
+    ) -> DownloadResult<HttpStreamResponse> {
+        let response = {
+            let merged_headers = Self::merged_headers(&mut self.cookie_jars, host, headers)?;
+            let merged_header_slice = merged_headers.as_slice()?;
+            self.platform
+                .request_to_writer(method, host, path, merged_header_slice, writer)?
+        };
+        self.store_response_cookies_from_headers(host, &response.headers)?;
+        if !(200..300).contains(&response.status) {
+            let body_preview = response.body.preview_lossy();
+            let status = response.status;
+            return Err(format!("HTTP {status}: {body_preview}").into());
         }
-        _ => {
-            fn request_to_writer(
-                &mut self,
-                method: HttpMethod<'_>,
-                host: &str,
-                path: &str,
-                headers: &[(&str, &str)],
-                _writer: &mut dyn IoWrite,
-            ) -> DownloadResult<HttpStreamResponse> {
-                let merged_headers = Self::merged_headers(&mut self.cookie_jars, host, headers)?;
-                let merged_header_slice = merged_headers.as_slice()?;
-                let body_len = method.body_len();
-                let header_count = headers.len();
-                let merged_header_count = merged_header_slice.len();
-                let method_name = method.name();
-                Err(format!(
-                    "외부 TLS 크레이트 없이 HTTPS 다운로드를 수행하려면 Windows WinHTTP 또는 Linux/macOS libcurl이 필요합니다. 요청: {method_name} https://{host}{path}, body={body_len} bytes, headers={header_count}/{merged_header_count}"
-                )
-                .into())
-            }
-        }
+        Ok(response)
     }
     fn store_response_cookies_from_headers(
         &mut self,
@@ -721,6 +707,26 @@ const fn hex_digit(nibble: u8) -> char {
         15 => 'F',
         _ => '?',
     }
+}
+const fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 const fn is_url_form_literal(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')

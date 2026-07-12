@@ -11,6 +11,12 @@ pub(super) struct AppError {
     message: Cow<'static, str>,
     source: Option<BoxError>,
 }
+struct ControlEscapingWriter<'formatter, 'output> {
+    formatter: &'formatter mut fmt::Formatter<'output>,
+}
+pub(super) struct TerminalSafeText<'text> {
+    text: &'text str,
+}
 impl AppError {
     fn context(context: impl Into<Cow<'static, str>>, source: impl Into<BoxError>) -> Self {
         Self {
@@ -27,11 +33,22 @@ impl AppError {
 }
 impl Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_control_escaped(f, self.message.as_ref())?;
         if let Some(source) = self.source.as_ref() {
-            write!(f, "{}: {source}", self.message)
-        } else {
-            f.write_str(self.message.as_ref())
+            f.write_str(": ")?;
+            write!(&mut ControlEscapingWriter { formatter: f }, "{source}")?;
         }
+        Ok(())
+    }
+}
+impl fmt::Write for ControlEscapingWriter<'_, '_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        write_control_escaped(self.formatter, s)
+    }
+}
+impl Display for TerminalSafeText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_control_escaped(f, self.text)
     }
 }
 impl fmt::Debug for AppError {
@@ -133,4 +150,19 @@ pub(super) fn path_pair_context_message(label: &str, from: &Path, to: &Path) -> 
         return out;
     }
     out
+}
+pub(super) const fn terminal_safe(text: &str) -> TerminalSafeText<'_> {
+    TerminalSafeText { text }
+}
+fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    for character in text.chars() {
+        if character.is_control() {
+            for escaped in character.escape_debug() {
+                formatter.write_char(escaped)?;
+            }
+        } else {
+            formatter.write_char(character)?;
+        }
+    }
+    Ok(())
 }

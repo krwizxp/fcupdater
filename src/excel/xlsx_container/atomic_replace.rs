@@ -2,8 +2,12 @@ use core::{error::Error, fmt};
 use std::{io, path::Path};
 cfg_select! {
     target_os = "windows" => {
-        use core::{ffi::c_void, ptr::null_mut};
-        use std::{fs, os::windows::ffi::OsStrExt as _};
+        use core::{ffi::c_void, ptr::null};
+        use std::{
+            fs,
+            os::windows::ffi::OsStrExt as _,
+            path::{Component, Prefix, absolute},
+        };
     }
     any(target_os = "linux", target_os = "macos") => {
         use alloc::ffi::CString;
@@ -21,8 +25,8 @@ cfg_select! {
                 replacement_file_name: *const u16,
                 backup_file_name: *const u16,
                 replace_flags: u32,
-                exclude: *mut c_void,
-                reserved: *mut c_void,
+                exclude: *const c_void,
+                reserved: *const c_void,
             ) -> i32;
         }
     }
@@ -109,13 +113,36 @@ impl Error for ReplaceFailure {
 cfg_select! {
     target_os = "windows" => {
         fn path_to_wide(path: &Path) -> io::Result<Vec<u16>> {
-            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-            if wide.contains(&0) {
+            let absolute = absolute(path)?;
+            let (extended_prefix, skipped_units) = match absolute.components().next() {
+                Some(Component::Prefix(component)) => match component.kind() {
+                    Prefix::Disk(_) => (r"\\?\", 0),
+                    Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+                    Prefix::Verbatim(_)
+                    | Prefix::VerbatimUNC(_, _)
+                    | Prefix::VerbatimDisk(_)
+                    | Prefix::DeviceNS(_) => ("", 0),
+                },
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows file path is not absolute",
+                    ));
+                }
+            };
+            let path_wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+            if path_wide.contains(&0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Windows file path contains a NUL character",
                 ));
             }
+            let path_tail = path_wide.get(skipped_units..).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Windows UNC path is invalid")
+            })?;
+            let mut wide = Vec::new();
+            wide.extend(extended_prefix.encode_utf16());
+            wide.extend_from_slice(path_tail);
             wide.push(0);
             Ok(wide)
         }
@@ -147,8 +174,8 @@ cfg_select! {
                     incoming_wide.as_ptr(),
                     backup_output_wide.as_ptr(),
                     0,
-                    null_mut(),
-                    null_mut(),
+                    null(),
+                    null(),
                 )
             };
             if status != 0_i32 {
@@ -243,18 +270,6 @@ cfg_select! {
         }
     }
     _ => {
-        pub(super) fn replace_files(
-            _target: &Path,
-            _replacement: &Path,
-            _backup: &Path,
-            _rollback: bool,
-        ) -> Result<DisplacedFile, ReplaceFilesError> {
-            Err(ReplaceFilesError::Retryable(ReplaceFailure::new(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "atomic file replacement is unsupported on this platform",
-                ),
-            )))
-        }
+        compile_error!("fcupdater atomic replacement supports only Windows, Linux, and macOS.");
     }
 }

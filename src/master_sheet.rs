@@ -6,7 +6,7 @@ use crate::{
     diagnostic::{Result, err, err_with_source},
     excel,
     excel::SourceRecord,
-    excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_row_numbers},
+    excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_formula_rows},
     region::{
         TARGET_REGION_COUNT, increment_target_region_count, normalize_address_key,
         target_region_index,
@@ -684,13 +684,13 @@ impl RebasedNonDataRowsBuilder<'_, '_> {
             .extract_if(.., |row_num, _| !old_data_rows.contains(row_num))
         {
             if row_num < self.old_data_rows.start {
-                remap_row_numbers(&mut row_obj, row_num, &|old_ref_row| {
+                remap_formula_rows(&mut row_obj, &|old_ref_row| {
                     self.row_mapper.map(old_ref_row)
                 })?;
                 new_rows_map.insert(row_num, row_obj);
             } else {
                 let shifted = self.row_mapper.shift(row_num)?;
-                remap_row_numbers(&mut row_obj, shifted, &|old_ref_row| {
+                remap_formula_rows(&mut row_obj, &|old_ref_row| {
                     self.row_mapper.map(old_ref_row)
                 })?;
                 new_rows_map.insert(shifted, row_obj);
@@ -715,11 +715,10 @@ impl<'source> KeptRowsPlacer<'_, '_, 'source> {
             let old_row = kept_source_row.old_row;
             let src = kept_source_row.source;
             let new_row = add_row_offset(self.data_start_row, i, "유류비 기존행 재배치")?;
-            let mut row_obj = if let Some(row_obj) = self.original_rows.remove(&old_row) {
-                row_obj
-            } else {
-                StdRow::numbered(old_row)?
-            };
+            let mut row_obj = self
+                .original_rows
+                .remove(&old_row)
+                .unwrap_or_else(StdRow::empty);
             let old_row_value = old_row;
             let resolver = |old_ref_row: u32| {
                 if old_ref_row == old_row_value {
@@ -728,7 +727,7 @@ impl<'source> KeptRowsPlacer<'_, '_, 'source> {
                     self.row_mapper.map(old_ref_row)
                 }
             };
-            remap_row_numbers(&mut row_obj, new_row, &resolver)?;
+            remap_formula_rows(&mut row_obj, &resolver)?;
             self.new_rows_map.insert(new_row, row_obj);
             kept_rows.push(KeptMasterRow { new_row, src });
         }
@@ -768,7 +767,7 @@ impl<'sources, 'source> NewSourcePlacementPlan<'_, 'sources, 'source> {
                     row_mapper.map(old_ref_row)
                 }
             };
-            let row_obj = template_row.copy_for_row(new_row, &resolver)?;
+            let row_obj = template_row.copy_with_row_mapping(&resolver)?;
             new_rows_map.insert(new_row, row_obj);
             new_rows_from_sources.push(NewSourcePlacement { new_row, source });
         }
@@ -810,106 +809,12 @@ impl SourceRowsWriter<'_, '_, '_, '_, '_> {
 }
 impl RankFormulaRangeRewriter<'_> {
     fn rewrite(&self) -> Result<Option<String>> {
-        let sort_key_col_name = excel::writer::col_to_name(self.sort_key_col)?;
-        let Some(range_marker_capacity) = sort_key_col_name.len().checked_add(2) else {
-            return Err(err("지역화폐 순위 formula marker 용량 계산 실패"));
-        };
-        let mut range_marker = String::new();
-        range_marker
-            .try_reserve_exact(range_marker_capacity)
-            .map_err(|source| {
-                err_with_source("지역화폐 순위 formula marker 메모리 확보 실패", source)
-            })?;
-        range_marker.push('$');
-        range_marker.push_str(&sort_key_col_name);
-        range_marker.push('$');
-        let Some(first_col_pos) = self.formula.find(&range_marker) else {
-            return Ok(None);
-        };
-        let Some(start_digits_start) = first_col_pos.checked_add(range_marker.len()) else {
-            return Ok(None);
-        };
-        let Some(start_digits_tail) = self.formula.get(start_digits_start..) else {
-            return Ok(None);
-        };
-        let start_digits_len = start_digits_tail
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .count();
-        if start_digits_len == 0 {
-            return Ok(None);
-        }
-        let Some(second_col_pos) = start_digits_start
-            .checked_add(start_digits_len)
-            .filter(|&pos| self.formula.as_bytes().get(pos) == Some(&b':'))
-            .and_then(|pos| pos.checked_add(1))
-        else {
-            return Ok(None);
-        };
-        let Some(second_tail) = self.formula.get(second_col_pos..) else {
-            return Ok(None);
-        };
-        let second_tail_without_col_lock = second_tail.strip_prefix('$').unwrap_or(second_tail);
-        let Some(end_digits_tail) = second_tail_without_col_lock
-            .strip_prefix(sort_key_col_name.as_str())
-            .and_then(|tail| tail.strip_prefix('$'))
-        else {
-            return Ok(None);
-        };
-        let Some(end_digits_start) =
-            second_col_pos.checked_add(second_tail.len().saturating_sub(end_digits_tail.len()))
-        else {
-            return Ok(None);
-        };
-        let end_digits_len = end_digits_tail
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .count();
-        if end_digits_len == 0 {
-            return Ok(None);
-        }
-        let Some(end_digits_end) = end_digits_start.checked_add(end_digits_len) else {
-            return Ok(None);
-        };
-        let Some(prefix) = self.formula.get(..first_col_pos) else {
-            return Ok(None);
-        };
-        let Some(suffix) = self.formula.get(end_digits_end..) else {
-            return Ok(None);
-        };
-        let data_start_row = self.data_rows.start;
-        let data_end_row = self.data_rows.last;
-        let Some(range_capacity) = range_marker
-            .len()
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(1))
-        else {
-            return Err(err("지역화폐 순위 formula 열 이름 용량 계산 실패"));
-        };
-        let Some(updated_capacity) = prefix
-            .len()
-            .checked_add(suffix.len())
-            .and_then(|value| value.checked_add(range_capacity))
-            .and_then(|value| value.checked_add(USIZE_DECIMAL_TEXT_MAX_LEN * 2))
-        else {
-            return Err(err("지역화폐 순위 formula 범위 치환 용량 계산 실패"));
-        };
-        let mut updated = String::new();
-        updated
-            .try_reserve_exact(updated_capacity)
-            .map_err(|source| {
-                err_with_source("지역화폐 순위 formula 범위 치환 메모리 확보 실패", source)
-            })?;
-        updated.push_str(prefix);
-        updated.push_str(&range_marker);
-        write!(&mut updated, "{data_start_row}:").map_err(|source| {
-            err_with_source("지역화폐 순위 formula 범위 치환 작성 실패", source)
-        })?;
-        updated.push_str(&range_marker);
-        write!(&mut updated, "{data_end_row}{suffix}").map_err(|source| {
-            err_with_source("지역화폐 순위 formula 범위 치환 작성 실패", source)
-        })?;
-        Ok((updated != self.formula).then_some(updated))
+        excel::writer::AbsoluteColumnRangeRewriter::from((
+            self.sort_key_col,
+            self.data_rows.start,
+            self.data_rows.last,
+        ))
+        .rewrite(self.formula)
     }
 }
 impl MasterHeaderResolver<'_> {
@@ -1128,13 +1033,10 @@ impl<'sources, 'source> MasterRowsRebuilder<'_, '_, '_, '_, 'sources, 'source> {
     ) -> Result<RebuiltMasterRows<'sources, 'source>> {
         let data_start_row = self.plan.data_start_row;
         let template_row_num = self.old_rows.last().copied().unwrap_or(data_start_row);
-        let fallback_template;
-        let template_row = if let Some(row) = original_rows.get(&template_row_num) {
-            row
-        } else {
-            fallback_template = StdRow::numbered(template_row_num)?;
-            &fallback_template
-        };
+        let fallback_template = StdRow::empty();
+        let template_row = original_rows
+            .get(&template_row_num)
+            .unwrap_or(&fallback_template);
         let mut new_rows_map = BTreeMap::new();
         let new_rows_from_sources = {
             NewSourcePlacementPlan {
@@ -1535,7 +1437,7 @@ impl RankRowsSorter<'_, '_> {
                 .get_mut(index)
                 .and_then(Option::take)
                 .ok_or_else(|| missing_sort_target_row_error(old_row))?;
-            remap_row_numbers(&mut row, new_row, &|old_ref_row| {
+            remap_formula_rows(&mut row, &|old_ref_row| {
                 Ok(
                     mapped_contiguous_row(row_mapping, self.data_rows.start, old_ref_row)
                         .unwrap_or(old_ref_row),

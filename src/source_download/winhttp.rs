@@ -12,33 +12,37 @@ use core::{
     ffi::c_void,
     mem,
     ptr::{NonNull, null, null_mut},
+    time::Duration,
 };
 use std::{
     ffi::OsStr,
     io::Write as IoWrite,
     os::windows::ffi::OsStrExt as WindowsOsStrExt,
+    time::Instant,
 };
 mod sys;
+const DWORD_BYTE_SIZE: u32 = 4;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const HTTP_MAX_HEADER_BYTES_DWORD: u32 = 256 * 1024;
 const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
 const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
 const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
 const WINHTTP_OPTION_DISABLE_FEATURE: u32 = 63;
-const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
+const WINHTTP_OPTION_ENABLE_FEATURE: u32 = 79;
 const WINHTTP_OPTION_SECURE_PROTOCOLS: u32 = 84;
 const WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE: u32 = 91;
 const WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK: u32 = 144;
 const WINHTTP_OPTION_IPV6_FAST_FALLBACK: u32 = 140;
 const WINHTTP_OPTION_DISABLE_GLOBAL_POOLING: u32 = 195;
-const WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP: u32 = 1;
 const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2: u32 = 0x0000_0800;
 const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3: u32 = 0x0000_2000;
 const WINHTTP_SECURE_PROTOCOLS_MIN_TLS_1_2: u32 =
     WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
 const WINHTTP_DISABLE_COOKIES: u32 = 0x0000_0001;
+const WINHTTP_DISABLE_REDIRECTS: u32 = 0x0000_0002;
+const WINHTTP_ENABLE_SSL_REVOCATION: u32 = 0x0000_0001;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_WINHTTP_INVALID_OPTION: u32 = 12_009;
-const ERROR_WINHTTP_OPTION_NOT_SETTABLE: u32 = 12_011;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
@@ -47,6 +51,7 @@ const WINHTTP_CONNECT_CACHE_LIMIT: usize = 4;
 const WINHTTP_RECEIVE_TIMEOUT_MS: i32 = 60_000;
 const WINHTTP_RESOLVE_TIMEOUT_MS: i32 = 30_000;
 const WINHTTP_SEND_TIMEOUT_MS: i32 = 60_000;
+const WINHTTP_TOTAL_TIMEOUT: Duration = Duration::from_mins(1);
 const WINHTTP_READ_BUFFER_BYTES: usize = 64 * 1024;
 const HEADER_SEPARATOR_WIDE: [u16; 2] = [0x3A, 0x20];
 const HEADER_TERMINATOR_WIDE: [u16; 2] = [0x0D, 0x0A];
@@ -68,8 +73,6 @@ struct CachedConnect {
 }
 struct ConnectCache {
     entries: [Option<CachedConnect>; WINHTTP_CONNECT_CACHE_LIMIT],
-    len: usize,
-    start: usize,
 }
 struct SessionCache {
     connects: ConnectCache,
@@ -95,24 +98,14 @@ impl ConnectCache {
             .filter_map(Option::as_ref)
             .find(|entry| entry.port == port && entry.host.as_str() == host)
     }
-    fn push_back(&mut self, entry: CachedConnect) -> Option<()> {
-        let slot = if self.len < WINHTTP_CONNECT_CACHE_LIMIT {
-            let slot = self.len;
-            self.len = self.len.checked_add(1)?;
-            slot
-        } else {
-            let slot = self.start;
-            let next_start = self.start.checked_add(1)?;
-            self.start = if next_start == WINHTTP_CONNECT_CACHE_LIMIT {
-                0
-            } else {
-                next_start
-            };
-            slot
-        };
-        let target = self.entries.get_mut(slot)?;
-        *target = Some(entry);
-        Some(())
+    fn push_back(&mut self, entry: CachedConnect) {
+        if let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(entry);
+            return;
+        }
+        self.entries.rotate_left(1);
+        let [_, _, _, slot] = self.entries.each_mut();
+        *slot = Some(entry);
     }
 }
 impl Client {
@@ -127,8 +120,6 @@ impl Client {
             self.session_cache = Some(SessionCache {
                 connects: ConnectCache {
                     entries: from_fn(|_| None),
-                    len: 0,
-                    start: 0,
                 },
                 session: self.open_session(&user_agent)?,
             });
@@ -153,18 +144,36 @@ impl Client {
             })?;
         host_key.push_str(host);
         let connect = handle.as_ptr();
-        cache
-            .connects
-            .push_back(CachedConnect {
-                handle,
-                host: host_key,
-                port,
-            })
-            .ok_or("WinHTTP connect cache 상태 오류")?;
+        cache.connects.push_back(CachedConnect {
+            handle,
+            host: host_key,
+            port,
+        });
         Ok(connect)
     }
     fn clear_session_cache(&mut self) {
         self.session_cache = None;
+    }
+    fn disable_global_pooling_if_supported(&self, handle: &Handle) -> DownloadResult<()> {
+        let raw_value = 1_u32;
+        // SAFETY: handle is a valid WinHTTP handle and raw_value points to a DWORD option value.
+        let ok = unsafe {
+            sys::WinHttpSetOption(
+                handle.as_ptr(),
+                WINHTTP_OPTION_DISABLE_GLOBAL_POOLING,
+                (&raw const raw_value).cast::<c_void>(),
+                DWORD_BYTE_SIZE,
+            )
+        };
+        if ok != 0_i32 {
+            return Ok(());
+        }
+        match Self::last_error_code() {
+            ERROR_WINHTTP_INVALID_OPTION => Ok(()),
+            _ => Err(self
+                .last_error_message("WinHttpSetOption DISABLE_GLOBAL_POOLING")
+                .into()),
+        }
     }
     fn last_error_code() -> u32 {
         // SAFETY: GetLastError has no preconditions.
@@ -235,19 +244,14 @@ impl Client {
             return Err(self.last_error_message("WinHttpSetTimeouts").into());
         }
         self.set_secure_protocols(&session)?;
-        self.set_optional_dword_option(
+        self.set_dword_option(
             &session,
             WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK,
             1,
             "WinHttpSetOption DISABLE_SECURE_PROTOCOL_FALLBACK",
         )?;
-        self.set_optional_dword_option(
-            &session,
-            WINHTTP_OPTION_DISABLE_GLOBAL_POOLING,
-            1,
-            "WinHttpSetOption DISABLE_GLOBAL_POOLING",
-        )?;
-        self.set_optional_dword_option(
+        self.disable_global_pooling_if_supported(&session)?;
+        self.set_dword_option(
             &session,
             WINHTTP_OPTION_IPV6_FAST_FALLBACK,
             1,
@@ -286,9 +290,7 @@ impl Client {
         if !header_bytes.is_multiple_of(2) {
             return Err("응답 헤더 UTF-16 버퍼 길이가 2바이트 단위가 아닙니다.".into());
         }
-        let units = header_bytes
-            .checked_div(2)
-            .ok_or("응답 헤더 길이 계산 실패")?;
+        let units = header_bytes.div_euclid(2);
         buffer.clear();
         if buffer.capacity() < units {
             buffer.try_reserve_exact(units).map_err(|source| {
@@ -355,10 +357,7 @@ impl Client {
     }
     fn query_status(&self, request: &Handle) -> DownloadResult<u32> {
         let mut status = 0_u32;
-        let mut bytes = u32::try_from(size_of::<u32>())
-            .map_err(|source| {
-                download_error_with_source("상태 코드 버퍼 길이 변환 실패", source)
-            })?;
+        let mut bytes = DWORD_BYTE_SIZE;
         // SAFETY: status and bytes are valid output buffers for the numeric status query.
         let ok = unsafe {
             sys::WinHttpQueryHeaders(
@@ -376,7 +375,12 @@ impl Client {
             Ok(status)
         }
     }
-    fn read_body(&mut self, request: &Handle, expected_len: Option<usize>) -> DownloadResult<Vec<u8>> {
+    fn read_body(
+        &mut self,
+        request: &Handle,
+        expected_len: Option<usize>,
+        started: Instant,
+    ) -> DownloadResult<Vec<u8>> {
         let mut body = Vec::new();
         if let Some(capacity) = expected_len {
             body.try_reserve_exact(capacity).map_err(|source| {
@@ -387,6 +391,7 @@ impl Client {
         let result = (|| {
             ensure_read_buffer(&mut chunk_buffer)?;
             loop {
+                ensure_within_total_timeout(started)?;
                 let read = self.read_chunk(request, &mut chunk_buffer)?;
                 let read_len = usize::try_from(read).map_err(|source| {
                     download_error_with_source("응답 read 길이 변환 실패", source)
@@ -419,6 +424,7 @@ impl Client {
         &mut self,
         request: &Handle,
         writer: &mut dyn IoWrite,
+        started: Instant,
     ) -> DownloadResult<StreamedBodySummary> {
         let mut sink = StreamingBodySink {
             limit: HTTP_MAX_BODY_BYTES,
@@ -432,6 +438,7 @@ impl Client {
         let result = (|| {
             ensure_read_buffer(&mut chunk_buffer)?;
             loop {
+                ensure_within_total_timeout(started)?;
                 let read = self.read_chunk(request, &mut chunk_buffer)?;
                 let read_len = usize::try_from(read).map_err(|source| {
                     download_error_with_source("응답 read 길이 변환 실패", source)
@@ -509,6 +516,7 @@ impl Client {
                 ));
             }
         };
+        let started = Instant::now();
         let connect = match self.cached_connect_ptr(host, &host_wide, self.default_https_port) {
             Ok(connect) => connect,
             Err(error) => {
@@ -524,7 +532,7 @@ impl Client {
             let response_headers = self.query_headers(&request, &mut headers_wide)?;
             let content_length =
                 validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
-            let response_body = self.read_body(&request, content_length)?;
+            let response_body = self.read_body(&request, content_length, started)?;
             enforce_http_body_length(response_body.len(), content_length)?;
             Ok(HttpResponse {
                 body: response_body,
@@ -590,6 +598,7 @@ impl Client {
                 ));
             }
         };
+        let started = Instant::now();
         let connect = match self.cached_connect_ptr(host, &host_wide, self.default_https_port) {
             Ok(connect) => connect,
             Err(error) => {
@@ -605,7 +614,7 @@ impl Client {
             let response_headers = self.query_headers(&request, &mut headers_wide)?;
             let content_length =
                 validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
-            let response_body = self.read_body_to_writer(&request, writer)?;
+            let response_body = self.read_body_to_writer(&request, writer, started)?;
             enforce_http_body_length(response_body.bytes_seen, content_length)?;
             Ok(HttpStreamResponse {
                 body: response_body,
@@ -661,15 +670,13 @@ impl Client {
         context: &str,
     ) -> DownloadResult<()> {
         let raw_value = value;
-        let buffer_length = u32::try_from(size_of::<u32>())
-            .map_err(|source| download_error_with_source("WinHTTP 옵션 길이 변환 실패", source))?;
         // SAFETY: handle is valid and raw_value points to a DWORD option value for this call.
         let ok = unsafe {
             sys::WinHttpSetOption(
                 handle.as_ptr(),
                 option,
                 (&raw const raw_value).cast::<c_void>(),
-                buffer_length,
+                DWORD_BYTE_SIZE,
             )
         };
         if ok == 0_i32 {
@@ -678,66 +685,35 @@ impl Client {
             Ok(())
         }
     }
-    fn set_optional_dword_option(
-        &self,
-        handle: &Handle,
-        option: u32,
-        value: u32,
-        operation: &str,
-    ) -> DownloadResult<()> {
-        let raw_value = value;
-        let buffer_length = u32::try_from(size_of::<u32>())
-            .map_err(|source| download_error_with_source("WinHTTP 옵션 길이 변환 실패", source))?;
-        // SAFETY: handle is a valid WinHTTP handle and raw_value points to a DWORD option value.
-        let ok = unsafe {
-            sys::WinHttpSetOption(
-                handle.as_ptr(),
-                option,
-                (&raw const raw_value).cast::<c_void>(),
-                buffer_length,
-            )
-        };
-        if ok != 0_i32 {
-            return Ok(());
-        }
-        match Self::last_error_code() {
-            ERROR_WINHTTP_INVALID_OPTION | ERROR_WINHTTP_OPTION_NOT_SETTABLE => Ok(()),
-            _ => Err(self.last_error_message(operation).into()),
-        }
-    }
     fn set_request_options(&self, request: &Handle) -> DownloadResult<()> {
         self.set_dword_option(
             request,
-            WINHTTP_OPTION_REDIRECT_POLICY,
-            WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP,
-            "WinHttpSetOption REDIRECT_POLICY",
+            WINHTTP_OPTION_ENABLE_FEATURE,
+            WINHTTP_ENABLE_SSL_REVOCATION,
+            "WinHttpSetOption ENABLE_FEATURE",
         )?;
         self.set_dword_option(
             request,
             WINHTTP_OPTION_DISABLE_FEATURE,
-            WINHTTP_DISABLE_COOKIES,
+            WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS,
             "WinHttpSetOption DISABLE_FEATURE",
         )?;
         self.set_dword_option(
             request,
             WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
-            u32::try_from(HTTP_MAX_HEADER_BYTES).map_err(|source| {
-                download_error_with_source("WinHTTP 헤더 한도 변환 실패", source)
-            })?,
+            HTTP_MAX_HEADER_BYTES_DWORD,
             "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
         )
     }
     fn set_secure_protocols(&self, session: &Handle) -> DownloadResult<()> {
         let raw_value = WINHTTP_SECURE_PROTOCOLS_MIN_TLS_1_2;
-        let buffer_length = u32::try_from(size_of::<u32>())
-            .map_err(|source| download_error_with_source("WinHTTP 옵션 길이 변환 실패", source))?;
         // SAFETY: session is valid and raw_value points to a DWORD option value for this call.
         let ok = unsafe {
             sys::WinHttpSetOption(
                 session.as_ptr(),
                 WINHTTP_OPTION_SECURE_PROTOCOLS,
                 (&raw const raw_value).cast::<c_void>(),
-                buffer_length,
+                DWORD_BYTE_SIZE,
             )
         };
         if ok != 0_i32 {
@@ -778,6 +754,13 @@ fn ensure_read_buffer(buffer: &mut Vec<u8>) -> DownloadResult<()> {
     }
     buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
     Ok(())
+}
+fn ensure_within_total_timeout(started: Instant) -> DownloadResult<()> {
+    if started.elapsed() >= WINHTTP_TOTAL_TIMEOUT {
+        Err("HTTP 전체 전송 제한 시간(60초)을 초과했습니다.".into())
+    } else {
+        Ok(())
+    }
 }
 const fn trim_ascii_utf16(mut value: &[u16]) -> &[u16] {
     while let Some((first, rest)) = value.split_first()

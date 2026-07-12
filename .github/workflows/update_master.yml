@@ -19,6 +19,11 @@ jobs:
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
+      - name: Remove build host paths from release binary
+        shell: bash
+        run: |
+          sysroot="$(rustc --print sysroot)"
+          printf 'RUSTFLAGS=--remap-path-prefix=%s=/rustc/1.97.0 --remap-path-scope=object\n' "$sysroot" >> "$GITHUB_ENV"
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Build release binary

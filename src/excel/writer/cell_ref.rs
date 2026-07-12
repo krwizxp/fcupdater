@@ -8,21 +8,124 @@ const COL_NAME_BUF_LEN: usize = 8;
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
 pub(super) const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
+pub(crate) struct AbsoluteColumnRangeRewriter {
+    column: u32,
+    first_row: u32,
+    last_row: u32,
+}
 pub(super) struct FormulaRewrite {
     end_index: usize,
     replacement: String,
 }
-struct FormulaBracket<'formula> {
+struct FormulaBracket {
     end_index: usize,
-    expression: &'formula str,
 }
 struct LockPrefix<'reference> {
     locked: bool,
     rest: &'reference str,
 }
-impl<'formula> TryFrom<(&'formula str, usize)> for FormulaBracket<'formula> {
+impl AbsoluteColumnRangeRewriter {
+    pub(crate) fn rewrite(&self, formula: &str) -> Result<Option<String>> {
+        rewrite_formula_cell_refs(formula, |candidate_formula, start| {
+            let bytes = candidate_formula.as_bytes();
+            if bytes.get(start) != Some(&b'$') {
+                return Ok(None);
+            }
+            let previous = start.checked_sub(1).and_then(|index| bytes.get(index));
+            if previous.is_some_and(|byte| is_ref_neighbor_identifier(*byte)) {
+                return Ok(None);
+            }
+            let Some(tail) = candidate_formula.get(start..) else {
+                return Ok(None);
+            };
+            let Some(colon_relative) = tail.find(':') else {
+                return Ok(None);
+            };
+            let Some(first_end) = start.checked_add(colon_relative) else {
+                return Ok(None);
+            };
+            let Some(first_text) = candidate_formula.get(start..first_end) else {
+                return Ok(None);
+            };
+            let Some(first) = parse_ref_with_locks(first_text) else {
+                return Ok(None);
+            };
+            let Some(second_start) = first_end.checked_add(1) else {
+                return Ok(None);
+            };
+            let Some(second_tail) = candidate_formula.get(second_start..) else {
+                return Ok(None);
+            };
+            let second_len = second_tail
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'$')
+                .count();
+            let Some(second_end) = second_start.checked_add(second_len) else {
+                return Ok(None);
+            };
+            let Some(second_text) = candidate_formula.get(second_start..second_end) else {
+                return Ok(None);
+            };
+            let Some(second) = parse_ref_with_locks(second_text) else {
+                return Ok(None);
+            };
+            if bytes
+                .get(second_end)
+                .is_some_and(|byte| is_ref_neighbor_identifier(*byte))
+                || first.col != self.column
+                || second.col != self.column
+                || !first.col_locked
+                || !first.row_locked
+                || !second.row_locked
+            {
+                return Ok(None);
+            }
+            if first.row == self.first_row && second.row == self.last_row {
+                return Ok(None);
+            }
+            let updated_first = ref_with_locks(CellReference {
+                col: self.column,
+                col_locked: true,
+                row: self.first_row,
+                row_locked: true,
+            })?;
+            let updated_second = ref_with_locks(CellReference {
+                col: self.column,
+                col_locked: true,
+                row: self.last_row,
+                row_locked: true,
+            })?;
+            let capacity = updated_first
+                .len()
+                .checked_add(1)
+                .and_then(|value| value.checked_add(updated_second.len()))
+                .ok_or_else(|| err("formula 절대 열 범위 치환 용량 계산 실패"))?;
+            let mut replacement = String::new();
+            replacement.try_reserve_exact(capacity).map_err(|source| {
+                err_with_source("formula 절대 열 범위 치환 메모리 확보 실패", source)
+            })?;
+            replacement.push_str(&updated_first);
+            replacement.push(':');
+            replacement.push_str(&updated_second);
+            Ok(Some(FormulaRewrite {
+                end_index: second_end,
+                replacement,
+            }))
+        })
+    }
+}
+impl From<(u32, u32, u32)> for AbsoluteColumnRangeRewriter {
+    fn from((column, first_row, last_row): (u32, u32, u32)) -> Self {
+        Self {
+            column,
+            first_row,
+            last_row,
+        }
+    }
+}
+impl TryFrom<(&str, usize)> for FormulaBracket {
     type Error = AppError;
-    fn try_from((formula, start): (&'formula str, usize)) -> Result<Self> {
+    fn try_from((formula, start): (&str, usize)) -> Result<Self> {
         let mut depth = 0_usize;
         let mut index = start;
         while let Some(tail) = formula.get(index..) {
@@ -70,13 +173,10 @@ impl<'formula> TryFrom<(&'formula str, usize)> for FormulaBracket<'formula> {
                 "formula structured reference cursor 계산에 실패했습니다.",
             )?;
         }
-        let expression = formula
+        formula
             .get(start..index)
             .ok_or_else(|| err("formula bracket 표현식 범위가 손상되었습니다."))?;
-        Ok(Self {
-            end_index: index,
-            expression,
-        })
+        Ok(Self { end_index: index })
     }
 }
 impl CellReference {
@@ -88,11 +188,18 @@ impl CellReference {
             row_locked: false,
         }
     }
+    const fn with_locks(self, col_locked: bool, row_locked: bool) -> Self {
+        Self {
+            col_locked,
+            row_locked,
+            ..self
+        }
+    }
     pub(super) const fn with_row(self, row: u32) -> Self {
         Self { row, ..self }
     }
 }
-pub(super) fn col_to_name(col: u32) -> Result<String> {
+pub(crate) fn col_to_name(col: u32) -> Result<String> {
     let mut buffer = [0_u8; COL_NAME_BUF_LEN];
     let text = col_name_text(col, &mut buffer)?;
     let mut out = String::new();
@@ -180,12 +287,7 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     if !(1..=MAX_A1_ROW).contains(&row) {
         return None;
     }
-    Some(CellReference {
-        col,
-        col_locked: col_prefix.locked,
-        row,
-        row_locked: row_prefix.locked,
-    })
+    Some(CellReference::unlocked(col, row).with_locks(col_prefix.locked, row_prefix.locked))
 }
 pub(super) fn ref_with_locks(reference: CellReference) -> Result<String> {
     let mut col_buffer = [0_u8; COL_NAME_BUF_LEN];
@@ -220,18 +322,33 @@ pub(super) fn ref_with_locks(reference: CellReference) -> Result<String> {
     out.push_str(row_text);
     Ok(out)
 }
+pub(super) fn with_unlocked_ref_text<R>(
+    col: u32,
+    row: u32,
+    use_text: impl FnOnce(&str, &str) -> R,
+) -> Result<R> {
+    let mut col_buffer = [0_u8; COL_NAME_BUF_LEN];
+    let col_name = col_name_text(col, &mut col_buffer)?;
+    if !(1..=MAX_A1_ROW).contains(&row) {
+        return Err(err(format!("Excel row 범위를 벗어났습니다: {row}")));
+    }
+    let row_digits = U128DecimalDigits::new(u128::from(row))
+        .ok_or_else(|| err("Excel row decimal 변환 실패"))?;
+    let row_text = row_digits
+        .as_str()
+        .ok_or_else(|| err("Excel row decimal 문자열 변환 실패"))?;
+    Ok(use_text(col_name, row_text))
+}
 pub(super) fn rewrite_formula_cell_refs<F>(
     formula: &str,
     mut try_rewrite_cell_ref: F,
-) -> Result<String>
+) -> Result<Option<String>>
 where
     F: FnMut(&str, usize) -> Result<Option<FormulaRewrite>>,
 {
     let mut i = 0_usize;
-    let capacity = formula.len();
-    let mut out = String::new();
-    out.try_reserve(capacity)
-        .map_err(|source| err_with_source("formula rewrite buffer 메모리 확보 실패", source))?;
+    let mut copy_start = 0_usize;
+    let mut out: Option<String> = None;
     let mut in_string = false;
     while let Some(tail) = formula.get(i..) {
         let Some(ch) = tail.chars().next() else {
@@ -239,16 +356,12 @@ where
         };
         let ch_len = ch.len_utf8();
         if ch == '"' {
-            out.push(ch);
             if in_string {
-                let escaped_quote_idx = i
-                    .checked_add(ch_len)
-                    .ok_or_else(|| err("formula 문자열 quote index 계산에 실패했습니다."))?;
+                let escaped_quote_idx = i.checked_add(ch_len).ok_or_else(|| err("quote 오류"))?;
                 if formula.as_bytes().get(escaped_quote_idx) == Some(&b'"') {
-                    out.push('"');
                     let escaped_quote_end = escaped_quote_idx
                         .checked_add(1)
-                        .ok_or_else(|| err("formula 문자열 cursor 계산에 실패했습니다."))?;
+                        .ok_or_else(|| err("quote 오류"))?;
                     i = escaped_quote_end;
                     continue;
                 }
@@ -260,7 +373,6 @@ where
             continue;
         }
         if in_string {
-            out.push(ch);
             advance_index(&mut i, ch_len, "formula 문자열 cursor 계산에 실패했습니다.")?;
             continue;
         }
@@ -297,29 +409,41 @@ where
                 )?;
             }
             if let Some(next_idx) = quoted_end {
-                let quoted = formula
-                    .get(i..next_idx)
-                    .ok_or_else(|| err("formula quoted sheet 범위가 손상되었습니다."))?;
-                out.push_str(quoted);
                 i = next_idx;
                 continue;
             }
         }
         if ch == '[' {
             let bracket = FormulaBracket::try_from((formula, i))?;
-            out.push_str(bracket.expression);
             i = bracket.end_index;
             continue;
         }
         if (ch == '$' || ch.is_ascii_alphabetic())
             && let Some(rewrite) = try_rewrite_cell_ref(formula, i)?
         {
-            out.push_str(&rewrite.replacement);
+            let output = out.get_or_insert_default();
+            if output.capacity() == 0 {
+                output.try_reserve(formula.len()).map_err(|source| {
+                    err_with_source("formula rewrite buffer 메모리 확보 실패", source)
+                })?;
+            }
+            output.push_str(
+                formula
+                    .get(copy_start..i)
+                    .ok_or_else(|| err("formula rewrite 복사 범위가 손상되었습니다."))?,
+            );
+            output.push_str(&rewrite.replacement);
             i = rewrite.end_index;
+            copy_start = i;
             continue;
         }
-        out.push(ch);
         advance_index(&mut i, ch_len, "formula cursor 계산에 실패했습니다.")?;
+    }
+    if let Some(output) = out.as_mut() {
+        let tail = formula
+            .get(copy_start..)
+            .ok_or_else(|| err("formula rewrite 나머지 범위가 손상되었습니다."))?;
+        output.push_str(tail);
     }
     Ok(out)
 }
@@ -349,11 +473,7 @@ where
     let bytes = formula.as_bytes();
     if bytes.get(index) == Some(&b'$') {
         col_lock = true;
-        advance_index(
-            &mut index,
-            1,
-            "formula column lock cursor 계산에 실패했습니다.",
-        )?;
+        advance_index(&mut index, 1, "formula 열 lock cursor 오류")?;
     }
     let col_start = index;
     while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
@@ -433,12 +553,15 @@ where
     if !(1..=MAX_A1_ROW).contains(&base_row) {
         return Ok(None);
     }
+    let parsed = CellReference::unlocked(base_col, base_row).with_locks(col_lock, row_lock);
     let rewritten = rewrite_ref(base_col, base_row, col_lock, row_lock)?;
+    if rewritten.col == base_col && rewritten.row == base_row {
+        return Ok(None);
+    }
     let replaced = ref_with_locks(CellReference {
         col: rewritten.col,
-        col_locked: col_lock,
         row: rewritten.row,
-        row_locked: row_lock,
+        ..parsed
     })?;
     Ok(Some(FormulaRewrite {
         end_index: index,

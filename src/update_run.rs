@@ -1,6 +1,6 @@
 use crate::{
     change_log::ChangeLogUpdater,
-    diagnostic::{Result, err, err_with_source, path_context_message},
+    diagnostic::{Result, err, err_with_source, path_context_message, terminal_safe},
     excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::{
@@ -16,7 +16,6 @@ use crate::{
 use core::time::Duration;
 use std::{
     collections::{HashMap, hash_map::Entry},
-    fs,
     io::Write,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -25,11 +24,15 @@ const MAX_DELETED_RATIO_EXCLUSIVE_NUMERATOR: usize = 1;
 const MAX_DELETED_RATIO_DENOMINATOR: usize = 2;
 const MIN_REGION_RETAIN_DENOMINATOR: usize = 2;
 const MIN_REGION_RETAIN_NUMERATOR: usize = 1;
+const MIN_SOURCE_FIELD_COVERAGE_DENOMINATOR: usize = 2;
+const MIN_SOURCE_FIELD_COVERAGE_NUMERATOR: usize = 1;
 const SOURCE_SAFETY_POLICY: SourceSafetyPolicy = SourceSafetyPolicy {
     max_deleted_ratio_exclusive_numerator: MAX_DELETED_RATIO_EXCLUSIVE_NUMERATOR,
     max_deleted_ratio_denominator: MAX_DELETED_RATIO_DENOMINATOR,
     min_region_retain_denominator: MIN_REGION_RETAIN_DENOMINATOR,
     min_region_retain_numerator: MIN_REGION_RETAIN_NUMERATOR,
+    min_source_field_coverage_denominator: MIN_SOURCE_FIELD_COVERAGE_DENOMINATOR,
+    min_source_field_coverage_numerator: MIN_SOURCE_FIELD_COVERAGE_NUMERATOR,
 };
 const DAYS_PER_100_YEARS_I64: i64 = 36_524;
 const DAYS_PER_400_YEARS_I64: i64 = 146_097;
@@ -66,6 +69,15 @@ struct SourceSafetyPolicy {
     max_deleted_ratio_exclusive_numerator: usize,
     min_region_retain_denominator: usize,
     min_region_retain_numerator: usize,
+    min_source_field_coverage_denominator: usize,
+    min_source_field_coverage_numerator: usize,
+}
+#[derive(Default)]
+struct SourceFieldCounts {
+    brand: usize,
+    diesel: usize,
+    gasoline: usize,
+    premium: usize,
 }
 struct SummaryRowDisplay<'row> {
     address: &'row str,
@@ -122,6 +134,71 @@ impl SourceSafetyPolicy {
         }
         Ok(())
     }
+    fn validate_source_field_coverage(
+        &self,
+        record_count: usize,
+        counts: &SourceFieldCounts,
+    ) -> Result<()> {
+        self.validate_source_field_ratio(record_count, counts.brand, "상표")?;
+        self.validate_source_field_ratio(record_count, counts.diesel, "경유 가격")?;
+        self.validate_source_field_ratio(record_count, counts.gasoline, "휘발유 가격")?;
+        if counts.premium == 0 {
+            return Err(err(
+                "Opinet 소스의 대상 지역에서 유효한 고급휘발유 가격을 찾지 못했습니다.",
+            ));
+        }
+        Ok(())
+    }
+    fn validate_source_field_ratio(
+        &self,
+        record_count: usize,
+        populated_count: usize,
+        label: &'static str,
+    ) -> Result<()> {
+        let populated_scaled = populated_count
+            .checked_mul(self.min_source_field_coverage_denominator)
+            .ok_or_else(|| {
+                err(format!(
+                    "Opinet 소스 {label} 완전성 계산 중 overflow가 발생했습니다."
+                ))
+            })?;
+        let required_scaled = record_count
+            .checked_mul(self.min_source_field_coverage_numerator)
+            .ok_or_else(|| {
+                err(format!(
+                    "Opinet 소스 {label} 최소 완전성 계산 중 overflow가 발생했습니다."
+                ))
+            })?;
+        if populated_scaled < required_scaled {
+            return Err(err(format!(
+                "Opinet 소스의 대상 지역 {label} 값이 비정상적으로 부족합니다: {populated_count}건 / {record_count}건"
+            )));
+        }
+        Ok(())
+    }
+}
+impl SourceFieldCounts {
+    fn increment(count: &mut usize, present: bool, label: &'static str) -> Result<()> {
+        if present {
+            *count = count.checked_add(1).ok_or_else(|| {
+                err(format!(
+                    "Opinet 소스 {label} 건수 계산 중 overflow가 발생했습니다."
+                ))
+            })?;
+        }
+        Ok(())
+    }
+    fn observe(&mut self, record: &SourceRecord) -> Result<()> {
+        Self::increment(&mut self.brand, !record.brand.is_empty(), "상표")?;
+        Self::increment(&mut self.diesel, record.diesel.is_some(), "경유 가격")?;
+        Self::increment(&mut self.gasoline, record.gasoline.is_some(), "휘발유 가격")?;
+        Self::increment(
+            &mut self.premium,
+            record.premium.is_some(),
+            "고급휘발유 가격",
+        )?;
+        Ok(())
+    }
 }
 pub(super) struct UpdateRun<'out> {
     pub master_path: &'out Path,
@@ -130,36 +207,36 @@ pub(super) struct UpdateRun<'out> {
 }
 impl UpdateRun<'_> {
     fn load_source(&mut self) -> Result<LoadedSource> {
-        let source_path = SourceDownload {
+        let mut source_file = SourceDownload {
             dir: Path::new("."),
             out: &mut *self.out,
         }
         .refresh_source()?;
         write_line(self.out, format_args!("Opinet 소스 파일 준비 완료"))?;
-        let source_name = source_path
+        let source_name = source_file
+            .path()
             .file_name()
             .and_then(|name| name.to_str())
-            .map_or_else(|| source_path.display().to_string(), str::to_owned);
+            .map_or_else(|| source_file.path().display().to_string(), str::to_owned);
         let result =
             (|| -> Result<(HashMap<String, SourceRecord>, [usize; TARGET_REGION_COUNT])> {
-                let source_records = SourceReader {
-                    path: source_path.as_path(),
-                }
-                .read_xls_source()
-                .map_err(|source_err| {
-                    err_with_source(
-                        path_context_message("소스 xls 파일 읽기 실패", &source_path),
-                        source_err,
-                    )
-                })?;
                 let mut map: HashMap<String, SourceRecord> = HashMap::new();
                 let mut target_record_count = 0_usize;
                 let mut region_counts = [0_usize; TARGET_REGION_COUNT];
+                let mut field_counts = SourceFieldCounts::default();
                 let mut target_region_scratch = String::new();
-                for record in source_records {
+                let (source_handle, source_path) =
+                    source_file.reader_parts().map_err(|source_err| {
+                        err_with_source("다운로드 소스 파일 상태 손상", source_err)
+                    })?;
+                let source_index_result = SourceReader {
+                    file: source_handle,
+                    path: source_path,
+                }
+                .visit_xls_source(|borrowed_record| {
                     if let Some(region_index) = target_region_index(
-                        &record.region,
-                        &record.address,
+                        borrowed_record.region,
+                        borrowed_record.address,
                         &mut target_region_scratch,
                     )? {
                         target_record_count = target_record_count
@@ -170,26 +247,36 @@ impl UpdateRun<'_> {
                             region_index,
                             "소스 지역별 건수",
                         )?;
+                        let key = normalize_address_key(borrowed_record.address)?;
+                        let owned_record = borrowed_record.into_owned()?;
+                        field_counts.observe(&owned_record)?;
                         if map.len() == map.capacity() {
                             map.try_reserve(1).map_err(|source| {
                                 err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
                             })?;
                         }
-                        let key = normalize_address_key(&record.address)?;
                         match map.entry(key) {
                             Entry::Vacant(vacant_entry) => {
-                                vacant_entry.insert(record);
+                                vacant_entry.insert(owned_record);
                             }
                             Entry::Occupied(occupied_entry) => {
                                 let existing = occupied_entry.get();
                                 return Err(err(format!(
                                     "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
-                                    existing.address, existing.name, record.name
+                                    existing.address, existing.name, owned_record.name
                                 )));
                             }
                         }
                     }
-                }
+                    Ok(())
+                })
+                .map_err(|source_err| {
+                    err_with_source(
+                        path_context_message("소스 xls 파일 읽기 실패", source_path),
+                        source_err,
+                    )
+                })?;
+                source_index_result?;
                 if target_record_count == 0 {
                     return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
                 }
@@ -200,15 +287,17 @@ impl UpdateRun<'_> {
                         )));
                     }
                 }
+                SOURCE_SAFETY_POLICY
+                    .validate_source_field_coverage(target_record_count, &field_counts)?;
                 Ok((map, region_counts))
             })();
-        match fs::remove_file(&source_path) {
+        match source_file.remove() {
             Ok(()) => write_line_best_effort(self.out, format_args!("임시 소스 파일 정리 완료")),
             Err(source_err) => write_line_best_effort(
                 self.out,
                 format_args!(
                     "경고: 임시 소스 파일 정리 실패: {} ({source_err})",
-                    source_path.display()
+                    source_file.path().display()
                 ),
             ),
         }
@@ -310,9 +399,9 @@ impl UpdateRun<'_> {
                 self.out,
                 format_args!(
                     "  {display_index}. {region} / {name} / {address}",
-                    region = item.region,
-                    name = item.name,
-                    address = item.address
+                    region = terminal_safe(item.region),
+                    name = terminal_safe(item.name),
+                    address = terminal_safe(item.address)
                 ),
             )?;
         }

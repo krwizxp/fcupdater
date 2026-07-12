@@ -8,12 +8,25 @@ use std::{
     io::{self, Write, stdout},
     path::Path,
 };
+cfg_select! {
+    target_os = "windows" => {
+        use std::os::windows::fs::OpenOptionsExt as _;
+    }
+    any(target_os = "linux", target_os = "macos") => {
+        use std::{
+            fs::Permissions,
+            os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+        };
+    }
+}
+use file_security::{apply_no_follow, validate_regular_file};
 use update_run::UpdateRun;
 mod build_info;
 mod change_log;
 mod decimal;
 mod diagnostic;
 mod excel;
+mod file_security;
 mod master_sheet;
 mod region;
 mod sheet_util;
@@ -22,6 +35,8 @@ mod temp_entry;
 mod update_run;
 const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
 const RUN_LOCK_PATH: &str = ".fcupdater.lock";
+#[cfg(target_os = "windows")]
+const RUN_LOCK_SHARE_MODE: u32 = 0x0000_0003;
 #[derive(Debug)]
 enum ParseAction {
     Help(String),
@@ -34,13 +49,25 @@ struct RunLock {
 impl TryFrom<&Path> for RunLock {
     type Error = AppError;
     fn try_from(path: &Path) -> Result<Self> {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut options = File::options();
+        options.read(true).write(true).create(true).truncate(false);
+        cfg_select! {
+            target_os = "windows" => {
+                options.share_mode(RUN_LOCK_SHARE_MODE);
+            }
+            any(target_os = "linux", target_os = "macos") => {
+                options.mode(0o600);
+            }
+        }
+        apply_no_follow(&mut options);
+        let file = options
             .open(path)
             .map_err(|source| err_with_source("실행 잠금 파일 열기 실패", source))?;
+        validate_regular_file(&file)
+            .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        file.set_permissions(Permissions::from_mode(0o600))
+            .map_err(|source| err_with_source("실행 잠금 파일 권한 설정 실패", source))?;
         match file.try_lock() {
             Ok(()) => Ok(Self { file }),
             Err(TryLockError::WouldBlock) => Err(err("다른 fcupdater 실행이 진행 중입니다.")),
@@ -50,8 +77,12 @@ impl TryFrom<&Path> for RunLock {
 }
 impl Drop for RunLock {
     fn drop(&mut self) {
-        match self.file.unlock() {
-            Ok(()) | Err(_) => {}
+        if let Err(source) = self.file.unlock() {
+            let mut error_output = io::stderr().lock();
+            write_line_best_effort(
+                &mut error_output,
+                format_args!("경고: 실행 잠금 해제 실패: {source}"),
+            );
         }
     }
 }

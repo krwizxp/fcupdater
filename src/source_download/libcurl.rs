@@ -31,13 +31,11 @@ const CURLOPT_HEADERFUNCTION: CurlOption = 20_079;
 const CURLOPT_HTTPHEADER: CurlOption = 10_023;
 const CURLOPT_HTTPGET: CurlOption = 80;
 const CURLOPT_MAXFILESIZE_LARGE: CurlOption = 30_117;
-const CURLOPT_MAXREDIRS: CurlOption = 68;
 const CURLOPT_NOSIGNAL: CurlOption = 99;
 const CURLOPT_POST: CurlOption = 47;
 const CURLOPT_POSTFIELDS: CurlOption = 10_015;
 const CURLOPT_POSTFIELDSIZE: CurlOption = 60;
 const CURLOPT_PROTOCOLS_STR: CurlOption = 10_318;
-const CURLOPT_REDIR_PROTOCOLS_STR: CurlOption = 10_319;
 const CURLOPT_SSLVERSION: CurlOption = 32;
 const CURLOPT_TIMEOUT_MS: CurlOption = 155;
 const CURLOPT_URL: CurlOption = 10_002;
@@ -47,7 +45,6 @@ const CURL_SSLVERSION_MAX_DEFAULT: c_long = 1 << 16;
 const CURL_SSLVERSION_TLSV1_2: c_long = 6;
 const HTTPS_SCHEME_PREFIX: &str = "https://";
 const HTTPS_PROTOCOL: &CStr = c"https";
-const MAX_HTTP_REDIRECTS: c_long = 5;
 static CURL_INIT: LazyLock<CurlCode> = LazyLock::new(|| {
     // SAFETY: LazyLock runs this initializer once before any easy handles are used.
     unsafe { sys::curl_global_init(CURL_GLOBAL_DEFAULT) }
@@ -380,11 +377,7 @@ impl Client {
             },
             CurlLongOption {
                 option: CURLOPT_FOLLOWLOCATION,
-                value: 1,
-            },
-            CurlLongOption {
-                option: CURLOPT_MAXREDIRS,
-                value: MAX_HTTP_REDIRECTS,
+                value: 0,
             },
             CurlLongOption {
                 option: CURLOPT_NOSIGNAL,
@@ -398,7 +391,6 @@ impl Client {
             handle.setopt_long(setting.option, setting.value)?;
         }
         handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
-        handle.setopt_str(CURLOPT_REDIR_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
         let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES)
             .map_err(|source| download_error_with_source("HTTP 본문 한도 변환 실패", source))?;
         handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;

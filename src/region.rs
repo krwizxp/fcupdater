@@ -13,6 +13,7 @@ const TARGET_REGION_KEYS: [&str; TARGET_REGION_COUNT] = [
     "충남아산시",
     "충남천안시",
 ];
+const DAEJEON_DISTRICT_KEYS: [&str; 5] = ["대덕구", "동구", "서구", "유성구", "중구"];
 pub(super) const TARGET_REGION_LABELS: [&str; TARGET_REGION_COUNT] = [
     "대전 대덕구",
     "대전 동구",
@@ -121,7 +122,9 @@ pub(super) fn target_region_index(
         return Ok(Some(index));
     }
     if region_is_daejeon {
-        return Ok(target_daejeon_district_index(scratch.as_str()));
+        return Ok(DAEJEON_DISTRICT_KEYS
+            .iter()
+            .position(|district| scratch.starts_with(district)));
     }
     Ok(None)
 }
@@ -145,9 +148,6 @@ fn target_region_index_from_normalized(text: &str) -> Option<usize> {
     {
         return Some(index);
     }
-    if let Some(district) = text.strip_prefix("대전광역시") {
-        return target_daejeon_district_index(district);
-    }
     if text.starts_with("세종") {
         return Some(5);
     }
@@ -166,20 +166,5 @@ fn target_region_index_from_normalized(text: &str) -> Option<usize> {
     if text.starts_with("충남천안") || text.starts_with("천안") {
         return Some(10);
     }
-    target_daejeon_district_index(text)
-}
-fn target_daejeon_district_index(text: &str) -> Option<usize> {
-    if text.starts_with("대덕구") {
-        Some(0)
-    } else if text.starts_with("동구") {
-        Some(1)
-    } else if text.starts_with("서구") {
-        Some(2)
-    } else if text.starts_with("유성구") {
-        Some(3)
-    } else if text.starts_with("중구") {
-        Some(4)
-    } else {
-        None
-    }
+    None
 }

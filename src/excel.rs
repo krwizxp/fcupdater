@@ -1,6 +1,8 @@
 pub(super) use self::source_reader::{SourceReader, SourceRecord};
 use crate::diagnostic::{Result, err, err_with_source};
 use core::range::Range;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::Permissions;
 use std::{fs::File, path::Path};
 mod path_util;
 mod source_reader;
@@ -8,6 +10,8 @@ pub(super) mod writer;
 pub(super) mod xlsx_container;
 mod xml;
 mod zip_archive;
+pub(super) const SPREADSHEETML_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 #[derive(Clone, Copy)]
 pub(super) enum SaveVerification {
     Skip,
@@ -18,12 +22,27 @@ struct ArchiveFingerprint {
     crc32: u32,
     len: usize,
 }
+enum ArchiveRead {
+    Fingerprint(ArchiveFingerprint),
+    Retained {
+        bytes: Vec<u8>,
+        fingerprint: ArchiveFingerprint,
+    },
+}
+#[derive(Clone, Copy)]
+enum ArchiveReadMode {
+    FingerprintOnly,
+    RetainBytes,
+}
 struct ZipArchiveBuilder<'path> {
     archive_path: &'path Path,
     file: File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    permissions: Permissions,
     root: &'path Path,
 }
 struct ZipArchiveExtractor<'path> {
+    archive_file: File,
     archive_path: &'path Path,
     unpack_dir: &'path Path,
 }

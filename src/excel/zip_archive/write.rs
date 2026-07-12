@@ -9,12 +9,15 @@ use crate::diagnostic::{
     Result, err, err_with_source, path_context_message, path_pair_context_message,
 };
 use core::mem;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::Permissions;
 use std::{
     fs::File,
     io::{BufWriter, Read as IoRead, Write as IoWrite},
     path::Path,
 };
 const CENTRAL_FILE_HEADER_BASE_LEN: usize = 46;
+const DEFLATE_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const ZIP_OUTPUT_BUFFER_CAPACITY: usize = 64 * 1024;
 const STORE_WITHOUT_DEFLATE_EXTENSIONS: [&str; 10] = [
     ".bin", ".gif", ".jpeg", ".jpg", ".mp3", ".mp4", ".png", ".webp", ".zip", ".zst",
@@ -50,6 +53,8 @@ struct StreamingZipWriter<'path> {
     file: BufWriter<File>,
     header_buffer: Vec<u8>,
     part_buffer: Vec<u8>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    permissions: Permissions,
 }
 impl ZipArchiveBuilder<'_> {
     pub(in crate::excel) fn create(self) -> Result<()> {
@@ -64,6 +69,8 @@ impl ZipArchiveBuilder<'_> {
             file: BufWriter::with_capacity(ZIP_OUTPUT_BUFFER_CAPACITY, self.file),
             header_buffer: Vec::new(),
             part_buffer: Vec::new(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            permissions: self.permissions,
         }
         .write(files)
     }
@@ -128,11 +135,12 @@ impl StreamingZipWriter<'_> {
         self.read_part_bytes(&file)?;
         let crc32 = crc32(&self.part_buffer)?;
         let uncompressed_size = self.part_buffer.len();
-        let store_without_deflate = STORE_WITHOUT_DEFLATE_EXTENSIONS.iter().any(|extension| {
-            file.name
-                .get(file.name.len().saturating_sub(extension.len())..)
-                .is_some_and(|tail| tail.eq_ignore_ascii_case(extension))
-        });
+        let store_without_deflate = uncompressed_size > DEFLATE_MAX_INPUT_BYTES
+            || STORE_WITHOUT_DEFLATE_EXTENSIONS.iter().any(|extension| {
+                file.name
+                    .get(file.name.len().saturating_sub(extension.len())..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(extension))
+            });
         let deflate_plan = if uncompressed_size == 0 || store_without_deflate {
             None
         } else {
@@ -297,6 +305,16 @@ impl StreamingZipWriter<'_> {
                 source_err,
             )
         })?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.file
+            .get_ref()
+            .set_permissions(self.permissions)
+            .map_err(|source_err| {
+                err_with_source(
+                    path_context_message("xlsx 압축 파일 권한 적용 실패", self.archive_path),
+                    source_err,
+                )
+            })?;
         self.file.get_ref().sync_all().map_err(|source_err| {
             err_with_source(
                 path_context_message("xlsx 압축 파일 sync 실패", self.archive_path),

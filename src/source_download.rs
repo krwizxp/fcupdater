@@ -14,30 +14,22 @@ cfg_select! {
     windows => {
         mod winhttp;
     }
-    _ => {}
+    _ => {
+        compile_error!("fcupdater supports only Windows, Linux, and macOS.");
+    }
 }
 mod http_client;
 mod workflow;
-cfg_select! {
-    any(target_os = "linux", target_os = "macos", windows) => {
-        const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-        const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
-        const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
-        const RESPONSE_HEADER_CONTENT_LENGTH: &[u8] = b"Content-Length";
-        const RESPONSE_HEADER_SET_COOKIE: &[u8] = b"Set-Cookie";
-    }
-    _ => {}
-}
+const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
+const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
+const RESPONSE_HEADER_CONTENT_LENGTH: &[u8] = b"Content-Length";
+const RESPONSE_HEADER_SET_COOKIE: &[u8] = b"Set-Cookie";
 const OLE2_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-cfg_select! {
-    any(target_os = "linux", target_os = "macos", windows) => {
-        const _: () = assert!(
-            OLE2_SIGNATURE.len() <= HTTP_ERROR_PREVIEW_BYTES,
-            "streamed OLE2 signature preview must include the full signature"
-        );
-    }
-    _ => {}
-}
+const _: () = assert!(
+    OLE2_SIGNATURE.len() <= HTTP_ERROR_PREVIEW_BYTES,
+    "streamed OLE2 signature preview must include the full signature"
+);
 const OPINET_HOST: &str = "www.opinet.co.kr";
 const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
 const OPDOWNLOAD_PATH: &str = "/user/opdown/opDownload.do";
@@ -65,15 +57,18 @@ pub(super) struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
     pub dir: &'dir Path,
     pub out: &'out mut W,
 }
+pub(super) struct TemporarySourceFile {
+    file: Option<File>,
+    path: PathBuf,
+    remove_on_drop: bool,
+}
 #[derive(Debug)]
 struct StreamedBodySummary {
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     bytes_seen: usize,
     preview: Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HttpHeaderKind {
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     ContentLength,
     SetCookie,
 }
@@ -91,26 +86,65 @@ struct HttpResponse {
 #[derive(Debug)]
 struct HttpStreamResponse {
     body: StreamedBodySummary,
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     headers: Vec<HttpHeader>,
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     status: u32,
 }
 struct ReservedDownloadFile {
     file: File,
     path: PathBuf,
 }
-cfg_select! {
-    any(target_os = "linux", target_os = "macos", windows) => {
-        struct StreamingBodySink<'writer> {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            error: Option<DownloadError>,
-            limit: usize,
-            summary: StreamedBodySummary,
-            writer: &'writer mut dyn Write,
+struct StreamingBodySink<'writer> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    error: Option<DownloadError>,
+    limit: usize,
+    summary: StreamedBodySummary,
+    writer: &'writer mut dyn Write,
+}
+impl TemporarySourceFile {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(super) fn reader_parts(&mut self) -> io::Result<(&mut File, &Path)> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(io::Error::other("다운로드 임시 파일 핸들이 닫혀 있습니다."));
+        };
+        Ok((file, &self.path))
+    }
+    pub(super) fn remove(&mut self) -> io::Result<()> {
+        if !self.remove_on_drop {
+            return Ok(());
+        }
+        drop(self.file.take());
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.remove_on_drop = false;
+                Ok(())
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.remove_on_drop = false;
+                Ok(())
+            }
+            Err(source) => Err(source),
         }
     }
-    _ => {}
+}
+impl Drop for TemporarySourceFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if self.remove_on_drop
+            && let Err(source) = fs::remove_file(&self.path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            let mut error_output = io::stderr().lock();
+            match writeln!(
+                error_output,
+                "경고: 다운로드 임시 파일 삭제 실패: {} ({source})",
+                self.path.display()
+            ) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
 }
 impl StreamedBodySummary {
     fn preview_lossy(&self) -> Cow<'_, str> {
@@ -151,57 +185,52 @@ impl From<&'static str> for DownloadError {
         Self::from(Cow::Borrowed(value))
     }
 }
-cfg_select! {
-    any(target_os = "linux", target_os = "macos", windows) => {
-        impl StreamingBodySink<'_> {
-            fn append(&mut self, bytes: &[u8]) -> DownloadResult<()> {
-                let Some(next_len) = self.summary.bytes_seen.checked_add(bytes.len()) else {
-                    return Err("HTTP 응답 본문 크기 계산 실패".into());
-                };
-                if next_len > self.limit {
-                    return Err(format!(
-                        "HTTP 응답 본문 크기가 허용 한도({} bytes)를 초과했습니다.",
-                        self.limit
-                    )
-                    .into());
-                }
-                self.capture_preview(bytes)?;
-                self.writer.write_all(bytes).map_err(|source| {
-                    download_error_with_source("HTTP 응답 본문 파일 쓰기 실패", source)
-                })?;
-                self.summary.bytes_seen = next_len;
-                Ok(())
-            }
-            fn capture_preview(&mut self, bytes: &[u8]) -> DownloadResult<()> {
-                let Some(remaining_preview) =
-                    HTTP_ERROR_PREVIEW_BYTES.checked_sub(self.summary.preview.len())
-                else {
-                    return Err("HTTP 응답 본문 preview 상태가 손상되었습니다.".into());
-                };
-                let take = remaining_preview.min(bytes.len());
-                if take == 0 {
-                    return Ok(());
-                }
-                let Some(next_preview_len) = self.summary.preview.len().checked_add(take) else {
-                    return Err("HTTP 응답 본문 preview 길이 계산 실패".into());
-                };
-                if self.summary.preview.capacity() < next_preview_len
-                    && let Err(source) = self.summary.preview.try_reserve_exact(take)
-                {
-                    return Err(download_error_with_source(
-                        "HTTP 응답 본문 preview 메모리 확보 실패",
-                        source,
-                    ));
-                }
-                let Some(preview) = bytes.get(..take) else {
-                    return Err("HTTP 응답 본문 preview 범위 계산 실패".into());
-                };
-                self.summary.preview.extend_from_slice(preview);
-                Ok(())
-            }
+impl StreamingBodySink<'_> {
+    fn append(&mut self, bytes: &[u8]) -> DownloadResult<()> {
+        let Some(next_len) = self.summary.bytes_seen.checked_add(bytes.len()) else {
+            return Err("HTTP 응답 본문 크기 계산 실패".into());
+        };
+        if next_len > self.limit {
+            return Err(format!(
+                "HTTP 응답 본문 크기가 허용 한도({} bytes)를 초과했습니다.",
+                self.limit
+            )
+            .into());
         }
+        self.capture_preview(bytes)?;
+        self.writer.write_all(bytes).map_err(|source| {
+            download_error_with_source("HTTP 응답 본문 파일 쓰기 실패", source)
+        })?;
+        self.summary.bytes_seen = next_len;
+        Ok(())
     }
-    _ => {}
+    fn capture_preview(&mut self, bytes: &[u8]) -> DownloadResult<()> {
+        let Some(remaining_preview) =
+            HTTP_ERROR_PREVIEW_BYTES.checked_sub(self.summary.preview.len())
+        else {
+            return Err("HTTP 응답 본문 preview 상태가 손상되었습니다.".into());
+        };
+        let take = remaining_preview.min(bytes.len());
+        if take == 0 {
+            return Ok(());
+        }
+        let Some(next_preview_len) = self.summary.preview.len().checked_add(take) else {
+            return Err("HTTP 응답 본문 preview 길이 계산 실패".into());
+        };
+        if self.summary.preview.capacity() < next_preview_len
+            && let Err(source) = self.summary.preview.try_reserve_exact(take)
+        {
+            return Err(download_error_with_source(
+                "HTTP 응답 본문 preview 메모리 확보 실패",
+                source,
+            ));
+        }
+        let Some(preview) = bytes.get(..take) else {
+            return Err("HTTP 응답 본문 preview 범위 계산 실패".into());
+        };
+        self.summary.preview.extend_from_slice(preview);
+        Ok(())
+    }
 }
 fn download_error_with_source<M, E>(context: M, source: E) -> DownloadError
 where
@@ -245,7 +274,6 @@ cfg_select! {
     }
     _ => {}
 }
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn enforce_http_body_length(actual: usize, expected: Option<usize>) -> DownloadResult<()> {
     if let Some(expected_len) = expected
         && actual != expected_len
@@ -257,7 +285,6 @@ fn enforce_http_body_length(actual: usize, expected: Option<usize>) -> DownloadR
     }
     Ok(())
 }
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn validated_http_content_length(
     headers: &[HttpHeader],
     limit: usize,

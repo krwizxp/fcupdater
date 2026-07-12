@@ -1,37 +1,36 @@
 use super::path_util::reject_windows_special_component;
 use super::{
-    ArchiveFingerprint, SaveVerification, SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
+    ArchiveFingerprint, ArchiveRead, ArchiveReadMode, SPREADSHEETML_NAMESPACE, SaveVerification,
+    SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
     path_util::path_to_slashes,
     xml::{
-        decode_xml_entities, extract_all_tag_text, extract_attr, extract_first_tag_text,
-        find_end_tag, find_start_tag, find_tag_end,
+        XmlAttrScanner, XmlScanner, XmlTag, decode_xml_entities, extract_all_tag_text,
+        extract_attr, extract_first_tag_text, find_end_tag, find_start_tag, find_tag_end,
     },
-    zip_archive::read_archive_bytes,
+    zip_archive::read_open_archive,
 };
 use crate::diagnostic::{
     AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
     prefixed_message,
 };
+use crate::file_security::{apply_no_follow, validate_regular_file};
 use crate::temp_entry::{
     STALE_TEMP_ENTRY_AGE, TEMP_ENTRY_NAME_CAPACITY, TEMP_ENTRY_RESERVATION_ATTEMPTS,
     temp_entry_age_nanos, write_temp_entry_name,
 };
 use alloc::borrow::Cow;
-use core::{num::NonZeroU32, range::Range, str, time::Duration};
+use core::{iter, num::NonZeroU32, range::Range, str, time::Duration};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry as HashEntry},
     env, fs,
-    io::{self, Read as _},
+    io::{self, Read as _, Write as _, stderr},
     path::{Component, Path, PathBuf},
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
-        use std::{
-            io::{Write as _, stderr},
-            os::unix::fs::DirBuilderExt as _,
-        };
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     }
     _ => {}
 }
@@ -45,11 +44,25 @@ const FAR_ARTIFACT_MIN_COL: u32 = 16_382;
 const MASTER_FILTER_DATA_START_ROW: u32 = 15;
 const MASTER_FILTER_HEADER_ROW: u32 = 14;
 const MASTER_FILTER_START_COL: u32 = 1;
+const CONTENT_TYPES_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/package/2006/content-types";
+const OFFICE_DOCUMENT_REL_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const OFFICE_DOCUMENT_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+const PACKAGE_RELATIONSHIPS_NAMESPACE: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships";
+const WORKBOOK_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+const WORKBOOK_PART_NAME: &str = "/xl/workbook.xml";
+const WORKBOOK_REL_TARGET: &str = "xl/workbook.xml";
 const WORKSHEET_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
 #[derive(Debug)]
 pub(crate) struct XlsxContainer {
     source_fingerprint: ArchiveFingerprint,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    source_permissions: fs::Permissions,
     unpack_dir: PathBuf,
     work_dir: PathBuf,
 }
@@ -97,13 +110,19 @@ impl ReservedTempArchive {
     const fn take_cleanup_path(&mut self) -> Option<PathBuf> {
         self.path.take()
     }
-    fn write_archive_from(&mut self, root: &Path) -> Result<()> {
+    fn write_archive_from(
+        &mut self,
+        root: &Path,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] permissions: fs::Permissions,
+    ) -> Result<()> {
         let Some(file) = self.file.take() else {
             return Err(err("xlsx 임시 저장 파일 handle이 이미 닫혔습니다."));
         };
         ZipArchiveBuilder {
             archive_path: self.path()?,
             file,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            permissions,
             root,
         }
         .create()
@@ -158,10 +177,25 @@ struct WorksheetSemanticSummary {
     master_auto_filter_ref: Option<String>,
     shared_ref_count: usize,
 }
+struct WorksheetNamespaceElement<'xml> {
+    local_name: &'xml str,
+    name: &'xml str,
+    raw: &'xml str,
+}
+struct DirectXmlChild<'xml> {
+    local_name: &'xml str,
+    raw: &'xml str,
+}
 struct WorkbookRelationship<'xml> {
     target: Cow<'xml, str>,
     target_mode: Option<Cow<'xml, str>>,
     type_: Cow<'xml, str>,
+}
+struct WorkbookRelationships<'xml>(HashMap<Cow<'xml, str>, WorkbookRelationship<'xml>>);
+struct WorkbookSheetCatalog(Vec<SheetInfo>);
+struct WorkbookSheetCatalogSource<'workbook, 'relationships, 'rels> {
+    relationships: &'relationships WorkbookRelationships<'rels>,
+    workbook_xml: &'workbook str,
 }
 #[repr(transparent)]
 struct InternalWorksheetTarget<'xml>(&'xml str);
@@ -222,6 +256,149 @@ impl WorkbookRelationship<'_> {
         Ok(InternalWorksheetTarget(target))
     }
 }
+impl<'xml> TryFrom<&'xml str> for WorkbookRelationships<'xml> {
+    type Error = AppError;
+    fn try_from(rels_xml: &'xml str) -> Result<Self> {
+        let mut relationships: HashMap<Cow<'_, str>, WorkbookRelationship<'_>> = HashMap::new();
+        let mut cursor = 0_usize;
+        while let Some(start) = find_start_tag(rels_xml, "Relationship", cursor) {
+            let end = find_tag_end(rels_xml, start)
+                .ok_or_else(|| err("workbook Relationship 시작 태그가 손상되었습니다."))?;
+            let tag = rels_xml
+                .get(start..=end)
+                .ok_or_else(|| err("workbook Relationship 태그 범위가 손상되었습니다."))?;
+            let id = extract_attr(tag, "Id")?
+                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Id 속성이 없습니다."))?;
+            let target = extract_attr(tag, "Target")?
+                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Target 속성이 없습니다."))?;
+            let type_ = extract_attr(tag, "Type")?
+                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Type 속성이 없습니다."))?;
+            let relationship = WorkbookRelationship {
+                target,
+                target_mode: extract_attr(tag, "TargetMode")?,
+                type_,
+            };
+            if relationships.len() == relationships.capacity() {
+                relationships.try_reserve(1).map_err(|source| {
+                    err_with_source("workbook 관계 맵 추가 메모리 확보 실패", source)
+                })?;
+            }
+            let HashEntry::Vacant(entry) = relationships.entry(id) else {
+                return Err(err("workbook.xml.rels에 중복 Relationship Id가 있습니다."));
+            };
+            entry.insert(relationship);
+            cursor = end
+                .checked_add(1)
+                .ok_or_else(|| err("다음 workbook Relationship 위치 계산에 실패했습니다."))?;
+        }
+        Ok(Self(relationships))
+    }
+}
+impl<'workbook, 'relationships, 'rels>
+    TryFrom<WorkbookSheetCatalogSource<'workbook, 'relationships, 'rels>> for WorkbookSheetCatalog
+{
+    type Error = AppError;
+    fn try_from(
+        source: WorkbookSheetCatalogSource<'workbook, 'relationships, 'rels>,
+    ) -> Result<Self> {
+        let workbook_xml = source.workbook_xml;
+        let mut workbook_scanner = XmlScanner::new(workbook_xml);
+        let workbook_tag = workbook_scanner
+            .next_start_named("workbook")
+            .ok_or_else(|| err("workbook.xml의 workbook 시작 태그를 찾지 못했습니다."))?;
+        let workbook_open_tag = workbook_tag.raw();
+        let sheets_tag = workbook_scanner
+            .next_start_named("sheets")
+            .ok_or_else(|| err("workbook.xml의 sheets 시작 태그를 찾지 못했습니다."))?;
+        let namespace_ancestors = [workbook_open_tag, sheets_tag.raw()];
+        let mut sheets = Vec::new();
+        let mut cursor = 0_usize;
+        while let Some(start) = find_start_tag(workbook_xml, "sheet", cursor) {
+            let end = find_tag_end(workbook_xml, start)
+                .ok_or_else(|| err("workbook.xml의 sheet 시작 태그가 손상되었습니다."))?;
+            let tag = workbook_xml
+                .get(start..=end)
+                .ok_or_else(|| err("workbook.xml의 sheet 태그 범위가 손상되었습니다."))?;
+            let name = extract_attr(tag, "name")?
+                .ok_or_else(|| err("workbook.xml의 sheet에 name 속성이 없습니다."))?;
+            let mut relationship_id = None;
+            let mut attributes = XmlAttrScanner::new(tag)?;
+            while let Some((attr_name, attr_value)) = attributes.next()? {
+                let Some((prefix, local_name)) = attr_name.split_once(':') else {
+                    continue;
+                };
+                if prefix.is_empty() || local_name != "id" {
+                    continue;
+                }
+                let mut binding = None;
+                for declaration_tag in
+                    iter::once(tag).chain(namespace_ancestors.iter().rev().copied())
+                {
+                    let mut declarations = XmlAttrScanner::new(declaration_tag)?;
+                    while let Some((declaration_name, value)) = declarations.next()? {
+                        if declaration_name.strip_prefix("xmlns:") == Some(prefix) {
+                            binding = Some(value);
+                            break;
+                        }
+                    }
+                    if binding.is_some() {
+                        break;
+                    }
+                }
+                if binding.as_deref() == Some(OFFICE_DOCUMENT_REL_NAMESPACE)
+                    && relationship_id.replace(attr_value).is_some()
+                {
+                    return Err(err(
+                        "workbook.xml의 sheet에 중복 officeDocument relationship id 속성이 있습니다.",
+                    ));
+                }
+            }
+            let rid = relationship_id.ok_or_else(|| {
+                err("workbook.xml의 sheet에 officeDocument relationship id 속성이 없습니다.")
+            })?;
+            let relationship = source.relationships.0.get(rid.as_ref()).ok_or_else(|| {
+                err(format!(
+                    "workbook.xml.rels에서 sheet 관계 target을 찾지 못했습니다: {}",
+                    rid.as_ref()
+                ))
+            })?;
+            let target = relationship.internal_worksheet_target(RelationshipId(rid.as_ref()))?;
+            let target_text = target.0;
+            if target_text.starts_with('/') {
+                return Err(err(format!(
+                    "sheet 관계 target에 절대 경로는 허용되지 않습니다: {target_text}"
+                )));
+            }
+            let mut combined: PathBuf = "xl".into();
+            for segment in target_text.split('/').filter(|segment| !segment.is_empty()) {
+                combined.push(segment);
+            }
+            let normalized = normalize_safe_relative_path(&combined, target_text)?;
+            let resolved = path_to_slashes(&normalized, target_text)?;
+            if resolved.is_empty() {
+                return Err(err(format!(
+                    "sheet 관계 target 정규화 결과가 비어 있습니다: {target_text}"
+                )));
+            }
+            if sheets.len() == sheets.capacity() {
+                sheets.try_reserve(1).map_err(|reserve_error| {
+                    err_with_source("시트 순서 목록 추가 메모리 확보 실패", reserve_error)
+                })?;
+            }
+            sheets.push(SheetInfo {
+                name: name.into_owned(),
+                path: resolved,
+            });
+            cursor = end
+                .checked_add(1)
+                .ok_or_else(|| err("workbook.xml의 다음 sheet 위치 계산에 실패했습니다."))?;
+        }
+        if sheets.is_empty() {
+            return Err(err("workbook에서 시트 정보를 찾지 못했습니다."));
+        }
+        Ok(Self(sheets))
+    }
+}
 impl SavedArchiveVerifier<'_> {
     fn trailing_row_num(cell_ref: &str) -> Result<u32> {
         let mut row = 0_u64;
@@ -261,17 +438,6 @@ impl SavedArchiveVerifier<'_> {
                 source_err,
             )
         })?;
-        container
-            .read_text("[Content_Types].xml")
-            .map_err(|source_err| {
-                err_with_source(
-                    path_context_message(
-                        "저장 검증 실패: 필수 OOXML 파트 읽기 실패",
-                        self.saved_archive,
-                    ),
-                    source_err,
-                )
-            })?;
         let workbook_xml = container
             .read_text("xl/workbook.xml")
             .map_err(|source_err| {
@@ -1176,6 +1342,7 @@ impl ArchiveSemanticVerifier<'_> {
         let mut master_auto_filter_ref = None;
         for sheet in sheets {
             let sheet_xml = self.container.read_text(&sheet.path)?;
+            validate_worksheet_core_namespaces(&sheet_xml, &sheet.name)?;
             if sheet.name == "유류비" {
                 Self::worksheet_cell_refs_unique(&sheet_xml, &sheet.name)?;
                 Self::worksheet_row_and_col_refs_valid(&sheet_xml, &sheet.name)?;
@@ -1263,7 +1430,8 @@ impl TempArchivePromotion<'_> {
         source: atomic_replace::ReplaceFailure,
     ) -> Result<()> {
         let message = format!(
-            "{context}; 수동 복구용 파일을 보존했습니다: replacement={}, backup={}",
+            "{context}; 자동 복구 실패 후 수동 복구를 위해 현재 경로 상태를 보존했습니다: target={}, replacement={}, backup={}",
+            self.target_xlsx.display(),
             self.temp_archive.path()?.display(),
             self.backup_archive.path()?.display(),
         );
@@ -1334,7 +1502,15 @@ impl TempArchivePromotion<'_> {
         if let Err(validation_error) = self.validate_displaced_original(displaced_file) {
             return self.rollback_after_validation_failure(validation_error);
         }
-        self.cleanup_displaced_original(displaced_file)?;
+        if let Err(cleanup_error) = self.cleanup_displaced_original(displaced_file) {
+            let mut error_output = stderr().lock();
+            match writeln!(
+                &mut error_output,
+                "경고: xlsx 저장은 완료됐지만 교체된 원본 정리에 실패했습니다: {cleanup_error}"
+            ) {
+                Ok(()) | Err(_) => {}
+            }
+        }
         cfg_select! {
             any(target_os = "linux", target_os = "macos") => {
                 if let Err(source_err) = fs::OpenOptions::new()
@@ -1379,14 +1555,26 @@ impl TempArchivePromotion<'_> {
         displaced_file: atomic_replace::DisplacedFile,
     ) -> Result<()> {
         let captured_original = self.displaced_path(displaced_file)?;
-        let fingerprint = read_archive_bytes(captured_original)
-            .and_then(|bytes| ArchiveFingerprint::from_bytes(bytes.as_slice()))
-            .map_err(|source| {
-                err_with_source(
-                    path_context_message("교체된 원본 xlsx 검증 실패", captured_original),
-                    source,
-                )
-            })?;
+        let captured_file = fs::File::open(captured_original).map_err(|source| {
+            err_with_source(
+                path_context_message("교체된 원본 xlsx 열기 실패", captured_original),
+                source,
+            )
+        })?;
+        let archive_read = read_open_archive(
+            &captured_file,
+            captured_original,
+            ArchiveReadMode::FingerprintOnly,
+        )
+        .map_err(|source| {
+            err_with_source(
+                path_context_message("교체된 원본 xlsx 검증 실패", captured_original),
+                source,
+            )
+        })?;
+        let ArchiveRead::Fingerprint(fingerprint) = archive_read else {
+            return Err(err("교체된 원본 xlsx 지문 읽기 결과가 손상되었습니다."));
+        };
         if fingerprint != self.expected_fingerprint {
             return Err(err(format!(
                 "원본 xlsx가 실행 중 변경되어 저장을 중단했습니다: {}",
@@ -1399,106 +1587,33 @@ impl TempArchivePromotion<'_> {
 impl XlsxContainer {
     pub(super) fn load_sheet_catalog(&self, workbook_xml: &str) -> Result<Vec<SheetInfo>> {
         let rels_xml = self.read_text("xl/_rels/workbook.xml.rels")?;
-        let relationship_count = rels_xml.matches("<Relationship").count();
-        let mut rid_to_rel: HashMap<Cow<'_, str>, WorkbookRelationship<'_>> = HashMap::new();
-        rid_to_rel
-            .try_reserve(relationship_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("workbook 관계 맵 메모리 확보 실패: {relationship_count} entries"),
-                    source,
-                )
-            })?;
-        let mut rels_cursor = 0_usize;
-        while let Some(rel_start) = find_start_tag(&rels_xml, "Relationship", rels_cursor) {
-            let Some(rel_end) = find_tag_end(&rels_xml, rel_start) else {
-                return Err(err("workbook Relationship 시작 태그가 손상되었습니다."));
-            };
-            let Some(tag) = rels_xml.get(rel_start..=rel_end) else {
-                return Err(err("workbook Relationship 태그 범위가 손상되었습니다."));
-            };
-            let id = extract_attr(tag, "Id")?
-                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Id 속성이 없습니다."))?;
-            let target = extract_attr(tag, "Target")?
-                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Target 속성이 없습니다."))?;
-            let type_ = extract_attr(tag, "Type")?
-                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Type 속성이 없습니다."))?;
-            let target_mode = extract_attr(tag, "TargetMode")?;
-            let relationship = WorkbookRelationship {
-                target,
-                target_mode,
-                type_,
-            };
-            let HashEntry::Vacant(entry) = rid_to_rel.entry(id) else {
-                return Err(err("workbook.xml.rels에 중복 Relationship Id가 있습니다."));
-            };
-            entry.insert(relationship);
-            rels_cursor = rel_end
-                .checked_add(1)
-                .ok_or_else(|| err("다음 workbook Relationship 위치 계산에 실패했습니다."))?;
-        }
-        let sheet_count = workbook_xml.matches("<sheet").count();
-        let mut sheets = Vec::new();
-        sheets.try_reserve_exact(sheet_count).map_err(|source| {
-            err_with_source(
-                format!("시트 순서 목록 메모리 확보 실패: {sheet_count} sheets"),
-                source,
-            )
-        })?;
-        let mut sheet_cursor = 0_usize;
-        while let Some(sheet_start) = find_start_tag(workbook_xml, "sheet", sheet_cursor) {
-            let Some(sheet_end) = find_tag_end(workbook_xml, sheet_start) else {
-                return Err(err("workbook.xml의 sheet 시작 태그가 손상되었습니다."));
-            };
-            let Some(tag) = workbook_xml.get(sheet_start..=sheet_end) else {
-                return Err(err("workbook.xml의 sheet 태그 범위가 손상되었습니다."));
-            };
-            let Some(name) = extract_attr(tag, "name")? else {
-                return Err(err("workbook.xml의 sheet에 name 속성이 없습니다."));
-            };
-            let Some(rid) = extract_attr(tag, "r:id")? else {
-                return Err(err("workbook.xml의 sheet에 r:id 속성이 없습니다."));
-            };
-            let Some(relationship) = rid_to_rel.get(rid.as_ref()) else {
-                return Err(err(format!(
-                    "workbook.xml.rels에서 sheet 관계 target을 찾지 못했습니다: {}",
-                    rid.as_ref()
-                )));
-            };
-            let target = relationship.internal_worksheet_target(RelationshipId(rid.as_ref()))?;
-            let target_text = target.0;
-            let resolved = if target_text.starts_with('/') {
-                return Err(err(format!(
-                    "sheet 관계 target에 절대 경로는 허용되지 않습니다: {target_text}"
-                )));
-            } else {
-                let mut combined: PathBuf = "xl".into();
-                for segment in target_text.split('/').filter(|segment| !segment.is_empty()) {
-                    combined.push(segment);
-                }
-                let normalized = normalize_safe_relative_path(&combined, target_text)?;
-                let resolved_path = path_to_slashes(&normalized, target_text)?;
-                if resolved_path.is_empty() {
-                    return Err(err(format!(
-                        "sheet 관계 target 정규화 결과가 비어 있습니다: {target_text}"
-                    )));
-                }
-                resolved_path
-            };
-            sheets.push(SheetInfo {
-                name: name.into_owned(),
-                path: resolved,
-            });
-            sheet_cursor = sheet_end
-                .checked_add(1)
-                .ok_or_else(|| err("workbook.xml의 다음 sheet 위치 계산에 실패했습니다."))?;
-        }
-        if sheets.is_empty() {
-            return Err(err("workbook에서 시트 정보를 찾지 못했습니다."));
-        }
-        Ok(sheets)
+        let relationships = WorkbookRelationships::try_from(rels_xml.as_str())?;
+        WorkbookSheetCatalog::try_from(WorkbookSheetCatalogSource {
+            relationships: &relationships,
+            workbook_xml,
+        })
+        .map(|catalog| catalog.0)
     }
     pub(crate) fn open(source_xlsx: &Path) -> Result<Self> {
+        let mut source_options = fs::File::options();
+        source_options.read(true);
+        apply_no_follow(&mut source_options);
+        let source_file = source_options.open(source_xlsx).map_err(|source_err| {
+            err_with_source(
+                path_context_message("마스터 xlsx 파일 열기 실패", source_xlsx),
+                source_err,
+            )
+        })?;
+        let source_metadata = validate_regular_file(&source_file).map_err(|source_err| {
+            err_with_source(
+                path_context_message("마스터 xlsx 파일 검증 실패", source_xlsx),
+                source_err,
+            )
+        });
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let source_permissions = source_metadata?.permissions();
+        #[cfg(target_os = "windows")]
+        source_metadata?;
         let base = env::temp_dir();
         cleanup_stale_temp_entries(&base, WORK_DIR_PREFIX, StaleTempEntryKind::Directory);
         let cleanup = WorkDirCleanup {
@@ -1525,16 +1640,21 @@ impl XlsxContainer {
         let unpack_dir = cleanup.path()?.join("unzipped");
         create_dir_all_checked(&unpack_dir, "임시 폴더 생성 실패")?;
         let source_fingerprint = ZipArchiveExtractor {
+            archive_file: source_file,
             archive_path: source_xlsx,
             unpack_dir: unpack_dir.as_path(),
         }
         .extract()?;
         let work_dir = cleanup.into_path()?;
-        Ok(Self {
+        let container = Self {
             source_fingerprint,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            source_permissions,
             unpack_dir,
             work_dir,
-        })
+        };
+        container.validate_package_identity()?;
+        Ok(container)
     }
     pub(super) fn read_shared_strings_text(&self) -> Result<Option<String>> {
         let path = self.resolve_relative_path("xl/sharedStrings.xml")?;
@@ -1638,38 +1758,30 @@ impl XlsxContainer {
         let mut tmp_archive = reserve_unique_temp_entry(
             parent,
             &temp_archive_prefix,
-            |path| {
-                let file = fs::File::options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)?;
-                Ok(ReservedTempArchive {
-                    file: Some(file),
-                    path: Some(path.to_path_buf()),
-                })
-            },
+            create_reserved_temp_archive,
             "임시 저장 파일 생성 실패",
             || prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
         let mut backup_archive = reserve_unique_temp_entry(
             parent,
             &backup_archive_prefix,
-            |path| {
-                let file = fs::File::options()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)?;
-                Ok(ReservedTempArchive {
-                    file: Some(file),
-                    path: Some(path.to_path_buf()),
-                })
-            },
+            create_reserved_temp_archive,
             "교체 예약 파일 생성 실패",
             || prefixed_message("교체 예약 파일 경로 생성 실패: ", target_xlsx.display()),
         )?;
         backup_archive.close_file();
         let result = (|| -> Result<()> {
-            tmp_archive.write_archive_from(self.unpack_dir.as_path())?;
+            cfg_select! {
+                any(target_os = "linux", target_os = "macos") => {
+                    tmp_archive.write_archive_from(
+                        self.unpack_dir.as_path(),
+                        self.source_permissions.clone(),
+                    )?;
+                }
+                target_os = "windows" => {
+                    tmp_archive.write_archive_from(self.unpack_dir.as_path())?;
+                }
+            }
             match verification {
                 SaveVerification::Skip => {}
                 SaveVerification::Verify => {
@@ -1688,11 +1800,7 @@ impl XlsxContainer {
             .promote()
         })();
         match result {
-            Ok(()) => {
-                backup_archive.disable_drop_cleanup();
-                tmp_archive.disable_drop_cleanup();
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(source) => {
                 let Some(tmp_archive_path) = tmp_archive.take_cleanup_path() else {
                     return Err(source);
@@ -1710,6 +1818,133 @@ impl XlsxContainer {
                 }
             }
         }
+    }
+    fn validate_content_types(&self) -> Result<()> {
+        let content_types_xml = self.read_text("[Content_Types].xml")?;
+        let children = direct_xml_children(
+            &content_types_xml,
+            "Types",
+            CONTENT_TYPES_NAMESPACE,
+            "[Content_Types].xml",
+        )?;
+        let mut seen_part_names = HashSet::new();
+        seen_part_names
+            .try_reserve(children.len())
+            .map_err(|source| {
+                err_with_source("content type part name 집합 메모리 확보 실패", source)
+            })?;
+        let mut workbook_override = None;
+        let mut xml_default = None;
+        for child in children {
+            match child.local_name {
+                "Default" => {
+                    let extension =
+                        required_xml_attr(child.raw, "Extension", "[Content_Types].xml Default")?;
+                    let content_type =
+                        required_xml_attr(child.raw, "ContentType", "[Content_Types].xml Default")?;
+                    if extension.eq_ignore_ascii_case("xml")
+                        && xml_default.replace(content_type).is_some()
+                    {
+                        return Err(err(
+                            "[Content_Types].xml에 중복 XML Default 항목이 있습니다.",
+                        ));
+                    }
+                }
+                "Override" => {
+                    let part_name =
+                        required_xml_attr(child.raw, "PartName", "[Content_Types].xml Override")?;
+                    let content_type = required_xml_attr(
+                        child.raw,
+                        "ContentType",
+                        "[Content_Types].xml Override",
+                    )?;
+                    if !seen_part_names.insert(part_name.clone()) {
+                        return Err(err(
+                            "[Content_Types].xml에 중복 Override PartName이 있습니다.",
+                        ));
+                    }
+                    if part_name.as_ref() == WORKBOOK_PART_NAME {
+                        workbook_override = Some(content_type);
+                    }
+                }
+                _ => {
+                    return Err(err(format!(
+                        "[Content_Types].xml에 알 수 없는 child 태그가 있습니다: {}",
+                        child.local_name
+                    )));
+                }
+            }
+        }
+        let workbook_content_type = workbook_override.or(xml_default).ok_or_else(|| {
+            err("[Content_Types].xml에서 workbook content type을 찾지 못했습니다.")
+        })?;
+        if workbook_content_type.as_ref() != WORKBOOK_CONTENT_TYPE {
+            return Err(err(format!(
+                "workbook content type이 올바르지 않습니다: {}",
+                workbook_content_type.as_ref()
+            )));
+        }
+        Ok(())
+    }
+    fn validate_package_identity(&self) -> Result<()> {
+        self.validate_content_types()?;
+        self.validate_root_relationships()
+    }
+    fn validate_root_relationships(&self) -> Result<()> {
+        let relationships_xml = self.read_text("_rels/.rels")?;
+        let children = direct_xml_children(
+            &relationships_xml,
+            "Relationships",
+            PACKAGE_RELATIONSHIPS_NAMESPACE,
+            "_rels/.rels",
+        )?;
+        let mut seen_ids = HashSet::new();
+        seen_ids.try_reserve(children.len()).map_err(|source| {
+            err_with_source("package relationship id 집합 메모리 확보 실패", source)
+        })?;
+        let mut office_document_seen = false;
+        for child in children {
+            if child.local_name != "Relationship" {
+                return Err(err(format!(
+                    "_rels/.rels에 알 수 없는 child 태그가 있습니다: {}",
+                    child.local_name
+                )));
+            }
+            let id = required_xml_attr(child.raw, "Id", "_rels/.rels Relationship")?;
+            let target = required_xml_attr(child.raw, "Target", "_rels/.rels Relationship")?;
+            let type_ = required_xml_attr(child.raw, "Type", "_rels/.rels Relationship")?;
+            let target_mode = unique_xml_attr(child.raw, "TargetMode", "_rels/.rels Relationship")?;
+            if !seen_ids.insert(id) {
+                return Err(err("_rels/.rels에 중복 Relationship Id가 있습니다."));
+            }
+            if type_.as_ref() != OFFICE_DOCUMENT_REL_TYPE {
+                continue;
+            }
+            if office_document_seen {
+                return Err(err(
+                    "_rels/.rels에 officeDocument Relationship이 여러 개 있습니다.",
+                ));
+            }
+            if target_mode
+                .as_ref()
+                .is_some_and(|mode| mode.as_ref() != "Internal")
+            {
+                return Err(err(
+                    "_rels/.rels의 officeDocument Relationship은 External일 수 없습니다.",
+                ));
+            }
+            if target.as_ref() != WORKBOOK_REL_TARGET {
+                return Err(err(format!(
+                    "_rels/.rels의 officeDocument target이 올바르지 않습니다: {}",
+                    target.as_ref()
+                )));
+            }
+            office_document_seen = true;
+        }
+        if !office_document_seen {
+            return Err(err("_rels/.rels에 officeDocument Relationship이 없습니다."));
+        }
+        Ok(())
     }
     pub(super) fn write_text(&self, relative_path: &str, content: &str) -> Result<()> {
         let path = self.resolve_relative_path(relative_path)?;
@@ -1742,6 +1977,95 @@ cfg_select! {
         }
     }
     _ => {}
+}
+pub(super) fn validate_worksheet_core_namespaces(sheet_xml: &str, sheet_name: &str) -> Result<()> {
+    let context = format!("worksheet XML namespace 검증: {sheet_name}");
+    let mut scanner = XmlScanner::new(sheet_xml);
+    let root = scanner
+        .next_tag()
+        .ok_or_else(|| err(format!("{context}에 root 태그가 없습니다.")))?;
+    if !root.is_start() || root.local_name() != "worksheet" || root.self_closing() {
+        return Err(err(format!("{context}의 root 태그가 올바르지 않습니다.")));
+    }
+    if resolved_element_namespace(&root, &[], &context)?.as_deref() != Some(SPREADSHEETML_NAMESPACE)
+    {
+        return Err(err(format!(
+            "{context}의 worksheet namespace가 올바르지 않습니다."
+        )));
+    }
+    let mut ancestors = Vec::new();
+    ancestors
+        .try_reserve_exact(8)
+        .map_err(|source| err_with_source(format!("{context} stack 메모리 확보 실패"), source))?;
+    ancestors.push(WorksheetNamespaceElement {
+        local_name: root.local_name(),
+        name: root.name(),
+        raw: root.raw(),
+    });
+    while let Some(tag) = scanner.next_tag() {
+        if ancestors.is_empty() {
+            return Err(err(format!("{context}에 root 밖의 XML 요소가 있습니다.")));
+        }
+        if tag.is_start() {
+            let parent_name = ancestors.last().map(|element| element.local_name);
+            let is_core_element = matches!(
+                (parent_name, tag.local_name()),
+                (Some("worksheet"), "sheetData")
+                    | (Some("sheetData"), "row")
+                    | (Some("row"), "c")
+                    | (Some("c"), "f" | "is" | "v")
+                    | (Some("is"), "r" | "t")
+                    | (Some("r"), "t")
+            );
+            if is_core_element
+                && resolved_element_namespace(&tag, &ancestors, &context)?.as_deref()
+                    != Some(SPREADSHEETML_NAMESPACE)
+            {
+                return Err(err(format!(
+                    "{context}의 {} namespace가 올바르지 않습니다.",
+                    tag.name()
+                )));
+            }
+            if !tag.self_closing() {
+                if ancestors.len() == ancestors.capacity() {
+                    ancestors.try_reserve(1).map_err(|source| {
+                        err_with_source(format!("{context} stack 메모리 확보 실패"), source)
+                    })?;
+                }
+                ancestors.push(WorksheetNamespaceElement {
+                    local_name: tag.local_name(),
+                    name: tag.name(),
+                    raw: tag.raw(),
+                });
+            }
+            continue;
+        }
+        let open = ancestors
+            .pop()
+            .ok_or_else(|| err(format!("{context}의 종료 태그 순서가 올바르지 않습니다.")))?;
+        if open.name != tag.name() {
+            return Err(err(format!(
+                "{context}의 XML 태그 쌍이 일치하지 않습니다: {} / {}",
+                open.name,
+                tag.name()
+            )));
+        }
+    }
+    if !ancestors.is_empty() {
+        return Err(err(format!("{context}에 닫히지 않은 XML 요소가 있습니다.")));
+    }
+    Ok(())
+}
+fn create_reserved_temp_archive(path: &Path) -> io::Result<ReservedTempArchive> {
+    let mut options = fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    Ok(ReservedTempArchive {
+        file: Some(file),
+        path: Some(path.to_path_buf()),
+    })
 }
 fn create_dir_all_checked(path: &Path, failure_label: &str) -> Result<()> {
     fs::create_dir_all(path).map_err(|source_err| {
@@ -1857,4 +2181,216 @@ where
         }
     }
     Err(err(exhausted_message()))
+}
+fn xml_misc_only(mut xml: &str, allow_bom: bool) -> bool {
+    if allow_bom && let Some(without_bom) = xml.strip_prefix('\u{feff}') {
+        xml = without_bom;
+    }
+    loop {
+        xml = xml.trim_start();
+        if xml.is_empty() {
+            return true;
+        }
+        let terminator = if xml.starts_with("<!--") {
+            "-->"
+        } else if xml.starts_with("<?") {
+            "?>"
+        } else {
+            return false;
+        };
+        let Some(end) = xml.find(terminator) else {
+            return false;
+        };
+        let Some(next) = end.checked_add(terminator.len()) else {
+            return false;
+        };
+        let Some(remaining) = xml.get(next..) else {
+            return false;
+        };
+        xml = remaining;
+    }
+}
+fn unique_xml_attr<'tag>(
+    tag: &'tag str,
+    attr_name: &str,
+    context: &str,
+) -> Result<Option<Cow<'tag, str>>> {
+    let mut value = None;
+    let mut attributes = XmlAttrScanner::new(tag)?;
+    while let Some((name, attr_value)) = attributes.next()? {
+        if name == attr_name && value.replace(attr_value).is_some() {
+            return Err(err(format!(
+                "{context}에 중복 {attr_name} 속성이 있습니다."
+            )));
+        }
+    }
+    Ok(value)
+}
+fn required_xml_attr<'tag>(
+    tag: &'tag str,
+    attr_name: &str,
+    context: &str,
+) -> Result<Cow<'tag, str>> {
+    unique_xml_attr(tag, attr_name, context)?
+        .ok_or_else(|| err(format!("{context}에 {attr_name} 속성이 없습니다.")))
+}
+fn declared_element_namespace<'tag>(
+    tag: &'tag str,
+    qualified_name: &str,
+    context: &str,
+) -> Result<Option<Cow<'tag, str>>> {
+    let prefix = match qualified_name.split_once(':') {
+        Some((prefix, local_name))
+            if !prefix.is_empty() && !local_name.is_empty() && !local_name.contains(':') =>
+        {
+            Some(prefix)
+        }
+        Some(_) => {
+            return Err(err(format!(
+                "{context}의 XML qualified name이 잘못되었습니다."
+            )));
+        }
+        None => None,
+    };
+    let mut namespace = None;
+    let mut attributes = XmlAttrScanner::new(tag)?;
+    while let Some((name, value)) = attributes.next()? {
+        let matches = (prefix.is_none() && name == "xmlns")
+            || prefix.is_some_and(|namespace_prefix| {
+                name.strip_prefix("xmlns:") == Some(namespace_prefix)
+            });
+        if matches && namespace.replace(value).is_some() {
+            return Err(err(format!(
+                "{context}에 중복 XML namespace 선언이 있습니다."
+            )));
+        }
+    }
+    Ok(namespace)
+}
+fn resolved_element_namespace<'xml>(
+    tag: &XmlTag<'xml>,
+    ancestors: &[WorksheetNamespaceElement<'xml>],
+    context: &str,
+) -> Result<Option<Cow<'xml, str>>> {
+    for declaration in
+        iter::once(tag.raw()).chain(ancestors.iter().rev().map(|element| element.raw))
+    {
+        if let Some(namespace) = declared_element_namespace(declaration, tag.name(), context)? {
+            return Ok(Some(namespace));
+        }
+    }
+    Ok(None)
+}
+fn validate_element_namespace(
+    tag: &XmlTag<'_>,
+    root_tag: &XmlTag<'_>,
+    expected_namespace: &str,
+    context: &str,
+) -> Result<()> {
+    let own_namespace = declared_element_namespace(tag.raw(), tag.name(), context)?;
+    let namespace = match own_namespace {
+        Some(namespace) => Some(namespace),
+        None => declared_element_namespace(root_tag.raw(), tag.name(), context)?,
+    };
+    if namespace.as_deref() != Some(expected_namespace) {
+        return Err(err(format!(
+            "{context}의 XML namespace가 올바르지 않습니다."
+        )));
+    }
+    Ok(())
+}
+fn direct_xml_children<'xml>(
+    xml: &'xml str,
+    root_local_name: &str,
+    expected_namespace: &str,
+    context: &str,
+) -> Result<Vec<DirectXmlChild<'xml>>> {
+    let mut scanner = XmlScanner::new(xml);
+    let root_tag = scanner
+        .next_tag()
+        .ok_or_else(|| err(format!("{context}의 XML root 태그가 없습니다.")))?;
+    if !root_tag.is_start() || root_tag.local_name() != root_local_name {
+        return Err(err(format!(
+            "{context}의 XML root 태그가 올바르지 않습니다."
+        )));
+    }
+    if root_tag.self_closing() {
+        return Err(err(format!("{context}의 XML root 태그가 비어 있습니다.")));
+    }
+    let leading = xml
+        .get(..root_tag.start())
+        .ok_or_else(|| err(format!("{context}의 XML root 범위가 손상되었습니다.")))?;
+    if !xml_misc_only(leading, true) {
+        return Err(err(format!(
+            "{context}의 XML root 앞 내용이 올바르지 않습니다."
+        )));
+    }
+    validate_element_namespace(
+        &root_tag,
+        &root_tag,
+        expected_namespace,
+        &format!("{context} root"),
+    )?;
+    let root_name = root_tag.name();
+    let mut open_child_name = None;
+    let mut children = Vec::new();
+    let mut root_closed = false;
+    while let Some(tag) = scanner.next_tag() {
+        if root_closed {
+            return Err(err(format!(
+                "{context}에 XML root 태그가 여러 개 있습니다."
+            )));
+        }
+        if tag.is_start() {
+            if open_child_name.is_some() {
+                return Err(err(format!(
+                    "{context}의 XML child 태그는 중첩될 수 없습니다."
+                )));
+            }
+            validate_element_namespace(&tag, &root_tag, expected_namespace, context)?;
+            if children.len() == children.capacity() {
+                children.try_reserve(1).map_err(|source| {
+                    err_with_source(format!("{context} child 목록 메모리 확보 실패"), source)
+                })?;
+            }
+            if !tag.self_closing() {
+                open_child_name = Some(tag.name());
+            }
+            children.push(DirectXmlChild {
+                local_name: tag.local_name(),
+                raw: tag.raw(),
+            });
+        } else if let Some(child_name) = open_child_name {
+            if tag.name() != child_name {
+                return Err(err(format!(
+                    "{context}의 XML child 종료 태그가 일치하지 않습니다."
+                )));
+            }
+            open_child_name = None;
+        } else {
+            if tag.name() != root_name {
+                return Err(err(format!(
+                    "{context}의 XML root 종료 태그가 일치하지 않습니다."
+                )));
+            }
+            let trailing_start = tag
+                .end()
+                .checked_add(1)
+                .ok_or_else(|| err(format!("{context}의 XML root 범위가 손상되었습니다.")))?;
+            let trailing = xml
+                .get(trailing_start..)
+                .ok_or_else(|| err(format!("{context}의 XML root 범위가 손상되었습니다.")))?;
+            if !xml_misc_only(trailing, false) {
+                return Err(err(format!(
+                    "{context}의 XML root 뒤 내용이 올바르지 않습니다."
+                )));
+            }
+            root_closed = true;
+            break;
+        }
+    }
+    if open_child_name.is_some() || !root_closed {
+        return Err(err(format!("{context}의 XML 종료 태그가 없습니다.")));
+    }
+    Ok(children)
 }

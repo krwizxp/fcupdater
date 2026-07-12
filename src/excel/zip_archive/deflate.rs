@@ -375,6 +375,12 @@ impl Huffman {
                 return Err(zip_static("deflate Huffman next code 범위 오류"));
             };
             let assigned = *next_slot;
+            let code_limit = 1_u16
+                .checked_shl(u32::from(len))
+                .ok_or_else(|| zip_static("deflate Huffman code 범위 계산 실패"))?;
+            if assigned >= code_limit {
+                return Err(zip_static("deflate Huffman code가 과포화되었습니다."));
+            }
             *next_slot = next_slot.saturating_add(1);
             let symbol_u16 = u16::try_from(symbol)
                 .map_err(|source| zip_with_source("deflate symbol 변환 실패", source))?;
@@ -519,6 +525,9 @@ impl InflateState<'_> {
         let literal_count = usize::try_from(self.reader.read_bits(5)?)
             .map_err(|source| zip_with_source("deflate HLIT 변환 실패", source))?
             .saturating_add(257);
+        if literal_count > LITERAL_LENGTH_SYMBOLS {
+            return Err(zip_static("deflate HLIT 범위 오류"));
+        }
         let distance_count = usize::try_from(self.reader.read_bits(5)?)
             .map_err(|source| zip_with_source("deflate HDIST 변환 실패", source))?
             .saturating_add(1);

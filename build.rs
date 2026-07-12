@@ -6,38 +6,44 @@ use std::{
     process::Command,
 };
 const UNKNOWN: &str = "unknown";
+const INVALID_RERUN_PATH: &str = "Git path contains a Cargo directive line terminator";
 fn main() {
+    if env::var_os("CARGO_CFG_TARGET_OS").is_some_and(|target_os| target_os == "windows") {
+        println!("cargo::rustc-link-arg-bin=fcupdater=/SUBSYSTEM:CONSOLE,10.0");
+        println!("cargo::rustc-link-arg-bin=fcupdater=/DEPENDENTLOADFLAG:0x800");
+        println!("cargo::rustc-link-arg-bin=fcupdater=/Brepro");
+    }
     let dot_git = Path::new(".git");
     let has_git_metadata = fs::exists(dot_git).is_ok_and(|exists| exists);
     if has_git_metadata {
         let git_head = git_path("HEAD");
         if let Some(path) = git_head.as_deref() {
-            emit_rerun_if_changed(path);
+            if !emit_existing_rerun_if_changed(path) {
+                return;
+            }
             if let Ok(head) = fs::read_to_string(path)
                 && let Some(ref_name) = head.trim().strip_prefix("ref: ")
                 && let Some(ref_path) = git_path(ref_name)
+                && !emit_existing_rerun_if_changed(ref_path.as_path())
             {
-                emit_rerun_if_changed(ref_path.as_path());
+                return;
             }
         }
         for name in ["packed-refs", "index"] {
-            if let Some(path) = git_path(name) {
-                emit_rerun_if_changed(path.as_path());
+            if let Some(path) = git_path(name)
+                && !emit_existing_rerun_if_changed(path.as_path())
+            {
+                return;
             }
         }
     }
     if has_git_metadata
-        && let Some(paths) = git_command_stdout(&[
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-        ])
+        && let Some(paths) = git_command_stdout(&["ls-files", "--cached", "-z", "--"])
     {
         for path in paths.split_terminator('\0') {
-            println!("cargo::rerun-if-changed={path}");
+            if !emit_rerun_if_changed(Path::new(path)) {
+                return;
+            }
         }
     }
     println!("cargo::rerun-if-env-changed=GITHUB_SHA");
@@ -53,7 +59,7 @@ fn main() {
         })
         .unwrap_or_else(|| UNKNOWN.to_owned());
     let git_dirty = if has_git_metadata {
-        git_command_stdout(&["status", "--porcelain", "--untracked-files=normal"]).map_or(
+        git_command_stdout(&["status", "--porcelain", "--untracked-files=no"]).map_or(
             UNKNOWN,
             |text| {
                 if text.trim().is_empty() {
@@ -104,15 +110,7 @@ fn short_git_sha(raw: &str) -> Option<String> {
     Some(trimmed.bytes().take(12).map(char::from).collect())
 }
 fn git_command_stdout(args: &[&str]) -> Option<String> {
-    command_stdout(OsStr::new("git"), args).or_else(|| {
-        [
-            r"C:\Program Files\Git\cmd\git.exe",
-            r"C:\Program Files\Git\bin\git.exe",
-            r"C:\Program Files (x86)\Git\cmd\git.exe",
-        ]
-        .into_iter()
-        .find_map(|candidate| command_stdout(OsStr::new(candidate), args))
-    })
+    command_stdout(OsStr::new("git"), args)
 }
 fn git_path(name: &str) -> Option<PathBuf> {
     let raw_path =
@@ -136,8 +134,18 @@ fn command_stdout(program: &OsStr, args: &[&str]) -> Option<String> {
     };
     Some(text)
 }
-fn emit_rerun_if_changed(path: &Path) {
-    if fs::exists(path).is_ok_and(|exists| exists) {
-        println!("cargo::rerun-if-changed={}", path.display());
+fn emit_existing_rerun_if_changed(path: &Path) -> bool {
+    if !fs::exists(path).is_ok_and(|exists| exists) {
+        return true;
     }
+    emit_rerun_if_changed(path)
+}
+fn emit_rerun_if_changed(path: &Path) -> bool {
+    let rendered = path.to_string_lossy();
+    if rendered.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+        println!("cargo::error={INVALID_RERUN_PATH}");
+        return false;
+    }
+    println!("cargo::rerun-if-changed={rendered}");
+    true
 }

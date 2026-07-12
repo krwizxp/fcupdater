@@ -11,6 +11,7 @@
 - 기본 저장은 빠른 승격 사용, `--verify` 실행 시 저장 후 OOXML 필수 파트 무결성 검증
 ## 요구사항
 - MSRV: Rust 1.97
+- Windows 실행 환경: Windows 10 22H2 이상, 최신 Windows 11 권장
 - 자동 다운로드: Windows는 WinHTTP, Linux/macOS는 native libcurl 사용
 - Linux/macOS native libcurl은 HTTPS protocol allowlist 설정을 위해 7.85.0 이상이 필요합니다.
 - Linux 빌드 환경: `libcurl4-openssl-dev`
@@ -57,11 +58,13 @@ Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어
 - 포함 파일: `fcupdater-result.xlsx`
 ## 동작 기준
 - Opinet 자동 다운로드는 항상 수행합니다.
+- 자동 다운로드는 지정한 HTTPS 호스트의 직접 응답만 허용하며 HTTP 리다이렉트를 따라가지 않습니다.
 - 소스 형식은 OLE2/BIFF `.xls` 기준입니다.
 - BIFF `CODEPAGE = 1200` 기준으로 읽습니다.
 - 소스 worksheet는 1개 구조를 기준으로 읽습니다.
 - 소스 cell record는 `LABELSST` 기반 문자열 셀 구조를 기준으로 읽습니다.
 - 소스 데이터는 고정 열 구조를 사용합니다.
+- 주소·상호·셀프 구분과 가격 형식/범위/완전성 검증에 실패하면 저장을 중단합니다.
 - 마스터 파일을 직접 저장하며 기본 실행은 저장 검증을 생략합니다.
 - `--verify` 실행은 임시 XLSX 생성 후 재열기 검증을 통과한 경우에만 대상 파일로 승격합니다.
 - 변경내역 시트는 항상 갱신합니다.

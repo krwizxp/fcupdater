@@ -3,7 +3,7 @@ use super::{
     GAS_STATION_LPG_CODE, NETFUNNEL_DOWNLOAD_ACTION_ID, NETFUNNEL_ENTRY_ACTION_ID,
     OIL_PRICE_DOWNLOAD_TAR_URL, OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH,
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, ReservedDownloadFile, SourceDownload,
-    attach_remove_file_error, download_error_with_source,
+    TemporarySourceFile, attach_remove_file_error, download_error_with_source,
     http_client::{self, PostHeaderProfile},
 };
 use crate::{
@@ -17,10 +17,19 @@ use core::time::Duration;
 use std::{
     fs::{self, File},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     process, thread,
     time::{SystemTime, UNIX_EPOCH},
 };
+cfg_select! {
+    windows => {
+        use std::os::windows::fs::OpenOptionsExt as _;
+    }
+    any(target_os = "linux", target_os = "macos") => {
+        use std::os::unix::fs::OpenOptionsExt as _;
+    }
+    _ => {}
+}
 const AUTO_SOURCE_OLD_TEMP_FILE_NAME: &str = "fcupdater-opinet-source.tmp";
 const AUTO_SOURCE_TEMP_FILE_PREFIX: &str = ".fcupdater-opinet-source.tmp_";
 struct SourceDownloadWorkflow<'dir, 'out, W: Write + ?Sized> {
@@ -49,25 +58,30 @@ impl<W> SourceDownload<'_, '_, W>
 where
     W: Write + ?Sized,
 {
-    pub(crate) fn refresh_source(&mut self) -> Result<PathBuf> {
+    pub(crate) fn refresh_source(&mut self) -> Result<TemporarySourceFile> {
         fs::create_dir_all(self.dir).map_err(|source_err| {
             err_with_source(
                 path_context_message("소스 폴더 생성 실패", self.dir),
                 source_err,
             )
         })?;
-        SourceDownloadWorkflow {
+        let target = SourceDownloadWorkflow {
             dir: self.dir,
             out: &mut *self.out,
         }
-        .refresh_source()
+        .refresh_source()?;
+        Ok(TemporarySourceFile {
+            file: Some(target.file),
+            path: target.path,
+            remove_on_drop: true,
+        })
     }
 }
 impl<W> SourceDownloadWorkflow<'_, '_, W>
 where
     W: Write + ?Sized,
 {
-    fn download_nationwide_source_http(&self) -> DownloadResult<PathBuf> {
+    fn download_nationwide_source_http(&self) -> DownloadResult<ReservedDownloadFile> {
         let mut client = http_client::HttpClient::default();
         let opdownload_page = client.get_text(OPINET_HOST, OPDOWNLOAD_PATH, None)?;
         let opinet_key = {
@@ -156,14 +170,13 @@ where
                 "다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: ",
                 preview,
             );
-            return Err(attach_remove_file_error(
-                error_text.into(),
-                &downloaded.path,
-            ));
+            let ReservedDownloadFile { file, path } = downloaded.target;
+            drop(file);
+            return Err(attach_remove_file_error(error_text.into(), &path));
         }
-        Ok(downloaded.path)
+        Ok(downloaded.target)
     }
-    fn refresh_source(&mut self) -> Result<PathBuf> {
+    fn refresh_source(&mut self) -> Result<ReservedDownloadFile> {
         let removed_temp_count = self.remove_stale_auto_source_temp_files()?;
         if removed_temp_count != 0 {
             match writeln!(self.out, "이전 임시 소스 파일 {removed_temp_count}개 정리") {
@@ -270,7 +283,18 @@ where
             )
             .ok_or("다운로드 임시 파일명 작성 실패")?;
             path.push(file_name.as_str());
-            match File::options().write(true).create_new(true).open(&path) {
+            let mut options = File::options();
+            options.read(true).write(true).create_new(true);
+            cfg_select! {
+                windows => {
+                    options.share_mode(0);
+                }
+                any(target_os = "linux", target_os = "macos") => {
+                    options.mode(0o600);
+                }
+                _ => {}
+            }
+            match options.open(&path) {
                 Ok(file) => return Ok(ReservedDownloadFile { file, path }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     path.pop();
