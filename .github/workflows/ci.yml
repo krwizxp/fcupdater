@@ -1,5 +1,6 @@
 name: CI
 on:
+  push:
   pull_request:
   workflow_dispatch:
 permissions:
@@ -15,11 +16,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-26-intel
-          - macos-26
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            artifact_path: artifacts/fcupdater-linux-x64.tar.gz
+            binary_name: fcupdater-linux-x64
+          - os: macos-26-intel
+            artifact_path: artifacts/fcupdater-macos-x64.tar.gz
+            binary_name: fcupdater-macos-x64
+          - os: macos-26
+            artifact_path: artifacts/fcupdater-macos-arm64.tar.gz
+            binary_name: fcupdater-macos-arm64
+          - os: windows-latest
+            artifact_path: target/release/fcupdater-windows-x64.exe
+            binary_name: fcupdater-windows-x64
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         env:
@@ -42,3 +51,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Build Release Binary
         run: cargo build --release --locked
+      - name: Prepare Unix artifact
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p artifacts package
+          cp target/release/fcupdater "package/${{ matrix.binary_name }}"
+          tar -C package -czf "${{ matrix.artifact_path }}" "${{ matrix.binary_name }}"
+      - name: Rename Windows artifact file
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Move-Item target\release\fcupdater.exe target\release\${{ matrix.binary_name }}.exe -Force
+      - name: Upload Binary Artifact
+        if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          path: ${{ matrix.artifact_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

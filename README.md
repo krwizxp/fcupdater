@@ -39,15 +39,13 @@ fcupdater
 - `--version`: 버전 표시
 - `--version --verbose`: target/rustc/git 등 빌드 메타데이터 표시
 ## GitHub Actions
-`.github/workflows/ci.yml`은 Pull Request와 수동 실행에서 `ubuntu-latest`, `macos-26-intel`, `macos-26`, `windows-latest`의 `cargo build --release --locked`만 검증하고 실행 파일을 업로드하지 않습니다.
-
-`.github/workflows/publish.yml`의 `Publish Binaries` 워크플로는 `main` 브랜치 또는 태그에 push된 신뢰된 코드에서만 다음 파일을 직접 Artifact로 업로드합니다.
+`.github/workflows/ci.yml`은 `ubuntu-latest`, `macos-26-intel`, `macos-26`, `windows-latest`에서 `cargo build --release --locked`를 수행합니다. 실행 파일은 Pull Request가 아닌 `main` 브랜치 또는 태그의 신뢰된 실행에서만 다음 파일명으로 직접 Artifact 업로드합니다.
 - Linux: `fcupdater-linux-x64.tar.gz` (내부 실행 파일: `fcupdater-linux-x64`)
 - macOS x64: `fcupdater-macos-x64.tar.gz` (내부 실행 파일: `fcupdater-macos-x64`)
 - macOS arm64: `fcupdater-macos-arm64.tar.gz` (내부 실행 파일: `fcupdater-macos-arm64`)
 - Windows: `fcupdater-windows-x64.exe`
 
-Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어 업로드합니다. Windows는 빌드 결과를 `fcupdater-windows-x64.exe`로 이름만 바꿔 그대로 업로드합니다. 실행 파일은 `Publish Binaries` 워크플로의 `push` 실행에서 생성되었고 ref가 `main` 또는 태그인지 확인한 뒤 사용하세요. Pull Request 실행이나 출처를 확인할 수 없는 산출물은 실행하지 마세요.
+Linux/macOS는 실행 권한 보존을 위해 바이너리를 `tar.gz`로 묶어 업로드합니다. Windows는 빌드 결과를 `fcupdater-windows-x64.exe`로 이름만 바꿔 그대로 업로드합니다. 실행 파일은 `CI` 워크플로의 `main` 또는 태그 push 실행에서 생성되었는지 확인한 뒤 사용하세요. Pull Request 실행이나 출처를 확인할 수 없는 산출물은 실행하지 마세요.
 `.github/workflows/update_master.yml`은 `ubuntu-latest`에서 고정 워크플로를 실행합니다.
 - 마스터: `fuel_cost_chungcheong.xlsx`
 - 직접 업로드 Artifact/파일 이름: `fcupdater-result.xlsx`
