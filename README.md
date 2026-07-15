@@ -39,7 +39,7 @@ fcupdater
 - `--version`: 버전 표시
 - `--version --verbose`: target/rustc/git 등 빌드 메타데이터 표시
 ## GitHub Actions
-`.github/workflows/ci.yml`은 Pull Request를 포함한 모든 CI 실행에서 `ubuntu-latest`, `macos-26-intel`, `macos-26`, `windows-latest`의 `cargo build --release --locked`만 검증하고 실행 파일을 업로드하지 않습니다.
+`.github/workflows/ci.yml`은 Pull Request와 수동 실행에서 `ubuntu-latest`, `macos-26-intel`, `macos-26`, `windows-latest`의 `cargo build --release --locked`만 검증하고 실행 파일을 업로드하지 않습니다.
 
 `.github/workflows/publish.yml`의 `Publish Binaries` 워크플로는 `main` 브랜치 또는 태그에 push된 신뢰된 코드에서만 다음 파일을 직접 Artifact로 업로드합니다.
 - Linux: `fcupdater-linux-x64.tar.gz` (내부 실행 파일: `fcupdater-linux-x64`)
