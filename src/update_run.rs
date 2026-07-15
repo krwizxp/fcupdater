@@ -7,8 +7,8 @@ use crate::{
         AddedStoreRow, ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, StoreRow,
     },
     region::{
-        TARGET_REGION_COUNT, TARGET_REGION_LABELS, increment_target_region_count,
-        normalize_address_key, target_region_index,
+        TARGET_REGION_COUNT, TARGET_REGION_LABELS, TargetRegionPolicy,
+        increment_target_region_count, normalize_address_key, target_region_index,
     },
     source_download::SourceDownload,
     write_line, write_line_best_effort,
@@ -79,6 +79,13 @@ struct SourceFieldCounts {
     gasoline: usize,
     premium: usize,
 }
+#[derive(Default)]
+struct SourceIndexBuilder {
+    field_counts: SourceFieldCounts,
+    map: HashMap<String, SourceRecord>,
+    region_counts: [usize; TARGET_REGION_COUNT],
+    target_record_count: usize,
+}
 struct SummaryRowDisplay<'row> {
     address: &'row str,
     name: &'row str,
@@ -105,12 +112,15 @@ impl SourceSafetyPolicy {
     fn validate_region_counts(
         &self,
         existing_counts: &[usize; TARGET_REGION_COUNT],
+        matched_existing_counts: &[usize; TARGET_REGION_COUNT],
         source_counts: &[usize; TARGET_REGION_COUNT],
     ) -> Result<()> {
-        for ((label, existing_count), source_count) in TARGET_REGION_LABELS
-            .iter()
-            .zip(existing_counts.iter())
-            .zip(source_counts.iter())
+        for (((label, existing_count), matched_existing_count), source_count) in
+            TARGET_REGION_LABELS
+                .iter()
+                .zip(existing_counts.iter())
+                .zip(matched_existing_counts.iter())
+                .zip(source_counts.iter())
         {
             if *source_count == 0 {
                 return Err(err(format!(
@@ -120,15 +130,15 @@ impl SourceSafetyPolicy {
             if *existing_count == 0 {
                 continue;
             }
-            let retained_scaled = source_count
+            let retained_scaled = matched_existing_count
                 .checked_mul(self.min_region_retain_denominator)
-                .ok_or_else(|| err("지역별 소스 건수 감소율 계산 중 overflow가 발생했습니다."))?;
+                .ok_or_else(|| err("지역별 기존 주소 일치율 계산 중 overflow가 발생했습니다."))?;
             let required_scaled = existing_count
                 .checked_mul(self.min_region_retain_numerator)
                 .ok_or_else(|| err("지역별 기존 건수 감소율 계산 중 overflow가 발생했습니다."))?;
             if retained_scaled < required_scaled {
                 return Err(err(format!(
-                    "대상 지역 소스 건수가 기존 마스터 대비 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing_count}건 / 소스 {source_count}건"
+                    "대상 지역의 기존 주소 일치 건수가 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
                 )));
             }
         }
@@ -200,6 +210,62 @@ impl SourceFieldCounts {
         Ok(())
     }
 }
+impl SourceIndexBuilder {
+    fn finish(self) -> Result<(HashMap<String, SourceRecord>, [usize; TARGET_REGION_COUNT])> {
+        if self.target_record_count == 0 {
+            return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
+        }
+        for (label, count) in TARGET_REGION_LABELS.iter().zip(self.region_counts.iter()) {
+            if *count == 0 {
+                return Err(err(format!(
+                    "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {label}"
+                )));
+            }
+        }
+        SOURCE_SAFETY_POLICY
+            .validate_source_field_coverage(self.target_record_count, &self.field_counts)?;
+        Ok((self.map, self.region_counts))
+    }
+    fn insert(&mut self, key: String, mut record: SourceRecord, region_index: usize) -> Result<()> {
+        let canonical_region = TARGET_REGION_LABELS
+            .get(region_index)
+            .copied()
+            .ok_or_else(|| err("소스 대상 지역 index 범위 오류"))?;
+        record.region.clear();
+        record
+            .region
+            .try_reserve_exact(canonical_region.len())
+            .map_err(|source| err_with_source("검증된 소스 지역 메모리 확보 실패", source))?;
+        record.region.push_str(canonical_region);
+        if self.map.len() == self.map.capacity() {
+            self.map
+                .try_reserve(1)
+                .map_err(|source| err_with_source("소스 index 맵 추가 메모리 확보 실패", source))?;
+        }
+        match self.map.entry(key) {
+            Entry::Vacant(vacant_entry) => {
+                let inserted_record = vacant_entry.insert(record);
+                self.target_record_count = self
+                    .target_record_count
+                    .checked_add(1)
+                    .ok_or_else(|| err("대상 지역 소스 레코드 수 계산 실패"))?;
+                increment_target_region_count(
+                    &mut self.region_counts,
+                    region_index,
+                    "소스 지역별 건수",
+                )?;
+                self.field_counts.observe(inserted_record)
+            }
+            Entry::Occupied(occupied_entry) => {
+                let existing = occupied_entry.get();
+                Err(err(format!(
+                    "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
+                    existing.address, existing.name, record.name
+                )))
+            }
+        }
+    }
+}
 pub(super) struct UpdateRun<'out> {
     pub master_path: &'out Path,
     pub out: &'out mut dyn Write,
@@ -220,10 +286,7 @@ impl UpdateRun<'_> {
             .map_or_else(|| source_file.path().display().to_string(), str::to_owned);
         let result =
             (|| -> Result<(HashMap<String, SourceRecord>, [usize; TARGET_REGION_COUNT])> {
-                let mut map: HashMap<String, SourceRecord> = HashMap::new();
-                let mut target_record_count = 0_usize;
-                let mut region_counts = [0_usize; TARGET_REGION_COUNT];
-                let mut field_counts = SourceFieldCounts::default();
+                let mut source_index = SourceIndexBuilder::default();
                 let mut target_region_scratch = String::new();
                 let (source_handle, source_path) =
                     source_file.reader_parts().map_err(|source_err| {
@@ -238,35 +301,10 @@ impl UpdateRun<'_> {
                         borrowed_record.region,
                         borrowed_record.address,
                         &mut target_region_scratch,
+                        TargetRegionPolicy::StrictSource,
                     )? {
-                        target_record_count = target_record_count
-                            .checked_add(1)
-                            .ok_or_else(|| err("대상 지역 소스 레코드 수 계산 실패"))?;
-                        increment_target_region_count(
-                            &mut region_counts,
-                            region_index,
-                            "소스 지역별 건수",
-                        )?;
                         let key = normalize_address_key(borrowed_record.address)?;
-                        let owned_record = borrowed_record.into_owned()?;
-                        field_counts.observe(&owned_record)?;
-                        if map.len() == map.capacity() {
-                            map.try_reserve(1).map_err(|source| {
-                                err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
-                            })?;
-                        }
-                        match map.entry(key) {
-                            Entry::Vacant(vacant_entry) => {
-                                vacant_entry.insert(owned_record);
-                            }
-                            Entry::Occupied(occupied_entry) => {
-                                let existing = occupied_entry.get();
-                                return Err(err(format!(
-                                    "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
-                                    existing.address, existing.name, owned_record.name
-                                )));
-                            }
-                        }
+                        source_index.insert(key, borrowed_record.into_owned()?, region_index)?;
                     }
                     Ok(())
                 })
@@ -277,19 +315,7 @@ impl UpdateRun<'_> {
                     )
                 })?;
                 source_index_result?;
-                if target_record_count == 0 {
-                    return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
-                }
-                for (label, count) in TARGET_REGION_LABELS.iter().zip(region_counts.iter()) {
-                    if *count == 0 {
-                        return Err(err(format!(
-                            "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {label}"
-                        )));
-                    }
-                }
-                SOURCE_SAFETY_POLICY
-                    .validate_source_field_coverage(target_record_count, &field_counts)?;
-                Ok((map, region_counts))
+                source_index.finish()
             })();
         match source_file.remove() {
             Ok(()) => write_line_best_effort(self.out, format_args!("임시 소스 파일 정리 완료")),
@@ -321,10 +347,12 @@ impl UpdateRun<'_> {
         .update(&mut book)?;
         self.print_region_count_summary(
             &master_update.existing_region_counts,
+            &master_update.matched_existing_region_counts,
             &loaded_source.region_counts,
         )?;
         SOURCE_SAFETY_POLICY.validate_region_counts(
             &master_update.existing_region_counts,
+            &master_update.matched_existing_region_counts,
             &loaded_source.region_counts,
         )?;
         SOURCE_SAFETY_POLICY
@@ -349,17 +377,22 @@ impl UpdateRun<'_> {
     fn print_region_count_summary(
         &mut self,
         existing_counts: &[usize; TARGET_REGION_COUNT],
+        matched_existing_counts: &[usize; TARGET_REGION_COUNT],
         source_counts: &[usize; TARGET_REGION_COUNT],
     ) -> Result<()> {
         write_line(self.out, format_args!("대상 지역별 건수 확인:"))?;
-        for ((label, existing_count), source_count) in TARGET_REGION_LABELS
-            .iter()
-            .zip(existing_counts.iter())
-            .zip(source_counts.iter())
+        for (((label, existing_count), matched_existing_count), source_count) in
+            TARGET_REGION_LABELS
+                .iter()
+                .zip(existing_counts.iter())
+                .zip(matched_existing_counts.iter())
+                .zip(source_counts.iter())
         {
             write_line(
                 self.out,
-                format_args!("  {label}: 기존 {existing_count}건 / 소스 {source_count}건"),
+                format_args!(
+                    "  {label}: 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
+                ),
             )?;
         }
         Ok(())

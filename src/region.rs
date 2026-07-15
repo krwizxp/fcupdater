@@ -49,6 +49,11 @@ struct AddressKeyReplacement {
     from: &'static str,
     to: &'static str,
 }
+#[derive(Clone, Copy)]
+pub(super) enum TargetRegionPolicy {
+    Flexible,
+    StrictSource,
+}
 const fn ignored_address_key_char(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
 }
@@ -111,7 +116,48 @@ pub(super) fn target_region_index(
     region: &str,
     address: &str,
     scratch: &mut String,
+    policy: TargetRegionPolicy,
 ) -> Result<Option<usize>> {
+    if matches!(policy, TargetRegionPolicy::StrictSource) {
+        normalize_address_key_into(region, scratch)?;
+        let region_index = TARGET_REGION_KEYS
+            .iter()
+            .position(|key| scratch.as_str() == *key);
+        let mut tokens = address.split_whitespace();
+        let address_index = match tokens.next() {
+            Some("대전") => match tokens.next() {
+                Some("광역시") => tokens.next().and_then(daejeon_district_index),
+                district => district.and_then(daejeon_district_index),
+            },
+            Some("대전광역시") => tokens.next().and_then(daejeon_district_index),
+            Some("세종" | "세종시" | "세종특별자치시") => Some(5),
+            Some("충북" | "충청북도") => (tokens.next() == Some("청주시")).then_some(6),
+            Some("충남" | "충청남도") => match tokens.next() {
+                Some("공주시") => Some(7),
+                Some("보령시") => Some(8),
+                Some("아산시") => Some(9),
+                Some("천안시") => Some(10),
+                Some("천안") if tokens.next() == Some("서북구") => Some(10),
+                Some(_) | None => None,
+            },
+            Some(_) | None => None,
+        };
+        return match (region_index, address_index) {
+            (Some(region_match), Some(address_match)) if region_match == address_match => {
+                Ok(Some(address_match))
+            }
+            (Some(_), Some(_)) => Err(err(format!(
+                "Opinet 소스의 지역 값과 주소가 서로 다른 대상 지역을 가리킵니다: region={region}, address={address}"
+            ))),
+            (Some(_), None) => Err(err(format!(
+                "Opinet 소스의 지역 값은 대상 지역이지만 주소는 대상 지역이 아닙니다: region={region}, address={address}"
+            ))),
+            (None, Some(_)) => Err(err(format!(
+                "Opinet 소스의 주소는 대상 지역이지만 지역 값이 예상 형식과 다릅니다: region={region}, address={address}"
+            ))),
+            (None, None) => Ok(None),
+        };
+    }
     normalize_address_key_into(region, scratch)?;
     if let Some(index) = target_region_index_from_normalized(scratch.as_str()) {
         return Ok(Some(index));
@@ -127,6 +173,11 @@ pub(super) fn target_region_index(
             .position(|district| scratch.starts_with(district)));
     }
     Ok(None)
+}
+fn daejeon_district_index(district: &str) -> Option<usize> {
+    DAEJEON_DISTRICT_KEYS
+        .iter()
+        .position(|candidate| district == *candidate)
 }
 pub(super) fn increment_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],

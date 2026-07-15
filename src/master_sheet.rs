@@ -6,10 +6,10 @@ use crate::{
     diagnostic::{Result, err, err_with_source},
     excel,
     excel::SourceRecord,
-    excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_formula_rows},
+    excel::writer::{Row as StdRow, Workbook as StdWorkbook, col_to_name, remap_formula_rows},
     region::{
-        TARGET_REGION_COUNT, increment_target_region_count, normalize_address_key,
-        target_region_index,
+        TARGET_REGION_COUNT, TargetRegionPolicy, increment_target_region_count,
+        normalize_address_key, target_region_index,
     },
     sheet_util::{add_row_offset, usize_to_u32},
 };
@@ -26,6 +26,10 @@ const CHANGE_REASON_REGION_BIT: usize = 1 << 1;
 const CHANGE_REASON_NAME_BIT: usize = 1 << 2;
 const CHANGE_REASON_BRAND_BIT: usize = 1 << 3;
 const CHANGE_REASON_SELF_YN_BIT: usize = 1 << 4;
+const SMART_DISCOUNT_BRAND_KEYWORD: &str = "현대오일뱅크";
+const SMART_DISCOUNT_DIRECT_KEYWORD: &str = "직영";
+const SMART_DISCOUNT_INPUT_COL: u32 = 2;
+const SMART_DISCOUNT_INPUT_ROW: u32 = 13;
 const CHANGE_REASON_TEXTS: [&str; 32] = [
     "",
     "가격변동",
@@ -100,6 +104,7 @@ pub(super) struct MasterSheetUpdateResult<'source> {
     pub deleted: Vec<StoreRow>,
     pub existing_count: usize,
     pub existing_region_counts: [usize; TARGET_REGION_COUNT],
+    pub matched_existing_region_counts: [usize; TARGET_REGION_COUNT],
 }
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ScaledDecimal(i64);
@@ -316,8 +321,8 @@ struct ParsedMasterRow<'text> {
     diesel: Option<i32>,
     gasoline: Option<i32>,
     identity: ParsedMasterIdentity<'text>,
+    manual_smart_discount: Option<ScaledDecimal>,
     premium: Option<i32>,
-    smart_discount: Option<ScaledDecimal>,
 }
 struct RankRowBase {
     adjusted_prices: AdjustedFuelPrices,
@@ -364,6 +369,7 @@ struct MasterSheetUpdateOutcome<'source> {
     existing_count: usize,
     existing_region_counts: [usize; TARGET_REGION_COUNT],
     filter_target: FilterTarget,
+    matched_existing_region_counts: [usize; TARGET_REGION_COUNT],
 }
 struct NewSourcePlacementPlan<'work, 'sources, 'source> {
     data_start_row: u32,
@@ -388,6 +394,7 @@ struct MasterRowEvaluation<'source> {
     existing_count: usize,
     existing_region_counts: [usize; TARGET_REGION_COUNT],
     kept_source_rows: Vec<KeptSourceRow<'source>>,
+    matched_existing_region_counts: [usize; TARGET_REGION_COUNT],
     matched_source_keys: HashSet<&'source str>,
     old_rows: Vec<u32>,
 }
@@ -512,9 +519,14 @@ impl<'text> ParsedMasterRow<'text> {
         row: u32,
         shared_strings: &'text [String],
     ) -> Result<Self> {
-        let smart_discount = match layout.smart_discount {
-            Some(col) => MasterSheetUpdater::get_f64_at(ws, col, row, shared_strings)?,
-            None => None,
+        let manual_smart_discount = match layout.smart_discount {
+            Some(col)
+                if ws.try_get_formula_at(col, row)?.is_none()
+                    && MasterSheetUpdater::is_exact_zero_at(ws, col, row, shared_strings)? =>
+            {
+                Some(ScaledDecimal::ZERO)
+            }
+            Some(_) | None => None,
         };
         Ok(Self {
             diesel: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
@@ -528,12 +540,12 @@ impl<'text> ParsedMasterRow<'text> {
                 shared_strings,
             )?),
             identity,
+            manual_smart_discount,
             premium: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
                 layout.premium,
                 row,
                 shared_strings,
             )?),
-            smart_discount,
         })
     }
 }
@@ -543,14 +555,14 @@ impl RankRowBase {
         currency_apply: bool,
         sort_context: &RankSortContext,
     ) -> Self {
-        let default_smart_discount = if row.identity.name.contains("현대오일뱅크")
-            && row.identity.name.contains("직영")
+        let default_smart_discount = if row.identity.name.contains(SMART_DISCOUNT_BRAND_KEYWORD)
+            && row.identity.name.contains(SMART_DISCOUNT_DIRECT_KEYWORD)
         {
             sort_context.smart_discount
         } else {
             ScaledDecimal::ZERO
         };
-        let smart_discount = row.smart_discount.unwrap_or(default_smart_discount);
+        let smart_discount = row.manual_smart_discount.unwrap_or(default_smart_discount);
         let adjusted_prices = AdjustedFuelPrices {
             gasoline: MasterSheetUpdater::adjusted_fuel_price(row.gasoline, smart_discount),
             premium: MasterSheetUpdater::adjusted_fuel_price(row.premium, smart_discount),
@@ -800,8 +812,7 @@ impl SourceRowsWriter<'_, '_, '_, '_, '_> {
                 self.layout,
             )?;
             if let Some(col) = self.layout.smart_discount {
-                self.ws
-                    .set_formula_cached_value_at(col, new_row, None, None)?;
+                self.ws.set_i32_at(col, new_row, None)?;
             }
         }
         Ok(())
@@ -1597,7 +1608,47 @@ impl RankSortKeyBuilder<'_, '_, '_> {
     }
 }
 impl RankSortRefresher<'_, '_> {
+    fn normalize_smart_discount_formulas(&mut self) -> Result<()> {
+        let Some(smart_discount_col) = self.layout.smart_discount else {
+            return Ok(());
+        };
+        let name_col = col_to_name(self.layout.name)?;
+        let input_col = col_to_name(SMART_DISCOUNT_INPUT_COL)?;
+        for row in self.data_rows {
+            let canonical_formula = format!(
+                "IF(AND(IFERROR(SEARCH(\"{SMART_DISCOUNT_BRAND_KEYWORD}\",${name_col}{row}),0)>0,IFERROR(SEARCH(\"{SMART_DISCOUNT_DIRECT_KEYWORD}\",${name_col}{row}),0)>0),${input_col}${SMART_DISCOUNT_INPUT_ROW},0)"
+            );
+            let (has_formula, formula_matches) = {
+                let formula = self.ws.try_get_formula_at(smart_discount_col, row)?;
+                (
+                    formula.is_some(),
+                    formula
+                        .as_deref()
+                        .is_some_and(|existing_formula| existing_formula == canonical_formula),
+                )
+            };
+            if formula_matches {
+                continue;
+            }
+            if !has_formula {
+                if MasterSheetUpdater::is_exact_zero_at(
+                    self.ws,
+                    smart_discount_col,
+                    row,
+                    self.shared_strings,
+                )? {
+                    self.ws.set_i32_at(smart_discount_col, row, Some(0_i32))?;
+                    continue;
+                }
+                self.ws.set_i32_at(smart_discount_col, row, None)?;
+            }
+            self.ws
+                .set_formula_at(smart_discount_col, row, &canonical_formula)?;
+        }
+        Ok(())
+    }
     fn refresh(&mut self) -> Result<()> {
+        self.normalize_smart_discount_formulas()?;
         let sort_context =
             MasterSheetUpdater::build_rank_sort_context(self.ws, self.shared_strings)?;
         RankRowsSorter {
@@ -1671,8 +1722,13 @@ impl<'source> MasterSheetUpdater<'source> {
             premium_qty,
             diesel_qty,
             total_qty,
-            smart_discount: Self::get_f64_at(ws, 2, 13, shared_strings)?
-                .unwrap_or(ScaledDecimal::ZERO),
+            smart_discount: Self::get_f64_at(
+                ws,
+                SMART_DISCOUNT_INPUT_COL,
+                SMART_DISCOUNT_INPUT_ROW,
+                shared_strings,
+            )?
+            .unwrap_or(ScaledDecimal::ZERO),
             region_rates,
         })
     }
@@ -1761,8 +1817,7 @@ impl<'source> MasterSheetUpdater<'source> {
         layout: MasterSheetLayout,
     ) -> Result<MasterRowEvaluation<'source>> {
         let row_count = ws.row_count();
-        let mut old_rows: Vec<u32> = Vec::new();
-        reserve_row_vec(&mut old_rows, row_count, "마스터 데이터 행 목록")?;
+        let mut old_rows = reserved_row_vec(row_count, "마스터 데이터 행 목록")?;
         let mut matched_source_keys: HashSet<&str> = HashSet::new();
         matched_source_keys
             .try_reserve(row_count)
@@ -1782,15 +1837,12 @@ impl<'source> MasterSheetUpdater<'source> {
                 )
             })?;
         let mut master_address_rows = MasterAddressRows(master_address_map);
-        let mut kept_source_rows: Vec<KeptSourceRow<'source>> = Vec::new();
-        reserve_row_vec(&mut kept_source_rows, row_count, "유지 행 목록")?;
-        let mut changes: Vec<ChangeRow<'source>> = Vec::new();
-        reserve_row_vec(&mut changes, row_count, "변경 행 목록")?;
-        let mut deleted: Vec<StoreRow> = Vec::new();
-        reserve_row_vec(&mut deleted, row_count, "삭제 행 목록")?;
-        let mut deleted_rows: Vec<u32> = Vec::new();
-        reserve_row_vec(&mut deleted_rows, row_count, "삭제 행 번호 목록")?;
+        let mut kept_source_rows = reserved_row_vec(row_count, "유지 행 목록")?;
+        let mut changes = reserved_row_vec(row_count, "변경 행 목록")?;
+        let mut deleted = reserved_row_vec(row_count, "삭제 행 목록")?;
+        let mut deleted_rows = reserved_row_vec(row_count, "삭제 행 번호 목록")?;
         let mut existing_region_counts = [0_usize; TARGET_REGION_COUNT];
+        let mut matched_existing_region_counts = [0_usize; TARGET_REGION_COUNT];
         let mut existing_count = 0_usize;
         let mut target_region_scratch = String::new();
         for old_row in ws.row_numbers_from(data_start_row) {
@@ -1801,17 +1853,17 @@ impl<'source> MasterSheetUpdater<'source> {
             existing_count = existing_count
                 .checked_add(1)
                 .ok_or_else(|| err("기존 마스터 업체 수 계산 중 overflow가 발생했습니다."))?;
-            if let Some(region_index) = target_region_index(
+            let existing_region_index = target_region_index(
                 identity.region.as_ref(),
                 identity.address.as_ref(),
                 &mut target_region_scratch,
-            )? {
-                increment_target_region_count(
-                    &mut existing_region_counts,
-                    region_index,
-                    "마스터 지역별 건수",
-                )?;
-            }
+                TargetRegionPolicy::Flexible,
+            )?;
+            increment_optional_target_region_count(
+                &mut existing_region_counts,
+                existing_region_index,
+                "마스터 지역별 건수",
+            )?;
             old_rows.push(old_row);
             let MasterRowDecision {
                 src,
@@ -1838,6 +1890,11 @@ impl<'source> MasterSheetUpdater<'source> {
             }
             if let Some(key) = matched_key {
                 matched_source_keys.insert(key);
+                increment_optional_target_region_count(
+                    &mut matched_existing_region_counts,
+                    existing_region_index,
+                    "마스터 지역별 기존 주소 일치 건수",
+                )?;
             }
             if let Some(row_change) = change {
                 changes.push(row_change);
@@ -1854,6 +1911,7 @@ impl<'source> MasterSheetUpdater<'source> {
             existing_count,
             existing_region_counts,
             kept_source_rows,
+            matched_existing_region_counts,
             matched_source_keys,
             old_rows,
         })
@@ -1944,6 +2002,30 @@ impl<'source> MasterSheetUpdater<'source> {
         };
         Ok(combined.checked_mul(sign).map(ScaledDecimal))
     }
+    fn is_exact_zero_at(
+        ws: &excel::writer::Worksheet,
+        col: u32,
+        row: u32,
+        shared_strings: &[String],
+    ) -> Result<bool> {
+        let display = ws.try_get_display_at(col, row, shared_strings)?;
+        let trimmed = display.trim();
+        let digits = trimmed
+            .strip_prefix('+')
+            .or_else(|| trimmed.strip_prefix('-'))
+            .unwrap_or(trimmed);
+        let mut has_digit = false;
+        let mut has_decimal_point = false;
+        for byte in digits.bytes() {
+            match byte {
+                b'0' => has_digit = true,
+                b',' => {}
+                b'.' if !has_decimal_point => has_decimal_point = true,
+                _ => return Ok(false),
+            }
+        }
+        Ok(has_digit)
+    }
     fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
         value.filter(|price| *price > 0_i32)
     }
@@ -1979,6 +2061,7 @@ impl<'source> MasterSheetUpdater<'source> {
                     existing_count: evaluation.existing_count,
                     existing_region_counts: evaluation.existing_region_counts,
                     filter_target,
+                    matched_existing_region_counts: evaluation.matched_existing_region_counts,
                 })
             })?
         else {
@@ -1996,6 +2079,7 @@ impl<'source> MasterSheetUpdater<'source> {
             deleted: outcome.deleted,
             existing_count: outcome.existing_count,
             existing_region_counts: outcome.existing_region_counts,
+            matched_existing_region_counts: outcome.matched_existing_region_counts,
         })
     }
     fn write_master_row_from_source(
@@ -2030,13 +2114,25 @@ fn row_range_len(rows: RowRange, context: &'static str) -> Result<usize> {
     usize::try_from(row_count)
         .map_err(|source| err_with_source(format!("{context} 변환 실패"), source))
 }
-fn reserve_row_vec<T>(rows: &mut Vec<T>, row_count: usize, label: &str) -> Result<()> {
+fn increment_optional_target_region_count(
+    counts: &mut [usize; TARGET_REGION_COUNT],
+    region_index: Option<usize>,
+    context: &'static str,
+) -> Result<()> {
+    if let Some(index) = region_index {
+        increment_target_region_count(counts, index, context)?;
+    }
+    Ok(())
+}
+fn reserved_row_vec<T>(row_count: usize, label: &str) -> Result<Vec<T>> {
+    let mut rows = Vec::new();
     rows.try_reserve_exact(row_count).map_err(|source| {
         err_with_source(
             format!("{label} 메모리 확보 실패: {row_count} rows"),
             source,
         )
-    })
+    })?;
+    Ok(rows)
 }
 fn mapped_contiguous_row(
     row_mapping: &[Option<u32>],

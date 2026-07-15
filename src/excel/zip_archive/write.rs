@@ -3,7 +3,7 @@ use super::{
     CENTRAL_DIRECTORY_SIGNATURE, DOS_DATE_1980_01_01, END_OF_CENTRAL_DIRECTORY_LEN,
     END_OF_CENTRAL_DIRECTORY_SIGNATURE, GENERAL_PURPOSE_UTF8_FLAG, LOCAL_FILE_HEADER_LEN,
     LOCAL_FILE_HEADER_SIGNATURE, METHOD_DEFLATE, METHOD_STORE, PendingFile, VERSION_NEEDED,
-    ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, collect_files, crc32, deflate,
+    ZIP_MAX_ARCHIVE_BYTES, ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, collect_files, crc32, deflate,
 };
 use crate::diagnostic::{
     Result, err, err_with_source, path_context_message, path_pair_context_message,
@@ -76,13 +76,6 @@ impl ZipArchiveBuilder<'_> {
     }
 }
 impl StreamingZipWriter<'_> {
-    fn add_bytes_written(&self, len: usize, context: &str) -> Result<u64> {
-        let len_u64 = u64::try_from(len)
-            .map_err(|source| err_with_source("ZIP written byte count 변환 실패", source))?;
-        self.bytes_written
-            .checked_add(len_u64)
-            .ok_or_else(|| err(format!("{context} 중 overflow가 발생했습니다.")))
-    }
     fn append_central_directory(&mut self) -> Result<()> {
         let central_dir_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 offset 변환 실패", source))?;
@@ -108,6 +101,11 @@ impl StreamingZipWriter<'_> {
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
         let entry_count_u16 = u16::try_from(entries.len())
             .map_err(|source| err_with_source("ZIP entry 수 변환 실패", source))?;
+        let central_output_size = central_dir_plan
+            .size
+            .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
+            .ok_or_else(|| err("ZIP 중앙 디렉터리 전체 크기 계산 중 overflow가 발생했습니다."))?;
+        self.ensure_output_limit(central_output_size, "ZIP 중앙 디렉터리 출력 크기 계산")?;
         self.prepare_header_buffer(
             central_dir_plan.max_header_capacity,
             "ZIP 중앙 header 메모리 확보 실패",
@@ -144,13 +142,11 @@ impl StreamingZipWriter<'_> {
         let deflate_plan = if uncompressed_size == 0 || store_without_deflate {
             None
         } else {
-            Some(
-                (deflate::DeflateWriter {
-                    bytes: &self.part_buffer,
-                    workspace: &mut self.deflate_workspace,
-                })
-                .plan()?,
-            )
+            (deflate::DeflateWriter {
+                bytes: &self.part_buffer,
+                workspace: &mut self.deflate_workspace,
+            })
+            .plan()?
         };
         let use_deflate = deflate_plan
             .as_ref()
@@ -168,6 +164,10 @@ impl StreamingZipWriter<'_> {
         let local_header_capacity = LOCAL_FILE_HEADER_LEN
             .checked_add(file.name.len())
             .ok_or_else(|| err("ZIP local header 크기 계산 중 overflow가 발생했습니다."))?;
+        let entry_output_size = local_header_capacity
+            .checked_add(compressed_size)
+            .ok_or_else(|| err("ZIP entry 출력 크기 계산 중 overflow가 발생했습니다."))?;
+        self.ensure_output_limit(entry_output_size, "ZIP entry 출력 크기 계산")?;
         self.prepare_header_buffer(local_header_capacity, "ZIP local header 메모리 확보 실패")?;
         write_file_header(
             &mut self.header_buffer,
@@ -184,23 +184,25 @@ impl StreamingZipWriter<'_> {
             let plan = deflate_plan
                 .as_ref()
                 .ok_or_else(|| err("ZIP deflate 계획 상태가 손상되었습니다."))?;
+            let next_bytes_written =
+                self.ensure_output_limit(compressed_size, "ZIP deflated byte count 계산")?;
             let actual_written = plan.write_to(&mut self.file)?;
             if actual_written != compressed_size {
                 return Err(err(format!(
                     "ZIP deflate 출력 크기가 계획과 다릅니다: expected={compressed_size}, actual={actual_written}"
                 )));
             }
-            self.bytes_written =
-                self.add_bytes_written(actual_written, "ZIP deflated byte count 계산")?;
+            self.bytes_written = next_bytes_written;
         } else {
+            let next_bytes_written =
+                self.ensure_output_limit(compressed_size, "ZIP stored byte count 계산")?;
             IoWrite::write_all(&mut self.file, &self.part_buffer).map_err(|source_err| {
                 err_with_source(
                     path_context_message("xlsx 압축 파일 데이터 쓰기 실패", self.archive_path),
                     source_err,
                 )
             })?;
-            self.bytes_written =
-                self.add_bytes_written(compressed_size, "ZIP stored byte count 계산")?;
+            self.bytes_written = next_bytes_written;
         }
         if let Some(plan) = deflate_plan {
             self.deflate_workspace.recycle(plan);
@@ -214,6 +216,23 @@ impl StreamingZipWriter<'_> {
             uncompressed_size,
         });
         Ok(())
+    }
+    fn ensure_output_limit(&self, len: usize, context: &str) -> Result<u64> {
+        let len_u64 = u64::try_from(len)
+            .map_err(|source| err_with_source("ZIP written byte count 변환 실패", source))?;
+        let next = self
+            .bytes_written
+            .checked_add(len_u64)
+            .ok_or_else(|| err(format!("{context} 중 overflow가 발생했습니다.")))?;
+        let limit = u64::try_from(ZIP_MAX_ARCHIVE_BYTES)
+            .map_err(|source| err_with_source("ZIP 출력 한도 변환 실패", source))?;
+        if next > limit {
+            return Err(err(format!(
+                "xlsx 압축 출력 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과합니다: {}",
+                self.archive_path.display()
+            )));
+        }
+        Ok(next)
     }
     fn prepare_header_buffer(&mut self, capacity: usize, context: &'static str) -> Result<()> {
         self.header_buffer.clear();
@@ -323,11 +342,12 @@ impl StreamingZipWriter<'_> {
         })
     }
     fn write_header_buffer(&mut self, context: &str) -> Result<()> {
+        let next_bytes_written =
+            self.ensure_output_limit(self.header_buffer.len(), "ZIP written byte count 계산")?;
         IoWrite::write_all(&mut self.file, &self.header_buffer).map_err(|source_err| {
             err_with_source(path_context_message(context, self.archive_path), source_err)
         })?;
-        self.bytes_written =
-            self.add_bytes_written(self.header_buffer.len(), "ZIP written byte count 계산")?;
+        self.bytes_written = next_bytes_written;
         Ok(())
     }
 }
