@@ -823,10 +823,14 @@ impl RankSortRefresher<'_, '_> {
         };
         let name_col = col_to_name(self.layout.name)?;
         let input_col = col_to_name(SMART_DISCOUNT_INPUT_COL)?;
+        let mut canonical_formula = String::new();
         for row in self.data_rows {
-            let canonical_formula = format!(
+            canonical_formula.clear();
+            write!(
+                &mut canonical_formula,
                 "IF(AND(IFERROR(SEARCH(\"{SMART_DISCOUNT_BRAND_KEYWORD}\",${name_col}{row}),0)>0,IFERROR(SEARCH(\"{SMART_DISCOUNT_DIRECT_KEYWORD}\",${name_col}{row}),0)>0),${input_col}${SMART_DISCOUNT_INPUT_ROW},0)"
-            );
+            )
+            .map_err(|source| err_with_source("스마트주유 할인 수식 작성 실패", source))?;
             let has_formula = {
                 let formula = self.ws.try_get_formula_at(smart_discount_col, row)?;
                 if formula.as_deref() == Some(canonical_formula.as_str()) {
