@@ -1635,9 +1635,11 @@ impl Worksheet {
             Some(value_type) => set_attr(&mut cell.attrs, "t", value_type),
             None => remove_attr(&mut cell.attrs, "t"),
         }
-        let Some(inner) = cell.inner_xml.as_mut() else {
-            return Ok(());
-        };
+        let inner = cell.inner_xml.as_mut().ok_or_else(|| {
+            err(format!(
+                "수식 cache 대상 cell이 비어 있습니다: row={row}, col={col}"
+            ))
+        })?;
         let encoded = value
             .map(|raw_value| {
                 try_xml_escape_text(

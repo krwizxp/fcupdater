@@ -156,8 +156,11 @@ where
                 _ => {}
             }
             options.open(path).map(|file| TemporarySourceFile {
-                file: Some(file),
-                path: path.to_path_buf(),
+                file,
+                path_cleanup: super::TempFileCleanup {
+                    path: path.to_path_buf(),
+                    remove_on_drop: true,
+                },
             })
         })
         .map_err(|source| {

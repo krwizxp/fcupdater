@@ -1,6 +1,6 @@
 use super::{
-    DownloadError, DownloadResult, HttpHeader, HttpHeaderKind, HttpResponse, HttpStreamResponse,
-    NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, OPINET_HOST, PlatformHttpClient,
+    DownloadResult, HttpHeader, HttpHeaderKind, HttpResponse, HttpStreamResponse, NETFUNNEL_HOST,
+    NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID, OPINET_HOST, PlatformHttpClient,
     TemporarySourceFile, USER_AGENT, download_error_with_source, push_decimal_fragment,
 };
 use crate::diagnostic::prefixed_message;
@@ -370,10 +370,7 @@ impl HttpClient {
             Self::encode_form_body_into(&mut body, form)?;
             let headers = Self::post_headers(referer, profile)?;
             let mut target = reserve_target()?;
-            let target_file = target
-                .file
-                .as_mut()
-                .ok_or_else(|| DownloadError::from("다운로드 임시 파일 상태가 손상되었습니다."))?;
+            let target_file = &mut target.file;
             let response = match self.request_to_writer(
                 HttpMethod::Post(body.as_bytes()),
                 host,

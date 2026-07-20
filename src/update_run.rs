@@ -123,10 +123,7 @@ impl UpdateRun<'_> {
             (|| -> Result<(HashMap<String, SourceRecord>, [usize; TARGET_REGION_COUNT])> {
                 let mut source_index = SourceIndexBuilder::default();
                 let mut target_region_scratch = String::new();
-                let (source_handle, source_path) =
-                    source_file.reader_parts().map_err(|source_err| {
-                        err_with_source("다운로드 소스 파일 상태 손상", source_err)
-                    })?;
+                let (source_handle, source_path) = source_file.reader_parts();
                 let source_index_result = SourceReader {
                     file: source_handle,
                     path: source_path,
@@ -156,10 +153,7 @@ impl UpdateRun<'_> {
             Ok(()) => write_line_best_effort(self.out, format_args!("임시 소스 파일 정리 완료")),
             Err(source_err) => write_line_best_effort(
                 self.out,
-                format_args!(
-                    "경고: 임시 소스 파일 정리 실패: {} ({source_err})",
-                    source_file.path().display()
-                ),
+                format_args!("경고: 임시 소스 파일 정리 실패: {source_name} ({source_err})"),
             ),
         }
         let (index, region_counts) = result?;

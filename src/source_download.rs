@@ -56,8 +56,12 @@ pub(super) struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
     pub out: &'out mut W,
 }
 pub(super) struct TemporarySourceFile {
-    file: Option<File>,
+    file: File,
+    path_cleanup: TempFileCleanup,
+}
+struct TempFileCleanup {
     path: PathBuf,
+    remove_on_drop: bool,
 }
 #[derive(Debug)]
 struct StreamedBodySummary {
@@ -90,36 +94,41 @@ struct StreamingBodySink<'writer> {
 }
 impl TemporarySourceFile {
     pub(super) fn path(&self) -> &Path {
-        &self.path
+        &self.path_cleanup.path
     }
-    pub(super) fn reader_parts(&mut self) -> io::Result<(&mut File, &Path)> {
-        let Some(file) = self.file.as_mut() else {
-            return Err(io::Error::other("다운로드 임시 파일 핸들이 닫혀 있습니다."));
-        };
-        Ok((file, &self.path))
+    pub(super) fn reader_parts(&mut self) -> (&mut File, &Path) {
+        (&mut self.file, &self.path_cleanup.path)
     }
-    pub(super) fn remove(&mut self) -> io::Result<()> {
-        drop(self.file.take());
+    pub(super) fn remove(self) -> io::Result<()> {
+        let Self {
+            file,
+            mut path_cleanup,
+        } = self;
+        drop(file);
+        path_cleanup.remove()
+    }
+    fn remove_after_error(self, mut error: DownloadError) -> DownloadError {
+        let path = self.path().display().to_string();
+        if let Err(remove_error) = self.remove() {
+            let cleanup_text = format!("다운로드 임시 파일 삭제 실패: {path} ({remove_error})");
+            error.update_message(|message| format!("{message}; {cleanup_text}"));
+        }
+        error
+    }
+}
+impl TempFileCleanup {
+    fn remove(&mut self) -> io::Result<()> {
+        self.remove_on_drop = false;
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(source) => Err(source),
         }
     }
-    fn remove_after_error(mut self, mut error: DownloadError) -> DownloadError {
-        if let Err(remove_error) = self.remove() {
-            let cleanup_text = format!(
-                "다운로드 임시 파일 삭제 실패: {} ({remove_error})",
-                self.path.display()
-            );
-            error.update_message(|message| format!("{message}; {cleanup_text}"));
-        }
-        error
-    }
 }
-impl Drop for TemporarySourceFile {
+impl Drop for TempFileCleanup {
     fn drop(&mut self) {
-        if self.file.is_some()
+        if self.remove_on_drop
             && let Err(source) = self.remove()
         {
             let mut error_output = io::stderr().lock();
