@@ -48,9 +48,10 @@ fn required_arg(args: &mut impl Iterator<Item = OsString>) -> io::Result<OsStrin
         .ok_or_else(|| invalid_input("source, destination, entry name arguments are required"))
 }
 fn octal_field<const WIDTH: usize>(value: u64) -> io::Result<[u8; WIDTH]> {
-    let digit_count = WIDTH
-        .checked_sub(1)
-        .ok_or_else(|| invalid_input("tar octal field width is zero"))?;
+    let digit_count = const {
+        assert!(WIDTH > 0, "tar octal field width must be positive");
+        WIDTH - 1
+    };
     let text = format!("{value:0digit_count$o}\0");
     if text.len() != WIDTH {
         return Err(invalid_input("tar octal value exceeds its header field"));
@@ -107,9 +108,6 @@ fn main() -> io::Result<()> {
             .map(|byte| u64::from(*byte))
             .sum::<u64>();
         let checksum_text = format!("{checksum:06o}\0 ");
-        if checksum_text.len() != 8 {
-            return Err(invalid_input("tar checksum exceeds its header field"));
-        }
         for (slot, byte) in header.checksum.iter_mut().zip(checksum_text.bytes()) {
             *slot = byte;
         }
