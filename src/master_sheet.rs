@@ -5,8 +5,8 @@ use crate::{
     excel::SourceRecord,
     excel::writer::{Row as StdRow, Workbook as StdWorkbook, col_to_name, remap_formula_rows},
     region::{
-        TARGET_REGION_COUNT, TargetRegion, TargetRegionPolicy, increment_target_region_count,
-        normalize_address_key, target_region,
+        TARGET_REGION_COUNT, TARGET_REGIONS, TargetRegion, TargetRegionPolicy,
+        increment_target_region_count, normalize_address_key, target_region,
     },
     sheet_util::{add_row_offset, usize_to_u32},
 };
@@ -157,9 +157,19 @@ struct RankSortContext {
     diesel_qty: ScaledDecimal,
     gasoline_qty: ScaledDecimal,
     premium_qty: ScaledDecimal,
-    region_rates: HashMap<String, ScaledDecimal>,
+    region_rates: [(TargetRegion, Option<ScaledDecimal>); TARGET_REGION_COUNT],
     smart_discount: ScaledDecimal,
     total_qty: Option<ScaledDecimal>,
+}
+impl RankSortContext {
+    fn region_rate(&self, label: &str) -> Option<ScaledDecimal> {
+        for &(region, rate) in &self.region_rates {
+            if region.label() == label {
+                return rate;
+            }
+        }
+        None
+    }
 }
 struct RankSortKey {
     address: String,
@@ -322,9 +332,7 @@ impl RankRowBase {
         };
         let region_rate = if currency_apply {
             sort_context
-                .region_rates
-                .get(row.identity.region.as_ref())
-                .copied()
+                .region_rate(row.identity.region.as_ref())
                 .ok_or_else(|| {
                     err(format!(
                         "지역화폐 적용 대상 행의 적용률을 찾지 못했습니다: 지역={}",
@@ -1064,10 +1072,7 @@ impl<'source> MasterSheetUpdater<'source> {
         let premium_qty =
             Self::get_f64_at(ws, 2, 5, shared_strings)?.unwrap_or(ScaledDecimal::ZERO);
         let diesel_qty = Self::get_f64_at(ws, 2, 6, shared_strings)?.unwrap_or(ScaledDecimal::ZERO);
-        let mut region_rates = HashMap::new();
-        region_rates.try_reserve(10).map_err(|source| {
-            err_with_source("지역 보정률 맵 메모리 확보 실패: 10 regions", source)
-        })?;
+        let mut region_rates = TARGET_REGIONS.map(|region| (region, None));
         for row in 4..=13 {
             let region_display = ws.try_get_display_at(3, row, shared_strings)?;
             let region = region_display.trim();
@@ -1075,7 +1080,12 @@ impl<'source> MasterSheetUpdater<'source> {
                 continue;
             }
             if let Some(rate) = Self::get_f64_at(ws, 4, row, shared_strings)? {
-                region_rates.insert(region.to_owned(), rate);
+                for &mut (target, ref mut slot) in &mut region_rates {
+                    if target.label() == region {
+                        *slot = Some(rate);
+                        break;
+                    }
+                }
             }
         }
         let total_qty = Self::get_f64_at(ws, 2, 10, shared_strings)?
