@@ -6,9 +6,54 @@ use super::{
 };
 use core::{array::from_fn, cmp::Ordering, iter::repeat_n, mem, range::Range};
 use std::io::Write as IoWrite;
+#[cfg(target_arch = "x86_64")]
+macro_rules! matching_prefix_16 {
+    ($left:expr, $right:expr) => {{
+        use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_movemask_epi8};
+        // SAFETY: The caller keeps the complete 16-byte candidate range inside the input slice.
+        let left_bytes = unsafe { $left.cast::<[u8; SIMD_MATCH_BYTES]>().read_unaligned() };
+        // SAFETY: __m128i and the byte array have the same size, and every bit pattern is valid for both types.
+        let left_vector = unsafe { core::mem::transmute::<[u8; SIMD_MATCH_BYTES], __m128i>(left_bytes) };
+        // SAFETY: The caller keeps the complete 16-byte current range inside the input slice.
+        let right_bytes = unsafe { $right.cast::<[u8; SIMD_MATCH_BYTES]>().read_unaligned() };
+        // SAFETY: __m128i and the byte array have the same size, and every bit pattern is valid for both types.
+        let right_vector = unsafe { core::mem::transmute::<[u8; SIMD_MATCH_BYTES], __m128i>(right_bytes) };
+        // SAFETY: SSE2 is part of the x86-64 baseline, and both operands are complete vectors.
+        let equal = unsafe { _mm_cmpeq_epi8(left_vector, right_vector) };
+        // SAFETY: SSE2 is part of the x86-64 baseline, and equal is a complete vector.
+        let mismatch_mask = !unsafe { _mm_movemask_epi8(equal) } & 0xffff_i32;
+        let [prefix, ..] = mismatch_mask.trailing_zeros().to_le_bytes();
+        usize::from(prefix).min(SIMD_MATCH_BYTES)
+    }};
+}
+#[cfg(target_arch = "aarch64")]
+macro_rules! matching_prefix_16 {
+    ($left:expr, $right:expr) => {{
+        use core::arch::aarch64::{vceqq_u8, vld1q_u8, vminvq_u8, vst1q_u8};
+        // SAFETY: The caller keeps the complete unaligned 16-byte candidate range inside the input slice.
+        let left_vector = unsafe { vld1q_u8($left) };
+        // SAFETY: The caller keeps the complete unaligned 16-byte current range inside the input slice.
+        let right_vector = unsafe { vld1q_u8($right) };
+        // SAFETY: Advanced SIMD is part of the AArch64 baseline, and both operands are complete vectors.
+        let equal = unsafe { vceqq_u8(left_vector, right_vector) };
+        // SAFETY: Advanced SIMD is part of the AArch64 baseline, and equal is a complete vector.
+        if unsafe { vminvq_u8(equal) } == u8::MAX {
+            SIMD_MATCH_BYTES
+        } else {
+            let mut lanes = [0_u8; SIMD_MATCH_BYTES];
+            // SAFETY: lanes owns exactly 16 writable bytes required by the NEON store.
+            unsafe { vst1q_u8(lanes.as_mut_ptr(), equal); }
+            lanes
+                .iter()
+                .position(|lane| *lane == 0)
+                .unwrap_or(SIMD_MATCH_BYTES)
+        }
+    }};
+}
 const TOO_FAR_MATCH_DISTANCE: usize = 4096;
 const DEFLATE_SEARCH_WORK_LIMIT: usize = 512 * 1024 * 1024;
 const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
+const SIMD_MATCH_BYTES: usize = 16;
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 const XML_NICE_MATCH_LEN: usize = 128;
 const XLSX_XML_NEEDLES: [&[u8]; 7] = [
@@ -396,14 +441,8 @@ impl Huffman {
             let Some(code_bucket) = codes.get_mut(len_index) else {
                 return Err(zip_static("deflate Huffman code bucket 범위 오류"));
             };
-            let mut assigned_code = assigned;
-            let mut reversed = 0_u16;
-            for _ in 0_u8..len {
-                reversed = (reversed << 1_u8) | (assigned_code & 1_u16);
-                assigned_code >>= 1_u8;
-            }
             code_bucket.push(HuffmanCode {
-                code: reversed,
+                code: reverse_low_bits(assigned, len),
                 symbol: symbol_u16,
             });
         }
@@ -450,7 +489,7 @@ impl WriteHuffman {
             let Some(code_slot) = codes.get_mut(symbol) else {
                 return Err(zip_static("deflate 출력 Huffman symbol 범위 오류"));
             };
-            *code_slot = reverse_bits(*next_slot, len);
+            *code_slot = reverse_low_bits(*next_slot, len);
             *next_slot = next_slot.saturating_add(1);
         }
         Ok(Self { codes, lengths })
@@ -1055,7 +1094,7 @@ impl<O: BitOutput> FixedTokenWriter<'_, O> {
             return Err(zip_static("deflate distance 범위 오류"));
         };
         self.writer
-            .write_bits(reverse_bits(distance_code.symbol, 5), 5)?;
+            .write_bits(reverse_low_bits(distance_code.symbol, 5), 5)?;
         if distance_code.extra_bits > 0 {
             self.writer
                 .write_bits(distance_code.extra, distance_code.extra_bits)?;
@@ -1094,7 +1133,7 @@ impl<O: BitOutput> FixedTokenWriter<'_, O> {
             _ => return Err(zip_static("deflate fixed symbol 범위 오류")),
         };
         self.writer.write_bits(
-            reverse_bits(encoded.code, encoded.bit_count),
+            reverse_low_bits(encoded.code, encoded.bit_count),
             encoded.bit_count,
         )
     }
@@ -1462,17 +1501,34 @@ impl DeflateWriter<'_, '_> {
                 return DeflateMatchSearch::BudgetExhausted;
             }
             let mut len = 0_usize;
-            while len < max_len {
+            let mut mismatch_found = false;
+            while max_len.saturating_sub(len) >= SIMD_MATCH_BYTES
+                && work_budget.remaining >= SIMD_MATCH_BYTES
+            {
+                let left_offset = candidate.saturating_add(len);
+                let right_offset = position.saturating_add(len);
+                let left = bytes.as_ptr().wrapping_add(left_offset);
+                let right = bytes.as_ptr().wrapping_add(right_offset);
+                let prefix = matching_prefix_16!(left, right);
+                let compared = if prefix < SIMD_MATCH_BYTES {
+                    prefix.saturating_add(1)
+                } else {
+                    SIMD_MATCH_BYTES
+                };
+                work_budget.remaining = work_budget.remaining.saturating_sub(compared);
+                len = len.saturating_add(prefix);
+                if prefix < SIMD_MATCH_BYTES {
+                    mismatch_found = true;
+                    break;
+                }
+            }
+            while !mismatch_found && len < max_len {
                 if !work_budget.consume() {
                     return DeflateMatchSearch::BudgetExhausted;
                 }
-                let Some(&left) = bytes.get(candidate.saturating_add(len)) else {
-                    break;
-                };
-                let Some(&right) = bytes.get(position.saturating_add(len)) else {
-                    break;
-                };
-                if left != right {
+                if bytes.get(candidate.saturating_add(len))
+                    != bytes.get(position.saturating_add(len))
+                {
                     break;
                 }
                 len = len.saturating_add(1);
@@ -1727,11 +1783,8 @@ fn push_repeated(lengths: &mut Vec<u8>, value: u8, repeat: usize, total: usize) 
     lengths.extend(repeat_n(value, repeat));
     Ok(())
 }
-fn reverse_bits(mut value: u16, count: u8) -> u16 {
-    let mut out = 0_u16;
-    for _ in 0_u8..count {
-        out = (out << 1_u8) | (value & 1_u16);
-        value >>= 1_u8;
-    }
-    out
+fn reverse_low_bits(value: u16, count: u8) -> u16 {
+    value
+        .reverse_bits()
+        .unbounded_shr(u16::BITS.saturating_sub(u32::from(count)))
 }

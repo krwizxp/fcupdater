@@ -1,32 +1,27 @@
 use super::path_util::reject_windows_special_component;
 use super::{
-    ArchiveFingerprint, ArchiveRead, ArchiveReadMode, SPREADSHEETML_NAMESPACE, SaveVerification,
-    SheetInfo, ZipArchiveBuilder, ZipArchiveExtractor,
+    ArchiveFingerprint, SPREADSHEETML_NAMESPACE, SaveVerification, SheetInfo, ZipArchiveBuilder,
+    ZipArchiveExtractor,
     path_util::path_to_slashes,
+    writer::parse_ref_with_locks,
     xml::{
         XmlAttrScanner, XmlScanner, XmlTag, decode_xml_entities, extract_all_tag_text,
         extract_attr, extract_first_tag_text, find_end_tag, find_start_tag, find_tag_end,
     },
-    zip_archive::read_open_archive,
+    zip_archive::scan_open_archive,
 };
 use crate::diagnostic::{
     AppError, Result, err, err_with_source, path_context_message, path_pair_context_message,
-    prefixed_message,
 };
-use crate::file_security::{apply_no_follow, validate_regular_file};
-use crate::temp_entry::{
-    STALE_TEMP_ENTRY_AGE, TEMP_ENTRY_NAME_CAPACITY, TEMP_ENTRY_RESERVATION_ATTEMPTS,
-    temp_entry_age_nanos, write_temp_entry_name,
-};
+use crate::temp_entry::{TempEntryKind, cleanup_stale_temp_entries, reserve_unique_temp_entry};
+use crate::validate_regular_file;
 use alloc::borrow::Cow;
-use core::{iter, num::NonZeroU32, range::Range, str, time::Duration};
+use core::{iter, num::NonZeroU32, range::Range, str};
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry as HashEntry},
     env, fs,
     io::{self, Read as _, Write as _, stderr},
     path::{Component, Path, PathBuf},
-    process, thread,
-    time::{SystemTime, UNIX_EPOCH},
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
@@ -35,8 +30,6 @@ cfg_select! {
     _ => {}
 }
 mod atomic_replace;
-const TEMP_ARCHIVE_PROMOTION_ATTEMPTS: u32 = 5;
-const TEMP_ARCHIVE_PROMOTION_RETRY_DELAY: Duration = Duration::from_millis(50);
 const WORK_DIR_PREFIX: &str = "fcupdater_";
 const MAX_XLSX_TEXT_PART_BYTES: u64 = 64 * 1024 * 1024;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
@@ -60,55 +53,83 @@ const WORKSHEET_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
 #[derive(Debug)]
 pub(crate) struct XlsxContainer {
+    _work_dir: WorkDirCleanup,
     source_fingerprint: ArchiveFingerprint,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     source_permissions: fs::Permissions,
     unpack_dir: PathBuf,
-    work_dir: PathBuf,
 }
 #[derive(Debug)]
 struct WorkDirCleanup {
-    path: Option<PathBuf>,
+    path: PathBuf,
 }
 struct ReservedTempArchive {
     file: Option<fs::File>,
-    path: Option<PathBuf>,
-}
-impl WorkDirCleanup {
-    fn into_path(mut self) -> Result<PathBuf> {
-        self.path
-            .take()
-            .ok_or_else(|| err("임시 작업 폴더 cleanup 상태가 손상되었습니다."))
-    }
-    fn path(&self) -> Result<&Path> {
-        self.path
-            .as_deref()
-            .ok_or_else(|| err("임시 작업 폴더 cleanup 상태가 손상되었습니다."))
-    }
+    path: PathBuf,
+    remove_on_drop: bool,
 }
 impl Drop for WorkDirCleanup {
     fn drop(&mut self) {
-        if let Some(path) = self.path.as_deref() {
-            match fs::remove_dir_all(path) {
-                Ok(()) | Err(_) => {}
-            }
+        if let Err(source) = fs::remove_dir_all(&self.path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            write_path_warning("xlsx 작업 폴더 정리 실패", &self.path, &source);
         }
     }
 }
 impl ReservedTempArchive {
-    fn close_file(&mut self) {
-        self.file = None;
+    const fn disable_drop_cleanup(&mut self) {
+        self.remove_on_drop = false;
     }
-    fn disable_drop_cleanup(&mut self) {
-        self.path = None;
+    fn path(&self) -> &Path {
+        &self.path
     }
-    fn path(&self) -> Result<&Path> {
-        self.path
-            .as_deref()
-            .ok_or_else(|| err("xlsx 임시 저장 파일 cleanup 상태가 손상되었습니다."))
-    }
-    const fn take_cleanup_path(&mut self) -> Option<PathBuf> {
-        self.path.take()
+    fn verify_saved_archive(&self) -> Result<()> {
+        let saved_archive = self.path();
+        let saved_container = XlsxContainer::open(saved_archive).map_err(|source_err| {
+            err_with_source(
+                path_context_message(
+                    "저장 검증 실패: 저장 직후 압축 해제 점검에 실패했습니다",
+                    saved_archive,
+                ),
+                source_err,
+            )
+        })?;
+        let workbook_xml = saved_container
+            .read_text("xl/workbook.xml")
+            .map_err(|source_err| {
+                err_with_source(
+                    path_context_message("저장 검증 실패: workbook.xml 읽기 실패", saved_archive),
+                    source_err,
+                )
+            })?;
+        let master_auto_filter_ref = ArchiveSemanticVerifier {
+            container: &saved_container,
+            workbook_xml: &workbook_xml,
+        }
+        .verify()?;
+        let saved_workbook =
+            super::writer::Workbook::from_container(saved_container).map_err(|source_err| {
+                err_with_source(
+                    path_context_message(
+                        "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
+                        saved_archive,
+                    ),
+                    source_err,
+                )
+            })?;
+        let normalized = ArchiveSemanticVerifier::normalize_filter_ref(
+            &master_auto_filter_ref,
+            &FilterRefPolicy::AnyA1,
+        )?;
+        let (start_ref, end_ref) = normalized.split_once(':').map_or(
+            (normalized.as_str(), normalized.as_str()),
+            |(start, end)| (start, end),
+        );
+        let header_row = saved_archive_trailing_row_num(start_ref)?;
+        let filter_end_row = saved_archive_trailing_row_num(end_ref)?;
+        saved_workbook.verify_sheet_address_data_end_row("유류비", header_row, filter_end_row)?;
+        Ok(())
     }
     fn write_archive_from(
         &mut self,
@@ -119,7 +140,7 @@ impl ReservedTempArchive {
             return Err(err("xlsx 임시 저장 파일 handle이 이미 닫혔습니다."));
         };
         ZipArchiveBuilder {
-            archive_path: self.path()?,
+            archive_path: self.path(),
             file,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             permissions,
@@ -130,25 +151,18 @@ impl ReservedTempArchive {
 }
 impl Drop for ReservedTempArchive {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            drop(file);
-        }
-        if let Some(path) = self.path.take() {
-            match fs::remove_file(path) {
-                Ok(()) | Err(_) => {}
-            }
+        drop(self.file.take());
+        if self.remove_on_drop
+            && let Err(source) = fs::remove_file(&self.path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            write_path_warning("xlsx 임시 저장 파일 정리 실패", &self.path, &source);
         }
     }
-}
-struct SavedArchiveVerifier<'path> {
-    saved_archive: &'path Path,
 }
 struct ArchiveSemanticVerifier<'container> {
     container: &'container XlsxContainer,
     workbook_xml: &'container str,
-}
-struct ArchiveSemanticSummary {
-    master_auto_filter_ref: String,
 }
 struct CellPosition {
     col: u32,
@@ -162,20 +176,10 @@ enum FilterRefPolicy {
     AnyA1,
     RequireAbsolute,
 }
-#[derive(Clone, Copy)]
-enum StaleTempEntryKind {
-    Directory,
-    File,
-}
 struct SharedStringsSummary {
     declared_total: Option<usize>,
     declared_unique: Option<usize>,
-    present: bool,
     unique_entries: usize,
-}
-struct WorksheetSemanticSummary {
-    master_auto_filter_ref: Option<String>,
-    shared_ref_count: usize,
 }
 struct WorksheetNamespaceElement<'xml> {
     local_name: &'xml str,
@@ -191,26 +195,11 @@ struct WorkbookRelationship<'xml> {
     target_mode: Option<Cow<'xml, str>>,
     type_: Cow<'xml, str>,
 }
-struct WorkbookRelationships<'xml>(HashMap<Cow<'xml, str>, WorkbookRelationship<'xml>>);
-struct WorkbookSheetCatalog(Vec<SheetInfo>);
-struct WorkbookSheetCatalogSource<'workbook, 'relationships, 'rels> {
-    relationships: &'relationships WorkbookRelationships<'rels>,
-    workbook_xml: &'workbook str,
-}
-#[repr(transparent)]
-struct InternalWorksheetTarget<'xml>(&'xml str);
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-struct RelationshipId<'xml>(&'xml str);
 impl WorkbookRelationship<'_> {
-    fn internal_worksheet_target(
-        &self,
-        rid: RelationshipId<'_>,
-    ) -> Result<InternalWorksheetTarget<'_>> {
+    fn internal_worksheet_target(&self, rid: &str) -> Result<&str> {
         if self.type_.as_ref() != WORKSHEET_REL_TYPE {
             return Err(err(format!(
-                "workbook.xml sheet 관계 Type이 worksheet가 아닙니다: rid={}, type={}",
-                rid.0,
+                "workbook.xml sheet 관계 Type이 worksheet가 아닙니다: rid={rid}, type={}",
                 self.type_.as_ref()
             )));
         }
@@ -220,27 +209,23 @@ impl WorkbookRelationship<'_> {
             .is_some_and(|mode| mode.as_ref() != "Internal")
         {
             return Err(err(format!(
-                "workbook.xml sheet 관계 TargetMode는 External일 수 없습니다: rid={}",
-                rid.0
+                "workbook.xml sheet 관계 TargetMode는 External일 수 없습니다: rid={rid}"
             )));
         }
         if self.target.is_empty() {
             return Err(err(format!(
-                "workbook.xml sheet 관계 Target이 비어 있습니다: rid={}",
-                rid.0
+                "workbook.xml sheet 관계 Target이 비어 있습니다: rid={rid}"
             )));
         }
         let target = self.target.as_ref();
         if target.contains('\\') {
             return Err(err(format!(
-                "workbook.xml sheet 관계 Target에는 백슬래시를 사용할 수 없습니다: rid={}, target={target}",
-                rid.0
+                "workbook.xml sheet 관계 Target에는 백슬래시를 사용할 수 없습니다: rid={rid}, target={target}"
             )));
         }
         if target.bytes().any(|byte| matches!(byte, b'?' | b'#')) {
             return Err(err(format!(
-                "workbook.xml sheet 관계 Target에는 query/fragment를 사용할 수 없습니다: rid={}, target={target}",
-                rid.0
+                "workbook.xml sheet 관계 Target에는 query/fragment를 사용할 수 없습니다: rid={rid}, target={target}"
             )));
         }
         if target
@@ -249,233 +234,10 @@ impl WorkbookRelationship<'_> {
             .is_some_and(|segment| segment.contains(':'))
         {
             return Err(err(format!(
-                "workbook.xml sheet 관계 Target에는 URI scheme을 사용할 수 없습니다: rid={}, target={target}",
-                rid.0
+                "workbook.xml sheet 관계 Target에는 URI scheme을 사용할 수 없습니다: rid={rid}, target={target}"
             )));
         }
-        Ok(InternalWorksheetTarget(target))
-    }
-}
-impl<'xml> TryFrom<&'xml str> for WorkbookRelationships<'xml> {
-    type Error = AppError;
-    fn try_from(rels_xml: &'xml str) -> Result<Self> {
-        let mut relationships: HashMap<Cow<'_, str>, WorkbookRelationship<'_>> = HashMap::new();
-        let mut cursor = 0_usize;
-        while let Some(start) = find_start_tag(rels_xml, "Relationship", cursor) {
-            let end = find_tag_end(rels_xml, start)
-                .ok_or_else(|| err("workbook Relationship 시작 태그가 손상되었습니다."))?;
-            let tag = rels_xml
-                .get(start..=end)
-                .ok_or_else(|| err("workbook Relationship 태그 범위가 손상되었습니다."))?;
-            let id = extract_attr(tag, "Id")?
-                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Id 속성이 없습니다."))?;
-            let target = extract_attr(tag, "Target")?
-                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Target 속성이 없습니다."))?;
-            let type_ = extract_attr(tag, "Type")?
-                .ok_or_else(|| err("workbook.xml.rels의 Relationship에 Type 속성이 없습니다."))?;
-            let relationship = WorkbookRelationship {
-                target,
-                target_mode: extract_attr(tag, "TargetMode")?,
-                type_,
-            };
-            if relationships.len() == relationships.capacity() {
-                relationships.try_reserve(1).map_err(|source| {
-                    err_with_source("workbook 관계 맵 추가 메모리 확보 실패", source)
-                })?;
-            }
-            let HashEntry::Vacant(entry) = relationships.entry(id) else {
-                return Err(err("workbook.xml.rels에 중복 Relationship Id가 있습니다."));
-            };
-            entry.insert(relationship);
-            cursor = end
-                .checked_add(1)
-                .ok_or_else(|| err("다음 workbook Relationship 위치 계산에 실패했습니다."))?;
-        }
-        Ok(Self(relationships))
-    }
-}
-impl<'workbook, 'relationships, 'rels>
-    TryFrom<WorkbookSheetCatalogSource<'workbook, 'relationships, 'rels>> for WorkbookSheetCatalog
-{
-    type Error = AppError;
-    fn try_from(
-        source: WorkbookSheetCatalogSource<'workbook, 'relationships, 'rels>,
-    ) -> Result<Self> {
-        let workbook_xml = source.workbook_xml;
-        let mut workbook_scanner = XmlScanner::new(workbook_xml);
-        let workbook_tag = workbook_scanner
-            .next_start_named("workbook")
-            .ok_or_else(|| err("workbook.xml의 workbook 시작 태그를 찾지 못했습니다."))?;
-        let workbook_open_tag = workbook_tag.raw();
-        let sheets_tag = workbook_scanner
-            .next_start_named("sheets")
-            .ok_or_else(|| err("workbook.xml의 sheets 시작 태그를 찾지 못했습니다."))?;
-        let namespace_ancestors = [workbook_open_tag, sheets_tag.raw()];
-        let mut sheets = Vec::new();
-        let mut cursor = 0_usize;
-        while let Some(start) = find_start_tag(workbook_xml, "sheet", cursor) {
-            let end = find_tag_end(workbook_xml, start)
-                .ok_or_else(|| err("workbook.xml의 sheet 시작 태그가 손상되었습니다."))?;
-            let tag = workbook_xml
-                .get(start..=end)
-                .ok_or_else(|| err("workbook.xml의 sheet 태그 범위가 손상되었습니다."))?;
-            let name = extract_attr(tag, "name")?
-                .ok_or_else(|| err("workbook.xml의 sheet에 name 속성이 없습니다."))?;
-            let mut relationship_id = None;
-            let mut attributes = XmlAttrScanner::new(tag)?;
-            while let Some((attr_name, attr_value)) = attributes.next()? {
-                let Some((prefix, local_name)) = attr_name.split_once(':') else {
-                    continue;
-                };
-                if prefix.is_empty() || local_name != "id" {
-                    continue;
-                }
-                let mut binding = None;
-                for declaration_tag in
-                    iter::once(tag).chain(namespace_ancestors.iter().rev().copied())
-                {
-                    let mut declarations = XmlAttrScanner::new(declaration_tag)?;
-                    while let Some((declaration_name, value)) = declarations.next()? {
-                        if declaration_name.strip_prefix("xmlns:") == Some(prefix) {
-                            binding = Some(value);
-                            break;
-                        }
-                    }
-                    if binding.is_some() {
-                        break;
-                    }
-                }
-                if binding.as_deref() == Some(OFFICE_DOCUMENT_REL_NAMESPACE)
-                    && relationship_id.replace(attr_value).is_some()
-                {
-                    return Err(err(
-                        "workbook.xml의 sheet에 중복 officeDocument relationship id 속성이 있습니다.",
-                    ));
-                }
-            }
-            let rid = relationship_id.ok_or_else(|| {
-                err("workbook.xml의 sheet에 officeDocument relationship id 속성이 없습니다.")
-            })?;
-            let relationship = source.relationships.0.get(rid.as_ref()).ok_or_else(|| {
-                err(format!(
-                    "workbook.xml.rels에서 sheet 관계 target을 찾지 못했습니다: {}",
-                    rid.as_ref()
-                ))
-            })?;
-            let target = relationship.internal_worksheet_target(RelationshipId(rid.as_ref()))?;
-            let target_text = target.0;
-            if target_text.starts_with('/') {
-                return Err(err(format!(
-                    "sheet 관계 target에 절대 경로는 허용되지 않습니다: {target_text}"
-                )));
-            }
-            let mut combined: PathBuf = "xl".into();
-            for segment in target_text.split('/').filter(|segment| !segment.is_empty()) {
-                combined.push(segment);
-            }
-            let normalized = normalize_safe_relative_path(&combined, target_text)?;
-            let resolved = path_to_slashes(&normalized, target_text)?;
-            if resolved.is_empty() {
-                return Err(err(format!(
-                    "sheet 관계 target 정규화 결과가 비어 있습니다: {target_text}"
-                )));
-            }
-            if sheets.len() == sheets.capacity() {
-                sheets.try_reserve(1).map_err(|reserve_error| {
-                    err_with_source("시트 순서 목록 추가 메모리 확보 실패", reserve_error)
-                })?;
-            }
-            sheets.push(SheetInfo {
-                name: name.into_owned(),
-                path: resolved,
-            });
-            cursor = end
-                .checked_add(1)
-                .ok_or_else(|| err("workbook.xml의 다음 sheet 위치 계산에 실패했습니다."))?;
-        }
-        if sheets.is_empty() {
-            return Err(err("workbook에서 시트 정보를 찾지 못했습니다."));
-        }
-        Ok(Self(sheets))
-    }
-}
-impl SavedArchiveVerifier<'_> {
-    fn trailing_row_num(cell_ref: &str) -> Result<u32> {
-        let mut row = 0_u64;
-        let mut place = 1_u64;
-        let mut saw_digit = false;
-        for byte in cell_ref.bytes().rev() {
-            if !byte.is_ascii_digit() {
-                break;
-            }
-            saw_digit = true;
-            let digit = u64::from(byte.wrapping_sub(b'0'));
-            let contribution = digit
-                .checked_mul(place)
-                .ok_or_else(|| err("저장 검증 실패: filter row 번호 해석 실패"))?;
-            row = row
-                .checked_add(contribution)
-                .ok_or_else(|| err("저장 검증 실패: filter row 번호 해석 실패"))?;
-            place = place
-                .checked_mul(10)
-                .ok_or_else(|| err("저장 검증 실패: filter row 번호 해석 실패"))?;
-        }
-        if !saw_digit {
-            return Err(err(format!(
-                "저장 검증 실패: filter cell reference에 row 번호가 없습니다: {cell_ref}"
-            )));
-        }
-        u32::try_from(row)
-            .map_err(|source| err_with_source("저장 검증 실패: filter row 번호 해석 실패", source))
-    }
-    fn verify(&self) -> Result<()> {
-        let container = XlsxContainer::open(self.saved_archive).map_err(|source_err| {
-            err_with_source(
-                path_context_message(
-                    "저장 검증 실패: 저장 직후 압축 해제 점검에 실패했습니다",
-                    self.saved_archive,
-                ),
-                source_err,
-            )
-        })?;
-        let workbook_xml = container
-            .read_text("xl/workbook.xml")
-            .map_err(|source_err| {
-                err_with_source(
-                    path_context_message(
-                        "저장 검증 실패: workbook.xml 읽기 실패",
-                        self.saved_archive,
-                    ),
-                    source_err,
-                )
-            })?;
-        let summary = ArchiveSemanticVerifier {
-            container: &container,
-            workbook_xml: &workbook_xml,
-        }
-        .verify()?;
-        let workbook =
-            super::writer::Workbook::from_container(container).map_err(|source_err| {
-                err_with_source(
-                    path_context_message(
-                        "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
-                        self.saved_archive,
-                    ),
-                    source_err,
-                )
-            })?;
-        let normalized = ArchiveSemanticVerifier::normalize_filter_ref(
-            &summary.master_auto_filter_ref,
-            &FilterRefPolicy::AnyA1,
-        )?;
-        let (start_ref, end_ref) = normalized.split_once(':').map_or(
-            (normalized.as_str(), normalized.as_str()),
-            |(start, end)| (start, end),
-        );
-        let header_row = Self::trailing_row_num(start_ref)?;
-        let filter_end_row = Self::trailing_row_num(end_ref)?;
-        workbook.verify_sheet_address_data_end_row("유류비", header_row, filter_end_row)?;
-        Ok(())
+        Ok(target)
     }
 }
 impl ArchiveSemanticVerifier<'_> {
@@ -507,35 +269,27 @@ impl ArchiveSemanticVerifier<'_> {
             .checked_add(1)
             .ok_or_else(|| err("저장 검증 실패: cell cursor 계산 실패"))
     }
-    fn filter_database_ref(&self, sheets: &[SheetInfo]) -> Result<String> {
+    fn filter_database_ref(&self, sheets: &[SheetInfo]) -> Result<Cow<'_, str>> {
         let master_sheet_index = super::workbook_sheet_index_by_name(self.workbook_xml, "유류비")?;
         if sheets.iter().filter(|sheet| sheet.name == "유류비").count() != 1 {
             return Err(err(
                 "저장 검증 실패: workbook에 유류비 시트가 중복되어 있습니다.",
             ));
         }
-        let mut quoted_sheet = String::new();
-        quoted_sheet
-            .try_reserve_exact("'유류비'!".len())
-            .map_err(|source| {
-                err_with_source("저장 검증 실패: sheet 이름 메모리 확보 실패", source)
-            })?;
-        quoted_sheet.push('\'');
-        quoted_sheet.push_str("유류비");
-        quoted_sheet.push_str("'!");
+        let quoted_sheet = "'유류비'!";
         let plain_sheet = "유류비!";
         let span = super::workbook_defined_name_content_span(
             self.workbook_xml,
             "_xlnm._FilterDatabase",
             master_sheet_index,
-            &quoted_sheet,
+            quoted_sheet,
             plain_sheet,
         )?;
         let raw_ref = self
             .workbook_xml
             .get(span)
             .ok_or_else(|| err("저장 검증 실패: definedName 본문 범위가 손상되었습니다."))?;
-        Ok(decode_xml_entities(raw_ref)?.into_owned())
+        decode_xml_entities(raw_ref)
     }
     fn normalize_filter_ref(ref_text: &str, policy: &FilterRefPolicy) -> Result<String> {
         let range_text = ref_text
@@ -604,38 +358,14 @@ impl ArchiveSemanticVerifier<'_> {
     fn optional_usize_attr(tag: &str, attr_name: &str, context: &str) -> Result<Option<usize>> {
         extract_attr(tag, attr_name)?
             .map(|value| {
-                if value.is_empty() {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                     return Err(err(format!(
                         "{context}: {attr_name}가 음이 아닌 10진수 형식이 아닙니다."
                     )));
                 }
-                let mut parsed = 0_usize;
-                let mut overflowed = false;
-                for byte in value.bytes() {
-                    if !byte.is_ascii_digit() {
-                        return Err(err(format!(
-                            "{context}: {attr_name}가 음이 아닌 10진수 형식이 아닙니다."
-                        )));
-                    }
-                    if overflowed {
-                        continue;
-                    }
-                    let digit_raw = byte.wrapping_sub(b'0');
-                    let Some(next) = parsed
-                        .checked_mul(10)
-                        .and_then(|scaled| scaled.checked_add(usize::from(digit_raw)))
-                    else {
-                        overflowed = true;
-                        continue;
-                    };
-                    parsed = next;
-                }
-                if overflowed {
-                    return value.parse::<usize>().map_err(|source| {
-                        err_with_source(format!("{context}: {attr_name} 해석 실패"), source)
-                    });
-                }
-                Ok(parsed)
+                value.parse::<usize>().map_err(|source| {
+                    err_with_source(format!("{context}: {attr_name} 해석 실패"), source)
+                })
             })
             .transpose()
     }
@@ -653,117 +383,26 @@ impl ArchiveSemanticVerifier<'_> {
         Ok(CellBounds { max, min })
     }
     fn parse_cell_position(cell_ref: &str, context: &str) -> Result<CellPosition> {
-        let bytes = cell_ref.as_bytes();
-        let mut cursor = 0_usize;
-        if bytes.get(cursor) == Some(&b'$') {
-            cursor = cursor
-                .checked_add(1)
-                .ok_or_else(|| err(format!("{context}: cell reference cursor 계산 실패")))?;
-        }
-        let mut col = 0_u32;
-        let mut saw_col = false;
-        while let Some(&byte) = bytes.get(cursor) {
-            let upper = byte.to_ascii_uppercase();
-            if !upper.is_ascii_uppercase() {
-                break;
-            }
-            let digit = upper
-                .checked_sub(b'A')
-                .and_then(|value| value.checked_add(1))
-                .map(u32::from)
-                .ok_or_else(|| err(format!("{context}: column 계산에 실패했습니다.")))?;
-            col = col
-                .checked_mul(26)
-                .and_then(|value| value.checked_add(digit))
-                .ok_or_else(|| {
-                    err(format!(
-                        "{context}: column 계산 중 overflow가 발생했습니다."
-                    ))
-                })?;
-            saw_col = true;
-            cursor = cursor
-                .checked_add(1)
-                .ok_or_else(|| err(format!("{context}: column cursor 계산 실패")))?;
-        }
-        if !saw_col {
-            return Err(err(format!(
-                "{context}: cell reference에 column이 없습니다."
-            )));
-        }
-        if bytes.get(cursor) == Some(&b'$') {
-            cursor = cursor
-                .checked_add(1)
-                .ok_or_else(|| err(format!("{context}: row cursor 계산 실패")))?;
-        }
-        let row_text = cell_ref
-            .get(cursor..)
-            .ok_or_else(|| err(format!("{context}: row 범위가 손상되었습니다.")))?;
-        let mut row = 0_u32;
-        let mut saw_row = false;
-        for byte in row_text.bytes() {
-            if !byte.is_ascii_digit() {
-                return Err(err(format!(
-                    "{context}: cell reference에 row 번호가 없습니다."
-                )));
-            }
-            saw_row = true;
-            let digit = u32::from(byte.wrapping_sub(b'0'));
-            row = row
-                .checked_mul(10)
-                .and_then(|value| value.checked_add(digit))
-                .ok_or_else(|| err(format!("{context}: row 번호 해석 실패")))?;
-        }
-        if !saw_row {
-            return Err(err(format!(
-                "{context}: cell reference에 row 번호가 없습니다."
-            )));
-        }
-        if row == 0 || col == 0 {
-            return Err(err(format!(
-                "{context}: cell reference는 1 이상이어야 합니다."
-            )));
-        }
-        Ok(CellPosition { col, row })
+        let reference = parse_ref_with_locks(cell_ref)
+            .ok_or_else(|| err(format!("{context}: 유효한 A1 cell reference가 아닙니다.")))?;
+        Ok(CellPosition {
+            col: reference.col,
+            row: reference.row,
+        })
     }
     fn parse_positive_u32(text: &str, context: &'static str) -> Result<u32> {
-        if text.is_empty() {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(err(format!("{context}: 양의 10진수 형식이 아닙니다.")));
         }
-        let mut parsed = 0_u32;
-        let mut overflowed = false;
-        for byte in text.bytes() {
-            if !byte.is_ascii_digit() {
-                return Err(err(format!("{context}: 양의 10진수 형식이 아닙니다.")));
-            }
-            if overflowed {
-                continue;
-            }
-            let digit_raw = byte.wrapping_sub(b'0');
-            let Some(next) = parsed
-                .checked_mul(10)
-                .and_then(|value| value.checked_add(u32::from(digit_raw)))
-            else {
-                overflowed = true;
-                continue;
-            };
-            parsed = next;
-        }
-        if overflowed {
-            parsed = text
-                .parse::<u32>()
-                .map_err(|source| err_with_source(context, source))?;
-        }
+        let parsed = text
+            .parse::<u32>()
+            .map_err(|source| err_with_source(context, source))?;
         let Some(non_zero) = NonZeroU32::new(parsed) else {
             return Err(err(format!("{context}는 1 이상이어야 합니다.")));
         };
         Ok(non_zero.get())
     }
-    fn shared_string_index_format_error(sheet_name: &str, cell_ref: &str) -> AppError {
-        err(format!(
-            "저장 검증 실패: shared string index가 음이 아닌 정수가 아닙니다: {sheet_name}!{cell_ref}"
-        ))
-    }
-    fn shared_strings_summary(&self) -> Result<SharedStringsSummary> {
+    fn shared_strings_summary(&self) -> Result<Option<SharedStringsSummary>> {
         let shared_strings_path = self
             .container
             .resolve_relative_path("xl/sharedStrings.xml")?;
@@ -773,12 +412,7 @@ impl ArchiveSemanticVerifier<'_> {
                 source_err,
             )
         })? {
-            return Ok(SharedStringsSummary {
-                declared_total: None,
-                declared_unique: None,
-                present: false,
-                unique_entries: 0,
-            });
+            return Ok(None);
         }
         let shared_xml = self.container.read_text("xl/sharedStrings.xml")?;
         let sst_start = find_start_tag(&shared_xml, "sst", 0)
@@ -825,22 +459,22 @@ impl ArchiveSemanticVerifier<'_> {
                     .ok_or_else(|| err("저장 검증 실패: sharedStrings <si> cursor 계산 실패"))?
             };
         }
-        Ok(SharedStringsSummary {
+        Ok(Some(SharedStringsSummary {
             declared_total,
             declared_unique,
-            present: true,
             unique_entries,
-        })
+        }))
     }
-    fn verify(&self) -> Result<ArchiveSemanticSummary> {
+    fn verify(&self) -> Result<String> {
         let sheets = self.container.load_sheet_catalog(self.workbook_xml)?;
         let shared_summary = self.shared_strings_summary()?;
         let shared_entry_count = shared_summary
-            .present
-            .then_some(shared_summary.unique_entries);
-        let worksheet_summary = self.worksheet_summary(&sheets, shared_entry_count)?;
+            .as_ref()
+            .map(|summary| summary.unique_entries);
+        let (master_auto_filter_ref, shared_ref_count) =
+            self.worksheet_summary(&sheets, shared_entry_count)?;
         let filter_database_ref = self.filter_database_ref(&sheets)?;
-        let Some(auto_filter_ref) = worksheet_summary.master_auto_filter_ref else {
+        let Some(auto_filter_ref) = master_auto_filter_ref else {
             return Err(err(
                 "저장 검증 실패: _FilterDatabase definedName이 있지만 autoFilter가 없습니다.",
             ));
@@ -854,30 +488,29 @@ impl ArchiveSemanticVerifier<'_> {
                 "저장 검증 실패: autoFilter 범위와 _FilterDatabase 범위가 다릅니다: autoFilter={auto_filter_ref}, definedName={filter_database_ref}"
             )));
         }
-        if worksheet_summary.shared_ref_count > 0 && !shared_summary.present {
+        if shared_ref_count > 0 && shared_summary.is_none() {
             return Err(err(
                 "저장 검증 실패: shared string 참조가 있지만 sharedStrings.xml이 없습니다.",
             ));
         }
-        if let Some(declared_count) = shared_summary.declared_total
-            && declared_count != worksheet_summary.shared_ref_count
-        {
-            return Err(err(format!(
-                "저장 검증 실패: sharedStrings count가 실제 참조 수와 다릅니다: declared={declared_count}, actual={}",
-                worksheet_summary.shared_ref_count
-            )));
+        if let Some(summary) = shared_summary {
+            if let Some(declared_count) = summary.declared_total
+                && declared_count != shared_ref_count
+            {
+                return Err(err(format!(
+                    "저장 검증 실패: sharedStrings count가 실제 참조 수와 다릅니다: declared={declared_count}, actual={shared_ref_count}"
+                )));
+            }
+            if let Some(declared_unique) = summary.declared_unique
+                && declared_unique != summary.unique_entries
+            {
+                return Err(err(format!(
+                    "저장 검증 실패: sharedStrings uniqueCount가 실제 <si> 수와 다릅니다: declared={declared_unique}, actual={}",
+                    summary.unique_entries
+                )));
+            }
         }
-        if let Some(declared_unique) = shared_summary.declared_unique
-            && declared_unique != shared_summary.unique_entries
-        {
-            return Err(err(format!(
-                "저장 검증 실패: sharedStrings uniqueCount가 실제 <si> 수와 다릅니다: declared={declared_unique}, actual={}",
-                shared_summary.unique_entries
-            )));
-        }
-        Ok(ArchiveSemanticSummary {
-            master_auto_filter_ref: auto_filter_ref,
-        })
+        Ok(auto_filter_ref)
     }
     fn worksheet_bounds_and_shared_refs(
         sheet_xml: &str,
@@ -943,28 +576,17 @@ impl ArchiveSemanticVerifier<'_> {
                 };
                 let decoded_index = decode_xml_entities(raw_index)?;
                 let trimmed_index = decoded_index.trim();
-                let mut index = 0_usize;
-                let mut saw_index_digit = false;
-                for byte in trimmed_index.bytes() {
-                    if !byte.is_ascii_digit() {
-                        return Err(Self::shared_string_index_format_error(
-                            sheet_name,
-                            cell_ref.as_ref(),
-                        ));
-                    }
-                    saw_index_digit = true;
-                    let digit = usize::from(byte.wrapping_sub(b'0'));
-                    index = index
-                        .checked_mul(10)
-                        .and_then(|value| value.checked_add(digit))
-                        .ok_or_else(|| err("저장 검증 실패: shared string index 해석 실패"))?;
+                if trimmed_index.is_empty()
+                    || !trimmed_index.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(err(format!(
+                        "저장 검증 실패: shared string index가 음이 아닌 정수가 아닙니다: {sheet_name}!{}",
+                        cell_ref.as_ref()
+                    )));
                 }
-                if !saw_index_digit {
-                    return Err(Self::shared_string_index_format_error(
-                        sheet_name,
-                        cell_ref.as_ref(),
-                    ));
-                }
+                let index = trimmed_index.parse::<usize>().map_err(|source| {
+                    err_with_source("저장 검증 실패: shared string index 해석 실패", source)
+                })?;
                 if index >= shared_count {
                     return Err(err(format!(
                         "저장 검증 실패: shared string index가 범위를 벗어났습니다: {sheet_name}!{} index={index}, uniqueCount={shared_count}",
@@ -1337,7 +959,7 @@ impl ArchiveSemanticVerifier<'_> {
         &self,
         sheets: &[SheetInfo],
         shared_entry_count: Option<usize>,
-    ) -> Result<WorksheetSemanticSummary> {
+    ) -> Result<(Option<String>, usize)> {
         let mut shared_ref_count = 0_usize;
         let mut master_auto_filter_ref = None;
         for sheet in sheets {
@@ -1382,10 +1004,7 @@ impl ArchiveSemanticVerifier<'_> {
                 .checked_add(count)
                 .ok_or_else(|| err("저장 검증 실패: shared string 참조 수 계산 실패"))?;
         }
-        Ok(WorksheetSemanticSummary {
-            master_auto_filter_ref,
-            shared_ref_count,
-        })
+        Ok((master_auto_filter_ref, shared_ref_count))
     }
 }
 struct TempArchivePromotion<'path> {
@@ -1399,7 +1018,7 @@ impl TempArchivePromotion<'_> {
         &self,
         displaced_file: atomic_replace::DisplacedFile,
     ) -> Result<()> {
-        let captured_original = self.displaced_path(displaced_file)?;
+        let captured_original = self.displaced_path(displaced_file);
         fs::remove_file(captured_original).map_err(|source| {
             err_with_source(
                 path_context_message("교체된 원본 xlsx 정리 실패", captured_original),
@@ -1407,7 +1026,7 @@ impl TempArchivePromotion<'_> {
             )
         })?;
         if matches!(displaced_file, atomic_replace::DisplacedFile::Replacement) {
-            let backup_archive_path = self.backup_archive.path()?;
+            let backup_archive_path = self.backup_archive.path();
             fs::remove_file(backup_archive_path).map_err(|source| {
                 err_with_source(
                     path_context_message("xlsx 교체 예약 파일 정리 실패", backup_archive_path),
@@ -1417,7 +1036,7 @@ impl TempArchivePromotion<'_> {
         }
         Ok(())
     }
-    fn displaced_path(&self, displaced: atomic_replace::DisplacedFile) -> Result<&Path> {
+    fn displaced_path(&self, displaced: atomic_replace::DisplacedFile) -> &Path {
         match displaced {
             #[cfg(target_os = "windows")]
             atomic_replace::DisplacedFile::Backup => self.backup_archive.path(),
@@ -1432,47 +1051,27 @@ impl TempArchivePromotion<'_> {
         let message = format!(
             "{context}; 자동 복구 실패 후 수동 복구를 위해 현재 경로 상태를 보존했습니다: target={}, replacement={}, backup={}",
             self.target_xlsx.display(),
-            self.temp_archive.path()?.display(),
-            self.backup_archive.path()?.display(),
+            self.temp_archive.path().display(),
+            self.backup_archive.path().display(),
         );
         self.temp_archive.disable_drop_cleanup();
         self.backup_archive.disable_drop_cleanup();
         Err(err_with_source(message, source))
     }
     fn promote(&mut self) -> Result<()> {
-        let replace_result = {
-            let temp_archive = self.temp_archive.path()?;
-            let backup_archive = self.backup_archive.path()?;
-            let mut result = atomic_replace::replace_files(
-                self.target_xlsx,
-                temp_archive,
-                backup_archive,
-                false,
-            );
-            for _ in 1..TEMP_ARCHIVE_PROMOTION_ATTEMPTS {
-                if !matches!(
-                    &result,
-                    Err(atomic_replace::ReplaceFilesError::Retryable(_))
-                ) {
-                    break;
-                }
-                thread::sleep(TEMP_ARCHIVE_PROMOTION_RETRY_DELAY);
-                result = atomic_replace::replace_files(
-                    self.target_xlsx,
-                    temp_archive,
-                    backup_archive,
-                    false,
-                );
-            }
-            result
-        };
+        let replace_result = atomic_replace::replace_files(
+            self.target_xlsx,
+            self.temp_archive.path(),
+            self.backup_archive.path(),
+            false,
+        );
         let displaced_file = match replace_result {
             Ok(displaced) => displaced,
-            Err(atomic_replace::ReplaceFilesError::Retryable(source)) => {
+            Err(atomic_replace::ReplaceFilesError::Failed(source)) => {
                 return Err(err_with_source(
                     path_pair_context_message(
                         "xlsx 저장 실패",
-                        self.temp_archive.path()?,
+                        self.temp_archive.path(),
                         self.target_xlsx,
                     ),
                     source,
@@ -1483,7 +1082,7 @@ impl TempArchivePromotion<'_> {
                 return Err(err_with_source(
                     path_pair_context_message(
                         "xlsx 저장 실패 후 원본 대상 파일 자동 복원 완료",
-                        self.temp_archive.path()?,
+                        self.temp_archive.path(),
                         self.target_xlsx,
                     ),
                     source,
@@ -1493,7 +1092,7 @@ impl TempArchivePromotion<'_> {
             Err(atomic_replace::ReplaceFilesError::RecoveryRequired(source)) => {
                 let context = path_pair_context_message(
                     "xlsx 저장 중 원본 대상 파일 자동 복구 실패",
-                    self.temp_archive.path()?,
+                    self.temp_archive.path(),
                     self.target_xlsx,
                 );
                 return self.preserve_recovery_archives(&context, source);
@@ -1518,7 +1117,11 @@ impl TempArchivePromotion<'_> {
                     .open(self.target_xlsx)
                     .and_then(|file| file.sync_all())
                 {
-                    write_durability_warning("파일", self.target_xlsx, &source_err);
+                    write_path_warning(
+                        "저장 내구성 동기화 실패(파일)",
+                        self.target_xlsx,
+                        &source_err,
+                    );
                 }
                 let parent = self
                     .target_xlsx
@@ -1526,7 +1129,7 @@ impl TempArchivePromotion<'_> {
                     .filter(|path| !path.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."));
                 if let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
-                    write_durability_warning("폴더", parent, &source_err);
+                    write_path_warning("저장 내구성 동기화 실패(폴더)", parent, &source_err);
                 }
             }
             _ => {}
@@ -1536,8 +1139,8 @@ impl TempArchivePromotion<'_> {
     fn rollback_after_validation_failure(&mut self, validation_error: AppError) -> Result<()> {
         let rollback_error = match atomic_replace::replace_files(
             self.target_xlsx,
-            self.temp_archive.path()?,
-            self.backup_archive.path()?,
+            self.temp_archive.path(),
+            self.backup_archive.path(),
             true,
         ) {
             Ok(_) => return Err(validation_error),
@@ -1545,7 +1148,7 @@ impl TempArchivePromotion<'_> {
             Err(atomic_replace::ReplaceFilesError::Restored(_)) => return Err(validation_error),
             #[cfg(target_os = "windows")]
             Err(atomic_replace::ReplaceFilesError::RecoveryRequired(source)) => source,
-            Err(atomic_replace::ReplaceFilesError::Retryable(source)) => source,
+            Err(atomic_replace::ReplaceFilesError::Failed(source)) => source,
         };
         let context = format!("원본 xlsx 검증 실패 후 복구 실패 ({validation_error})");
         self.preserve_recovery_archives(&context, rollback_error)
@@ -1554,27 +1157,20 @@ impl TempArchivePromotion<'_> {
         &self,
         displaced_file: atomic_replace::DisplacedFile,
     ) -> Result<()> {
-        let captured_original = self.displaced_path(displaced_file)?;
+        let captured_original = self.displaced_path(displaced_file);
         let captured_file = fs::File::open(captured_original).map_err(|source| {
             err_with_source(
                 path_context_message("교체된 원본 xlsx 열기 실패", captured_original),
                 source,
             )
         })?;
-        let archive_read = read_open_archive(
-            &captured_file,
-            captured_original,
-            ArchiveReadMode::FingerprintOnly,
-        )
-        .map_err(|source| {
-            err_with_source(
-                path_context_message("교체된 원본 xlsx 검증 실패", captured_original),
-                source,
-            )
-        })?;
-        let ArchiveRead::Fingerprint(fingerprint) = archive_read else {
-            return Err(err("교체된 원본 xlsx 지문 읽기 결과가 손상되었습니다."));
-        };
+        let fingerprint =
+            scan_open_archive(&captured_file, captured_original, None).map_err(|source| {
+                err_with_source(
+                    path_context_message("교체된 원본 xlsx 검증 실패", captured_original),
+                    source,
+                )
+            })?;
         if fingerprint != self.expected_fingerprint {
             return Err(err(format!(
                 "원본 xlsx가 실행 중 변경되어 저장을 중단했습니다: {}",
@@ -1587,17 +1183,109 @@ impl TempArchivePromotion<'_> {
 impl XlsxContainer {
     pub(super) fn load_sheet_catalog(&self, workbook_xml: &str) -> Result<Vec<SheetInfo>> {
         let rels_xml = self.read_text("xl/_rels/workbook.xml.rels")?;
-        let relationships = WorkbookRelationships::try_from(rels_xml.as_str())?;
-        WorkbookSheetCatalog::try_from(WorkbookSheetCatalogSource {
-            relationships: &relationships,
-            workbook_xml,
-        })
-        .map(|catalog| catalog.0)
+        let mut relationship_map: HashMap<Cow<'_, str>, WorkbookRelationship<'_>> = HashMap::new();
+        let mut relationship_scanner = XmlScanner::new(&rels_xml);
+        while let Some(relationship_tag) = relationship_scanner.next_start_named("Relationship") {
+            let tag = relationship_tag.raw();
+            let id = required_xml_attr(tag, "Id", "workbook.xml.rels Relationship")?;
+            let target = required_xml_attr(tag, "Target", "workbook.xml.rels Relationship")?;
+            let type_ = required_xml_attr(tag, "Type", "workbook.xml.rels Relationship")?;
+            let relationship = WorkbookRelationship {
+                target,
+                target_mode: extract_attr(tag, "TargetMode")?,
+                type_,
+            };
+            relationship_map.try_reserve(1).map_err(|source| {
+                err_with_source("workbook 관계 맵 추가 메모리 확보 실패", source)
+            })?;
+            let HashEntry::Vacant(entry) = relationship_map.entry(id) else {
+                return Err(err("workbook.xml.rels Relationship Id가 중복됩니다."));
+            };
+            entry.insert(relationship);
+        }
+        let mut workbook_scanner = XmlScanner::new(workbook_xml);
+        let workbook_tag = workbook_scanner
+            .next_start_named("workbook")
+            .ok_or_else(|| err("workbook.xml의 workbook 시작 태그를 찾지 못했습니다."))?;
+        let workbook_open_tag = workbook_tag.raw();
+        let sheets_tag = workbook_scanner
+            .next_start_named("sheets")
+            .ok_or_else(|| err("workbook.xml의 sheets 시작 태그를 찾지 못했습니다."))?;
+        let namespace_ancestors = [workbook_open_tag, sheets_tag.raw()];
+        let mut sheets = Vec::new();
+        while let Some(sheet_tag) = workbook_scanner.next_start_named("sheet") {
+            let tag = sheet_tag.raw();
+            let name = required_xml_attr(tag, "name", "workbook.xml sheet")?;
+            let mut relationship_id = None;
+            let mut attributes = XmlAttrScanner::new(tag)?;
+            while let Some((attr_name, attr_value)) = attributes.next()? {
+                let Some((prefix, local_name)) = attr_name.split_once(':') else {
+                    continue;
+                };
+                if prefix.is_empty() || local_name != "id" {
+                    continue;
+                }
+                let mut binding = None;
+                for declaration_tag in
+                    iter::once(tag).chain(namespace_ancestors.iter().rev().copied())
+                {
+                    let mut declarations = XmlAttrScanner::new(declaration_tag)?;
+                    while let Some((declaration_name, value)) = declarations.next()? {
+                        if declaration_name.strip_prefix("xmlns:") == Some(prefix) {
+                            binding = Some(value);
+                            break;
+                        }
+                    }
+                    if binding.is_some() {
+                        break;
+                    }
+                }
+                if binding.as_deref() == Some(OFFICE_DOCUMENT_REL_NAMESPACE)
+                    && relationship_id.replace(attr_value).is_some()
+                {
+                    return Err(err("workbook.xml sheet 관계 id가 중복됩니다."));
+                }
+            }
+            let rid =
+                relationship_id.ok_or_else(|| err("workbook.xml sheet 관계 id가 없습니다."))?;
+            let relationship = relationship_map.get(rid.as_ref()).ok_or_else(|| {
+                err(format!(
+                    "workbook.xml.rels에서 sheet 관계 target을 찾지 못했습니다: {rid}"
+                ))
+            })?;
+            let target_text = relationship.internal_worksheet_target(rid.as_ref())?;
+            if target_text.starts_with('/') {
+                return Err(err(format!(
+                    "sheet 관계 target에 절대 경로는 허용되지 않습니다: {target_text}"
+                )));
+            }
+            let mut combined: PathBuf = "xl".into();
+            for segment in target_text.split('/').filter(|segment| !segment.is_empty()) {
+                combined.push(segment);
+            }
+            let normalized = normalize_safe_relative_path(&combined, target_text)?;
+            let resolved = path_to_slashes(&normalized, target_text)?;
+            if resolved.is_empty() {
+                return Err(err(format!(
+                    "sheet 관계 target 정규화 결과가 비어 있습니다: {target_text}"
+                )));
+            }
+            sheets.try_reserve(1).map_err(|reserve_error| {
+                err_with_source("시트 순서 목록 추가 메모리 확보 실패", reserve_error)
+            })?;
+            sheets.push(SheetInfo {
+                name: name.into_owned(),
+                path: resolved,
+            });
+        }
+        if sheets.is_empty() {
+            return Err(err("workbook에서 시트 정보를 찾지 못했습니다."));
+        }
+        Ok(sheets)
     }
     pub(crate) fn open(source_xlsx: &Path) -> Result<Self> {
         let mut source_options = fs::File::options();
         source_options.read(true);
-        apply_no_follow(&mut source_options);
         let source_file = source_options.open(source_xlsx).map_err(|source_err| {
             err_with_source(
                 path_context_message("마스터 xlsx 파일 열기 실패", source_xlsx),
@@ -1615,29 +1303,28 @@ impl XlsxContainer {
         #[cfg(target_os = "windows")]
         source_metadata?;
         let base = env::temp_dir();
-        cleanup_stale_temp_entries(&base, WORK_DIR_PREFIX, StaleTempEntryKind::Directory);
-        let cleanup = WorkDirCleanup {
-            path: Some(reserve_unique_temp_entry(
-                &base,
-                WORK_DIR_PREFIX,
-                |path| {
-                    cfg_select! {
-                        any(target_os = "linux", target_os = "macos") => {
-                            let mut builder = fs::DirBuilder::new();
-                            builder.mode(0o700);
-                            builder.create(path)?;
-                        }
-                        _ => {
-                            fs::DirBuilder::new().create(path)?;
-                        }
+        if let Err(source) =
+            cleanup_stale_temp_entries(&base, WORK_DIR_PREFIX, TempEntryKind::Directory)
+        {
+            write_path_warning("이전 xlsx 작업 폴더 정리 실패", &base, &source);
+        }
+        let work_dir = WorkDirCleanup {
+            path: reserve_unique_temp_entry(&base, WORK_DIR_PREFIX, |path| {
+                cfg_select! {
+                    any(target_os = "linux", target_os = "macos") => {
+                        let mut builder = fs::DirBuilder::new();
+                        builder.mode(0o700);
+                        builder.create(path)?;
                     }
-                    Ok(path.to_path_buf())
-                },
-                "임시 작업 폴더 생성 실패",
-                || "임시 작업 폴더 생성 시도가 모두 실패했습니다. 잠시 후 다시 시도하세요.".into(),
-            )?),
+                    _ => {
+                        fs::DirBuilder::new().create(path)?;
+                    }
+                }
+                Ok(path.to_path_buf())
+            })
+            .map_err(|source| err_with_source("임시 작업 폴더 생성 실패", source))?,
         };
-        let unpack_dir = cleanup.path()?.join("unzipped");
+        let unpack_dir = work_dir.path.join("unzipped");
         create_dir_all_checked(&unpack_dir, "임시 폴더 생성 실패")?;
         let source_fingerprint = ZipArchiveExtractor {
             archive_file: source_file,
@@ -1645,15 +1332,15 @@ impl XlsxContainer {
             unpack_dir: unpack_dir.as_path(),
         }
         .extract()?;
-        let work_dir = cleanup.into_path()?;
         let container = Self {
+            _work_dir: work_dir,
             source_fingerprint,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             source_permissions,
             unpack_dir,
-            work_dir,
         };
-        container.validate_package_identity()?;
+        container.validate_content_types()?;
+        container.validate_root_relationships()?;
         Ok(container)
     }
     pub(super) fn read_shared_strings_text(&self) -> Result<Option<String>> {
@@ -1737,7 +1424,7 @@ impl XlsxContainer {
         let path = normalize_safe_relative_path(Path::new(relative_path), relative_path)?;
         Ok(self.unpack_dir.join(path))
     }
-    pub(super) fn save(&self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
+    pub(super) fn save(self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
         let parent = target_xlsx
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -1747,35 +1434,41 @@ impl XlsxContainer {
             .file_name()
             .and_then(|file_name_os| file_name_os.to_str())
             .unwrap_or("workbook.xlsx");
-        let mut temp_archive_prefix = String::from(".");
-        temp_archive_prefix.push_str(target_file_name);
-        temp_archive_prefix.push_str(".tmp_");
-        let mut backup_archive_prefix = String::from(".");
-        backup_archive_prefix.push_str(target_file_name);
-        backup_archive_prefix.push_str(".backup_");
-        cleanup_stale_temp_entries(parent, &temp_archive_prefix, StaleTempEntryKind::File);
-        cleanup_stale_temp_entries(parent, &backup_archive_prefix, StaleTempEntryKind::File);
-        let mut tmp_archive = reserve_unique_temp_entry(
-            parent,
-            &temp_archive_prefix,
-            create_reserved_temp_archive,
-            "임시 저장 파일 생성 실패",
-            || prefixed_message("임시 저장 파일 경로 생성 실패: ", target_xlsx.display()),
-        )?;
-        let mut backup_archive = reserve_unique_temp_entry(
-            parent,
-            &backup_archive_prefix,
-            create_reserved_temp_archive,
-            "교체 예약 파일 생성 실패",
-            || prefixed_message("교체 예약 파일 경로 생성 실패: ", target_xlsx.display()),
-        )?;
-        backup_archive.close_file();
+        let temp_archive_prefix = format!(".{target_file_name}.tmp_");
+        let backup_archive_prefix = format!(".{target_file_name}.backup_");
+        if let Err(source) =
+            cleanup_stale_temp_entries(parent, &temp_archive_prefix, TempEntryKind::File)
+        {
+            write_path_warning("이전 xlsx 임시 저장 파일 정리 실패", parent, &source);
+        }
+        if let Err(source) =
+            cleanup_stale_temp_entries(parent, &backup_archive_prefix, TempEntryKind::File)
+        {
+            write_path_warning("이전 xlsx 교체 예약 파일 정리 실패", parent, &source);
+        }
+        let mut tmp_archive =
+            reserve_unique_temp_entry(parent, &temp_archive_prefix, create_reserved_temp_archive)
+                .map_err(|source| {
+                err_with_source(
+                    path_context_message("임시 저장 파일 생성 실패", target_xlsx),
+                    source,
+                )
+            })?;
+        let mut backup_archive =
+            reserve_unique_temp_entry(parent, &backup_archive_prefix, create_reserved_temp_archive)
+                .map_err(|source| {
+                    err_with_source(
+                        path_context_message("교체 예약 파일 생성 실패", target_xlsx),
+                        source,
+                    )
+                })?;
+        backup_archive.file = None;
         let result = (|| -> Result<()> {
             cfg_select! {
                 any(target_os = "linux", target_os = "macos") => {
                     tmp_archive.write_archive_from(
                         self.unpack_dir.as_path(),
-                        self.source_permissions.clone(),
+                        self.source_permissions,
                     )?;
                 }
                 target_os = "windows" => {
@@ -1785,10 +1478,7 @@ impl XlsxContainer {
             match verification {
                 SaveVerification::Skip => {}
                 SaveVerification::Verify => {
-                    SavedArchiveVerifier {
-                        saved_archive: tmp_archive.path()?,
-                    }
-                    .verify()?;
+                    tmp_archive.verify_saved_archive()?;
                 }
             }
             TempArchivePromotion {
@@ -1802,10 +1492,12 @@ impl XlsxContainer {
         match result {
             Ok(()) => Ok(()),
             Err(source) => {
-                let Some(tmp_archive_path) = tmp_archive.take_cleanup_path() else {
+                if !tmp_archive.remove_on_drop {
                     return Err(source);
-                };
-                match fs::remove_file(&tmp_archive_path) {
+                }
+                tmp_archive.disable_drop_cleanup();
+                let tmp_archive_path = tmp_archive.path();
+                match fs::remove_file(tmp_archive_path) {
                     Ok(()) => Err(source),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => Err(source),
                     Err(error) => Err(err_with_source(
@@ -1858,12 +1550,13 @@ impl XlsxContainer {
                         "ContentType",
                         "[Content_Types].xml Override",
                     )?;
-                    if !seen_part_names.insert(part_name.clone()) {
+                    let is_workbook_part = part_name.as_ref() == WORKBOOK_PART_NAME;
+                    if !seen_part_names.insert(part_name) {
                         return Err(err(
                             "[Content_Types].xml에 중복 Override PartName이 있습니다.",
                         ));
                     }
-                    if part_name.as_ref() == WORKBOOK_PART_NAME {
+                    if is_workbook_part {
                         workbook_override = Some(content_type);
                     }
                 }
@@ -1885,10 +1578,6 @@ impl XlsxContainer {
             )));
         }
         Ok(())
-    }
-    fn validate_package_identity(&self) -> Result<()> {
-        self.validate_content_types()?;
-        self.validate_root_relationships()
     }
     fn validate_root_relationships(&self) -> Result<()> {
         let relationships_xml = self.read_text("_rels/.rels")?;
@@ -1956,27 +1645,18 @@ impl XlsxContainer {
         })
     }
 }
-impl Drop for XlsxContainer {
-    fn drop(&mut self) {
-        match fs::remove_dir_all(&self.work_dir) {
-            Ok(()) | Err(_) => {}
-        }
+fn saved_archive_trailing_row_num(cell_ref: &str) -> Result<u32> {
+    let row_text = cell_ref
+        .rsplit_once(|ch: char| !ch.is_ascii_digit())
+        .map_or(cell_ref, |(_, row)| row);
+    if row_text.is_empty() {
+        return Err(err(format!(
+            "저장 검증 실패: filter cell reference에 row 번호가 없습니다: {cell_ref}"
+        )));
     }
-}
-cfg_select! {
-    any(target_os = "linux", target_os = "macos") => {
-        fn write_durability_warning(path_kind: &str, path: &Path, source_err: &io::Error) {
-            let mut err = stderr().lock();
-            match writeln!(
-                &mut err,
-                "경고: 저장 내구성 동기화 실패({path_kind}): {} ({source_err})",
-                path.display(),
-            ) {
-                Ok(()) | Err(_) => {}
-            }
-        }
-    }
-    _ => {}
+    row_text
+        .parse::<u32>()
+        .map_err(|source| err_with_source("저장 검증 실패: filter row 번호 해석 실패", source))
 }
 pub(super) fn validate_worksheet_core_namespaces(sheet_xml: &str, sheet_name: &str) -> Result<()> {
     let context = format!("worksheet XML namespace 검증: {sheet_name}");
@@ -2064,7 +1744,8 @@ fn create_reserved_temp_archive(path: &Path) -> io::Result<ReservedTempArchive> 
     let file = options.open(path)?;
     Ok(ReservedTempArchive {
         file: Some(file),
-        path: Some(path.to_path_buf()),
+        path: path.to_path_buf(),
+        remove_on_drop: true,
     })
 }
 fn create_dir_all_checked(path: &Path, failure_label: &str) -> Result<()> {
@@ -2102,85 +1783,6 @@ fn normalize_safe_relative_path(path: &Path, relative_path: &str) -> Result<Path
         return Err(err(format!("상대 경로가 비어 있습니다: {relative_path}")));
     }
     Ok(normalized)
-}
-fn cleanup_stale_temp_entries(parent: &Path, prefix: &str, kind: StaleTempEntryKind) {
-    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry_result in entries {
-        let Ok(entry) = entry_result else {
-            continue;
-        };
-        let file_name_os = entry.file_name();
-        let Some(file_name) = file_name_os.to_str() else {
-            continue;
-        };
-        let Some(age_nanos) = temp_entry_age_nanos(file_name, prefix, now.as_nanos()) else {
-            continue;
-        };
-        if age_nanos < STALE_TEMP_ENTRY_AGE.as_nanos() {
-            continue;
-        }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let path = entry.path();
-        match kind {
-            StaleTempEntryKind::Directory if file_type.is_dir() => match fs::remove_dir_all(path) {
-                Ok(()) | Err(_) => {}
-            },
-            StaleTempEntryKind::File if !file_type.is_dir() => match fs::remove_file(path) {
-                Ok(()) | Err(_) => {}
-            },
-            StaleTempEntryKind::Directory | StaleTempEntryKind::File => {}
-        }
-    }
-}
-fn reserve_unique_temp_entry<FCreate, FExhausted, T>(
-    parent: &Path,
-    prefix: &str,
-    mut create_entry: FCreate,
-    create_failure_label: &str,
-    exhausted_message: FExhausted,
-) -> Result<T>
-where
-    FCreate: FnMut(&Path) -> io::Result<T>,
-    FExhausted: FnOnce() -> String,
-{
-    let pid = process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|source| err_with_source("임시 xlsx 경로 시각 계산 실패", source))?
-        .as_nanos();
-    let mut file_name = String::new();
-    file_name
-        .try_reserve_exact(TEMP_ENTRY_NAME_CAPACITY)
-        .map_err(|source| err_with_source("임시 xlsx 파일명 메모리 확보 실패", source))?;
-    let mut path = parent.to_path_buf();
-    path.try_reserve(TEMP_ENTRY_NAME_CAPACITY)
-        .map_err(|source| err_with_source("임시 xlsx 경로 메모리 확보 실패", source))?;
-    for seq in 0..TEMP_ENTRY_RESERVATION_ATTEMPTS {
-        write_temp_entry_name(&mut file_name, prefix, pid, nanos, seq)
-            .ok_or_else(|| err("임시 xlsx 파일명 작성 실패"))?;
-        path.push(file_name.as_str());
-        match create_entry(&path) {
-            Ok(entry) => return Ok(entry),
-            Err(io_err) if io_err.kind() == io::ErrorKind::AlreadyExists => {
-                path.pop();
-                thread::sleep(Duration::from_micros(50));
-            }
-            Err(io_err) => {
-                return Err(err_with_source(
-                    path_context_message(create_failure_label, &path),
-                    io_err,
-                ));
-            }
-        }
-    }
-    Err(err(exhausted_message()))
 }
 fn xml_misc_only(mut xml: &str, allow_bom: bool) -> bool {
     if allow_bom && let Some(without_bom) = xml.strip_prefix('\u{feff}') {
@@ -2393,4 +1995,14 @@ fn direct_xml_children<'xml>(
         return Err(err(format!("{context}의 XML 종료 태그가 없습니다.")));
     }
     Ok(children)
+}
+fn write_path_warning(context: &str, path: &Path, source: &io::Error) {
+    let mut error_output = stderr().lock();
+    match writeln!(
+        &mut error_output,
+        "경고: {context}: {} ({source})",
+        path.display(),
+    ) {
+        Ok(()) | Err(_) => {}
+    }
 }

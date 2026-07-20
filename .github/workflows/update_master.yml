@@ -9,40 +9,24 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        env:
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: init.defaultBranch
-          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
-          toolchain: 1.97.0
-      - name: Remove build host paths from release binary
-        shell: bash
-        run: |
-          sysroot="$(rustc --print sysroot)"
-          printf 'RUSTFLAGS=--remap-path-prefix=%s=/rustc/1.97.0 --remap-path-scope=object\n' "$sysroot" >> "$GITHUB_ENV"
+          toolchain: 1.97.1
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-      - name: Build release binary
-        run: cargo build --release --locked
+        run: sudo apt-get update
+      - name: Install libcurl headers
+        run: sudo apt-get install -y libcurl4-openssl-dev
       - name: Run updater
-        id: run_updater
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./target/release/fcupdater
-          artifact_dir="$PWD/artifacts"
-          mkdir -p "$artifact_dir"
-          artifact_path="$artifact_dir/fcupdater-result.xlsx"
-          cp fuel_cost_chungcheong.xlsx "$artifact_path"
-          echo "artifact_path=$artifact_path" >> "$GITHUB_OUTPUT"
+        run: cargo run --release --locked
+      - name: Prepare result artifact with Rust
+        run: cargo run --locked --example package_artifact -- fuel_cost_chungcheong.xlsx artifacts/fcupdater-result.xlsx fcupdater-result.xlsx
       - name: Upload result artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          path: ${{ steps.run_updater.outputs.artifact_path }}
-          archive: false
+          name: fcupdater-result
+          path: artifacts/fcupdater-result.xlsx
           if-no-files-found: error
           retention-days: 14

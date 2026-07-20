@@ -14,21 +14,27 @@ pub(super) struct AppError {
 struct ControlEscapingWriter<'formatter, 'output> {
     formatter: &'formatter mut fmt::Formatter<'output>,
 }
-pub(super) struct TerminalSafeText<'text> {
+struct TerminalSafeText<'text> {
     text: &'text str,
 }
 impl AppError {
-    fn context(context: impl Into<Cow<'static, str>>, source: impl Into<BoxError>) -> Self {
+    pub(super) fn context(
+        context: impl Into<Cow<'static, str>>,
+        source: impl Into<BoxError>,
+    ) -> Self {
         Self {
             message: context.into(),
             source: Some(source.into()),
         }
     }
-    fn message(message: impl Into<Cow<'static, str>>) -> Self {
+    pub(super) fn message(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             message: message.into(),
             source: None,
         }
+    }
+    pub(super) fn update_message(&mut self, update: impl FnOnce(&str) -> String) {
+        self.message = Cow::Owned(update(self.message.as_ref()));
     }
 }
 impl Display for AppError {
@@ -101,57 +107,15 @@ pub(super) fn prefixed_message<D>(prefix: &str, detail: D) -> String
 where
     D: Display,
 {
-    let mut out = String::new();
-    if out.try_reserve_exact(prefix.len()).is_err() {
-        return format!("{prefix}{detail}");
-    }
-    out.push_str(prefix);
-    if write!(&mut out, "{detail}").is_err() {
-        return out;
-    }
-    out
+    format!("{prefix}{detail}")
 }
 pub(super) fn path_context_message(label: &str, path: &Path) -> String {
-    let fallback = || format!("{label}: {}", path.display());
-    let Some(capacity) = label.len().checked_add(": ".len()) else {
-        return fallback();
-    };
-    let mut out = String::new();
-    if out.try_reserve_exact(capacity).is_err() {
-        return fallback();
-    }
-    out.push_str(label);
-    out.push_str(": ");
-    if write!(&mut out, "{}", path.display()).is_err() {
-        return out;
-    }
-    out
+    format!("{label}: {}", path.display())
 }
 pub(super) fn path_pair_context_message(label: &str, from: &Path, to: &Path) -> String {
-    let fallback = || format!("{label}: {} -> {}", from.display(), to.display());
-    let Some(capacity) = label
-        .len()
-        .checked_add(": ".len())
-        .and_then(|value| value.checked_add(" -> ".len()))
-    else {
-        return fallback();
-    };
-    let mut out = String::new();
-    if out.try_reserve_exact(capacity).is_err() {
-        return fallback();
-    }
-    out.push_str(label);
-    out.push_str(": ");
-    if write!(&mut out, "{}", from.display()).is_err() {
-        return out;
-    }
-    out.push_str(" -> ");
-    if write!(&mut out, "{}", to.display()).is_err() {
-        return out;
-    }
-    out
+    format!("{label}: {} -> {}", from.display(), to.display())
 }
-pub(super) const fn terminal_safe(text: &str) -> TerminalSafeText<'_> {
+pub(super) const fn terminal_safe(text: &str) -> impl Display + '_ {
     TerminalSafeText { text }
 }
 fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {

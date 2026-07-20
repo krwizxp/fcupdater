@@ -1,4 +1,4 @@
-pub(super) use self::source_reader::{SourceReader, SourceRecord};
+pub(super) use self::source_reader::{SourceReader, SourceRecord, SourceRecordRef};
 use crate::diagnostic::{Result, err, err_with_source};
 use core::range::Range;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -22,18 +22,6 @@ struct ArchiveFingerprint {
     crc32: u32,
     len: usize,
 }
-enum ArchiveRead {
-    Fingerprint(ArchiveFingerprint),
-    Retained {
-        bytes: Vec<u8>,
-        fingerprint: ArchiveFingerprint,
-    },
-}
-#[derive(Clone, Copy)]
-enum ArchiveReadMode {
-    FingerprintOnly,
-    RetainBytes,
-}
 struct ZipArchiveBuilder<'path> {
     archive_path: &'path Path,
     file: File,
@@ -49,6 +37,13 @@ struct ZipArchiveExtractor<'path> {
 struct SheetInfo {
     name: String,
     path: String,
+}
+fn copy_text(text: &str, context: &str) -> Result<String> {
+    let mut out = String::new();
+    out.try_reserve_exact(text.len())
+        .map_err(|source| err_with_source(format!("{context} 메모리 확보 실패"), source))?;
+    out.push_str(text);
+    Ok(out)
 }
 fn workbook_defined_name_content_span(
     workbook_xml: &str,
@@ -81,38 +76,14 @@ fn workbook_defined_name_content_span(
         if xml::extract_attr(open_tag, "name")?.as_deref() == Some(defined_name) {
             let local_sheet_id = xml::extract_attr(open_tag, "localSheetId")?
                 .map(|value| {
-                    if value.is_empty() {
+                    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                         return Err(err(
                             "workbook.xml localSheetId가 음이 아닌 10진수 형식이 아닙니다.",
                         ));
                     }
-                    let mut parsed = 0_u32;
-                    let mut overflowed = false;
-                    for byte in value.bytes() {
-                        if !byte.is_ascii_digit() {
-                            return Err(err(
-                                "workbook.xml localSheetId가 음이 아닌 10진수 형식이 아닙니다.",
-                            ));
-                        }
-                        if overflowed {
-                            continue;
-                        }
-                        let digit_raw = byte.wrapping_sub(b'0');
-                        let Some(next) = parsed
-                            .checked_mul(10)
-                            .and_then(|scaled| scaled.checked_add(u32::from(digit_raw)))
-                        else {
-                            overflowed = true;
-                            continue;
-                        };
-                        parsed = next;
-                    }
-                    if overflowed {
-                        return value.parse::<u32>().map_err(|source| {
-                            err_with_source("workbook.xml localSheetId 해석 실패", source)
-                        });
-                    }
-                    Ok(parsed)
+                    value.parse::<u32>().map_err(|source| {
+                        err_with_source("workbook.xml localSheetId 해석 실패", source)
+                    })
                 })
                 .transpose()?;
             let references_sheet = decoded_reference.starts_with(quoted_sheet)

@@ -2,7 +2,7 @@
 name = "fcupdater"
 version = "1.0.9"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.97.1"
 description = "CLI tool to update fuel_cost_chungcheong.xlsx from the Opinet current-price .xls source."
 license = "UNLICENSED"
 repository = "https://github.com/krwizxp/fcupdater"

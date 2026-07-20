@@ -443,9 +443,19 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                         return Err(err(format!("지원하지 않는 XML entity입니다: &{entity};")));
                     };
                     let value = if let Some(hex) = body.strip_prefix(['x', 'X']) {
-                        parse_xml_numeric_entity(hex, 16)?
+                        if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                            return Err(err("XML numeric hex entity가 16진수 형식이 아닙니다."));
+                        }
+                        u32::from_str_radix(hex, 16).map_err(|source| {
+                            err_with_source("XML numeric hex entity 해석 실패", source)
+                        })?
                     } else {
-                        parse_xml_numeric_entity(body, 10)?
+                        if body.is_empty() || !body.bytes().all(|byte| byte.is_ascii_digit()) {
+                            return Err(err("XML numeric entity가 10진수 형식이 아닙니다."));
+                        }
+                        body.parse::<u32>().map_err(|source| {
+                            err_with_source("XML numeric entity 해석 실패", source)
+                        })?
                     };
                     char::from_u32(value)
                 }
@@ -487,57 +497,6 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
             .ok_or_else(|| err("XML entity decode cursor 계산에 실패했습니다."))?;
     }
     Ok(out.map_or(Cow::Borrowed(text), Cow::Owned))
-}
-fn parse_xml_numeric_entity(body: &str, radix: u32) -> Result<u32> {
-    let (format_error, parse_error) = match radix {
-        10 => (
-            "XML numeric entity가 10진수 형식이 아닙니다.",
-            "XML numeric entity 해석 실패",
-        ),
-        16 => (
-            "XML numeric hex entity가 16진수 형식이 아닙니다.",
-            "XML numeric hex entity 해석 실패",
-        ),
-        _ => {
-            return Err(err("XML numeric entity 진법이 지원되지 않습니다."));
-        }
-    };
-    if body.is_empty() {
-        return Err(err(format_error));
-    }
-    let mut parsed = 0_u32;
-    let mut overflowed = false;
-    for byte in body.bytes() {
-        let digit = if radix == 10 {
-            if !byte.is_ascii_digit() {
-                return Err(err(format_error));
-            }
-            u32::from(byte.wrapping_sub(b'0'))
-        } else if byte.is_ascii_digit() {
-            u32::from(byte.wrapping_sub(b'0'))
-        } else if byte.is_ascii_hexdigit() {
-            let upper = byte.to_ascii_uppercase();
-            u32::from(upper.wrapping_sub(b'A').wrapping_add(10))
-        } else {
-            return Err(err(format_error));
-        };
-        if overflowed {
-            continue;
-        }
-        let Some(next) = parsed
-            .checked_mul(radix)
-            .and_then(|scaled| scaled.checked_add(digit))
-        else {
-            overflowed = true;
-            continue;
-        };
-        parsed = next;
-    }
-    if overflowed {
-        return u32::from_str_radix(body, radix)
-            .map_err(|source| err_with_source(parse_error, source));
-    }
-    Ok(parsed)
 }
 pub(super) fn is_valid_xml_char(ch: char) -> bool {
     matches!(

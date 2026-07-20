@@ -12,6 +12,7 @@ use core::{
     ffi::c_void,
     mem,
     ptr::{NonNull, null, null_mut},
+    result::Result as CoreResult,
     time::Duration,
 };
 use std::{
@@ -34,6 +35,23 @@ const WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE: u32 = 91;
 const WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK: u32 = 144;
 const WINHTTP_OPTION_IPV6_FAST_FALLBACK: u32 = 140;
 const WINHTTP_OPTION_DISABLE_GLOBAL_POOLING: u32 = 195;
+const WINHTTP_SESSION_OPTIONS: [(u32, &str, Option<u32>); 3] = [
+    (
+        WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK,
+        "WinHttpSetOption DISABLE_SECURE_PROTOCOL_FALLBACK",
+        None,
+    ),
+    (
+        WINHTTP_OPTION_DISABLE_GLOBAL_POOLING,
+        "WinHttpSetOption DISABLE_GLOBAL_POOLING",
+        Some(ERROR_WINHTTP_INVALID_OPTION),
+    ),
+    (
+        WINHTTP_OPTION_IPV6_FAST_FALLBACK,
+        "WinHttpSetOption IPV6_FAST_FALLBACK",
+        None,
+    ),
+];
 const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2: u32 = 0x0000_0800;
 const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3: u32 = 0x0000_2000;
 const WINHTTP_SECURE_PROTOCOLS_MIN_TLS_1_2: u32 =
@@ -58,9 +76,8 @@ const HEADER_TERMINATOR_WIDE: [u16; 2] = [0x0D, 0x0A];
 const METHOD_GET_WIDE: [u16; 4] = [0x47, 0x45, 0x54, 0];
 const METHOD_POST_WIDE: [u16; 5] = [0x50, 0x4F, 0x53, 0x54, 0];
 type HInternet = *mut c_void;
+#[derive(Default)]
 pub(super) struct Client {
-    default_https_port: u16,
-    error_code_label: &'static str,
     header_buffer: Vec<u16>,
     read_buffer: Vec<u8>,
     session_cache: Option<SessionCache>,
@@ -69,13 +86,9 @@ struct Handle(NonNull<c_void>);
 struct CachedConnect {
     handle: Handle,
     host: String,
-    port: u16,
-}
-struct ConnectCache {
-    entries: [Option<CachedConnect>; WINHTTP_CONNECT_CACHE_LIMIT],
 }
 struct SessionCache {
-    connects: ConnectCache,
+    connects: [Option<CachedConnect>; WINHTTP_CONNECT_CACHE_LIMIT],
     session: Handle,
 }
 impl Drop for Handle {
@@ -91,108 +104,132 @@ impl Handle {
         self.0.as_ptr()
     }
 }
-impl ConnectCache {
-    fn find(&self, host: &str, port: u16) -> Option<&CachedConnect> {
-        self.entries
-            .iter()
-            .filter_map(Option::as_ref)
-            .find(|entry| entry.port == port && entry.host.as_str() == host)
-    }
-    fn push_back(&mut self, entry: CachedConnect) {
-        if let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(entry);
-            return;
-        }
-        self.entries.rotate_left(1);
-        let [_, _, _, slot] = self.entries.each_mut();
-        *slot = Some(entry);
-    }
-}
 impl Client {
     fn cached_connect_ptr(
         &mut self,
         host: &str,
         host_wide: &[u16],
-        port: u16,
     ) -> DownloadResult<HInternet> {
         if self.session_cache.is_none() {
             let user_agent = wide(super::USER_AGENT)?;
+            // SAFETY: user_agent is NUL-terminated and optional proxy pointers are intentionally null.
+            let raw_session = unsafe {
+                sys::WinHttpOpen(
+                    user_agent.as_ptr(),
+                    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    null(),
+                    null(),
+                    0,
+                )
+            };
+            let session = Self::non_null_handle(raw_session, "WinHttpOpen")?;
+            // SAFETY: session is a valid WinHTTP session handle.
+            let timeout_ok = unsafe {
+                sys::WinHttpSetTimeouts(
+                    session.as_ptr(),
+                    WINHTTP_RESOLVE_TIMEOUT_MS,
+                    WINHTTP_CONNECT_TIMEOUT_MS,
+                    WINHTTP_SEND_TIMEOUT_MS,
+                    WINHTTP_RECEIVE_TIMEOUT_MS,
+                )
+            };
+            Self::check_winhttp(timeout_ok, "WinHttpSetTimeouts")?;
+            if let Err(code) = Self::try_set_dword_option(
+                &session,
+                WINHTTP_OPTION_SECURE_PROTOCOLS,
+                WINHTTP_SECURE_PROTOCOLS_MIN_TLS_1_2,
+            ) {
+                if matches!(code, ERROR_INVALID_PARAMETER | ERROR_WINHTTP_INVALID_OPTION) {
+                    Self::set_dword_option(
+                        &session,
+                        WINHTTP_OPTION_SECURE_PROTOCOLS,
+                        WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2,
+                        "WinHttpSetOption SECURE_PROTOCOLS",
+                    )?;
+                } else {
+                    return Err(Self::windows_error_message(
+                        "WinHttpSetOption SECURE_PROTOCOLS",
+                        code,
+                    )
+                    .into());
+                }
+            }
+            for (option, context, ignored_error) in WINHTTP_SESSION_OPTIONS {
+                if let Err(code) = Self::try_set_dword_option(&session, option, 1)
+                    && ignored_error != Some(code)
+                {
+                    return Err(Self::windows_error_message(context, code).into());
+                }
+            }
             self.session_cache = Some(SessionCache {
-                connects: ConnectCache {
-                    entries: from_fn(|_| None),
-                },
-                session: self.open_session(&user_agent)?,
+                connects: from_fn(|_| None),
+                session,
             });
         }
-        let error_code_label = self.error_code_label;
         let cache = self
             .session_cache
             .as_mut()
             .ok_or("WinHTTP session cache 상태 오류")?;
-        if let Some(entry) = cache.connects.find(host, port) {
+        if let Some(entry) = cache
+            .connects
+            .iter()
+            .filter_map(Option::as_ref)
+            .find(|entry| entry.host == host)
+        {
             return Ok(entry.handle.as_ptr());
         }
         // SAFETY: host_wide is NUL-terminated and cache.session is a valid session handle.
-        let raw_connect =
-            unsafe { sys::WinHttpConnect(cache.session.as_ptr(), host_wide.as_ptr(), port, 0) };
+        let raw_connect = unsafe {
+            sys::WinHttpConnect(
+                cache.session.as_ptr(),
+                host_wide.as_ptr(),
+                INTERNET_DEFAULT_HTTPS_PORT,
+                0,
+            )
+        };
         let handle = NonNull::new(raw_connect)
             .map(Handle)
-            .ok_or_else(|| Self::last_error_message_for(error_code_label, "WinHttpConnect"))?;
+            .ok_or_else(|| Self::last_error_message("WinHttpConnect"))?;
         let mut host_key = String::new();
         host_key.try_reserve_exact(host.len()).map_err(|source| {
                 download_error_with_source("WinHTTP connect host key 메모리 확보 실패", source)
-            })?;
+        })?;
         host_key.push_str(host);
         let connect = handle.as_ptr();
-        cache.connects.push_back(CachedConnect {
+        let entry = CachedConnect {
             handle,
             host: host_key,
-            port,
-        });
+        };
+        if let Some(slot) = cache.connects.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(entry);
+        } else {
+            cache.connects.rotate_left(1);
+            let [_, _, _, slot] = cache.connects.each_mut();
+            *slot = Some(entry);
+        }
         Ok(connect)
     }
-    fn clear_session_cache(&mut self) {
-        self.session_cache = None;
-    }
-    fn disable_global_pooling_if_supported(&self, handle: &Handle) -> DownloadResult<()> {
-        let raw_value = 1_u32;
-        // SAFETY: handle is a valid WinHTTP handle and raw_value points to a DWORD option value.
-        let ok = unsafe {
-            sys::WinHttpSetOption(
-                handle.as_ptr(),
-                WINHTTP_OPTION_DISABLE_GLOBAL_POOLING,
-                (&raw const raw_value).cast::<c_void>(),
-                DWORD_BYTE_SIZE,
-            )
-        };
-        if ok != 0_i32 {
-            return Ok(());
-        }
-        match Self::last_error_code() {
-            ERROR_WINHTTP_INVALID_OPTION => Ok(()),
-            _ => Err(self
-                .last_error_message("WinHttpSetOption DISABLE_GLOBAL_POOLING")
-                .into()),
+    fn check_winhttp(ok: i32, context: &str) -> DownloadResult<()> {
+        if ok == 0_i32 {
+            Err(Self::last_error_message(context).into())
+        } else {
+            Ok(())
         }
     }
     fn last_error_code() -> u32 {
         // SAFETY: GetLastError has no preconditions.
         unsafe { sys::GetLastError() }
     }
-    fn last_error_message(&self, context: &str) -> String {
-        Self::last_error_message_for(self.error_code_label, context)
-    }
-    fn last_error_message_for(error_code_label: &'static str, context: &str) -> String {
+    fn last_error_message(context: &str) -> String {
         let code = Self::last_error_code();
-        format!("{context} 실패: {error_code_label} {code}")
+        Self::windows_error_message(context, code)
     }
-    fn non_null_handle(&self, handle: HInternet, context: &str) -> DownloadResult<Handle> {
+    fn non_null_handle(handle: HInternet, context: &str) -> DownloadResult<Handle> {
         Ok(NonNull::new(handle)
             .map(Handle)
-            .ok_or_else(|| self.last_error_message(context))?)
+            .ok_or_else(|| Self::last_error_message(context))?)
     }
     fn open_request(
-        &self,
         connect: HInternet,
         method: HttpMethod<'_>,
         path: &[u16],
@@ -214,53 +251,28 @@ impl Client {
                 WINHTTP_FLAG_SECURE,
             )
         };
-        let request = self.non_null_handle(raw_request, "WinHttpOpenRequest")?;
-        self.set_request_options(&request)?;
+        let request = Self::non_null_handle(raw_request, "WinHttpOpenRequest")?;
+        Self::set_dword_option(
+            &request,
+            WINHTTP_OPTION_ENABLE_FEATURE,
+            WINHTTP_ENABLE_SSL_REVOCATION,
+            "WinHttpSetOption ENABLE_FEATURE",
+        )?;
+        Self::set_dword_option(
+            &request,
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS,
+            "WinHttpSetOption DISABLE_FEATURE",
+        )?;
+        Self::set_dword_option(
+            &request,
+            WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
+            HTTP_MAX_HEADER_BYTES_DWORD,
+            "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
+        )?;
         Ok(request)
     }
-    fn open_session(&self, user_agent: &[u16]) -> DownloadResult<Handle> {
-        // SAFETY: user_agent is NUL-terminated and optional proxy pointers are intentionally null.
-        let raw_session = unsafe {
-            sys::WinHttpOpen(
-                user_agent.as_ptr(),
-                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                null(),
-                null(),
-                0,
-            )
-        };
-        let session = self.non_null_handle(raw_session, "WinHttpOpen")?;
-        // SAFETY: session is a valid WinHTTP session handle.
-        let timeout_ok = unsafe {
-            sys::WinHttpSetTimeouts(
-                session.as_ptr(),
-                WINHTTP_RESOLVE_TIMEOUT_MS,
-                WINHTTP_CONNECT_TIMEOUT_MS,
-                WINHTTP_SEND_TIMEOUT_MS,
-                WINHTTP_RECEIVE_TIMEOUT_MS,
-            )
-        };
-        if timeout_ok == 0_i32 {
-            return Err(self.last_error_message("WinHttpSetTimeouts").into());
-        }
-        self.set_secure_protocols(&session)?;
-        self.set_dword_option(
-            &session,
-            WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK,
-            1,
-            "WinHttpSetOption DISABLE_SECURE_PROTOCOL_FALLBACK",
-        )?;
-        self.disable_global_pooling_if_supported(&session)?;
-        self.set_dword_option(
-            &session,
-            WINHTTP_OPTION_IPV6_FAST_FALLBACK,
-            1,
-            "WinHttpSetOption IPV6_FAST_FALLBACK",
-        )?;
-        Ok(session)
-    }
     fn query_headers(
-        &self,
         request: &Handle,
         buffer: &mut Vec<u16>,
     ) -> DownloadResult<Vec<HttpHeader>> {
@@ -282,7 +294,7 @@ impl Client {
         }
         let last_error = Self::last_error_code();
         if last_error != ERROR_INSUFFICIENT_BUFFER {
-            return Err(self.last_error_message("WinHttpQueryHeaders").into());
+            return Err(Self::windows_error_message("WinHttpQueryHeaders", last_error).into());
         }
         let header_bytes = usize::try_from(bytes)
             .map_err(|source| download_error_with_source("응답 헤더 길이 변환 실패", source))?;
@@ -310,9 +322,7 @@ impl Client {
                 &raw mut index,
             )
         };
-        if fetch_ok == 0_i32 {
-            return Err(self.last_error_message("WinHttpQueryHeaders").into());
-        }
+        Self::check_winhttp(fetch_ok, "WinHttpQueryHeaders")?;
         while buffer.pop_if(|value| *value == 0).is_some() {}
         let mut parsed = Vec::new();
         for raw_line in buffer.split(|unit| *unit == u16::from(b'\n')).skip(1) {
@@ -355,7 +365,7 @@ impl Client {
         }
         Ok(parsed)
     }
-    fn query_status(&self, request: &Handle) -> DownloadResult<u32> {
+    fn query_status(request: &Handle) -> DownloadResult<u32> {
         let mut status = 0_u32;
         let mut bytes = DWORD_BYTE_SIZE;
         // SAFETY: status and bytes are valid output buffers for the numeric status query.
@@ -369,11 +379,8 @@ impl Client {
                 null_mut(),
             )
         };
-        if ok == 0_i32 {
-            Err(self.last_error_message("WinHttpQueryHeaders status").into())
-        } else {
-            Ok(status)
-        }
+        Self::check_winhttp(ok, "WinHttpQueryHeaders status")?;
+        Ok(status)
     }
     fn read_body(
         &mut self,
@@ -392,7 +399,7 @@ impl Client {
             ensure_read_buffer(&mut chunk_buffer)?;
             loop {
                 ensure_within_total_timeout(started)?;
-                let read = self.read_chunk(request, &mut chunk_buffer)?;
+                let read = Self::read_chunk(request, &mut chunk_buffer)?;
                 let read_len = usize::try_from(read).map_err(|source| {
                     download_error_with_source("응답 read 길이 변환 실패", source)
                 })?;
@@ -439,7 +446,7 @@ impl Client {
             ensure_read_buffer(&mut chunk_buffer)?;
             loop {
                 ensure_within_total_timeout(started)?;
-                let read = self.read_chunk(request, &mut chunk_buffer)?;
+                let read = Self::read_chunk(request, &mut chunk_buffer)?;
                 let read_len = usize::try_from(read).map_err(|source| {
                     download_error_with_source("응답 read 길이 변환 실패", source)
                 })?;
@@ -457,7 +464,6 @@ impl Client {
         result
     }
     fn read_chunk(
-        &self,
         request: &Handle,
         chunk: &mut [u8],
     ) -> DownloadResult<u32> {
@@ -473,20 +479,13 @@ impl Client {
                 &raw mut read,
             )
         };
-        if read_ok == 0_i32 {
-            Err(self.last_error_message("WinHttpReadData").into())
-        } else {
-            Ok(read)
-        }
+        Self::check_winhttp(read_ok, "WinHttpReadData")?;
+        Ok(read)
     }
-    fn receive_response(&self, request: &Handle) -> DownloadResult<()> {
+    fn receive_response(request: &Handle) -> DownloadResult<()> {
         // SAFETY: request is a valid request handle and no reserved pointer is required.
         let received = unsafe { sys::WinHttpReceiveResponse(request.as_ptr(), null_mut()) };
-        if received == 0_i32 {
-            Err(self.last_error_message("WinHttpReceiveResponse").into())
-        } else {
-            Ok(())
-        }
+        Self::check_winhttp(received, "WinHttpReceiveResponse")
     }
     pub(super) fn request(
         &mut self,
@@ -498,49 +497,35 @@ impl Client {
         let host_wide = wide(host)?;
         let path_wide = wide(path)?;
         let mut headers_wide = mem::take(&mut self.header_buffer);
-        if let Err(error) = Self::request_headers_wide(&mut headers_wide, headers) {
-            self.header_buffer = headers_wide;
-            return Err(error);
-        }
-        let body_slice = match method {
-            HttpMethod::Get => &[],
-            HttpMethod::Post(body) => body,
-        };
-        let body_len = match u32::try_from(body_slice.len()) {
-            Ok(body_len) => body_len,
-            Err(source) => {
-                self.header_buffer = headers_wide;
-                return Err(download_error_with_source(
-                    "요청 본문 길이 변환 실패",
-                    source,
-                ));
-            }
-        };
-        let started = Instant::now();
-        let connect = match self.cached_connect_ptr(host, &host_wide, self.default_https_port) {
-            Ok(connect) => connect,
-            Err(error) => {
-                self.header_buffer = headers_wide;
-                return Err(error);
-            }
-        };
         let response = (|| {
-            let request = self.open_request(connect, method, &path_wide)?;
-            self.send_request(&request, &headers_wide, body_slice, body_len)?;
-            self.receive_response(&request)?;
-            let status = self.query_status(&request)?;
-            let response_headers = self.query_headers(&request, &mut headers_wide)?;
-            let content_length =
-                validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
-            let response_body = self.read_body(&request, content_length, started)?;
-            enforce_http_body_length(response_body.len(), content_length)?;
-            Ok(HttpResponse {
-                body: response_body,
-                headers: response_headers,
-                status,
-            })
-        })()
-        .inspect_err(|_| self.clear_session_cache());
+            Self::request_headers_wide(&mut headers_wide, headers)?;
+            let body_slice = match method {
+                HttpMethod::Get => &[],
+                HttpMethod::Post(body) => body,
+            };
+            let body_len = u32::try_from(body_slice.len()).map_err(|source| {
+                download_error_with_source("요청 본문 길이 변환 실패", source)
+            })?;
+            let started = Instant::now();
+            let connect = self.cached_connect_ptr(host, &host_wide)?;
+            (|| {
+                let request = Self::open_request(connect, method, &path_wide)?;
+                Self::send_request(&request, &headers_wide, body_slice, body_len)?;
+                Self::receive_response(&request)?;
+                let status = Self::query_status(&request)?;
+                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
+                let content_length =
+                    validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
+                let response_body = self.read_body(&request, content_length, started)?;
+                enforce_http_body_length(response_body.len(), content_length)?;
+                Ok(HttpResponse {
+                    body: response_body,
+                    headers: response_headers,
+                    status,
+                })
+            })()
+            .inspect_err(|_| self.session_cache = None)
+        })();
         self.header_buffer = headers_wide;
         response
     }
@@ -580,54 +565,39 @@ impl Client {
         let host_wide = wide(host)?;
         let path_wide = wide(path)?;
         let mut headers_wide = mem::take(&mut self.header_buffer);
-        if let Err(error) = Self::request_headers_wide(&mut headers_wide, headers) {
-            self.header_buffer = headers_wide;
-            return Err(error);
-        }
-        let body_slice = match method {
-            HttpMethod::Get => &[],
-            HttpMethod::Post(body) => body,
-        };
-        let body_len = match u32::try_from(body_slice.len()) {
-            Ok(body_len) => body_len,
-            Err(source) => {
-                self.header_buffer = headers_wide;
-                return Err(download_error_with_source(
-                    "요청 본문 길이 변환 실패",
-                    source,
-                ));
-            }
-        };
-        let started = Instant::now();
-        let connect = match self.cached_connect_ptr(host, &host_wide, self.default_https_port) {
-            Ok(connect) => connect,
-            Err(error) => {
-                self.header_buffer = headers_wide;
-                return Err(error);
-            }
-        };
         let response = (|| {
-            let request = self.open_request(connect, method, &path_wide)?;
-            self.send_request(&request, &headers_wide, body_slice, body_len)?;
-            self.receive_response(&request)?;
-            let status = self.query_status(&request)?;
-            let response_headers = self.query_headers(&request, &mut headers_wide)?;
-            let content_length =
-                validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
-            let response_body = self.read_body_to_writer(&request, writer, started)?;
-            enforce_http_body_length(response_body.bytes_seen, content_length)?;
-            Ok(HttpStreamResponse {
-                body: response_body,
-                headers: response_headers,
-                status,
-            })
-        })()
-        .inspect_err(|_| self.clear_session_cache());
+            Self::request_headers_wide(&mut headers_wide, headers)?;
+            let body_slice = match method {
+                HttpMethod::Get => &[],
+                HttpMethod::Post(body) => body,
+            };
+            let body_len = u32::try_from(body_slice.len()).map_err(|source| {
+                download_error_with_source("요청 본문 길이 변환 실패", source)
+            })?;
+            let started = Instant::now();
+            let connect = self.cached_connect_ptr(host, &host_wide)?;
+            (|| {
+                let request = Self::open_request(connect, method, &path_wide)?;
+                Self::send_request(&request, &headers_wide, body_slice, body_len)?;
+                Self::receive_response(&request)?;
+                let status = Self::query_status(&request)?;
+                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
+                let content_length =
+                    validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
+                let response_body = self.read_body_to_writer(&request, writer, started)?;
+                enforce_http_body_length(response_body.bytes_seen, content_length)?;
+                Ok(HttpStreamResponse {
+                    body: response_body,
+                    headers: response_headers,
+                    status,
+                })
+            })()
+            .inspect_err(|_| self.session_cache = None)
+        })();
         self.header_buffer = headers_wide;
         response
     }
     fn send_request(
-        &self,
         request: &Handle,
         headers: &[u16],
         body: &[u8],
@@ -656,92 +626,39 @@ impl Client {
                 0,
             )
         };
-        if sent == 0_i32 {
-            Err(self.last_error_message("WinHttpSendRequest").into())
-        } else {
-            Ok(())
-        }
+        Self::check_winhttp(sent, "WinHttpSendRequest")
     }
     fn set_dword_option(
-        &self,
         handle: &Handle,
         option: u32,
         value: u32,
         context: &str,
     ) -> DownloadResult<()> {
-        let raw_value = value;
-        // SAFETY: handle is valid and raw_value points to a DWORD option value for this call.
+        Self::try_set_dword_option(handle, option, value)
+            .map_err(|code| Self::windows_error_message(context, code).into())
+    }
+    fn try_set_dword_option(
+        handle: &Handle,
+        option: u32,
+        value: u32,
+    ) -> CoreResult<(), u32> {
+        // SAFETY: handle is valid and value points to a DWORD option value for this call.
         let ok = unsafe {
             sys::WinHttpSetOption(
                 handle.as_ptr(),
                 option,
-                (&raw const raw_value).cast::<c_void>(),
+                (&raw const value).cast::<c_void>(),
                 DWORD_BYTE_SIZE,
             )
         };
         if ok == 0_i32 {
-            Err(self.last_error_message(context).into())
+            Err(Self::last_error_code())
         } else {
             Ok(())
         }
     }
-    fn set_request_options(&self, request: &Handle) -> DownloadResult<()> {
-        self.set_dword_option(
-            request,
-            WINHTTP_OPTION_ENABLE_FEATURE,
-            WINHTTP_ENABLE_SSL_REVOCATION,
-            "WinHttpSetOption ENABLE_FEATURE",
-        )?;
-        self.set_dword_option(
-            request,
-            WINHTTP_OPTION_DISABLE_FEATURE,
-            WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS,
-            "WinHttpSetOption DISABLE_FEATURE",
-        )?;
-        self.set_dword_option(
-            request,
-            WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
-            HTTP_MAX_HEADER_BYTES_DWORD,
-            "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
-        )
-    }
-    fn set_secure_protocols(&self, session: &Handle) -> DownloadResult<()> {
-        let raw_value = WINHTTP_SECURE_PROTOCOLS_MIN_TLS_1_2;
-        // SAFETY: session is valid and raw_value points to a DWORD option value for this call.
-        let ok = unsafe {
-            sys::WinHttpSetOption(
-                session.as_ptr(),
-                WINHTTP_OPTION_SECURE_PROTOCOLS,
-                (&raw const raw_value).cast::<c_void>(),
-                DWORD_BYTE_SIZE,
-            )
-        };
-        if ok != 0_i32 {
-            return Ok(());
-        }
-        if matches!(
-            Self::last_error_code(),
-            ERROR_INVALID_PARAMETER | ERROR_WINHTTP_INVALID_OPTION
-        ) {
-            return self.set_dword_option(
-                session,
-                WINHTTP_OPTION_SECURE_PROTOCOLS,
-                WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2,
-                "WinHttpSetOption SECURE_PROTOCOLS",
-            );
-        }
-        Err(self.last_error_message("WinHttpSetOption SECURE_PROTOCOLS").into())
-    }
-}
-impl Default for Client {
-    fn default() -> Self {
-        Self {
-            default_https_port: INTERNET_DEFAULT_HTTPS_PORT,
-            error_code_label: "Windows error",
-            header_buffer: Vec::new(),
-            read_buffer: Vec::new(),
-            session_cache: None,
-        }
+    fn windows_error_message(context: &str, code: u32) -> String {
+        format!("{context} 실패: Windows error {code}")
     }
 }
 fn ensure_read_buffer(buffer: &mut Vec<u8>) -> DownloadResult<()> {

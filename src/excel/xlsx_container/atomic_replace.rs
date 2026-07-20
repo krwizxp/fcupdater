@@ -78,11 +78,11 @@ pub(super) struct ReplaceFailure {
 }
 #[derive(Debug)]
 pub(super) enum ReplaceFilesError {
+    Failed(ReplaceFailure),
     #[cfg(target_os = "windows")]
     RecoveryRequired(ReplaceFailure),
     #[cfg(target_os = "windows")]
     Restored(ReplaceFailure),
-    Retryable(ReplaceFailure),
 }
 impl ReplaceFailure {
     const fn new(replace: io::Error) -> Self {
@@ -110,18 +110,23 @@ impl Error for ReplaceFailure {
         Some(&self.replace)
     }
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn path_to_c_string(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|source| io::Error::new(io::ErrorKind::InvalidInput, source))
+}
 cfg_select! {
     target_os = "windows" => {
         fn path_to_wide(path: &Path) -> io::Result<Vec<u16>> {
             let absolute = absolute(path)?;
             let (extended_prefix, skipped_units) = match absolute.components().next() {
                 Some(Component::Prefix(component)) => match component.kind() {
-                    Prefix::Disk(_) => (r"\\?\", 0),
-                    Prefix::UNC(_, _) => (r"\\?\UNC\", 2),
+                    Prefix::Disk(_) => (r"\\?\", 0_usize),
+                    Prefix::UNC(_, _) => (r"\\?\UNC\", 2_usize),
                     Prefix::Verbatim(_)
                     | Prefix::VerbatimUNC(_, _)
                     | Prefix::VerbatimDisk(_)
-                    | Prefix::DeviceNS(_) => ("", 0),
+                    | Prefix::DeviceNS(_) => ("", 0_usize),
                 },
                 _ => {
                     return Err(io::Error::new(
@@ -130,19 +135,30 @@ cfg_select! {
                     ));
                 }
             };
-            let path_wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
-            if path_wide.contains(&0) {
+            let mut path_wide = absolute.as_os_str().encode_wide();
+            for _ in 0_usize..skipped_units {
+                let Some(unit) = path_wide.next() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows UNC path is invalid",
+                    ));
+                };
+                if unit == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows file path contains a NUL character",
+                    ));
+                }
+            }
+            let mut wide = Vec::new();
+            wide.extend(extended_prefix.encode_utf16());
+            wide.extend(path_wide);
+            if wide.contains(&0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Windows file path contains a NUL character",
                 ));
             }
-            let path_tail = path_wide.get(skipped_units..).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Windows UNC path is invalid")
-            })?;
-            let mut wide = Vec::new();
-            wide.extend(extended_prefix.encode_utf16());
-            wide.extend_from_slice(path_tail);
             wide.push(0);
             Ok(wide)
         }
@@ -159,13 +175,13 @@ cfg_select! {
             };
             let target_wide = path_to_wide(target)
                 .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Retryable)?;
+                .map_err(ReplaceFilesError::Failed)?;
             let incoming_wide = path_to_wide(incoming)
                 .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Retryable)?;
+                .map_err(ReplaceFilesError::Failed)?;
             let backup_output_wide = path_to_wide(backup_output)
                 .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Retryable)?;
+                .map_err(ReplaceFilesError::Failed)?;
             // SAFETY: all three paths are valid NUL-terminated UTF-16 buffers and reserved pointers
             // are null as required by ReplaceFileW.
             let status = unsafe {
@@ -187,7 +203,7 @@ cfg_select! {
             }
             let replace = io::Error::last_os_error();
             if replace.raw_os_error() != Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
-                return Err(ReplaceFilesError::Retryable(ReplaceFailure::new(replace)));
+                return Err(ReplaceFilesError::Failed(ReplaceFailure::new(replace)));
             }
             let restore_from = if rollback { incoming } else { backup_output };
             match fs::rename(restore_from, target) {
@@ -199,12 +215,7 @@ cfg_select! {
             }
         }
     }
-    target_os = "linux" => {
-        fn path_to_c_string(path: &Path) -> io::Result<CString> {
-            CString::new(path.as_os_str().as_bytes()).map_err(|source| {
-                io::Error::new(io::ErrorKind::InvalidInput, source)
-            })
-        }
+    any(target_os = "linux", target_os = "macos") => {
         pub(super) fn replace_files(
             target: &Path,
             replacement: &Path,
@@ -213,57 +224,34 @@ cfg_select! {
         ) -> Result<DisplacedFile, ReplaceFilesError> {
             let target_c = path_to_c_string(target)
                 .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Retryable)?;
+                .map_err(ReplaceFilesError::Failed)?;
             let replacement_c = path_to_c_string(replacement)
                 .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Retryable)?;
-            // SAFETY: both paths are valid NUL-terminated byte strings and AT_FDCWD selects the
-            // current process path resolution context.
-            let status = unsafe {
-                renameat2(
-                    AT_FDCWD,
-                    target_c.as_ptr(),
-                    AT_FDCWD,
-                    replacement_c.as_ptr(),
-                    RENAME_EXCHANGE,
-                )
+                .map_err(ReplaceFilesError::Failed)?;
+            #[cfg(target_os = "linux")]
+            let status = {
+                // SAFETY: both paths are valid NUL-terminated byte strings and AT_FDCWD selects
+                // the current process path resolution context.
+                unsafe {
+                    renameat2(
+                        AT_FDCWD,
+                        target_c.as_ptr(),
+                        AT_FDCWD,
+                        replacement_c.as_ptr(),
+                        RENAME_EXCHANGE,
+                    )
+                }
+            };
+            #[cfg(target_os = "macos")]
+            let status = {
+                // SAFETY: both paths are valid NUL-terminated byte strings and RENAME_SWAP
+                // requests an atomic exchange of two existing paths.
+                unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP) }
             };
             if status == 0_i32 {
                 Ok(DisplacedFile::Replacement)
             } else {
-                Err(ReplaceFilesError::Retryable(ReplaceFailure::new(
-                    io::Error::last_os_error(),
-                )))
-            }
-        }
-    }
-    target_os = "macos" => {
-        fn path_to_c_string(path: &Path) -> io::Result<CString> {
-            CString::new(path.as_os_str().as_bytes()).map_err(|source| {
-                io::Error::new(io::ErrorKind::InvalidInput, source)
-            })
-        }
-        pub(super) fn replace_files(
-            target: &Path,
-            replacement: &Path,
-            _backup: &Path,
-            _rollback: bool,
-        ) -> Result<DisplacedFile, ReplaceFilesError> {
-            let target_c = path_to_c_string(target)
-                .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Retryable)?;
-            let replacement_c = path_to_c_string(replacement)
-                .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Retryable)?;
-            // SAFETY: both paths are valid NUL-terminated byte strings and RENAME_SWAP requests an
-            // atomic exchange of two existing paths.
-            let status = unsafe {
-                renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP)
-            };
-            if status == 0_i32 {
-                Ok(DisplacedFile::Replacement)
-            } else {
-                Err(ReplaceFilesError::Retryable(ReplaceFailure::new(
+                Err(ReplaceFilesError::Failed(ReplaceFailure::new(
                     io::Error::last_os_error(),
                 )))
             }

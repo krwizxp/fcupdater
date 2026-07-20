@@ -1,6 +1,10 @@
 name: CI
 on:
   push:
+    branches:
+      - main
+    tags:
+      - "*"
   pull_request:
   workflow_dispatch:
 permissions:
@@ -10,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
-    name: ${{ matrix.os }} / rust-1.97.0
+    name: ${{ matrix.os }} / rust-1.97.1
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -18,56 +22,45 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_path: artifacts/fcupdater-linux-x64.tar.gz
+            artifact_path: artifacts/fcupdater-linux-x64.tar
             binary_name: fcupdater-linux-x64
+            source_path: target/release/fcupdater
           - os: macos-26-intel
-            artifact_path: artifacts/fcupdater-macos-x64.tar.gz
+            artifact_path: artifacts/fcupdater-macos-x64.tar
             binary_name: fcupdater-macos-x64
+            source_path: target/release/fcupdater
           - os: macos-26
-            artifact_path: artifacts/fcupdater-macos-arm64.tar.gz
+            artifact_path: artifacts/fcupdater-macos-arm64.tar
             binary_name: fcupdater-macos-arm64
+            source_path: target/release/fcupdater
           - os: windows-latest
             artifact_path: target/release/fcupdater-windows-x64.exe
             binary_name: fcupdater-windows-x64
+            source_path: target/release/fcupdater.exe
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        env:
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: init.defaultBranch
-          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
-          toolchain: 1.97.0
-      - name: Remove build host paths from release binary
-        shell: bash
-        run: |
-          sysroot="$(rustc --print sysroot)"
-          printf 'RUSTFLAGS=--remap-path-prefix=%s=/rustc/1.97.0 --remap-path-scope=object\n' "$sysroot" >> "$GITHUB_ENV"
+          toolchain: 1.97.1
       - name: Install Linux native dependencies
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: sudo apt-get update
+      - name: Install Linux libcurl headers
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y libcurl4-openssl-dev
       - name: Build Release Binary
         run: cargo build --release --locked
-      - name: Prepare Unix artifact
-        if: matrix.os != 'windows-latest'
-        shell: bash
-        run: |
-          mkdir -p artifacts package
-          cp target/release/fcupdater "package/${{ matrix.binary_name }}"
-          tar -C package -czf "${{ matrix.artifact_path }}" "${{ matrix.binary_name }}"
-      - name: Rename Windows artifact file
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Move-Item target\release\fcupdater.exe target\release\${{ matrix.binary_name }}.exe -Force
+      - name: Prepare binary artifact with Rust
+        if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+        run: cargo run --locked --example package_artifact -- "${{ matrix.source_path }}" "${{ matrix.artifact_path }}" "${{ matrix.binary_name }}"
       - name: Upload Binary Artifact
         if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          name: ${{ matrix.binary_name }}
           path: ${{ matrix.artifact_path }}
-          archive: false
           if-no-files-found: error
           retention-days: 14

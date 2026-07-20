@@ -1,6 +1,9 @@
-use crate::decimal::U128DecimalDigits;
+use crate::diagnostic::{
+    AppError as DownloadError, Result as DownloadResult,
+    err_with_source as download_error_with_source,
+};
 use alloc::borrow::Cow;
-use core::{error::Error, fmt, fmt::Display, mem::replace, result::Result as CoreResult};
+use core::fmt::Write as FmtWrite;
 use std::{
     fs,
     fs::File,
@@ -9,9 +12,11 @@ use std::{
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
+        use self::libcurl::Client as PlatformHttpClient;
         mod libcurl;
     }
     windows => {
+        use self::winhttp::Client as PlatformHttpClient;
         mod winhttp;
     }
     _ => {
@@ -46,13 +51,6 @@ const GAS_STATION_API_GBN: &str = "A";
 const DEFAULT_REGION_LABEL: &str = "선택하세요.";
 const USER_AGENT: &str = concat!("fcupdater/", env!("CARGO_PKG_VERSION"));
 const NETFUNNEL_POLL_LIMIT: usize = 20;
-type BoxError = Box<dyn Error + Send + Sync>;
-#[derive(Debug)]
-struct DownloadError {
-    message: Cow<'static, str>,
-    source: Option<BoxError>,
-}
-type DownloadResult<T> = CoreResult<T, DownloadError>;
 pub(super) struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
     pub dir: &'dir Path,
     pub out: &'out mut W,
@@ -60,7 +58,6 @@ pub(super) struct SourceDownload<'dir, 'out, W: Write + ?Sized> {
 pub(super) struct TemporarySourceFile {
     file: Option<File>,
     path: PathBuf,
-    remove_on_drop: bool,
 }
 #[derive(Debug)]
 struct StreamedBodySummary {
@@ -78,21 +75,12 @@ struct HttpHeader {
     value: String,
 }
 #[derive(Debug)]
-struct HttpResponse {
-    body: Vec<u8>,
+struct HttpResponse<B = Vec<u8>> {
+    body: B,
     headers: Vec<HttpHeader>,
     status: u32,
 }
-#[derive(Debug)]
-struct HttpStreamResponse {
-    body: StreamedBodySummary,
-    headers: Vec<HttpHeader>,
-    status: u32,
-}
-struct ReservedDownloadFile {
-    file: File,
-    path: PathBuf,
-}
+type HttpStreamResponse = HttpResponse<StreamedBodySummary>;
 struct StreamingBodySink<'writer> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     error: Option<DownloadError>,
@@ -111,29 +99,28 @@ impl TemporarySourceFile {
         Ok((file, &self.path))
     }
     pub(super) fn remove(&mut self) -> io::Result<()> {
-        if !self.remove_on_drop {
-            return Ok(());
-        }
         drop(self.file.take());
         match fs::remove_file(&self.path) {
-            Ok(()) => {
-                self.remove_on_drop = false;
-                Ok(())
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                self.remove_on_drop = false;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(source) => Err(source),
         }
+    }
+    fn remove_after_error(mut self, mut error: DownloadError) -> DownloadError {
+        if let Err(remove_error) = self.remove() {
+            let cleanup_text = format!(
+                "다운로드 임시 파일 삭제 실패: {} ({remove_error})",
+                self.path.display()
+            );
+            error.update_message(|message| format!("{message}; {cleanup_text}"));
+        }
+        error
     }
 }
 impl Drop for TemporarySourceFile {
     fn drop(&mut self) {
-        drop(self.file.take());
-        if self.remove_on_drop
-            && let Err(source) = fs::remove_file(&self.path)
-            && source.kind() != io::ErrorKind::NotFound
+        if self.file.is_some()
+            && let Err(source) = self.remove()
         {
             let mut error_output = io::stderr().lock();
             match writeln!(
@@ -150,47 +137,10 @@ impl StreamedBodySummary {
     fn preview_lossy(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.preview)
     }
-    fn starts_with(&self, prefix: &[u8]) -> bool {
-        self.preview.starts_with(prefix)
-    }
-}
-impl Display for DownloadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.message.as_ref())
-    }
-}
-impl Error for DownloadError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_deref().map(|source| {
-            let source_ref: &(dyn Error + 'static) = source;
-            source_ref
-        })
-    }
-}
-impl From<Cow<'static, str>> for DownloadError {
-    fn from(value: Cow<'static, str>) -> Self {
-        Self {
-            message: value,
-            source: None,
-        }
-    }
-}
-impl From<String> for DownloadError {
-    fn from(value: String) -> Self {
-        Self::from(Cow::Owned(value))
-    }
-}
-impl From<&'static str> for DownloadError {
-    fn from(value: &'static str) -> Self {
-        Self::from(Cow::Borrowed(value))
-    }
 }
 impl StreamingBodySink<'_> {
     fn append(&mut self, bytes: &[u8]) -> DownloadResult<()> {
-        let Some(next_len) = self.summary.bytes_seen.checked_add(bytes.len()) else {
-            return Err("HTTP 응답 본문 크기 계산 실패".into());
-        };
-        if next_len > self.limit {
+        if bytes.len() > self.limit.saturating_sub(self.summary.bytes_seen) {
             return Err(format!(
                 "HTTP 응답 본문 크기가 허용 한도({} bytes)를 초과했습니다.",
                 self.limit
@@ -201,55 +151,31 @@ impl StreamingBodySink<'_> {
         self.writer.write_all(bytes).map_err(|source| {
             download_error_with_source("HTTP 응답 본문 파일 쓰기 실패", source)
         })?;
-        self.summary.bytes_seen = next_len;
+        self.summary.bytes_seen = self.summary.bytes_seen.saturating_add(bytes.len());
         Ok(())
     }
     fn capture_preview(&mut self, bytes: &[u8]) -> DownloadResult<()> {
-        let Some(remaining_preview) =
-            HTTP_ERROR_PREVIEW_BYTES.checked_sub(self.summary.preview.len())
-        else {
-            return Err("HTTP 응답 본문 preview 상태가 손상되었습니다.".into());
-        };
+        let remaining_preview = HTTP_ERROR_PREVIEW_BYTES.saturating_sub(self.summary.preview.len());
         let take = remaining_preview.min(bytes.len());
         if take == 0 {
             return Ok(());
         }
-        let Some(next_preview_len) = self.summary.preview.len().checked_add(take) else {
-            return Err("HTTP 응답 본문 preview 길이 계산 실패".into());
-        };
-        if self.summary.preview.capacity() < next_preview_len
-            && let Err(source) = self.summary.preview.try_reserve_exact(take)
-        {
-            return Err(download_error_with_source(
-                "HTTP 응답 본문 preview 메모리 확보 실패",
-                source,
-            ));
-        }
-        let Some(preview) = bytes.get(..take) else {
-            return Err("HTTP 응답 본문 preview 범위 계산 실패".into());
-        };
-        self.summary.preview.extend_from_slice(preview);
+        self.summary
+            .preview
+            .try_reserve_exact(take)
+            .map_err(|source| {
+                download_error_with_source("HTTP 응답 본문 preview 메모리 확보 실패", source)
+            })?;
+        self.summary
+            .preview
+            .extend(bytes.iter().copied().take(take));
         Ok(())
     }
 }
-fn download_error_with_source<M, E>(context: M, source: E) -> DownloadError
-where
-    M: Into<Cow<'static, str>>,
-    E: Error + Send + Sync + 'static,
-{
-    DownloadError {
-        message: context.into(),
-        source: Some(Box::new(source)),
+fn push_decimal_fragment(out: &mut String, value: u128) {
+    match FmtWrite::write_fmt(out, format_args!("{value}")) {
+        Ok(()) | Err(_) => {}
     }
-}
-fn push_decimal_fragment(
-    out: &mut String,
-    value: u128,
-    context: &'static str,
-) -> DownloadResult<()> {
-    let digits = U128DecimalDigits::new(value).ok_or(context)?;
-    digits.push_to(out).ok_or(context)?;
-    Ok(())
 }
 cfg_select! {
     windows => {
@@ -300,12 +226,11 @@ fn validated_http_content_length(
             return Err("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.".into());
         }
         let mut parsed = 0_usize;
-        let mut over_limit = false;
         for byte in value.bytes() {
             if !byte.is_ascii_digit() {
                 return Err("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.".into());
             }
-            if over_limit {
+            if parsed > limit {
                 continue;
             }
             let digit_raw = byte.wrapping_sub(b'0');
@@ -313,9 +238,6 @@ fn validated_http_content_length(
                 .checked_mul(10)
                 .and_then(|scaled| scaled.checked_add(usize::from(digit_raw)))
                 .ok_or("HTTP Content-Length 해석 실패")?;
-            if parsed > limit {
-                over_limit = true;
-            }
         }
         if parsed > limit {
             return Err(
@@ -331,50 +253,4 @@ fn validated_http_content_length(
         }
     }
     Ok(content_length)
-}
-fn attach_remove_file_error(mut error: DownloadError, path: &Path) -> DownloadError {
-    match fs::remove_file(path) {
-        Ok(()) => error,
-        Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => error,
-        Err(remove_error) => {
-            let cleanup_text = format!(
-                "다운로드 임시 파일 삭제 실패: {} ({remove_error})",
-                path.display()
-            );
-            append_download_error_message(&mut error, &cleanup_text);
-            error
-        }
-    }
-}
-fn append_download_error_message(error: &mut DownloadError, additional: &str) {
-    const SEPARATOR: &str = "; ";
-    let original = replace(&mut error.message, Cow::Borrowed(""));
-    match original {
-        Cow::Borrowed(existing_message) => {
-            if let Some(capacity) = existing_message
-                .len()
-                .checked_add(SEPARATOR.len())
-                .and_then(|value| value.checked_add(additional.len()))
-            {
-                let mut combined = String::new();
-                if combined.try_reserve_exact(capacity).is_ok() {
-                    combined.push_str(existing_message);
-                    combined.push_str(SEPARATOR);
-                    combined.push_str(additional);
-                    error.message = Cow::Owned(combined);
-                    return;
-                }
-            }
-            error.message = Cow::Borrowed(existing_message);
-        }
-        Cow::Owned(mut existing_message) => {
-            if let Some(extra_len) = SEPARATOR.len().checked_add(additional.len())
-                && existing_message.try_reserve_exact(extra_len).is_ok()
-            {
-                existing_message.push_str(SEPARATOR);
-                existing_message.push_str(additional);
-            }
-            error.message = Cow::Owned(existing_message);
-        }
-    }
 }

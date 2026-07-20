@@ -1,36 +1,104 @@
-use crate::decimal::U128DecimalDigits;
 use core::time::Duration;
-pub(crate) const STALE_TEMP_ENTRY_AGE: Duration = Duration::from_hours(24);
-pub(crate) const TEMP_ENTRY_NAME_CAPACITY: usize = 128;
-pub(crate) const TEMP_ENTRY_RESERVATION_ATTEMPTS: u32 = 1024;
-pub(crate) fn temp_entry_age_nanos(file_name: &str, prefix: &str, now_nanos: u128) -> Option<u128> {
-    let suffix = file_name.strip_prefix(prefix)?;
-    let mut fragments = suffix.split('_');
-    let (Some(pid), Some(created_at), Some(sequence), None) = (
-        fragments.next(),
-        fragments.next(),
-        fragments.next(),
-        fragments.next(),
-    ) else {
-        return None;
-    };
-    pid.parse::<u32>().ok()?;
-    let created_at_nanos = created_at.parse::<u128>().ok()?;
-    sequence.parse::<u32>().ok()?;
-    now_nanos.checked_sub(created_at_nanos)
+use std::{
+    fs, io,
+    path::Path,
+    process, thread,
+    time::{SystemTime, UNIX_EPOCH},
+};
+const STALE_TEMP_ENTRY_AGE: Duration = Duration::from_hours(24);
+const TEMP_ENTRY_RESERVATION_ATTEMPTS: u32 = 1024;
+const TEMP_ENTRY_RESERVATION_DELAY: Duration = Duration::from_micros(50);
+#[derive(Clone, Copy)]
+pub(crate) enum TempEntryKind {
+    Directory,
+    File,
 }
-pub(crate) fn write_temp_entry_name(
-    out: &mut String,
+pub(crate) fn cleanup_stale_temp_entries(
+    parent: &Path,
     prefix: &str,
-    pid: u32,
-    nanos: u128,
-    sequence: u32,
-) -> Option<()> {
-    out.clear();
-    out.push_str(prefix);
-    U128DecimalDigits::new(u128::from(pid))?.push_to(out)?;
-    out.push('_');
-    U128DecimalDigits::new(nanos)?.push_to(out)?;
-    out.push('_');
-    U128DecimalDigits::new(u128::from(sequence))?.push_to(out)
+    kind: TempEntryKind,
+) -> io::Result<usize> {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let mut removed = 0_usize;
+    for entry_result in fs::read_dir(parent)? {
+        let entry = entry_result?;
+        let file_name_os = entry.file_name();
+        let Some(file_name) = file_name_os.to_str() else {
+            continue;
+        };
+        let Some(suffix) = file_name.strip_prefix(prefix) else {
+            continue;
+        };
+        let mut fragments = suffix.split('_');
+        let (Some(pid), Some(created_at), Some(sequence), None) = (
+            fragments.next(),
+            fragments.next(),
+            fragments.next(),
+            fragments.next(),
+        ) else {
+            continue;
+        };
+        if pid.parse::<u32>().is_err() || sequence.parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(created_at_nanos) = created_at.parse::<u128>() else {
+            continue;
+        };
+        let Some(age_nanos) = now_nanos.checked_sub(created_at_nanos) else {
+            continue;
+        };
+        if age_nanos < STALE_TEMP_ENTRY_AGE.as_nanos() {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        let remove_result = match kind {
+            TempEntryKind::Directory if file_type.is_dir() => fs::remove_dir_all(&path),
+            TempEntryKind::File if !file_type.is_dir() => fs::remove_file(&path),
+            TempEntryKind::Directory | TempEntryKind::File => continue,
+        };
+        match remove_result {
+            Ok(()) => {
+                removed = removed.checked_add(1).ok_or_else(|| {
+                    io::Error::other("정리한 임시 항목 수 계산 중 overflow가 발생했습니다.")
+                })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(removed)
+}
+pub(crate) fn reserve_unique_temp_entry<T>(
+    parent: &Path,
+    prefix: &str,
+    mut create_entry: impl FnMut(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    let pid = process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    for sequence in 0..TEMP_ENTRY_RESERVATION_ATTEMPTS {
+        let path = parent.join(format!("{prefix}{pid}_{nanos}_{sequence}"));
+        match create_entry(&path) {
+            Ok(entry) => return Ok(entry),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                thread::sleep(TEMP_ENTRY_RESERVATION_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "임시 항목 이름 충돌이 반복되었습니다. 잠시 후 다시 시도하세요.",
+    ))
 }

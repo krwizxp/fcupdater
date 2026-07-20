@@ -22,10 +22,6 @@ const ZIP_OUTPUT_BUFFER_CAPACITY: usize = 64 * 1024;
 const STORE_WITHOUT_DEFLATE_EXTENSIONS: [&str; 10] = [
     ".bin", ".gif", ".jpeg", ".jpg", ".mp3", ".mp4", ".png", ".webp", ".zip", ".zst",
 ];
-struct CentralDirectoryPlan {
-    max_header_capacity: usize,
-    size: usize,
-}
 struct WriteEntry {
     compressed_size: usize,
     crc32: u32,
@@ -80,36 +76,25 @@ impl StreamingZipWriter<'_> {
         let central_dir_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 offset 변환 실패", source))?;
         let entries = mem::take(&mut self.entries);
-        let Some(central_dir_plan) = entries.iter().try_fold(
-            CentralDirectoryPlan {
-                max_header_capacity: 0,
-                size: 0,
-            },
-            |plan, entry| {
+        let Some((max_header_capacity, central_dir_size_usize)) =
+            entries.iter().try_fold((0_usize, 0_usize), |plan, entry| {
                 let header_len = CENTRAL_FILE_HEADER_BASE_LEN.checked_add(entry.name.len())?;
-                Some(CentralDirectoryPlan {
-                    max_header_capacity: plan.max_header_capacity.max(header_len),
-                    size: plan.size.checked_add(header_len)?,
-                })
-            },
-        ) else {
+                Some((plan.0.max(header_len), plan.1.checked_add(header_len)?))
+            })
+        else {
             return Err(err(
                 "ZIP 중앙 디렉터리 크기 계산 중 overflow가 발생했습니다.",
             ));
         };
-        let central_dir_size = u32::try_from(central_dir_plan.size)
+        let central_dir_size = u32::try_from(central_dir_size_usize)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
         let entry_count_u16 = u16::try_from(entries.len())
             .map_err(|source| err_with_source("ZIP entry 수 변환 실패", source))?;
-        let central_output_size = central_dir_plan
-            .size
+        let central_output_size = central_dir_size_usize
             .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
             .ok_or_else(|| err("ZIP 중앙 디렉터리 전체 크기 계산 중 overflow가 발생했습니다."))?;
         self.ensure_output_limit(central_output_size, "ZIP 중앙 디렉터리 출력 크기 계산")?;
-        self.prepare_header_buffer(
-            central_dir_plan.max_header_capacity,
-            "ZIP 중앙 header 메모리 확보 실패",
-        )?;
+        self.prepare_header_buffer(max_header_capacity, "ZIP 중앙 header 메모리 확보 실패")?;
         for entry in &entries {
             self.header_buffer.clear();
             write_file_header(&mut self.header_buffer, ZipFileHeader::Central(entry))?;
@@ -148,17 +133,13 @@ impl StreamingZipWriter<'_> {
             })
             .plan()?
         };
-        let use_deflate = deflate_plan
+        let compressed_plan = deflate_plan
             .as_ref()
-            .is_some_and(|plan| plan.len() < uncompressed_size);
-        let (compressed_size, method) = if use_deflate {
-            let plan = deflate_plan
-                .as_ref()
-                .ok_or_else(|| err("ZIP deflate 계획 상태가 손상되었습니다."))?;
-            (plan.len(), METHOD_DEFLATE)
-        } else {
-            (uncompressed_size, METHOD_STORE)
-        };
+            .filter(|plan| plan.len() < uncompressed_size);
+        let (compressed_size, method) = compressed_plan
+            .map_or((uncompressed_size, METHOD_STORE), |plan| {
+                (plan.len(), METHOD_DEFLATE)
+            });
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
         let local_header_capacity = LOCAL_FILE_HEADER_LEN
@@ -180,10 +161,7 @@ impl StreamingZipWriter<'_> {
             },
         )?;
         self.write_header_buffer("xlsx 압축 local header 쓰기 실패")?;
-        if use_deflate {
-            let plan = deflate_plan
-                .as_ref()
-                .ok_or_else(|| err("ZIP deflate 계획 상태가 손상되었습니다."))?;
+        if let Some(plan) = compressed_plan {
             let next_bytes_written =
                 self.ensure_output_limit(compressed_size, "ZIP deflated byte count 계산")?;
             let actual_written = plan.write_to(&mut self.file)?;

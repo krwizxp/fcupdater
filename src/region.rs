@@ -1,58 +1,48 @@
 use crate::diagnostic::{Result, err, err_with_source};
-pub(super) const TARGET_REGION_COUNT: usize = 11;
-const TARGET_REGION_KEYS: [&str; TARGET_REGION_COUNT] = [
-    "대전대덕구",
-    "대전동구",
-    "대전서구",
-    "대전유성구",
-    "대전중구",
-    "세종시",
-    "충북청주시",
-    "충남공주시",
-    "충남보령시",
-    "충남아산시",
-    "충남천안시",
-];
+pub(super) const TARGET_REGION_COUNT: usize = 7;
 const DAEJEON_DISTRICT_KEYS: [&str; 5] = ["대덕구", "동구", "서구", "유성구", "중구"];
-pub(super) const TARGET_REGION_LABELS: [&str; TARGET_REGION_COUNT] = [
-    "대전 대덕구",
-    "대전 동구",
-    "대전 서구",
-    "대전 유성구",
-    "대전 중구",
-    "세종",
-    "청주",
-    "공주",
-    "보령",
-    "아산",
-    "천안",
+pub(super) const TARGET_REGIONS: [TargetRegion; TARGET_REGION_COUNT] = [
+    TargetRegion::Daejeon,
+    TargetRegion::Sejong,
+    TargetRegion::Cheongju,
+    TargetRegion::Gongju,
+    TargetRegion::Boryeong,
+    TargetRegion::Asan,
+    TargetRegion::Cheonan,
 ];
-const ADDRESS_KEY_REPLACEMENTS: [AddressKeyReplacement; 4] = [
-    AddressKeyReplacement {
-        from: "충청남도",
-        to: "충남",
-    },
-    AddressKeyReplacement {
-        from: "충청북도",
-        to: "충북",
-    },
-    AddressKeyReplacement {
-        from: "대전광역시",
-        to: "대전",
-    },
-    AddressKeyReplacement {
-        from: "세종특별자치시",
-        to: "세종",
-    },
+const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
+    ("충청남도", "충남"),
+    ("충청북도", "충북"),
+    ("대전광역시", "대전"),
+    ("세종특별자치시", "세종"),
 ];
-struct AddressKeyReplacement {
-    from: &'static str,
-    to: &'static str,
-}
 #[derive(Clone, Copy)]
 pub(super) enum TargetRegionPolicy {
     Flexible,
     StrictSource,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum TargetRegion {
+    Asan,
+    Boryeong,
+    Cheonan,
+    Cheongju,
+    Daejeon,
+    Gongju,
+    Sejong,
+}
+impl TargetRegion {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Daejeon => "대전",
+            Self::Sejong => "세종",
+            Self::Cheongju => "청주",
+            Self::Gongju => "공주",
+            Self::Boryeong => "보령",
+            Self::Asan => "아산",
+            Self::Cheonan => "천안",
+        }
+    }
 }
 const fn ignored_address_key_char(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
@@ -71,9 +61,9 @@ fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     while !rest.is_empty() {
         let mut replaced = false;
         if matches!(rest.chars().next(), Some('충' | '대' | '세')) {
-            'replacement: for rule in ADDRESS_KEY_REPLACEMENTS {
+            'replacement: for (from, to) in ADDRESS_KEY_REPLACEMENTS {
                 let mut prefix_tail = rest;
-                for expected in rule.from.chars() {
+                for expected in from.chars() {
                     loop {
                         let Some(ch) = prefix_tail.chars().next() else {
                             continue 'replacement;
@@ -91,7 +81,7 @@ fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
                         break;
                     }
                 }
-                out.push_str(rule.to);
+                out.push_str(to);
                 rest = prefix_tail;
                 replaced = true;
                 break;
@@ -112,37 +102,54 @@ fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn target_region_index(
+pub(super) fn target_region(
     region: &str,
     address: &str,
     scratch: &mut String,
     policy: TargetRegionPolicy,
-) -> Result<Option<usize>> {
+) -> Result<Option<TargetRegion>> {
     if matches!(policy, TargetRegionPolicy::StrictSource) {
         normalize_address_key_into(region, scratch)?;
-        let region_index = TARGET_REGION_KEYS
-            .iter()
-            .position(|key| scratch.as_str() == *key);
+        let normalized_region = scratch.as_str();
+        let parsed_region = if normalized_region == "대전"
+            || normalized_region
+                .strip_prefix("대전")
+                .is_some_and(|district| DAEJEON_DISTRICT_KEYS.contains(&district))
+        {
+            Some(TargetRegion::Daejeon)
+        } else {
+            match normalized_region {
+                "세종시" => Some(TargetRegion::Sejong),
+                "충북청주시" => Some(TargetRegion::Cheongju),
+                "충남공주시" => Some(TargetRegion::Gongju),
+                "충남보령시" => Some(TargetRegion::Boryeong),
+                "충남아산시" => Some(TargetRegion::Asan),
+                "충남천안시" => Some(TargetRegion::Cheonan),
+                _ => None,
+            }
+        };
         let mut tokens = address.split_whitespace();
-        let address_index = match tokens.next() {
+        let address_region = match tokens.next() {
             Some("대전") => match tokens.next() {
-                Some("광역시") => tokens.next().and_then(daejeon_district_index),
-                district => district.and_then(daejeon_district_index),
+                Some("광역시") => tokens.next().and_then(daejeon_region),
+                district => district.and_then(daejeon_region),
             },
-            Some("대전광역시") => tokens.next().and_then(daejeon_district_index),
-            Some("세종" | "세종시" | "세종특별자치시") => Some(5),
-            Some("충북" | "충청북도") => (tokens.next() == Some("청주시")).then_some(6),
+            Some("대전광역시") => tokens.next().and_then(daejeon_region),
+            Some("세종" | "세종시" | "세종특별자치시") => Some(TargetRegion::Sejong),
+            Some("충북" | "충청북도") => {
+                (tokens.next() == Some("청주시")).then_some(TargetRegion::Cheongju)
+            }
             Some("충남" | "충청남도") => match tokens.next() {
-                Some("공주시") => Some(7),
-                Some("보령시") => Some(8),
-                Some("아산시") => Some(9),
-                Some("천안시") => Some(10),
-                Some("천안") if tokens.next() == Some("서북구") => Some(10),
+                Some("공주시") => Some(TargetRegion::Gongju),
+                Some("보령시") => Some(TargetRegion::Boryeong),
+                Some("아산시") => Some(TargetRegion::Asan),
+                Some("천안시") => Some(TargetRegion::Cheonan),
+                Some("천안") if tokens.next() == Some("서북구") => Some(TargetRegion::Cheonan),
                 Some(_) | None => None,
             },
             Some(_) | None => None,
         };
-        return match (region_index, address_index) {
+        return match (parsed_region, address_region) {
             (Some(region_match), Some(address_match)) if region_match == address_match => {
                 Ok(Some(address_match))
             }
@@ -159,63 +166,80 @@ pub(super) fn target_region_index(
         };
     }
     normalize_address_key_into(region, scratch)?;
-    if let Some(index) = target_region_index_from_normalized(scratch.as_str()) {
-        return Ok(Some(index));
-    }
     let region_is_daejeon = scratch.as_str() == "대전";
+    if !region_is_daejeon && let Some(target) = target_region_from_normalized(scratch.as_str()) {
+        return Ok(Some(target));
+    }
     normalize_address_key_into(address, scratch)?;
-    if let Some(index) = target_region_index_from_normalized(scratch.as_str()) {
-        return Ok(Some(index));
+    if let Some(target) = target_region_from_normalized(scratch.as_str()) {
+        return Ok(Some(target));
     }
     if region_is_daejeon {
         return Ok(DAEJEON_DISTRICT_KEYS
             .iter()
-            .position(|district| scratch.starts_with(district)));
+            .any(|district| scratch.starts_with(district))
+            .then_some(TargetRegion::Daejeon));
     }
     Ok(None)
 }
-fn daejeon_district_index(district: &str) -> Option<usize> {
+fn daejeon_region(district: &str) -> Option<TargetRegion> {
     DAEJEON_DISTRICT_KEYS
-        .iter()
-        .position(|candidate| district == *candidate)
+        .contains(&district)
+        .then_some(TargetRegion::Daejeon)
 }
 pub(super) fn increment_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],
-    region_index: usize,
+    region: TargetRegion,
     context: &'static str,
 ) -> Result<()> {
-    let Some(region_count) = counts.get_mut(region_index) else {
-        return Err(err(format!("{context} index 범위 오류")));
+    let &mut [
+        ref mut daejeon,
+        ref mut sejong,
+        ref mut cheongju,
+        ref mut gongju,
+        ref mut boryeong,
+        ref mut asan,
+        ref mut cheonan,
+    ] = counts;
+    let region_count = match region {
+        TargetRegion::Daejeon => daejeon,
+        TargetRegion::Sejong => sejong,
+        TargetRegion::Cheongju => cheongju,
+        TargetRegion::Gongju => gongju,
+        TargetRegion::Boryeong => boryeong,
+        TargetRegion::Asan => asan,
+        TargetRegion::Cheonan => cheonan,
     };
     *region_count = region_count
         .checked_add(1)
         .ok_or_else(|| err(format!("{context} 계산 중 overflow가 발생했습니다.")))?;
     Ok(())
 }
-fn target_region_index_from_normalized(text: &str) -> Option<usize> {
-    if let Some(index) = TARGET_REGION_KEYS
-        .iter()
-        .position(|key| text.starts_with(key))
-    {
-        return Some(index);
+fn target_region_from_normalized(text: &str) -> Option<TargetRegion> {
+    if text.strip_prefix("대전").is_some_and(|tail| {
+        DAEJEON_DISTRICT_KEYS
+            .iter()
+            .any(|district| tail.starts_with(district))
+    }) {
+        return Some(TargetRegion::Daejeon);
     }
     if text.starts_with("세종") {
-        return Some(5);
+        return Some(TargetRegion::Sejong);
     }
     if text.starts_with("충북청주") || text.starts_with("청주") {
-        return Some(6);
+        return Some(TargetRegion::Cheongju);
     }
     if text.starts_with("충남공주") || text.starts_with("공주") {
-        return Some(7);
+        return Some(TargetRegion::Gongju);
     }
     if text.starts_with("충남보령") || text.starts_with("보령") {
-        return Some(8);
+        return Some(TargetRegion::Boryeong);
     }
     if text.starts_with("충남아산") || text.starts_with("아산") {
-        return Some(9);
+        return Some(TargetRegion::Asan);
     }
     if text.starts_with("충남천안") || text.starts_with("천안") {
-        return Some(10);
+        return Some(TargetRegion::Cheonan);
     }
     None
 }
