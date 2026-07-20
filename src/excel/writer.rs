@@ -2008,28 +2008,10 @@ fn checked_capacity(parts: &[usize]) -> Option<usize> {
         .iter()
         .try_fold(0_usize, |sum, &part| sum.checked_add(part))
 }
-const fn u32_decimal_text_len(value: u32) -> usize {
-    if value < 10 {
-        1
-    } else if value < 100 {
-        2
-    } else if value < 1_000 {
-        3
-    } else if value < 10_000 {
-        4
-    } else if value < 100_000 {
-        5
-    } else if value < 1_000_000 {
-        6
-    } else if value < 10_000_000 {
-        7
-    } else if value < 100_000_000 {
-        8
-    } else if value < 1_000_000_000 {
-        9
-    } else {
-        10
-    }
+fn u32_decimal_text_len(value: u32) -> usize {
+    value
+        .checked_ilog10()
+        .map_or(1, |log| usize::from(log.to_le_bytes()[0]).saturating_add(1))
 }
 fn push_decimal_text(out: &mut String, value: impl Display) {
     match FmtWrite::write_fmt(out, format_args!("{value}")) {
