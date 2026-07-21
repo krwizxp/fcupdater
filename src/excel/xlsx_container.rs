@@ -1,6 +1,7 @@
 use super::path_util::reject_windows_special_component;
 use super::{
-    ArchiveFingerprint, SPREADSHEETML_NAMESPACE, SaveVerification, SheetInfo, ZipArchiveBuilder,
+    ArchiveFingerprint, CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH, MASTER_SHEET_NAME,
+    MASTER_SHEET_PATH, SPREADSHEETML_NAMESPACE, SaveVerification, ZipArchiveBuilder,
     ZipArchiveExtractor,
     path_util::path_to_slashes,
     writer::parse_ref_with_locks,
@@ -127,8 +128,13 @@ impl ReservedTempArchive {
             |(start, end)| (start, end),
         );
         let header_row = saved_archive_trailing_row_num(start_ref)?;
+        if header_row != 14 {
+            return Err(err(format!(
+                "저장 검증 실패: 유류비 autoFilter 시작 행이 고정 헤더 행과 다릅니다: {header_row}"
+            )));
+        }
         let filter_end_row = saved_archive_trailing_row_num(end_ref)?;
-        saved_workbook.verify_sheet_address_data_end_row("유류비", header_row, filter_end_row)?;
+        saved_workbook.verify_master_address_data_end_row(filter_end_row)?;
         Ok(())
     }
     fn write_archive_from(
@@ -163,6 +169,11 @@ impl Drop for ReservedTempArchive {
 struct ArchiveSemanticVerifier<'container> {
     container: &'container XlsxContainer,
     workbook_xml: &'container str,
+}
+struct WorksheetSemanticVerifier<'xml> {
+    name: &'xml str,
+    shared_entry_count: usize,
+    xml: &'xml str,
 }
 struct CellPosition {
     col: u32,
@@ -241,47 +252,13 @@ impl WorkbookRelationship<'_> {
     }
 }
 impl ArchiveSemanticVerifier<'_> {
-    fn cell_body_span(sheet_xml: &str, cell_open_end: usize) -> Result<Range<usize>> {
-        let body_start = cell_open_end
-            .checked_add(1)
-            .ok_or_else(|| err("저장 검증 실패: cell 본문 시작 계산 실패"))?;
-        let cell_close = find_end_tag(sheet_xml, "c", body_start)
-            .ok_or_else(|| err("저장 검증 실패: cell 종료 태그가 없습니다."))?;
-        Ok(Range {
-            start: body_start,
-            end: cell_close,
-        })
-    }
-    fn cell_cursor_after(
-        sheet_xml: &str,
-        cell_open_end: usize,
-        cell_self_closing: bool,
-    ) -> Result<usize> {
-        if cell_self_closing {
-            return cell_open_end
-                .checked_add(1)
-                .ok_or_else(|| err("저장 검증 실패: cell cursor 계산 실패"));
-        }
-        let cell_close_start = Self::cell_body_span(sheet_xml, cell_open_end)?.end;
-        let cell_close_end = find_tag_end(sheet_xml, cell_close_start)
-            .ok_or_else(|| err("저장 검증 실패: cell 종료 태그가 손상되었습니다."))?;
-        cell_close_end
-            .checked_add(1)
-            .ok_or_else(|| err("저장 검증 실패: cell cursor 계산 실패"))
-    }
-    fn filter_database_ref(&self, sheets: &[SheetInfo]) -> Result<Cow<'_, str>> {
-        let master_sheet_index = super::workbook_sheet_index_by_name(self.workbook_xml, "유류비")?;
-        if sheets.iter().filter(|sheet| sheet.name == "유류비").count() != 1 {
-            return Err(err(
-                "저장 검증 실패: workbook에 유류비 시트가 중복되어 있습니다.",
-            ));
-        }
+    fn filter_database_ref(&self) -> Result<Cow<'_, str>> {
         let quoted_sheet = "'유류비'!";
         let plain_sheet = "유류비!";
         let span = super::workbook_defined_name_content_span(
             self.workbook_xml,
             "_xlnm._FilterDatabase",
-            master_sheet_index,
+            0,
             quoted_sheet,
             plain_sheet,
         )?;
@@ -369,51 +346,7 @@ impl ArchiveSemanticVerifier<'_> {
             })
             .transpose()
     }
-    fn parse_cell_bounds(range_ref: &str, context: &str) -> Result<CellBounds> {
-        let (start_ref, end_ref) = range_ref
-            .split_once(':')
-            .map_or((range_ref, range_ref), |(start, end)| (start, end));
-        let min = Self::parse_cell_position(start_ref, context)?;
-        let max = Self::parse_cell_position(end_ref, context)?;
-        if min.col > max.col || min.row > max.row {
-            return Err(err(format!(
-                "{context}: cell range 순서가 올바르지 않습니다."
-            )));
-        }
-        Ok(CellBounds { max, min })
-    }
-    fn parse_cell_position(cell_ref: &str, context: &str) -> Result<CellPosition> {
-        let reference = parse_ref_with_locks(cell_ref)
-            .ok_or_else(|| err(format!("{context}: 유효한 A1 cell reference가 아닙니다.")))?;
-        Ok(CellPosition {
-            col: reference.col,
-            row: reference.row,
-        })
-    }
-    fn parse_positive_u32(text: &str, context: &'static str) -> Result<u32> {
-        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(err(format!("{context}: 양의 10진수 형식이 아닙니다.")));
-        }
-        let parsed = text
-            .parse::<u32>()
-            .map_err(|source| err_with_source(context, source))?;
-        let Some(non_zero) = NonZeroU32::new(parsed) else {
-            return Err(err(format!("{context}는 1 이상이어야 합니다.")));
-        };
-        Ok(non_zero.get())
-    }
-    fn shared_strings_summary(&self) -> Result<Option<SharedStringsSummary>> {
-        let shared_strings_path = self
-            .container
-            .resolve_relative_path("xl/sharedStrings.xml")?;
-        if !shared_strings_path.try_exists().map_err(|source_err| {
-            err_with_source(
-                path_context_message("sharedStrings.xml 존재 확인 실패", &shared_strings_path),
-                source_err,
-            )
-        })? {
-            return Ok(None);
-        }
+    fn shared_strings_summary(&self) -> Result<SharedStringsSummary> {
         let shared_xml = self.container.read_text("xl/sharedStrings.xml")?;
         let sst_start = find_start_tag(&shared_xml, "sst", 0)
             .ok_or_else(|| err("저장 검증 실패: sharedStrings.xml에 <sst>가 없습니다."))?;
@@ -459,21 +392,20 @@ impl ArchiveSemanticVerifier<'_> {
                     .ok_or_else(|| err("저장 검증 실패: sharedStrings <si> cursor 계산 실패"))?
             };
         }
-        Ok(Some(SharedStringsSummary {
+        Ok(SharedStringsSummary {
             declared_total,
             declared_unique,
             unique_entries,
-        }))
+        })
     }
     fn verify(&self) -> Result<String> {
-        let sheets = self.container.load_sheet_catalog(self.workbook_xml)?;
+        self.container
+            .ensure_fixed_sheet_catalog(self.workbook_xml)?;
         let shared_summary = self.shared_strings_summary()?;
-        let shared_entry_count = shared_summary
-            .as_ref()
-            .map(|summary| summary.unique_entries);
+        let shared_entry_count = shared_summary.unique_entries;
         let (master_auto_filter_ref, shared_ref_count) =
-            self.worksheet_summary(&sheets, shared_entry_count)?;
-        let filter_database_ref = self.filter_database_ref(&sheets)?;
+            self.worksheet_summary(shared_entry_count)?;
+        let filter_database_ref = self.filter_database_ref()?;
         let Some(auto_filter_ref) = master_auto_filter_ref else {
             return Err(err(
                 "저장 검증 실패: _FilterDatabase definedName이 있지만 autoFilter가 없습니다.",
@@ -488,52 +420,68 @@ impl ArchiveSemanticVerifier<'_> {
                 "저장 검증 실패: autoFilter 범위와 _FilterDatabase 범위가 다릅니다: autoFilter={auto_filter_ref}, definedName={filter_database_ref}"
             )));
         }
-        if shared_ref_count > 0 && shared_summary.is_none() {
-            return Err(err(
-                "저장 검증 실패: shared string 참조가 있지만 sharedStrings.xml이 없습니다.",
-            ));
+        if let Some(declared_count) = shared_summary.declared_total
+            && declared_count != shared_ref_count
+        {
+            return Err(err(format!(
+                "저장 검증 실패: sharedStrings count가 실제 참조 수와 다릅니다: declared={declared_count}, actual={shared_ref_count}"
+            )));
         }
-        if let Some(summary) = shared_summary {
-            if let Some(declared_count) = summary.declared_total
-                && declared_count != shared_ref_count
-            {
-                return Err(err(format!(
-                    "저장 검증 실패: sharedStrings count가 실제 참조 수와 다릅니다: declared={declared_count}, actual={shared_ref_count}"
-                )));
-            }
-            if let Some(declared_unique) = summary.declared_unique
-                && declared_unique != summary.unique_entries
-            {
-                return Err(err(format!(
-                    "저장 검증 실패: sharedStrings uniqueCount가 실제 <si> 수와 다릅니다: declared={declared_unique}, actual={}",
-                    summary.unique_entries
-                )));
-            }
+        if let Some(declared_unique) = shared_summary.declared_unique
+            && declared_unique != shared_summary.unique_entries
+        {
+            return Err(err(format!(
+                "저장 검증 실패: sharedStrings uniqueCount가 실제 <si> 수와 다릅니다: declared={declared_unique}, actual={}",
+                shared_summary.unique_entries
+            )));
         }
         Ok(auto_filter_ref)
     }
-    fn worksheet_bounds_and_shared_refs(
-        sheet_xml: &str,
-        sheet_name: &str,
-        shared_entry_count: Option<usize>,
-    ) -> Result<(Option<CellBounds>, usize)> {
+    fn worksheet_summary(&self, shared_entry_count: usize) -> Result<(Option<String>, usize)> {
+        let summarize = |name: &str, path: &str| -> Result<(Option<String>, usize)> {
+            let sheet_xml = self.container.read_text(path)?;
+            validate_worksheet_core_namespaces(&sheet_xml, name)?;
+            let verifier = WorksheetSemanticVerifier {
+                name,
+                shared_entry_count,
+                xml: &sheet_xml,
+            };
+            verifier.summarize()
+        };
+        let (master_auto_filter_ref, master_shared_ref_count) =
+            summarize(MASTER_SHEET_NAME, MASTER_SHEET_PATH)?;
+        let (_, change_log_shared_ref_count) =
+            summarize(CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH)?;
+        let shared_ref_count = master_shared_ref_count
+            .checked_add(change_log_shared_ref_count)
+            .ok_or_else(|| err("저장 검증 실패: shared string 참조 수 계산 실패"))?;
+        Ok((master_auto_filter_ref, shared_ref_count))
+    }
+}
+impl WorksheetSemanticVerifier<'_> {
+    fn bounds_and_shared_refs(&self) -> Result<(Option<CellBounds>, usize)> {
+        let Self {
+            name,
+            shared_entry_count,
+            xml,
+        } = *self;
         let mut bounds: Option<CellBounds> = None;
         let mut shared_ref_count = 0_usize;
         let mut cursor = 0_usize;
-        while let Some(cell_start) = find_start_tag(sheet_xml, "c", cursor) {
-            let cell_open_end = find_tag_end(sheet_xml, cell_start).ok_or_else(|| {
+        while let Some(cell_start) = find_start_tag(xml, "c", cursor) {
+            let cell_open_end = find_tag_end(xml, cell_start).ok_or_else(|| {
                 err(format!(
-                    "저장 검증 실패: cell 태그가 손상되었습니다: {sheet_name}"
+                    "저장 검증 실패: cell 태그가 손상되었습니다: {name}"
                 ))
             })?;
-            let cell_tag = sheet_xml.get(cell_start..=cell_open_end).ok_or_else(|| {
+            let cell_tag = xml.get(cell_start..=cell_open_end).ok_or_else(|| {
                 err(format!(
-                    "저장 검증 실패: cell 태그 범위가 손상되었습니다: {sheet_name}"
+                    "저장 검증 실패: cell 태그 범위가 손상되었습니다: {name}"
                 ))
             })?;
             let Some(cell_ref) = extract_attr(cell_tag, "r")? else {
                 return Err(err(format!(
-                    "저장 검증 실패: cell에 r 속성이 없습니다: {sheet_name}"
+                    "저장 검증 실패: cell에 r 속성이 없습니다: {name}"
                 )));
             };
             let cell =
@@ -553,24 +501,19 @@ impl ArchiveSemanticVerifier<'_> {
             }
             let cell_self_closing = cell_tag.trim_ascii_end().ends_with("/>");
             if extract_attr(cell_tag, "t")?.as_deref() == Some("s") {
-                let Some(shared_count) = shared_entry_count else {
-                    return Err(err(
-                        "저장 검증 실패: shared string 참조가 있지만 sharedStrings.xml이 없습니다.",
-                    ));
-                };
                 if cell_self_closing {
                     return Err(err(format!(
-                        "저장 검증 실패: shared string cell에 <v>가 없습니다: {sheet_name}!{}",
+                        "저장 검증 실패: shared string cell에 <v>가 없습니다: {name}!{}",
                         cell_ref.as_ref()
                     )));
                 }
-                let body_span = Self::cell_body_span(sheet_xml, cell_open_end)?;
-                let cell_body = sheet_xml
+                let body_span = Self::cell_body_span(xml, cell_open_end)?;
+                let cell_body = xml
                     .get(body_span)
                     .ok_or_else(|| err("저장 검증 실패: cell 본문 범위가 손상되었습니다."))?;
                 let Some(raw_index) = extract_first_tag_text(cell_body, "v")? else {
                     return Err(err(format!(
-                        "저장 검증 실패: shared string cell에 <v>가 없습니다: {sheet_name}!{}",
+                        "저장 검증 실패: shared string cell에 <v>가 없습니다: {name}!{}",
                         cell_ref.as_ref()
                     )));
                 };
@@ -580,16 +523,16 @@ impl ArchiveSemanticVerifier<'_> {
                     || !trimmed_index.bytes().all(|byte| byte.is_ascii_digit())
                 {
                     return Err(err(format!(
-                        "저장 검증 실패: shared string index가 음이 아닌 정수가 아닙니다: {sheet_name}!{}",
+                        "저장 검증 실패: shared string index가 음이 아닌 정수가 아닙니다: {name}!{}",
                         cell_ref.as_ref()
                     )));
                 }
                 let index = trimmed_index.parse::<usize>().map_err(|source| {
                     err_with_source("저장 검증 실패: shared string index 해석 실패", source)
                 })?;
-                if index >= shared_count {
+                if index >= shared_entry_count {
                     return Err(err(format!(
-                        "저장 검증 실패: shared string index가 범위를 벗어났습니다: {sheet_name}!{} index={index}, uniqueCount={shared_count}",
+                        "저장 검증 실패: shared string index가 범위를 벗어났습니다: {name}!{} index={index}, uniqueCount={shared_entry_count}",
                         cell_ref.as_ref()
                     )));
                 }
@@ -597,29 +540,58 @@ impl ArchiveSemanticVerifier<'_> {
                     .checked_add(1)
                     .ok_or_else(|| err("저장 검증 실패: shared string 참조 수 계산 실패"))?;
             }
-            cursor = Self::cell_cursor_after(sheet_xml, cell_open_end, cell_self_closing)?;
+            cursor = Self::cell_cursor_after(xml, cell_open_end, cell_self_closing)?;
         }
         Ok((bounds, shared_ref_count))
     }
-    fn worksheet_cell_refs_unique(sheet_xml: &str, sheet_name: &str) -> Result<()> {
+    fn cell_body_span(sheet_xml: &str, cell_open_end: usize) -> Result<Range<usize>> {
+        let body_start = cell_open_end
+            .checked_add(1)
+            .ok_or_else(|| err("저장 검증 실패: cell 본문 시작 계산 실패"))?;
+        let cell_close = find_end_tag(sheet_xml, "c", body_start)
+            .ok_or_else(|| err("저장 검증 실패: cell 종료 태그가 없습니다."))?;
+        Ok(Range {
+            start: body_start,
+            end: cell_close,
+        })
+    }
+    fn cell_cursor_after(
+        sheet_xml: &str,
+        cell_open_end: usize,
+        cell_self_closing: bool,
+    ) -> Result<usize> {
+        if cell_self_closing {
+            return cell_open_end
+                .checked_add(1)
+                .ok_or_else(|| err("저장 검증 실패: cell cursor 계산 실패"));
+        }
+        let cell_close_start = Self::cell_body_span(sheet_xml, cell_open_end)?.end;
+        let cell_close_end = find_tag_end(sheet_xml, cell_close_start)
+            .ok_or_else(|| err("저장 검증 실패: cell 종료 태그가 손상되었습니다."))?;
+        cell_close_end
+            .checked_add(1)
+            .ok_or_else(|| err("저장 검증 실패: cell cursor 계산 실패"))
+    }
+    fn cell_refs_unique(&self) -> Result<()> {
+        let Self { name, xml, .. } = *self;
         let mut seen_cells: HashSet<u64> = HashSet::new();
         let mut cursor = 0_usize;
-        while let Some(cell_start) = find_start_tag(sheet_xml, "c", cursor) {
-            let cell_open_end = find_tag_end(sheet_xml, cell_start)
+        while let Some(cell_start) = find_start_tag(xml, "c", cursor) {
+            let cell_open_end = find_tag_end(xml, cell_start)
                 .ok_or_else(|| err("저장 검증 실패: cell 태그가 손상되었습니다."))?;
-            let cell_tag = sheet_xml
+            let cell_tag = xml
                 .get(cell_start..=cell_open_end)
                 .ok_or_else(|| err("저장 검증 실패: cell 태그 범위가 손상되었습니다."))?;
             let Some(cell_ref) = extract_attr(cell_tag, "r")? else {
                 return Err(err(format!(
-                    "저장 검증 실패: cell에 r 속성이 없습니다: {sheet_name}"
+                    "저장 검증 실패: cell에 r 속성이 없습니다: {name}"
                 )));
             };
             let cell =
                 Self::parse_cell_position(cell_ref.as_ref(), "저장 검증 실패: cell reference")?;
             if cell.col >= FAR_ARTIFACT_MIN_COL {
                 return Err(err(format!(
-                    "저장 검증 실패: worksheet에 원거리 cell artifact가 있습니다: {sheet_name}!{}",
+                    "저장 검증 실패: worksheet에 원거리 cell artifact가 있습니다: {name}!{}",
                     cell_ref.as_ref()
                 )));
             }
@@ -634,27 +606,24 @@ impl ArchiveSemanticVerifier<'_> {
             }
             if !seen_cells.insert(cell_key) {
                 return Err(err(format!(
-                    "저장 검증 실패: worksheet에 중복 cell reference가 있습니다: {sheet_name}!{}",
+                    "저장 검증 실패: worksheet에 중복 cell reference가 있습니다: {name}!{}",
                     cell_ref.as_ref()
                 )));
             }
             let cell_self_closing = cell_tag.trim_ascii_end().ends_with("/>");
-            cursor = Self::cell_cursor_after(sheet_xml, cell_open_end, cell_self_closing)?;
+            cursor = Self::cell_cursor_after(xml, cell_open_end, cell_self_closing)?;
         }
         Ok(())
     }
-    fn worksheet_filter_semantics(
-        sheet_xml: &str,
-        sheet_name: &str,
-        actual_bounds: Option<&CellBounds>,
-    ) -> Result<Option<String>> {
-        if sheet_name == "유류비" {
+    fn filter_semantics(&self, actual_bounds: Option<&CellBounds>) -> Result<Option<String>> {
+        let Self { name, xml, .. } = *self;
+        if name == "유류비" {
             let mut cursor = 0_usize;
             let mut found_ref = None;
-            while let Some(filter_start) = find_start_tag(sheet_xml, "autoFilter", cursor) {
-                let filter_end = find_tag_end(sheet_xml, filter_start)
+            while let Some(filter_start) = find_start_tag(xml, "autoFilter", cursor) {
+                let filter_end = find_tag_end(xml, filter_start)
                     .ok_or_else(|| err("저장 검증 실패: autoFilter 태그가 손상되었습니다."))?;
-                let filter_tag = sheet_xml
+                let filter_tag = xml
                     .get(filter_start..=filter_end)
                     .ok_or_else(|| err("저장 검증 실패: autoFilter 태그 범위가 손상되었습니다."))?;
                 let Some(filter_ref) = extract_attr(filter_tag, "ref")? else {
@@ -672,14 +641,11 @@ impl ArchiveSemanticVerifier<'_> {
                         "저장 검증 실패: 유류비 autoFilter 시작 범위가 예상과 다릅니다: {filter_ref_text}"
                     )));
                 }
-                let expected_last_row = Self::worksheet_meaningful_row_bound(
-                    sheet_xml,
-                    MASTER_FILTER_DATA_START_ROW,
-                    filter_bounds.max.col,
-                )?
-                .ok_or_else(|| {
-                    err("저장 검증 실패: 유류비 autoFilter 데이터 행을 찾지 못했습니다.")
-                })?;
+                let expected_last_row = self
+                    .meaningful_row_bound(MASTER_FILTER_DATA_START_ROW, filter_bounds.max.col)?
+                    .ok_or_else(|| {
+                        err("저장 검증 실패: 유류비 autoFilter 데이터 행을 찾지 못했습니다.")
+                    })?;
                 if filter_bounds.max.row != expected_last_row {
                     return Err(err(format!(
                         "저장 검증 실패: 유류비 autoFilter 마지막 행이 실제 데이터 마지막 행과 다릅니다: filter={filter_ref_text}, actual={expected_last_row}"
@@ -701,19 +667,19 @@ impl ArchiveSemanticVerifier<'_> {
             }
             return Ok(found_ref);
         }
-        if sheet_name != "변경내역" {
+        if name != "변경내역" {
             return Ok(None);
         }
-        let expected_last_row =
-            Self::worksheet_meaningful_row_bound(sheet_xml, CHANGELOG_DATA_START_ROW, 13)?
-                .unwrap_or(CHANGELOG_DATA_START_ROW);
+        let expected_last_row = self
+            .meaningful_row_bound(CHANGELOG_DATA_START_ROW, 13)?
+            .unwrap_or(CHANGELOG_DATA_START_ROW);
         let mut delta_mask = 0_u8;
         let mut cursor = 0_usize;
-        while let Some(cf_start) = find_start_tag(sheet_xml, "conditionalFormatting", cursor) {
-            let cf_end = find_tag_end(sheet_xml, cf_start).ok_or_else(|| {
+        while let Some(cf_start) = find_start_tag(xml, "conditionalFormatting", cursor) {
+            let cf_end = find_tag_end(xml, cf_start).ok_or_else(|| {
                 err("저장 검증 실패: 변경내역 conditionalFormatting 태그가 손상되었습니다.")
             })?;
-            let cf_tag = sheet_xml.get(cf_start..=cf_end).ok_or_else(|| {
+            let cf_tag = xml.get(cf_start..=cf_end).ok_or_else(|| {
                 err("저장 검증 실패: 변경내역 conditionalFormatting 태그 범위가 손상되었습니다.")
             })?;
             if let Some(sqref) = extract_attr(cf_tag, "sqref")? {
@@ -739,26 +705,23 @@ impl ArchiveSemanticVerifier<'_> {
                 err("저장 검증 실패: 변경내역 conditionalFormatting cursor 계산 실패")
             })?;
         }
-        for (bit, name) in [(1, "G"), (2, "J"), (4, "M")] {
+        for (bit, column) in [(1, "G"), (2, "J"), (4, "M")] {
             if delta_mask & bit == 0 {
                 return Err(err(format!(
-                    "저장 검증 실패: 변경내역 {name}열 조건부 서식 기준 범위가 없습니다."
+                    "저장 검증 실패: 변경내역 {column}열 조건부 서식 기준 범위가 없습니다."
                 )));
             }
         }
         Ok(None)
     }
-    fn worksheet_meaningful_row_bound(
-        sheet_xml: &str,
-        min_row: u32,
-        max_col: u32,
-    ) -> Result<Option<u32>> {
+    fn meaningful_row_bound(&self, min_row: u32, max_col: u32) -> Result<Option<u32>> {
+        let xml = self.xml;
         let mut last_row = None;
         let mut cursor = 0_usize;
-        while let Some(cell_start) = find_start_tag(sheet_xml, "c", cursor) {
-            let cell_open_end = find_tag_end(sheet_xml, cell_start)
+        while let Some(cell_start) = find_start_tag(xml, "c", cursor) {
+            let cell_open_end = find_tag_end(xml, cell_start)
                 .ok_or_else(|| err("저장 검증 실패: cell 태그가 손상되었습니다."))?;
-            let cell_tag = sheet_xml
+            let cell_tag = xml
                 .get(cell_start..=cell_open_end)
                 .ok_or_else(|| err("저장 검증 실패: cell 태그 범위가 손상되었습니다."))?;
             let Some(cell_ref) = extract_attr(cell_tag, "r")? else {
@@ -767,11 +730,10 @@ impl ArchiveSemanticVerifier<'_> {
             let cell =
                 Self::parse_cell_position(cell_ref.as_ref(), "저장 검증 실패: cell reference")?;
             let cell_self_closing = cell_tag.trim_ascii_end().ends_with("/>");
-            let cursor_after_cell =
-                Self::cell_cursor_after(sheet_xml, cell_open_end, cell_self_closing)?;
+            let cursor_after_cell = Self::cell_cursor_after(xml, cell_open_end, cell_self_closing)?;
             if cell.row >= min_row && cell.col <= max_col && !cell_self_closing {
-                let body_span = Self::cell_body_span(sheet_xml, cell_open_end)?;
-                let cell_body = sheet_xml
+                let body_span = Self::cell_body_span(xml, cell_open_end)?;
+                let cell_body = xml
                     .get(body_span)
                     .ok_or_else(|| err("저장 검증 실패: cell 본문 범위가 손상되었습니다."))?;
                 let has_payload = if find_start_tag(cell_body, "f", 0).is_some() {
@@ -792,29 +754,59 @@ impl ArchiveSemanticVerifier<'_> {
         }
         Ok(last_row)
     }
-    fn worksheet_range_dimension_matches(
-        sheet_xml: &str,
-        sheet_name: &str,
-        actual_bounds: &CellBounds,
-    ) -> Result<()> {
-        let dim_start = find_start_tag(sheet_xml, "dimension", 0).ok_or_else(|| {
+    fn parse_cell_bounds(range_ref: &str, context: &str) -> Result<CellBounds> {
+        let (start_ref, end_ref) = range_ref
+            .split_once(':')
+            .map_or((range_ref, range_ref), |(start, end)| (start, end));
+        let min = Self::parse_cell_position(start_ref, context)?;
+        let max = Self::parse_cell_position(end_ref, context)?;
+        if min.col > max.col || min.row > max.row {
+            return Err(err(format!(
+                "{context}: cell range 순서가 올바르지 않습니다."
+            )));
+        }
+        Ok(CellBounds { max, min })
+    }
+    fn parse_cell_position(cell_ref: &str, context: &str) -> Result<CellPosition> {
+        let reference = parse_ref_with_locks(cell_ref)
+            .ok_or_else(|| err(format!("{context}: 유효한 A1 cell reference가 아닙니다.")))?;
+        Ok(CellPosition {
+            col: reference.col,
+            row: reference.row,
+        })
+    }
+    fn parse_positive_u32(text: &str, context: &'static str) -> Result<u32> {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(err(format!("{context}: 양의 10진수 형식이 아닙니다.")));
+        }
+        let parsed = text
+            .parse::<u32>()
+            .map_err(|source| err_with_source(context, source))?;
+        let Some(non_zero) = NonZeroU32::new(parsed) else {
+            return Err(err(format!("{context}는 1 이상이어야 합니다.")));
+        };
+        Ok(non_zero.get())
+    }
+    fn range_dimension_matches(&self, actual_bounds: &CellBounds) -> Result<()> {
+        let Self { name, xml, .. } = *self;
+        let dim_start = find_start_tag(xml, "dimension", 0).ok_or_else(|| {
             err(format!(
-                "저장 검증 실패: worksheet dimension 태그가 없습니다: {sheet_name}"
+                "저장 검증 실패: worksheet dimension 태그가 없습니다: {name}"
             ))
         })?;
-        let dim_end = find_tag_end(sheet_xml, dim_start).ok_or_else(|| {
+        let dim_end = find_tag_end(xml, dim_start).ok_or_else(|| {
             err(format!(
-                "저장 검증 실패: worksheet dimension 태그가 손상되었습니다: {sheet_name}"
+                "저장 검증 실패: worksheet dimension 태그가 손상되었습니다: {name}"
             ))
         })?;
-        let dim_tag = sheet_xml.get(dim_start..=dim_end).ok_or_else(|| {
+        let dim_tag = xml.get(dim_start..=dim_end).ok_or_else(|| {
             err(format!(
-                "저장 검증 실패: worksheet dimension 태그 범위가 손상되었습니다: {sheet_name}"
+                "저장 검증 실패: worksheet dimension 태그 범위가 손상되었습니다: {name}"
             ))
         })?;
         let Some(dim_ref) = extract_attr(dim_tag, "ref")? else {
             return Err(err(format!(
-                "저장 검증 실패: worksheet dimension ref 속성이 없습니다: {sheet_name}"
+                "저장 검증 실패: worksheet dimension ref 속성이 없습니다: {name}"
             )));
         };
         let declared_bounds =
@@ -827,7 +819,7 @@ impl ArchiveSemanticVerifier<'_> {
             return Ok(());
         }
         Err(err(format!(
-            "저장 검증 실패: worksheet dimension이 실제 cell 범위와 다릅니다: {sheet_name}, declared={}, actual=col {} row {}:col {} row {}",
+            "저장 검증 실패: worksheet dimension이 실제 cell 범위와 다릅니다: {name}, declared={}, actual=col {} row {}:col {} row {}",
             dim_ref.as_ref(),
             actual_bounds.min.col,
             actual_bounds.min.row,
@@ -835,17 +827,18 @@ impl ArchiveSemanticVerifier<'_> {
             actual_bounds.max.row
         )))
     }
-    fn worksheet_ref_formula_refs(sheet_xml: &str, sheet_name: &str) -> Result<()> {
+    fn ref_formula_refs(&self) -> Result<()> {
+        let Self { name, xml, .. } = *self;
         let mut cursor = 0_usize;
-        while let Some(formula_start) = find_start_tag(sheet_xml, "f", cursor) {
-            let open_end = find_tag_end(sheet_xml, formula_start).ok_or_else(|| {
+        while let Some(formula_start) = find_start_tag(xml, "f", cursor) {
+            let open_end = find_tag_end(xml, formula_start).ok_or_else(|| {
                 err(format!(
-                    "저장 검증 실패: formula 태그가 손상되었습니다: {sheet_name}"
+                    "저장 검증 실패: formula 태그가 손상되었습니다: {name}"
                 ))
             })?;
-            let formula_tag = sheet_xml.get(formula_start..=open_end).ok_or_else(|| {
+            let formula_tag = xml.get(formula_start..=open_end).ok_or_else(|| {
                 err(format!(
-                    "저장 검증 실패: formula 태그 범위가 손상되었습니다: {sheet_name}"
+                    "저장 검증 실패: formula 태그 범위가 손상되었습니다: {name}"
                 ))
             })?;
             if formula_tag.trim_ascii_end().ends_with("/>") {
@@ -857,24 +850,24 @@ impl ArchiveSemanticVerifier<'_> {
             let body_start = open_end
                 .checked_add(1)
                 .ok_or_else(|| err("저장 검증 실패: formula 본문 시작 계산 실패"))?;
-            let formula_end = find_end_tag(sheet_xml, "f", body_start).ok_or_else(|| {
+            let formula_end = find_end_tag(xml, "f", body_start).ok_or_else(|| {
                 err(format!(
-                    "저장 검증 실패: formula 종료 태그가 없습니다: {sheet_name}"
+                    "저장 검증 실패: formula 종료 태그가 없습니다: {name}"
                 ))
             })?;
-            let formula_raw = sheet_xml.get(body_start..formula_end).ok_or_else(|| {
+            let formula_raw = xml.get(body_start..formula_end).ok_or_else(|| {
                 err(format!(
-                    "저장 검증 실패: formula 본문 범위가 손상되었습니다: {sheet_name}"
+                    "저장 검증 실패: formula 본문 범위가 손상되었습니다: {name}"
                 ))
             })?;
             if decode_xml_entities(formula_raw)?.contains("#REF!") {
                 return Err(err(format!(
-                    "저장 검증 실패: worksheet에 #REF! 수식이 있습니다: {sheet_name}"
+                    "저장 검증 실패: worksheet에 #REF! 수식이 있습니다: {name}"
                 )));
             }
-            let formula_close_end = find_tag_end(sheet_xml, formula_end).ok_or_else(|| {
+            let formula_close_end = find_tag_end(xml, formula_end).ok_or_else(|| {
                 err(format!(
-                    "저장 검증 실패: formula 종료 태그가 손상되었습니다: {sheet_name}"
+                    "저장 검증 실패: formula 종료 태그가 손상되었습니다: {name}"
                 ))
             })?;
             cursor = formula_close_end
@@ -883,18 +876,19 @@ impl ArchiveSemanticVerifier<'_> {
         }
         Ok(())
     }
-    fn worksheet_row_and_col_refs_valid(sheet_xml: &str, sheet_name: &str) -> Result<()> {
+    fn row_and_col_refs_valid(&self) -> Result<()> {
+        let Self { name, xml, .. } = *self;
         let mut seen_rows: HashSet<u32> = HashSet::new();
         let mut cursor = 0_usize;
-        while let Some(row_start) = find_start_tag(sheet_xml, "row", cursor) {
-            let row_end = find_tag_end(sheet_xml, row_start)
+        while let Some(row_start) = find_start_tag(xml, "row", cursor) {
+            let row_end = find_tag_end(xml, row_start)
                 .ok_or_else(|| err("저장 검증 실패: row 태그가 손상되었습니다."))?;
-            let row_tag = sheet_xml
+            let row_tag = xml
                 .get(row_start..=row_end)
                 .ok_or_else(|| err("저장 검증 실패: row 태그 범위가 손상되었습니다."))?;
             let Some(row_ref) = extract_attr(row_tag, "r")? else {
                 return Err(err(format!(
-                    "저장 검증 실패: worksheet row에 r 속성이 없습니다: {sheet_name}"
+                    "저장 검증 실패: worksheet row에 r 속성이 없습니다: {name}"
                 )));
             };
             let row_num = Self::parse_positive_u32(
@@ -911,7 +905,7 @@ impl ArchiveSemanticVerifier<'_> {
             }
             if !seen_rows.insert(row_num) {
                 return Err(err(format!(
-                    "저장 검증 실패: worksheet에 중복 row reference가 있습니다: {sheet_name}!{row_num}"
+                    "저장 검증 실패: worksheet에 중복 row reference가 있습니다: {name}!{row_num}"
                 )));
             }
             cursor = row_end
@@ -919,10 +913,10 @@ impl ArchiveSemanticVerifier<'_> {
                 .ok_or_else(|| err("저장 검증 실패: row cursor 계산 실패"))?;
         }
         let mut col_cursor = 0_usize;
-        while let Some(col_start) = find_start_tag(sheet_xml, "col", col_cursor) {
-            let col_end = find_tag_end(sheet_xml, col_start)
+        while let Some(col_start) = find_start_tag(xml, "col", col_cursor) {
+            let col_end = find_tag_end(xml, col_start)
                 .ok_or_else(|| err("저장 검증 실패: col 태그가 손상되었습니다."))?;
-            let col_tag = sheet_xml
+            let col_tag = xml
                 .get(col_start..=col_end)
                 .ok_or_else(|| err("저장 검증 실패: col 태그 범위가 손상되었습니다."))?;
             let Some(min_col_text) = extract_attr(col_tag, "min")? else {
@@ -941,12 +935,12 @@ impl ArchiveSemanticVerifier<'_> {
             )?;
             if max_col < min_col {
                 return Err(err(format!(
-                    "저장 검증 실패: worksheet col 범위 순서가 올바르지 않습니다: {sheet_name}, min={min_col}, max={max_col}"
+                    "저장 검증 실패: worksheet col 범위 순서가 올바르지 않습니다: {name}, min={min_col}, max={max_col}"
                 )));
             }
             if max_col >= FAR_ARTIFACT_MIN_COL {
                 return Err(err(format!(
-                    "저장 검증 실패: worksheet에 원거리 col artifact가 있습니다: {sheet_name}, min={min_col}, max={max_col}"
+                    "저장 검증 실패: worksheet에 원거리 col artifact가 있습니다: {name}, min={min_col}, max={max_col}"
                 )));
             }
             col_cursor = col_end
@@ -955,56 +949,16 @@ impl ArchiveSemanticVerifier<'_> {
         }
         Ok(())
     }
-    fn worksheet_summary(
-        &self,
-        sheets: &[SheetInfo],
-        shared_entry_count: Option<usize>,
-    ) -> Result<(Option<String>, usize)> {
-        let mut shared_ref_count = 0_usize;
-        let mut master_auto_filter_ref = None;
-        for sheet in sheets {
-            let sheet_xml = self.container.read_text(&sheet.path)?;
-            validate_worksheet_core_namespaces(&sheet_xml, &sheet.name)?;
-            if sheet.name == "유류비" {
-                Self::worksheet_cell_refs_unique(&sheet_xml, &sheet.name)?;
-                Self::worksheet_row_and_col_refs_valid(&sheet_xml, &sheet.name)?;
-                Self::worksheet_ref_formula_refs(&sheet_xml, &sheet.name)?;
-                let (bounds, count) = Self::worksheet_bounds_and_shared_refs(
-                    &sheet_xml,
-                    &sheet.name,
-                    shared_entry_count,
-                )?;
-                if let Some(actual_bounds) = bounds.as_ref() {
-                    Self::worksheet_range_dimension_matches(
-                        &sheet_xml,
-                        &sheet.name,
-                        actual_bounds,
-                    )?;
-                }
-                master_auto_filter_ref =
-                    Self::worksheet_filter_semantics(&sheet_xml, &sheet.name, bounds.as_ref())?;
-                shared_ref_count = shared_ref_count
-                    .checked_add(count)
-                    .ok_or_else(|| err("저장 검증 실패: shared string 참조 수 계산 실패"))?;
-                continue;
-            }
-            Self::worksheet_cell_refs_unique(&sheet_xml, &sheet.name)?;
-            Self::worksheet_row_and_col_refs_valid(&sheet_xml, &sheet.name)?;
-            Self::worksheet_ref_formula_refs(&sheet_xml, &sheet.name)?;
-            let (bounds, count) = Self::worksheet_bounds_and_shared_refs(
-                &sheet_xml,
-                &sheet.name,
-                shared_entry_count,
-            )?;
-            if let Some(actual_bounds) = bounds.as_ref() {
-                Self::worksheet_range_dimension_matches(&sheet_xml, &sheet.name, actual_bounds)?;
-            }
-            Self::worksheet_filter_semantics(&sheet_xml, &sheet.name, bounds.as_ref())?;
-            shared_ref_count = shared_ref_count
-                .checked_add(count)
-                .ok_or_else(|| err("저장 검증 실패: shared string 참조 수 계산 실패"))?;
+    fn summarize(&self) -> Result<(Option<String>, usize)> {
+        self.cell_refs_unique()?;
+        self.row_and_col_refs_valid()?;
+        self.ref_formula_refs()?;
+        let (bounds, count) = self.bounds_and_shared_refs()?;
+        if let Some(actual_bounds) = bounds.as_ref() {
+            self.range_dimension_matches(actual_bounds)?;
         }
-        Ok((master_auto_filter_ref, shared_ref_count))
+        let auto_filter_ref = self.filter_semantics(bounds.as_ref())?;
+        Ok((auto_filter_ref, count))
     }
 }
 struct TempArchivePromotion<'path> {
@@ -1181,7 +1135,13 @@ impl TempArchivePromotion<'_> {
     }
 }
 impl XlsxContainer {
-    pub(super) fn load_sheet_catalog(&self, workbook_xml: &str) -> Result<Vec<SheetInfo>> {
+    pub(super) fn ensure_fixed_sheet_catalog(&self, workbook_xml: &str) -> Result<()> {
+        validate_unprefixed_spreadsheet_part(
+            workbook_xml,
+            "workbook",
+            &["workbook", "sheets", "sheet"],
+            "workbook.xml",
+        )?;
         let rels_xml = self.read_text("xl/_rels/workbook.xml.rels")?;
         let mut relationship_map: HashMap<Cow<'_, str>, WorkbookRelationship<'_>> = HashMap::new();
         let mut relationship_scanner = XmlScanner::new(&rels_xml);
@@ -1208,46 +1168,24 @@ impl XlsxContainer {
             .next_start_named("workbook")
             .ok_or_else(|| err("workbook.xml의 workbook 시작 태그를 찾지 못했습니다."))?;
         let workbook_open_tag = workbook_tag.raw();
-        let sheets_tag = workbook_scanner
+        if required_xml_attr(workbook_open_tag, "xmlns:r", "workbook.xml workbook")?.as_ref()
+            != OFFICE_DOCUMENT_REL_NAMESPACE
+        {
+            return Err(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."));
+        }
+        workbook_scanner
             .next_start_named("sheets")
             .ok_or_else(|| err("workbook.xml의 sheets 시작 태그를 찾지 못했습니다."))?;
-        let namespace_ancestors = [workbook_open_tag, sheets_tag.raw()];
-        let mut sheets = Vec::new();
-        while let Some(sheet_tag) = workbook_scanner.next_start_named("sheet") {
+        for (expected_name, expected_path) in [
+            (MASTER_SHEET_NAME, MASTER_SHEET_PATH),
+            (CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH),
+        ] {
+            let sheet_tag = workbook_scanner
+                .next_start_named("sheet")
+                .ok_or_else(|| err("workbook sheet 수가 고정 스키마의 2개보다 적습니다."))?;
             let tag = sheet_tag.raw();
             let name = required_xml_attr(tag, "name", "workbook.xml sheet")?;
-            let mut relationship_id = None;
-            let mut attributes = XmlAttrScanner::new(tag)?;
-            while let Some((attr_name, attr_value)) = attributes.next()? {
-                let Some((prefix, local_name)) = attr_name.split_once(':') else {
-                    continue;
-                };
-                if prefix.is_empty() || local_name != "id" {
-                    continue;
-                }
-                let mut binding = None;
-                for declaration_tag in
-                    iter::once(tag).chain(namespace_ancestors.iter().rev().copied())
-                {
-                    let mut declarations = XmlAttrScanner::new(declaration_tag)?;
-                    while let Some((declaration_name, value)) = declarations.next()? {
-                        if declaration_name.strip_prefix("xmlns:") == Some(prefix) {
-                            binding = Some(value);
-                            break;
-                        }
-                    }
-                    if binding.is_some() {
-                        break;
-                    }
-                }
-                if binding.as_deref() == Some(OFFICE_DOCUMENT_REL_NAMESPACE)
-                    && relationship_id.replace(attr_value).is_some()
-                {
-                    return Err(err("workbook.xml sheet 관계 id가 중복됩니다."));
-                }
-            }
-            let rid =
-                relationship_id.ok_or_else(|| err("workbook.xml sheet 관계 id가 없습니다."))?;
+            let rid = required_xml_attr(tag, "r:id", "workbook.xml sheet")?;
             let relationship = relationship_map.get(rid.as_ref()).ok_or_else(|| {
                 err(format!(
                     "workbook.xml.rels에서 sheet 관계 target을 찾지 못했습니다: {rid}"
@@ -1270,18 +1208,16 @@ impl XlsxContainer {
                     "sheet 관계 target 정규화 결과가 비어 있습니다: {target_text}"
                 )));
             }
-            sheets.try_reserve(1).map_err(|reserve_error| {
-                err_with_source("시트 순서 목록 추가 메모리 확보 실패", reserve_error)
-            })?;
-            sheets.push(SheetInfo {
-                name: name.into_owned(),
-                path: resolved,
-            });
+            if name != expected_name || resolved != expected_path {
+                return Err(err(format!(
+                    "workbook sheet가 고정 스키마와 다릅니다: expected={expected_name}({expected_path}), actual={name}({resolved})"
+                )));
+            }
         }
-        if sheets.is_empty() {
-            return Err(err("workbook에서 시트 정보를 찾지 못했습니다."));
+        if workbook_scanner.next_start_named("sheet").is_some() {
+            return Err(err("workbook sheet 수가 고정 스키마의 2개보다 많습니다."));
         }
-        Ok(sheets)
+        Ok(())
     }
     pub(crate) fn open(source_xlsx: &Path) -> Result<Self> {
         let mut source_options = fs::File::options();
@@ -1343,19 +1279,19 @@ impl XlsxContainer {
         container.validate_root_relationships()?;
         Ok(container)
     }
-    pub(super) fn read_shared_strings_text(&self) -> Result<Option<String>> {
+    pub(super) fn read_shared_strings_text(&self) -> Result<String> {
         let path = self.resolve_relative_path("xl/sharedStrings.xml")?;
-        let file = match fs::File::open(&path) {
-            Ok(file) => file,
-            Err(io_err) if io_err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(io_err) => {
-                return Err(err_with_source(
-                    path_context_message("파일 열기 실패", &path),
-                    io_err,
-                ));
-            }
-        };
-        Self::read_text_from_file(&path, file).map(Some)
+        let file = fs::File::open(&path).map_err(|source_err| {
+            err_with_source(path_context_message("파일 열기 실패", &path), source_err)
+        })?;
+        let xml = Self::read_text_from_file(&path, file)?;
+        validate_unprefixed_spreadsheet_part(
+            &xml,
+            "sst",
+            &["sst", "si", "t", "r", "rPr", "rPh", "phoneticPr"],
+            "sharedStrings.xml",
+        )?;
+        Ok(xml)
     }
     pub(super) fn read_text(&self, relative_path: &str) -> Result<String> {
         let path = self.resolve_relative_path(relative_path)?;
@@ -1664,7 +1600,11 @@ pub(super) fn validate_worksheet_core_namespaces(sheet_xml: &str, sheet_name: &s
     let root = scanner
         .next_tag()
         .ok_or_else(|| err(format!("{context}에 root 태그가 없습니다.")))?;
-    if !root.is_start() || root.local_name() != "worksheet" || root.self_closing() {
+    if !root.is_start()
+        || root.name() != "worksheet"
+        || root.local_name() != "worksheet"
+        || root.self_closing()
+    {
         return Err(err(format!("{context}의 root 태그가 올바르지 않습니다.")));
     }
     if resolved_element_namespace(&root, &[], &context)?.as_deref() != Some(SPREADSHEETML_NAMESPACE)
@@ -1697,6 +1637,12 @@ pub(super) fn validate_worksheet_core_namespaces(sheet_xml: &str, sheet_name: &s
                     | (Some("is"), "r" | "t")
                     | (Some("r"), "t")
             );
+            if is_core_element && tag.name() != tag.local_name() {
+                return Err(err(format!(
+                    "{context}의 prefixed core element는 지원하지 않습니다: {}",
+                    tag.name()
+                )));
+            }
             if is_core_element
                 && resolved_element_namespace(&tag, &ancestors, &context)?.as_deref()
                     != Some(SPREADSHEETML_NAMESPACE)
@@ -1733,6 +1679,35 @@ pub(super) fn validate_worksheet_core_namespaces(sheet_xml: &str, sheet_name: &s
     }
     if !ancestors.is_empty() {
         return Err(err(format!("{context}에 닫히지 않은 XML 요소가 있습니다.")));
+    }
+    Ok(())
+}
+fn validate_unprefixed_spreadsheet_part(
+    xml: &str,
+    root_name: &str,
+    core_names: &[&str],
+    context: &str,
+) -> Result<()> {
+    let mut scanner = XmlScanner::new(xml);
+    let root = scanner
+        .next_tag()
+        .ok_or_else(|| err(format!("{context}에 root 태그가 없습니다.")))?;
+    if !root.is_start() || root.name() != root_name || root.self_closing() {
+        return Err(err(format!("{context}의 root 형식이 올바르지 않습니다.")));
+    }
+    if resolved_element_namespace(&root, &[], context)?.as_deref() != Some(SPREADSHEETML_NAMESPACE)
+    {
+        return Err(err(format!(
+            "{context}의 root namespace가 올바르지 않습니다."
+        )));
+    }
+    while let Some(tag) = scanner.next_tag() {
+        if core_names.contains(&tag.local_name()) && tag.name() != tag.local_name() {
+            return Err(err(format!(
+                "{context}의 prefixed core element는 지원하지 않습니다: {}",
+                tag.name()
+            )));
+        }
     }
     Ok(())
 }

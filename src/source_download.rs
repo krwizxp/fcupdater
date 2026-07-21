@@ -156,28 +156,23 @@ impl StreamingBodySink<'_> {
             )
             .into());
         }
-        self.capture_preview(bytes)?;
+        let remaining_preview = HTTP_ERROR_PREVIEW_BYTES.saturating_sub(self.summary.preview.len());
+        let take = remaining_preview.min(bytes.len());
+        if take != 0 {
+            self.summary
+                .preview
+                .try_reserve_exact(take)
+                .map_err(|source| {
+                    download_error_with_source("HTTP 응답 본문 preview 메모리 확보 실패", source)
+                })?;
+            self.summary
+                .preview
+                .extend(bytes.iter().copied().take(take));
+        }
         self.writer.write_all(bytes).map_err(|source| {
             download_error_with_source("HTTP 응답 본문 파일 쓰기 실패", source)
         })?;
         self.summary.bytes_seen = self.summary.bytes_seen.saturating_add(bytes.len());
-        Ok(())
-    }
-    fn capture_preview(&mut self, bytes: &[u8]) -> DownloadResult<()> {
-        let remaining_preview = HTTP_ERROR_PREVIEW_BYTES.saturating_sub(self.summary.preview.len());
-        let take = remaining_preview.min(bytes.len());
-        if take == 0 {
-            return Ok(());
-        }
-        self.summary
-            .preview
-            .try_reserve_exact(take)
-            .map_err(|source| {
-                download_error_with_source("HTTP 응답 본문 preview 메모리 확보 실패", source)
-            })?;
-        self.summary
-            .preview
-            .extend(bytes.iter().copied().take(take));
         Ok(())
     }
 }

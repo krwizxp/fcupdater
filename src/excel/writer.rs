@@ -1,15 +1,16 @@
+pub(crate) use self::cell_ref::AbsoluteColumnRangeRewriter;
 pub(in crate::excel) use self::cell_ref::parse_ref_with_locks;
-pub(crate) use self::cell_ref::{AbsoluteColumnRangeRewriter, col_to_name};
 use self::cell_ref::{
-    MAX_A1_COL, MAX_A1_ROW, parse_range_token, ref_with_locks, rewrite_formula_cell_refs,
-    shift_formula_index, try_parse_and_rewrite_cell_ref, with_unlocked_ref_parts,
+    MAX_A1_COL, MAX_A1_ROW, parse_formula_cell_ref, parse_range_token, ref_with_locks,
+    rewrite_formula_cell_refs, with_unlocked_ref_parts,
 };
 use super::{
+    CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH, MASTER_SHEET_NAME, MASTER_SHEET_PATH,
     SaveVerification, copy_text,
     xlsx_container::{XlsxContainer, validate_worksheet_core_namespaces},
     xml::{
-        XmlScanner, decode_xml_entities, extract_all_tag_text, extract_first_tag_text,
-        find_end_tag, find_start_tag, find_tag_end, is_valid_xml_char,
+        XmlAttrScanner, XmlScanner, decode_xml_entities, extract_all_tag_text,
+        extract_first_tag_text, find_end_tag, find_start_tag, find_tag_end, is_valid_xml_char,
     },
 };
 use crate::{
@@ -24,45 +25,70 @@ use core::{
     mem,
     range::{Range, RangeFrom, RangeInclusive},
 };
-use std::collections::{HashMap, hash_map::Entry as HashEntry};
+use std::collections::HashMap;
 use std::path::Path;
 mod cell_ref;
 const XML_SPACE_PRESERVE_ATTR: &str = " xml:space=\"preserve\"";
 const FILTER_DATABASE_NAME: &str = "_xlnm._FilterDatabase";
-const RICH_INLINE_STRING_MARKERS: [&str; 4] = ["r", "rPr", "rPh", "phoneticPr"];
+const PENDING_SHARED_STRING_TYPE: &str = "_fcupdater_shared_string";
 const MAX_SHARED_STRING_COUNT: usize = 0x0010_0000;
 const MAX_WORKSHEET_CELL_COUNT: usize = 0x0010_0000;
 const MAX_XML_ATTRIBUTE_COUNT: usize = 128;
+const MASTER_HEADERS: [&str; 23] = [
+    "지역화폐적용순위",
+    "지역",
+    "상호",
+    "상표",
+    "셀프",
+    "주소",
+    "휘발유단가(원/L)",
+    "고급유단가(원/L)",
+    "울트라카젠 여부",
+    "경유단가(원/L)",
+    "스마트주유 할인(원/L)",
+    "조정휘발유단가(원/L)",
+    "조정고급유단가(원/L)",
+    "조정경유단가(원/L)",
+    "유종별 총가격(원)",
+    "총가격(원)",
+    "지역화폐 적용여부",
+    "지역화폐적립율",
+    "지역화폐적립액(원)",
+    "지역화폐적용금액(원)",
+    "지역화폐 적용단가(원/L)",
+    "지역화폐 미적용 단가(원/L)",
+    "정렬키",
+];
+const CHANGE_LOG_HEADERS: [&str; 13] = [
+    "지역",
+    "상호",
+    "주소",
+    "변경내용",
+    "휘발유(이전)",
+    "휘발유(신규)",
+    "휘발유 Δ",
+    "고급유(이전)",
+    "고급유(신규)",
+    "고급유 Δ",
+    "경유(이전)",
+    "경유(신규)",
+    "경유 Δ",
+];
 #[derive(Debug)]
 pub(crate) struct Workbook {
+    change_log_sheet: Worksheet,
     container: XlsxContainer,
+    master_sheet: Worksheet,
     shared_strings: Vec<String>,
-    shared_strings_xml_text: Option<String>,
-    sheets: BTreeMap<String, SheetEntry>,
+    shared_strings_xml_text: String,
     xml_text: String,
 }
 #[derive(Debug)]
-struct SheetEntry {
-    dirty: bool,
-    path: String,
-    worksheet: Worksheet,
-}
-#[derive(Debug)]
 pub(crate) struct Worksheet {
-    element_names: WorksheetElementNames,
     formula_cells: BTreeSet<(u32, u32)>,
     prefix: String,
     rows: BTreeMap<u32, Row>,
     suffix: String,
-}
-#[derive(Debug)]
-struct WorksheetElementNames {
-    cell: Cow<'static, str>,
-    formula: Cow<'static, str>,
-    inline_string: Cow<'static, str>,
-    row: Cow<'static, str>,
-    text: Cow<'static, str>,
-    value: Cow<'static, str>,
 }
 #[derive(Debug)]
 struct XmlTagLocation {
@@ -96,17 +122,6 @@ struct ParsedWorksheetRows {
 struct WorksheetXmlParser<'xml> {
     xml: &'xml str,
 }
-#[derive(Debug)]
-struct SharedFormulaHead {
-    anchor_col: u32,
-    anchor_row: u32,
-    formula: String,
-}
-#[derive(Debug)]
-struct SharedFormulaSpec {
-    formula_text: Option<String>,
-    si: String,
-}
 #[derive(Clone, Copy)]
 enum TagRemovalRule<'rule> {
     All,
@@ -132,134 +147,99 @@ pub(in crate::excel) struct CellReference {
     pub row: u32,
     pub row_locked: bool,
 }
-struct RewrittenCellReference {
-    col: u32,
-    row: u32,
+struct FormulaCellReference {
+    end_index: usize,
+    reference: CellReference,
+}
+struct FormulaRewrite {
+    end_index: usize,
+    replacement: String,
 }
 struct RangeTokenParts<'token> {
     end_ref: &'token str,
     start_ref: &'token str,
 }
 impl Workbook {
+    pub(crate) fn change_log_sheet_mut(&mut self) -> (&mut Worksheet, &[String]) {
+        (&mut self.change_log_sheet, &self.shared_strings)
+    }
     pub(crate) fn from_container(container: XlsxContainer) -> Result<Self> {
         let workbook_xml = container.read_text("xl/workbook.xml")?;
-        let sheet_catalog = container.load_sheet_catalog(&workbook_xml)?;
+        container.ensure_fixed_sheet_catalog(&workbook_xml)?;
         let shared_strings_xml_text = container.read_shared_strings_text()?;
-        let shared_strings = match shared_strings_xml_text.as_deref() {
-            Some(xml) => {
-                let mut out: Vec<String> = Vec::new();
-                let mut scanner = XmlScanner::new(xml);
-                while let Some(si_tag) = scanner.next_start_named("si") {
-                    if out.len() >= MAX_SHARED_STRING_COUNT {
-                        return Err(err(format!(
-                            "sharedStrings entry 개수가 허용 한도({MAX_SHARED_STRING_COUNT})를 초과했습니다."
-                        )));
-                    }
-                    if out.len() == out.capacity() {
-                        out.try_reserve(1).map_err(|source| {
-                            err_with_source("sharedStrings entry 메모리 확보 실패", source)
-                        })?;
-                    }
-                    if si_tag.self_closing() {
-                        out.push(String::new());
-                        continue;
-                    }
-                    let si_tag_end = si_tag.end();
-                    let Some(body_start) = si_tag_end.checked_add(1) else {
-                        return Err(err(
-                            "sharedStrings.xml의 <si> 본문 시작 계산에 실패했습니다.",
-                        ));
-                    };
-                    let Some(si_end) = find_end_tag(xml, "si", body_start) else {
-                        return Err(err("sharedStrings.xml의 </si> 태그를 찾지 못했습니다."));
-                    };
-                    let si_body_span = Range {
-                        start: body_start,
-                        end: si_end,
-                    };
-                    let Some(si_body) = xml.get(si_body_span) else {
-                        return Err(err("sharedStrings.xml의 <si> 본문 범위가 손상되었습니다."));
-                    };
-                    let text = extract_all_tag_text(si_body, "t")?
-                        .map_or_else(String::new, Cow::into_owned);
-                    out.push(text);
-                    let Some(si_close_end) = find_tag_end(xml, si_end) else {
-                        return Err(err("sharedStrings.xml의 </si> 태그가 손상되었습니다."));
-                    };
-                    let Some(next_cursor) = si_close_end.checked_add(1) else {
-                        return Err(err(
-                            "sharedStrings.xml의 다음 <si> 위치 계산에 실패했습니다.",
-                        ));
-                    };
-                    scanner.skip_to(next_cursor);
-                }
-                out
+        let mut shared_strings = Vec::new();
+        let mut scanner = XmlScanner::new(&shared_strings_xml_text);
+        while let Some(si_tag) = scanner.next_start_named("si") {
+            if shared_strings.len() >= MAX_SHARED_STRING_COUNT {
+                return Err(err(format!(
+                    "sharedStrings entry 개수가 허용 한도({MAX_SHARED_STRING_COUNT})를 초과했습니다."
+                )));
             }
-            None => Vec::new(),
-        };
-        let mut sheets = BTreeMap::new();
-        for sheet_info in sheet_catalog {
-            let xml = container.read_text(&sheet_info.path)?;
-            validate_worksheet_core_namespaces(&xml, &sheet_info.name)?;
-            let mut worksheet = WorksheetXmlParser { xml: &xml }.parse()?;
-            worksheet.normalize_shared_formulas()?;
-            match sheets.entry(sheet_info.name) {
-                BTreeEntry::Vacant(entry) => {
-                    entry.insert(SheetEntry {
-                        dirty: false,
-                        path: sheet_info.path,
-                        worksheet,
-                    });
-                }
-                BTreeEntry::Occupied(entry) => {
-                    return Err(err(format!(
-                        "workbook에 중복 sheet name이 있습니다: {}",
-                        entry.key()
-                    )));
-                }
+            if shared_strings.len() == shared_strings.capacity() {
+                shared_strings.try_reserve(1).map_err(|source| {
+                    err_with_source("sharedStrings entry 메모리 확보 실패", source)
+                })?;
             }
+            if si_tag.self_closing() {
+                shared_strings.push(String::new());
+                continue;
+            }
+            let si_tag_end = si_tag.end();
+            let body_start = si_tag_end
+                .checked_add(1)
+                .ok_or_else(|| err("sharedStrings.xml의 <si> 본문 시작 계산에 실패했습니다."))?;
+            let Some(si_end) = find_end_tag(&shared_strings_xml_text, "si", body_start) else {
+                return Err(err("sharedStrings.xml의 </si> 태그를 찾지 못했습니다."));
+            };
+            let si_body = shared_strings_xml_text
+                .get(body_start..si_end)
+                .ok_or_else(|| err("sharedStrings.xml의 <si> 본문 범위가 손상되었습니다."))?;
+            let text =
+                extract_all_tag_text(si_body, "t")?.map_or_else(String::new, Cow::into_owned);
+            shared_strings.push(text);
+            let Some(si_close_end) = find_tag_end(&shared_strings_xml_text, si_end) else {
+                return Err(err("sharedStrings.xml의 </si> 태그가 손상되었습니다."));
+            };
+            let next_cursor = si_close_end
+                .checked_add(1)
+                .ok_or_else(|| err("sharedStrings.xml의 다음 <si> 위치 계산에 실패했습니다."))?;
+            scanner.skip_to(next_cursor);
         }
+        let parse_sheet = |name: &str, path: &str| -> Result<Worksheet> {
+            let xml = container.read_text(path)?;
+            validate_worksheet_core_namespaces(&xml, name)?;
+            let worksheet = WorksheetXmlParser { xml: &xml }.parse()?;
+            worksheet.validate_fixed_header(name, &shared_strings)?;
+            Ok(worksheet)
+        };
+        let master_sheet = parse_sheet(MASTER_SHEET_NAME, MASTER_SHEET_PATH)?;
+        let change_log_sheet = parse_sheet(CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH)?;
         Ok(Self {
+            change_log_sheet,
             container,
+            master_sheet,
             shared_strings,
             shared_strings_xml_text,
-            sheets,
             xml_text: workbook_xml,
         })
     }
-    fn promote_safe_inline_strings_to_shared(&mut self) -> Result<()> {
-        if self.shared_strings_xml_text.is_none() {
-            return Ok(());
-        }
+    fn intern_pending_shared_strings(&mut self) -> Result<()> {
         let existing_table_len = self.shared_strings.len();
         let mut existing_index: Option<HashMap<&str, usize>> = None;
         let mut new_index: HashMap<String, usize> = HashMap::new();
         let mut next_new_idx = self.shared_strings.len();
-        let mut promoted_any = false;
-        let (shared_strings, sheets) = (&self.shared_strings, &mut self.sheets);
-        for sheet in sheets.values_mut() {
-            if !sheet.dirty {
-                continue;
-            }
-            let (element_names, rows) = (&sheet.worksheet.element_names, &mut sheet.worksheet.rows);
-            for row in rows.values_mut() {
+        let mut interned_any = false;
+        let shared_strings = &self.shared_strings;
+        for sheet in [&mut self.master_sheet, &mut self.change_log_sheet] {
+            for row in sheet.rows.values_mut() {
                 for cell in row.cells.values_mut() {
-                    if get_attr(&cell.attrs, "t") != Some("inlineStr") {
+                    if get_attr(&cell.attrs, "t") != Some(PENDING_SHARED_STRING_TYPE) {
                         continue;
                     }
-                    let Some(inner_xml) = cell.inner_xml.as_deref() else {
-                        continue;
-                    };
-                    if find_start_tag(inner_xml, "is", 0).is_none()
-                        || RICH_INLINE_STRING_MARKERS
-                            .iter()
-                            .any(|name| find_start_tag(inner_xml, name, 0).is_some())
-                    {
-                        continue;
-                    }
-                    let Some(text) = extract_all_tag_text(inner_xml, "t")? else {
-                        continue;
-                    };
+                    let text = cell
+                        .inner_xml
+                        .take()
+                        .ok_or_else(|| err("내부 shared string cell에 값이 없습니다."))?;
                     let existing_index_ref = if let Some(index) = existing_index.as_ref() {
                         index
                     } else {
@@ -272,9 +252,9 @@ impl Workbook {
                         }
                         existing_index.insert(index)
                     };
-                    let shared_idx = if let Some(&idx) = existing_index_ref.get(text.as_ref()) {
+                    let shared_idx = if let Some(&idx) = existing_index_ref.get(text.as_str()) {
                         idx
-                    } else if let Some(&idx) = new_index.get(text.as_ref()) {
+                    } else if let Some(&idx) = new_index.get(text.as_str()) {
                         idx
                     } else {
                         let idx = next_new_idx;
@@ -289,22 +269,19 @@ impl Workbook {
                                 )
                             })?;
                         }
-                        new_index.insert(text.into_owned(), idx);
+                        new_index.insert(text, idx);
                         idx
                     };
                     set_attr(&mut cell.attrs, "t", "s");
                     let shared_idx_u64 = u64::try_from(shared_idx)
                         .map_err(|source| err_with_source("XML 표시값 변환 실패", source))?;
-                    cell.inner_xml = Some(build_decimal_display_text_tag(
-                        element_names.value.as_ref(),
-                        None,
-                        shared_idx_u64,
-                    ));
-                    promoted_any = true;
+                    cell.inner_xml =
+                        Some(build_decimal_display_text_tag("v", None, shared_idx_u64));
+                    interned_any = true;
                 }
             }
         }
-        if !promoted_any {
+        if !interned_any {
             return Ok(());
         }
         let mut new_strings: Vec<(usize, String)> = Vec::new();
@@ -323,6 +300,9 @@ impl Workbook {
             shared_string_reference_count,
             self.shared_strings.len(),
         )
+    }
+    pub(crate) fn master_sheet_mut(&mut self) -> (&mut Worksheet, &[String]) {
+        (&mut self.master_sheet, &self.shared_strings)
     }
     fn remove_excel_recovery_artifacts(&mut self) -> Result<()> {
         remove_tags_matching(&mut self.xml_text, "fileRecoveryPr", TagRemovalRule::All)?;
@@ -359,24 +339,20 @@ impl Workbook {
             set_attr(attrs, "calcCompleted", "0");
         };
         let out = &mut self.xml_text;
-        let mut scanner = XmlScanner::new(out);
-        if let Some(calc_pr_tag) = scanner.next_start_named("calcPr") {
-            let calc_pr_start = calc_pr_tag.start();
-            let calc_pr_tag_end = calc_pr_tag.end();
-            let calc_pr_name = calc_pr_tag.name();
-            let calc_pr_open_span = RangeInclusive {
-                start: calc_pr_start,
-                last: calc_pr_tag_end,
-            };
-            let (mut attrs, self_closing) = {
-                let calc_pr_open_tag = out
-                    .get(calc_pr_open_span)
-                    .ok_or_else(|| err("workbook.xml의 calcPr 태그 범위가 손상되었습니다."))?;
-                (
-                    parse_tag_attrs(calc_pr_open_tag)?,
-                    calc_pr_open_tag.ends_with("/>"),
-                )
-            };
+        if let Some(location) = find_start_tag_location(out, "calcPr", 0, "calcPr 태그 이름 복사")?
+        {
+            if location.name != "calcPr" {
+                return Err(err(
+                    "고정 workbook은 prefixed calcPr 요소를 지원하지 않습니다.",
+                ));
+            }
+            let (element_span, _) =
+                xml_element_ranges(out, &location, "calcPr", "workbook.xml의 calcPr")?;
+            let mut attrs = parse_tag_attrs_at(
+                out,
+                &location,
+                "workbook.xml의 calcPr 태그 범위가 손상되었습니다.",
+            )?;
             reserve_xml_attrs(
                 &mut attrs,
                 4,
@@ -384,46 +360,15 @@ impl Workbook {
                 XmlReserveMode::Additional,
             )?;
             set_calc_pr_attrs(&mut attrs);
-            if self_closing {
-                let new_tag = build_self_closing_tag(calc_pr_name, &attrs)?;
-                out.replace_range(calc_pr_open_span, &new_tag);
+            let new_tag = if location.self_closing {
+                build_self_closing_tag("calcPr", &attrs)?
             } else {
-                let close_search_from =
-                    checked_usize_add(calc_pr_tag_end, 1, "calcPr 종료 태그 검색 시작")?;
-                let Some(calc_pr_close_start) = find_end_tag(out, "calcPr", close_search_from)
-                else {
-                    return Err(err("workbook.xml의 calcPr 종료 태그를 찾지 못했습니다."));
-                };
-                let Some(calc_pr_close_tag_end) = find_tag_end(out, calc_pr_close_start) else {
-                    return Err(err("workbook.xml의 calcPr 종료 태그가 손상되었습니다."));
-                };
-                let calc_pr_close_end =
-                    checked_usize_add(calc_pr_close_tag_end, 1, "calcPr 종료 태그 끝")?;
-                let mut new_tag = build_open_tag(calc_pr_name, &attrs)?;
-                new_tag.push_str("</");
-                new_tag.push_str(calc_pr_name);
-                new_tag.push('>');
-                out.replace_range(
-                    Range {
-                        start: calc_pr_start,
-                        end: calc_pr_close_end,
-                    },
-                    &new_tag,
-                );
-            }
-        } else {
-            let mut workbook_scanner = XmlScanner::new(out);
-            let Some(workbook_tag) = workbook_scanner.next_start_named("workbook") else {
-                return Err(err("workbook.xml의 workbook 시작 태그를 찾지 못했습니다."));
+                let mut new_tag = build_open_tag("calcPr", &attrs)?;
+                new_tag.push_str("</calcPr>");
+                new_tag
             };
-            let calc_pr_name = qualified_name_with_prefix(
-                workbook_tag
-                    .name()
-                    .rsplit_once(':')
-                    .map(|(prefix, _)| prefix),
-                "calcPr",
-                "calcPr qualified name",
-            )?;
+            out.replace_range(element_span, &new_tag);
+        } else {
             let Some(workbook_close_start) = find_end_tag(out, "workbook", 0) else {
                 return Err(err("workbook.xml의 workbook 종료 태그를 찾지 못했습니다."));
             };
@@ -435,34 +380,37 @@ impl Workbook {
                 XmlReserveMode::Exact,
             )?;
             set_calc_pr_attrs(&mut attrs);
-            let new_tag = build_self_closing_tag(calc_pr_name.as_ref(), &attrs)?;
+            let new_tag = build_self_closing_tag("calcPr", &attrs)?;
             out.insert_str(workbook_close_start, &new_tag);
         }
         Ok(())
     }
     pub(crate) fn save(mut self, target_path: &Path, verification: SaveVerification) -> Result<()> {
-        self.promote_safe_inline_strings_to_shared()?;
+        self.intern_pending_shared_strings()?;
         self.request_full_recalculation()?;
         self.remove_excel_recovery_artifacts()?;
         self.container
             .write_text("xl/workbook.xml", &self.xml_text)?;
-        if let Some(shared_strings_xml) = self.shared_strings_xml_text.as_ref() {
-            self.container
-                .write_text("xl/sharedStrings.xml", shared_strings_xml)?;
-        }
-        for sheet in self.sheets.values() {
-            if !sheet.dirty {
-                continue;
-            }
-            let sheet_xml = sheet.worksheet.to_xml()?;
-            self.container.write_text(&sheet.path, &sheet_xml)?;
+        self.container
+            .write_text("xl/sharedStrings.xml", &self.shared_strings_xml_text)?;
+        for (sheet_name, sheet_path, sheet) in [
+            (MASTER_SHEET_NAME, MASTER_SHEET_PATH, &self.master_sheet),
+            (
+                CHANGE_LOG_SHEET_NAME,
+                CHANGE_LOG_SHEET_PATH,
+                &self.change_log_sheet,
+            ),
+        ] {
+            sheet.validate_fixed_header(sheet_name, &self.shared_strings)?;
+            let sheet_xml = sheet.to_xml()?;
+            self.container.write_text(sheet_path, &sheet_xml)?;
         }
         self.container.save(target_path, verification)
     }
     fn shared_string_reference_count(&self) -> Result<usize> {
         let mut count = 0_usize;
-        for sheet in self.sheets.values() {
-            for row in sheet.worksheet.rows.values() {
+        for sheet in [&self.master_sheet, &self.change_log_sheet] {
+            for row in sheet.rows.values() {
                 for cell in row.cells.values() {
                     if get_attr(&cell.attrs, "t") == Some("s") {
                         count = count.checked_add(1).ok_or_else(|| {
@@ -474,84 +422,28 @@ impl Workbook {
         }
         Ok(count)
     }
-    pub(crate) fn update_filter_database_defined_name(
-        &mut self,
-        sheet_name: &str,
-        header_row: u32,
-        last_data_row: u32,
-        last_filter_col: u32,
-    ) -> Result<()> {
-        let quoted_sheet_capacity = sheet_name
-            .chars()
-            .try_fold(0_usize, |len, ch| {
-                len.checked_add(if ch == '\'' { 2 } else { ch.len_utf8() })
-            })
-            .and_then(|len| len.checked_add(3))
-            .ok_or_else(|| err("시트 이름 quote 용량 계산에 실패했습니다."))?;
-        let mut quoted_sheet = String::new();
-        quoted_sheet
-            .try_reserve_exact(quoted_sheet_capacity)
-            .map_err(|source| err_with_source("시트 이름 quote 메모리 확보 실패", source))?;
-        quoted_sheet.push('\'');
-        for ch in sheet_name.chars() {
-            if ch == '\'' {
-                quoted_sheet.push('\'');
-            }
-            quoted_sheet.push(ch);
-        }
-        quoted_sheet.push_str("'!");
-        let plain_sheet_capacity = sheet_name
+    pub(crate) fn update_filter_database_defined_name(&mut self, last_data_row: u32) -> Result<()> {
+        const QUOTED_SHEET: &str = "'유류비'!";
+        const PLAIN_SHEET: &str = "유류비!";
+        const REF_PREFIX: &str = "'유류비'!$A$14:$W$";
+        let replacement_capacity = REF_PREFIX
             .len()
-            .checked_add(1)
-            .ok_or_else(|| err("시트 이름 prefix 용량 계산에 실패했습니다."))?;
-        let mut plain_sheet = String::new();
-        plain_sheet
-            .try_reserve_exact(plain_sheet_capacity)
-            .map_err(|source| err_with_source("시트 이름 prefix 메모리 확보 실패", source))?;
-        plain_sheet.push_str(sheet_name);
-        plain_sheet.push('!');
-        let sheet_idx = super::workbook_sheet_index_by_name(&self.xml_text, sheet_name)?;
-        let end_col = col_to_name(last_filter_col)?;
-        let replacement_capacity = quoted_sheet
-            .len()
-            .checked_add("$A$".len())
-            .and_then(|len| len.checked_add(u32_decimal_text_len(header_row)))
-            .and_then(|len| len.checked_add(":$".len()))
-            .and_then(|len| len.checked_add(end_col.len()))
-            .and_then(|len| len.checked_add("$".len()))
-            .and_then(|len| len.checked_add(u32_decimal_text_len(last_data_row)))
+            .checked_add(u32_decimal_text_len(last_data_row))
             .ok_or_else(|| err("_FilterDatabase ref 용량 계산에 실패했습니다."))?;
         let mut replacement = String::new();
         replacement
             .try_reserve_exact(replacement_capacity)
             .map_err(|source| err_with_source("_FilterDatabase ref 메모리 확보 실패", source))?;
-        replacement.push_str(&quoted_sheet);
-        replacement.push_str("$A$");
-        push_decimal_text(&mut replacement, header_row);
-        replacement.push_str(":$");
-        replacement.push_str(&end_col);
-        replacement.push('$');
+        replacement.push_str(REF_PREFIX);
         push_decimal_text(&mut replacement, last_data_row);
         let span = super::workbook_defined_name_content_span(
             &self.xml_text,
             FILTER_DATABASE_NAME,
-            sheet_idx,
-            &quoted_sheet,
-            &plain_sheet,
+            0,
+            QUOTED_SHEET,
+            PLAIN_SHEET,
         )?;
         self.xml_text.replace_range(span, &replacement);
-        if sheet_idx != super::workbook_sheet_index_by_name(&self.xml_text, sheet_name)? {
-            return Err(err(
-                "workbook.xml 유류비 시트 index가 _FilterDatabase 갱신 중 변경되었습니다.",
-            ));
-        }
-        super::workbook_defined_name_content_span(
-            &self.xml_text,
-            FILTER_DATABASE_NAME,
-            sheet_idx,
-            &quoted_sheet,
-            &plain_sheet,
-        )?;
         Ok(())
     }
     fn update_shared_strings_xml_text(
@@ -564,15 +456,12 @@ impl Workbook {
             .shared_strings
             .get(existing_table_len..)
             .ok_or_else(|| err("sharedStrings 신규 값 범위가 손상되었습니다."))?;
-        let original_xml = self
-            .shared_strings_xml_text
-            .as_ref()
-            .ok_or_else(|| err("sharedStrings XML 상태가 비정상적입니다."))?;
+        let original_xml = &self.shared_strings_xml_text;
         let mut scanner = XmlScanner::new(original_xml);
         let Some(sst_tag) = scanner.next_start_named("sst") else {
             return Err(err("sharedStrings XML에 <sst>가 없습니다."));
         };
-        let (open_start, open_end, sst_name) = (sst_tag.start(), sst_tag.end(), sst_tag.name());
+        let (open_start, open_end) = (sst_tag.start(), sst_tag.end());
         let open_tag_span = RangeInclusive {
             start: open_start,
             last: open_end,
@@ -605,28 +494,35 @@ impl Workbook {
             shared_string_reference_count.to_string(),
         );
         set_attr(&mut attrs, "uniqueCount", unique_count.to_string());
-        let sst_prefix = sst_name.rsplit_once(':').map(|(prefix, _)| prefix);
-        let si_name = qualified_name_with_prefix(sst_prefix, "si", "shared string <si> 이름")?;
-        let t_name = qualified_name_with_prefix(sst_prefix, "t", "shared string <t> 이름")?;
         let mut new_si_xml = String::new();
         for value in new_values {
-            append_nested_text_xml(
-                &mut new_si_xml,
-                si_name.as_ref(),
-                t_name.as_ref(),
-                value,
-                "shared string XML",
-            )?;
+            let escaped_len =
+                validated_xml_escaped_len(value, XmlEscapeContext::Text, "shared string XML")?;
+            let text_attrs =
+                if value.starts_with(' ') || value.ends_with(' ') || value.contains("  ") {
+                    XML_SPACE_PRESERVE_ATTR
+                } else {
+                    ""
+                };
+            let additional =
+                checked_capacity(&["<si><t></t></si>".len(), text_attrs.len(), escaped_len])
+                    .ok_or_else(|| err("shared string XML 용량 계산 실패"))?;
+            new_si_xml
+                .try_reserve_exact(additional)
+                .map_err(|source| err_with_source("shared string XML 메모리 확보 실패", source))?;
+            new_si_xml.push_str("<si><t");
+            new_si_xml.push_str(text_attrs);
+            new_si_xml.push('>');
+            append_xml_escaped(&mut new_si_xml, value, XmlEscapeContext::Text);
+            new_si_xml.push_str("</t></si>");
         }
         let (replacement, maybe_close_start) = if open_tag.trim_ascii_end().ends_with("/>") {
-            let mut replacement = build_open_tag(sst_name, &attrs)?;
+            let mut replacement = build_open_tag("sst", &attrs)?;
             replacement.push_str(&new_si_xml);
-            replacement.push_str("</");
-            replacement.push_str(sst_name);
-            replacement.push('>');
+            replacement.push_str("</sst>");
             (replacement, None)
         } else {
-            let new_open_tag = build_open_tag(sst_name, &attrs)?;
+            let new_open_tag = build_open_tag("sst", &attrs)?;
             let close_search_from =
                 checked_usize_add(open_end, 1, "sharedStrings 종료 태그 검색 시작")?;
             let Some(original_close_start) = find_end_tag(original_xml, "sst", close_search_from)
@@ -635,50 +531,19 @@ impl Workbook {
             };
             (new_open_tag, Some(original_close_start))
         };
-        let mut updated_xml = self
-            .shared_strings_xml_text
-            .take()
-            .ok_or_else(|| err("sharedStrings XML 상태가 비정상적입니다."))?;
+        let mut updated_xml = mem::take(&mut self.shared_strings_xml_text);
         if let Some(close_start) = maybe_close_start {
             updated_xml.insert_str(close_start, &new_si_xml);
         }
         updated_xml.replace_range(open_tag_span, &replacement);
-        self.shared_strings_xml_text = Some(updated_xml);
+        self.shared_strings_xml_text = updated_xml;
         Ok(())
     }
-    pub(super) fn verify_sheet_address_data_end_row(
-        &self,
-        sheet_name: &str,
-        header_row: u32,
-        filter_end_row: u32,
-    ) -> Result<()> {
-        let Some(sheet) = self.sheets.get(sheet_name) else {
-            return Err(err(format!(
-                "저장 검증 실패: workbook에 {sheet_name} 시트가 없습니다."
-            )));
-        };
-        let worksheet = &sheet.worksheet;
-        let mut maybe_address_col = None;
-        for col in worksheet.cols_in_row(header_row) {
-            let display = worksheet.try_get_display_at(col, header_row, &self.shared_strings)?;
-            if display
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .eq("주소".chars())
-            {
-                maybe_address_col = Some(col);
-                break;
-            }
-        }
-        let address_col = maybe_address_col.ok_or_else(|| {
-            err("저장 검증 실패: 유류비 autoFilter header에서 주소 컬럼을 찾지 못했습니다.")
-        })?;
-        let data_start_row = header_row
-            .checked_add(1)
-            .ok_or_else(|| err("저장 검증 실패: 유류비 데이터 시작 행 계산 실패"))?;
-        let mut actual_end_row = data_start_row;
-        for row in worksheet.row_numbers_from(data_start_row) {
-            let display = worksheet.try_get_display_at(address_col, row, &self.shared_strings)?;
+    pub(super) fn verify_master_address_data_end_row(&self, filter_end_row: u32) -> Result<()> {
+        let worksheet = &self.master_sheet;
+        let mut actual_end_row = 15;
+        for row in worksheet.row_numbers_from(15) {
+            let display = worksheet.try_get_display_at(6, row, &self.shared_strings)?;
             if !display.trim().is_empty() {
                 actual_end_row = row;
             }
@@ -689,18 +554,6 @@ impl Workbook {
             )));
         }
         Ok(())
-    }
-    pub(crate) fn with_sheet_mut<R, F>(&mut self, name: &str, mutator: F) -> Result<Option<R>>
-    where
-        F: FnOnce(&mut Worksheet, &[String]) -> Result<R>,
-    {
-        let (shared_strings, sheets) = (&self.shared_strings, &mut self.sheets);
-        let Some(sheet) = sheets.get_mut(name) else {
-            return Ok(None);
-        };
-        let result = mutator(&mut sheet.worksheet, shared_strings)?;
-        sheet.dirty = true;
-        Ok(Some(result))
     }
 }
 impl WorksheetRowParser<'_> {
@@ -820,11 +673,43 @@ impl WorksheetRowParser<'_> {
                 "worksheet cell 개수가 허용 한도({MAX_WORKSHEET_CELL_COUNT})를 초과했습니다."
             )));
         }
-        if cell
-            .inner_xml
-            .as_deref()
-            .is_some_and(|inner_xml| find_start_tag(inner_xml, "f", 0).is_some())
+        match get_attr(&cell.attrs, "t") {
+            None | Some("n" | "s" | "str") => {}
+            Some(cell_type) => {
+                return Err(err(format!(
+                    "고정 workbook에서 지원하지 않는 cell type입니다: row={}, col={col}, type={cell_type}",
+                    self.row_num
+                )));
+            }
+        }
+        let has_formula = if let Some(inner_xml) = cell.inner_xml.as_deref()
+            && let Some(formula_start) = find_start_tag(inner_xml, "f", 0)
         {
+            let formula_end = find_tag_end(inner_xml, formula_start)
+                .ok_or_else(|| err("cell formula 시작 태그가 손상되었습니다."))?;
+            let formula_open = inner_xml
+                .get(RangeInclusive {
+                    start: formula_start,
+                    last: formula_end,
+                })
+                .ok_or_else(|| err("cell formula 시작 태그 범위가 손상되었습니다."))?;
+            if get_attr(&parse_tag_attrs(formula_open)?, "t") == Some("shared") {
+                return Err(err(format!(
+                    "고정 workbook은 shared formula를 지원하지 않습니다: row={}, col={col}",
+                    self.row_num
+                )));
+            }
+            if find_start_tag(inner_xml, "v", 0).is_none() {
+                return Err(err(format!(
+                    "고정 workbook formula cache가 없습니다: row={}, col={col}",
+                    self.row_num
+                )));
+            }
+            true
+        } else {
+            false
+        };
+        if has_formula {
             formula_cells.insert((self.row_num, col));
         }
         if row.cells.insert(col, cell).is_some() {
@@ -946,37 +831,9 @@ impl WorksheetXmlParser<'_> {
         let Some(sheet_data_tag) = scanner.next_start_named("sheetData") else {
             return Err(err("worksheet XML에 <sheetData>가 없습니다."));
         };
-        let sheet_data_open = sheet_data_tag.start();
         let sheet_data_open_end = sheet_data_tag.end();
-        let sheet_data_name = sheet_data_tag.name();
-        let element_prefix = match sheet_data_name.split_once(':') {
-            None if sheet_data_name == "sheetData" => None,
-            Some((prefix, "sheetData")) if !prefix.is_empty() && !prefix.contains(':') => {
-                Some(prefix)
-            }
-            None | Some(_) => {
-                return Err(err("worksheet sheetData qualified name이 잘못되었습니다."));
-            }
-        };
-        let element_names = WorksheetElementNames {
-            cell: qualified_name_with_prefix(element_prefix, "c", "worksheet cell 이름")?,
-            formula: qualified_name_with_prefix(element_prefix, "f", "worksheet formula 이름")?,
-            inline_string: qualified_name_with_prefix(
-                element_prefix,
-                "is",
-                "worksheet inline string 이름",
-            )?,
-            row: qualified_name_with_prefix(element_prefix, "row", "worksheet row 이름")?,
-            text: qualified_name_with_prefix(element_prefix, "t", "worksheet text 이름")?,
-            value: qualified_name_with_prefix(element_prefix, "v", "worksheet value 이름")?,
-        };
         if sheet_data_tag.self_closing() {
-            return self.parse_self_closing_sheet_data(
-                sheet_data_open,
-                sheet_data_open_end,
-                sheet_data_tag.name(),
-                element_names,
-            );
+            return Err(err("고정 workbook의 sheetData는 비어 있을 수 없습니다."));
         }
         let sheet_data_body_start =
             checked_usize_add(sheet_data_open_end, 1, "worksheet sheetData body 시작")?;
@@ -1003,76 +860,9 @@ impl WorksheetXmlParser<'_> {
             rows,
         } = self.collect_rows(sheet_data_body_span)?;
         Ok(Worksheet {
-            element_names,
             formula_cells,
             prefix,
             rows,
-            suffix,
-        })
-    }
-    fn parse_self_closing_sheet_data(
-        &self,
-        sheet_data_open: usize,
-        sheet_data_open_end: usize,
-        sheet_data_name: &str,
-        element_names: WorksheetElementNames,
-    ) -> Result<Worksheet> {
-        let open_tag = self
-            .xml
-            .get(RangeInclusive {
-                start: sheet_data_open,
-                last: sheet_data_open_end,
-            })
-            .ok_or_else(|| err("worksheet XML의 <sheetData/> 태그 범위가 손상되었습니다."))?;
-        let open_prefix = open_tag
-            .trim_ascii_end()
-            .strip_suffix("/>")
-            .ok_or_else(|| {
-                err("worksheet XML의 self-closing <sheetData/> 태그가 손상되었습니다.")
-            })?;
-        let sheet_data_end = checked_usize_add(sheet_data_open_end, 1, "worksheet sheetData 끝")?;
-        let before_sheet_data = self
-            .xml
-            .get(..sheet_data_open)
-            .ok_or_else(|| err("worksheet XML prefix 범위가 손상되었습니다."))?;
-        let after_sheet_data = self
-            .xml
-            .get(sheet_data_end..)
-            .ok_or_else(|| err("worksheet XML suffix 범위가 손상되었습니다."))?;
-        let prefix_capacity =
-            checked_capacity(&[before_sheet_data.len(), open_prefix.len(), ">".len()])
-                .ok_or_else(|| err("worksheet XML self-closing prefix 용량 계산 실패"))?;
-        let mut prefix = String::new();
-        prefix
-            .try_reserve_exact(prefix_capacity)
-            .map_err(|source| {
-                err_with_source("worksheet XML self-closing prefix 메모리 확보 실패", source)
-            })?;
-        prefix.push_str(before_sheet_data);
-        prefix.push_str(open_prefix);
-        prefix.push('>');
-        let suffix_capacity = checked_capacity(&[
-            "</".len(),
-            sheet_data_name.len(),
-            ">".len(),
-            after_sheet_data.len(),
-        ])
-        .ok_or_else(|| err("worksheet XML self-closing suffix 용량 계산 실패"))?;
-        let mut suffix = String::new();
-        suffix
-            .try_reserve_exact(suffix_capacity)
-            .map_err(|source| {
-                err_with_source("worksheet XML self-closing suffix 메모리 확보 실패", source)
-            })?;
-        suffix.push_str("</");
-        suffix.push_str(sheet_data_name);
-        suffix.push('>');
-        suffix.push_str(after_sheet_data);
-        Ok(Worksheet {
-            element_names,
-            formula_cells: BTreeSet::new(),
-            prefix,
-            rows: BTreeMap::new(),
             suffix,
         })
     }
@@ -1158,12 +948,6 @@ impl Worksheet {
             )
             .for_each(drop);
     }
-    fn cols_in_row(&self, row: u32) -> impl Iterator<Item = u32> + '_ {
-        self.rows
-            .get(&row)
-            .into_iter()
-            .flat_map(|row_obj| row_obj.cells.keys().copied())
-    }
     pub(crate) fn copy_row_style(
         &mut self,
         source_row: u32,
@@ -1228,12 +1012,11 @@ impl Worksheet {
             "conditionalFormatting 태그 이름 복사",
         )? {
             let cf_start = location.span.start;
-            let mut attrs = {
-                let tag = out
-                    .get(location.span)
-                    .ok_or_else(|| err("conditionalFormatting 태그 범위가 손상되었습니다."))?;
-                parse_tag_attrs(tag)?
-            };
+            let mut attrs = parse_tag_attrs_at(
+                out,
+                &location,
+                "conditionalFormatting 태그 범위가 손상되었습니다.",
+            )?;
             let Some(sqref_index) = attrs.iter().position(|attr| attr.name == "sqref") else {
                 cursor = location.span.end;
                 continue;
@@ -1310,6 +1093,42 @@ impl Worksheet {
         }
         Ok(())
     }
+    fn fixed_master_auto_filter(&self) -> Result<(XmlTagLocation, Vec<XmlAttr>)> {
+        let xml = &self.suffix;
+        let location = find_start_tag_location(xml, "autoFilter", 0, "autoFilter 태그 이름 복사")?
+            .ok_or_else(|| err("worksheet XML의 autoFilter 태그를 찾지 못했습니다."))?;
+        if find_start_tag_location(
+            xml,
+            "autoFilter",
+            location.span.end,
+            "autoFilter 태그 이름 복사",
+        )?
+        .is_some()
+        {
+            return Err(err("worksheet XML에 autoFilter 태그가 중복되어 있습니다."));
+        }
+        let attrs = parse_tag_attrs_at(
+            xml,
+            &location,
+            "worksheet XML의 autoFilter 태그 범위가 손상되었습니다.",
+        )?;
+        let existing_ref = get_attr(&attrs, "ref")
+            .ok_or_else(|| err("worksheet autoFilter ref 속성이 없습니다."))?;
+        let range = parse_range_token(existing_ref);
+        let start_reference = parse_ref_with_locks(range.start_ref)
+            .ok_or_else(|| err("worksheet autoFilter 시작 reference 해석 실패"))?;
+        let end_reference = parse_ref_with_locks(range.end_ref)
+            .ok_or_else(|| err("worksheet autoFilter 끝 reference 해석 실패"))?;
+        if (start_reference.col, start_reference.row) != (1, 14)
+            || end_reference.col != 23
+            || end_reference.row < 14
+        {
+            return Err(err(format!(
+                "worksheet autoFilter 범위가 고정 스키마와 다릅니다: {existing_ref}"
+            )));
+        }
+        Ok((location, attrs))
+    }
     pub(crate) fn get_i32_at(
         &self,
         col: u32,
@@ -1374,101 +1193,6 @@ impl Worksheet {
             .max()
             .unwrap_or(1)
     }
-    fn normalize_shared_formulas(&mut self) -> Result<()> {
-        let mut heads: HashMap<String, SharedFormulaHead> = HashMap::new();
-        for (row_num, row) in &self.rows {
-            for (col_num, cell) in &row.cells {
-                let Some(inner_xml) = cell.inner_xml.as_deref() else {
-                    continue;
-                };
-                let Some(spec) = parse_shared_formula_spec(inner_xml)? else {
-                    continue;
-                };
-                let Some(formula_text) = spec.formula_text else {
-                    continue;
-                };
-                if heads.len() == heads.capacity() {
-                    heads.try_reserve(1).map_err(|source| {
-                        err_with_source("shared formula head 맵 추가 메모리 확보 실패", source)
-                    })?;
-                }
-                match heads.entry(spec.si) {
-                    HashEntry::Vacant(entry) => {
-                        entry.insert(SharedFormulaHead {
-                            anchor_col: *col_num,
-                            anchor_row: *row_num,
-                            formula: formula_text,
-                        });
-                    }
-                    HashEntry::Occupied(entry) => {
-                        return Err(err(format!(
-                            "shared formula si가 중복되었습니다: {}",
-                            entry.key()
-                        )));
-                    }
-                }
-            }
-        }
-        if heads.is_empty() {
-            return Ok(());
-        }
-        for (row_num, row) in &mut self.rows {
-            for (col_num, cell) in &mut row.cells {
-                let Some(inner_xml) = cell.inner_xml.as_deref() else {
-                    continue;
-                };
-                let Some(spec) = parse_shared_formula_spec(inner_xml)? else {
-                    continue;
-                };
-                let Some(head) = heads.get(&spec.si) else {
-                    let col_name = col_to_name(*col_num)?;
-                    return Err(err(format!(
-                        "shared formula head를 찾지 못했습니다. (si={}, cell={col_name}{row_num} )",
-                        spec.si
-                    )));
-                };
-                let formula = if let Some(text) = spec.formula_text {
-                    Cow::Owned(text)
-                } else {
-                    let delta_col = (*col_num)
-                        .checked_signed_diff(head.anchor_col)
-                        .ok_or_else(|| err("shared formula column delta 계산 실패"))?;
-                    let delta_row = (*row_num)
-                        .checked_signed_diff(head.anchor_row)
-                        .ok_or_else(|| err("shared formula row delta 계산 실패"))?;
-                    rewrite_formula_cell_refs(&head.formula, |chars, start| {
-                        try_parse_and_rewrite_cell_ref(
-                            chars,
-                            start,
-                            |base_col, base_row, col_lock, row_lock| {
-                                let new_col = if col_lock {
-                                    base_col
-                                } else {
-                                    shift_formula_index(base_col, delta_col, MAX_A1_COL)?
-                                };
-                                let new_row = if row_lock {
-                                    base_row
-                                } else {
-                                    shift_formula_index(base_row, delta_row, MAX_A1_ROW)?
-                                };
-                                Ok(RewrittenCellReference {
-                                    col: new_col,
-                                    row: new_row,
-                                })
-                            },
-                        )
-                    })?
-                    .map_or_else(|| Cow::Borrowed(head.formula.as_str()), Cow::Owned)
-                };
-                cell.inner_xml = Some(replace_formula_tag_with_plain_formula(
-                    inner_xml,
-                    formula.as_ref(),
-                )?);
-            }
-        }
-        self.formula_cells = formula_cells_from_rows(&self.rows);
-        Ok(())
-    }
     fn prune_col_definitions_after_col(&mut self, max_col: u32) -> Result<()> {
         let mut cursor = 0_usize;
         while let Some(location) =
@@ -1477,11 +1201,11 @@ impl Worksheet {
             let element_span =
                 empty_xml_element_span(&self.prefix, &location, "col", "worksheet col 정의")?;
             let col_start = element_span.start;
-            let tag = self
-                .prefix
-                .get(location.span)
-                .ok_or_else(|| err("worksheet col 정의 태그 범위가 손상되었습니다."))?;
-            let mut attrs = parse_tag_attrs(tag)?;
+            let mut attrs = parse_tag_attrs_at(
+                &self.prefix,
+                &location,
+                "worksheet col 정의 태그 범위가 손상되었습니다.",
+            )?;
             let min_col_text = get_attr(&attrs, "min")
                 .ok_or_else(|| err("worksheet col 정의에 min 속성이 없습니다."))?;
             let min_col = parse_positive_u32_decimal(
@@ -1594,31 +1318,23 @@ impl Worksheet {
         self.rows.range(start..).map(|(&row, _)| row)
     }
     pub(crate) fn set_formula_at(&mut self, col: u32, row: u32, formula: &str) -> Result<()> {
-        let formula_name = self.element_names.formula.as_ref();
-        let value_name = self.element_names.value.as_ref();
         let cell = Self::get_or_create_cell_mut(&mut self.rows, col, row)?;
         remove_attr(&mut cell.attrs, "t");
+        let formula_text =
+            try_xml_escape_text(formula, XmlEscapeContext::Text, "formula XML escape")?;
         if let Some(inner) = cell.inner_xml.as_mut() {
             if find_start_tag(inner, "f", 0).is_some() {
-                *inner = replace_formula_tag_with_plain_formula(inner, formula)?;
+                replace_first_tag_text(inner, "f", &formula_text)?;
                 if !replace_first_tag_text(inner, "v", "")? {
                     append_peer_text_tag(inner, "f", "v", "")?;
                 }
             } else if inner.trim().is_empty() {
-                let formula_text =
-                    try_xml_escape_text(formula, XmlEscapeContext::Text, "formula XML escape")?;
-                *inner = build_formula_with_empty_value(formula_name, value_name, &formula_text)?;
+                *inner = build_formula_with_empty_value("f", "v", &formula_text)?;
             } else {
                 return Err(err("cell formula 태그를 찾지 못했습니다."));
             }
         } else {
-            let formula_text =
-                try_xml_escape_text(formula, XmlEscapeContext::Text, "formula XML escape")?;
-            cell.inner_xml = Some(build_formula_with_empty_value(
-                formula_name,
-                value_name,
-                &formula_text,
-            )?);
+            cell.inner_xml = Some(build_formula_with_empty_value("f", "v", &formula_text)?);
         }
         self.formula_cells.insert((row, col));
         Ok(())
@@ -1657,12 +1373,11 @@ impl Worksheet {
         Ok(())
     }
     pub(crate) fn set_i32_at(&mut self, col: u32, row: u32, value: Option<i32>) -> Result<()> {
-        let value_name = self.element_names.value.as_ref();
         let cell = Self::get_or_create_cell_mut(&mut self.rows, col, row)?;
         remove_attr(&mut cell.attrs, "t");
         if let Some(numeric_value) = value {
             cell.inner_xml = Some(build_decimal_display_text_tag(
-                value_name,
+                "v",
                 numeric_value.is_negative().then_some('-'),
                 u64::from(numeric_value.unsigned_abs()),
             ));
@@ -1673,19 +1388,9 @@ impl Worksheet {
         Ok(())
     }
     pub(crate) fn set_string_at(&mut self, col: u32, row: u32, value: &str) -> Result<()> {
-        let inline_string_name = self.element_names.inline_string.as_ref();
-        let text_name = self.element_names.text.as_ref();
         let cell = Self::get_or_create_cell_mut(&mut self.rows, col, row)?;
-        set_attr(&mut cell.attrs, "t", "inlineStr");
-        let mut inner = String::new();
-        append_nested_text_xml(
-            &mut inner,
-            inline_string_name,
-            text_name,
-            value,
-            "inline string XML",
-        )?;
-        cell.inner_xml = Some(inner);
+        set_attr(&mut cell.attrs, "t", PENDING_SHARED_STRING_TYPE);
+        cell.inner_xml = Some(copy_text(value, "shared string 값 복사")?);
         self.formula_cells.remove(&(row, col));
         Ok(())
     }
@@ -1694,8 +1399,8 @@ impl Worksheet {
         mem::take(&mut self.rows)
     }
     fn to_xml(&self) -> Result<String> {
-        let cell_name = self.element_names.cell.as_ref();
-        let row_name = self.element_names.row.as_ref();
+        let cell_name = "c";
+        let row_name = "row";
         let estimated_capacity = (|| {
             let cell_markup_len =
                 checked_capacity(&["< r=\"\"></>".len(), cell_name.len(), cell_name.len()])?;
@@ -1806,8 +1511,7 @@ impl Worksheet {
         let cell_type = get_attr(&cell.attrs, "t");
         let inner = cell.inner_xml.as_deref().unwrap_or("");
         match cell_type {
-            Some("inlineStr") => extract_all_tag_text(inner, "t")?
-                .ok_or_else(|| err("inlineStr cell text를 해석하지 못했습니다.")),
+            Some(PENDING_SHARED_STRING_TYPE) => Ok(Cow::Borrowed(inner)),
             ordinary_type => match ordinary_type {
                 Some("s") => {
                     let raw_v = extract_first_tag_text(inner, "v")?
@@ -1848,70 +1552,31 @@ impl Worksheet {
         };
         decode_xml_entities(text).map(Some)
     }
-    pub(crate) fn update_auto_filter_ref(
-        &mut self,
-        filter_rows: RangeInclusive<u32>,
-    ) -> Result<u32> {
+    pub(crate) fn update_auto_filter_ref(&mut self, last_data_row: u32) -> Result<()> {
+        let (location, mut attrs) = self.fixed_master_auto_filter()?;
         let out = &mut self.suffix;
-        let mut cursor = 0_usize;
-        let header_row = filter_rows.start;
-        let target_last_row = filter_rows.start.max(filter_rows.last);
-        let mut updated_end_col = None;
-        while let Some(location) =
-            find_start_tag_location(out, "autoFilter", cursor, "autoFilter 태그 이름 복사")?
-        {
-            let auto_filter_start = location.span.start;
-            let mut attrs = {
-                let tag = out
-                    .get(location.span)
-                    .ok_or_else(|| err("worksheet XML의 autoFilter 태그 범위가 손상되었습니다."))?;
-                parse_tag_attrs(tag)?
-            };
-            let existing_ref = get_attr(&attrs, "ref")
-                .ok_or_else(|| err("worksheet autoFilter ref 속성이 없습니다."))?;
-            let range = parse_range_token(existing_ref);
-            let start_reference = parse_ref_with_locks(range.start_ref)
-                .ok_or_else(|| err("worksheet autoFilter 시작 reference 해석 실패"))?;
-            let end_reference = parse_ref_with_locks(range.end_ref)
-                .ok_or_else(|| err("worksheet autoFilter 끝 reference 해석 실패"))?;
-            if start_reference.col != 1 || start_reference.row != header_row {
-                return Err(err(format!(
-                    "worksheet autoFilter 시작 범위가 예상과 다릅니다: ref={existing_ref}, expected=A{header_row}"
-                )));
-            }
-            if end_reference.col < start_reference.col || end_reference.row < start_reference.row {
-                return Err(err(format!(
-                    "worksheet autoFilter 범위 순서가 올바르지 않습니다: {existing_ref}"
-                )));
-            }
-            let end_col = end_reference.col;
-            if updated_end_col.replace(end_col).is_some() {
-                return Err(err("worksheet XML에 autoFilter 태그가 중복되어 있습니다."));
-            }
-            let new_ref = build_ref_range(
-                "A",
-                RangeInclusive {
-                    start: header_row,
-                    last: target_last_row,
-                },
-                end_col,
-            )?;
-            reserve_xml_attrs(
-                &mut attrs,
-                1,
-                "autoFilter 속성 목록 추가 메모리 확보 실패",
-                XmlReserveMode::Additional,
-            )?;
-            set_attr(&mut attrs, "ref", new_ref);
-            let new_tag = if location.self_closing {
-                build_self_closing_tag(&location.name, &attrs)?
-            } else {
-                build_open_tag(&location.name, &attrs)?
-            };
-            out.replace_range(location.span, &new_tag);
-            cursor = checked_usize_add(auto_filter_start, new_tag.len(), "autoFilter 다음 cursor")?;
-        }
-        updated_end_col.ok_or_else(|| err("worksheet XML의 autoFilter 태그를 찾지 못했습니다."))
+        let new_ref = build_ref_range(
+            "A",
+            RangeInclusive {
+                start: 14,
+                last: last_data_row.max(14),
+            },
+            23,
+        )?;
+        reserve_xml_attrs(
+            &mut attrs,
+            1,
+            "autoFilter 속성 목록 추가 메모리 확보 실패",
+            XmlReserveMode::Additional,
+        )?;
+        set_attr(&mut attrs, "ref", new_ref);
+        let new_tag = if location.self_closing {
+            build_self_closing_tag(&location.name, &attrs)?
+        } else {
+            build_open_tag(&location.name, &attrs)?
+        };
+        out.replace_range(location.span, &new_tag);
+        Ok(())
     }
     pub(crate) fn update_dimension(&mut self) -> Result<()> {
         let mut max_row = 1_u32;
@@ -1931,13 +1596,11 @@ impl Worksheet {
                 "dimension",
                 "worksheet dimension",
             )?;
-            let mut attrs = {
-                let tag = self
-                    .prefix
-                    .get(dim_location.span)
-                    .ok_or_else(|| err("dimension 태그 범위가 손상되었습니다."))?;
-                parse_tag_attrs(tag)?
-            };
+            let mut attrs = parse_tag_attrs_at(
+                &self.prefix,
+                &dim_location,
+                "dimension 태그 범위가 손상되었습니다.",
+            )?;
             reserve_xml_attrs(
                 &mut attrs,
                 1,
@@ -1958,6 +1621,31 @@ impl Worksheet {
             );
             let new_tag = build_self_closing_tag(&dim_location.name, &attrs)?;
             self.prefix.replace_range(element_span, &new_tag);
+        }
+        Ok(())
+    }
+    fn validate_fixed_header(&self, sheet_name: &str, shared_strings: &[String]) -> Result<()> {
+        let (header_row, headers, last_col): (u32, &[&str], u32) = match sheet_name {
+            "유류비" => (14, &MASTER_HEADERS, 23),
+            "변경내역" => (3, &CHANGE_LOG_HEADERS, 13),
+            _ => return Err(err(format!("고정 스키마에 없는 sheet입니다: {sheet_name}"))),
+        };
+        if self.max_cell_col() != last_col {
+            return Err(err(format!(
+                "{sheet_name} 시트의 마지막 열이 고정 스키마와 다릅니다: expected={last_col}, actual={}",
+                self.max_cell_col()
+            )));
+        }
+        for (col, expected) in (1_u32..).zip(headers.iter().copied()) {
+            let actual = self.try_get_display_at(col, header_row, shared_strings)?;
+            if actual.as_ref() != expected {
+                return Err(err(format!(
+                    "{sheet_name} 헤더가 고정 스키마와 다릅니다: row={header_row}, col={col}, expected={expected}, actual={actual}"
+                )));
+            }
+        }
+        if sheet_name == "유류비" {
+            self.fixed_master_auto_filter()?;
         }
         Ok(())
     }
@@ -2064,25 +1752,46 @@ fn empty_xml_element_span(
     local_name: &str,
     context: &str,
 ) -> Result<Range<usize>> {
-    if location.self_closing {
-        return Ok(location.span);
-    }
-    let body_start = location.span.end;
-    let body_end = find_end_tag(xml, local_name, body_start)
-        .ok_or_else(|| err(format!("{context} 종료 태그를 찾지 못했습니다.")))?;
+    let (element_span, body_span) = xml_element_ranges(xml, location, local_name, context)?;
     let body = xml
-        .get(body_start..body_end)
+        .get(body_span)
         .ok_or_else(|| err(format!("{context} 본문 범위가 손상되었습니다.")))?;
     if !body.trim().is_empty() {
         return Err(err(format!("{context}에 예상하지 않은 본문이 있습니다.")));
     }
+    Ok(element_span)
+}
+fn xml_element_ranges(
+    xml: &str,
+    location: &XmlTagLocation,
+    local_name: &str,
+    context: &str,
+) -> Result<(Range<usize>, Range<usize>)> {
+    let body_start = location.span.end;
+    if location.self_closing {
+        return Ok((
+            location.span,
+            Range {
+                start: body_start,
+                end: body_start,
+            },
+        ));
+    }
+    let body_end = find_end_tag(xml, local_name, body_start)
+        .ok_or_else(|| err(format!("{context} 종료 태그를 찾지 못했습니다.")))?;
     let close_end = find_tag_end(xml, body_end)
         .and_then(|end| end.checked_add(1))
         .ok_or_else(|| err(format!("{context} 종료 태그가 손상되었습니다.")))?;
-    Ok(Range {
-        start: location.span.start,
-        end: close_end,
-    })
+    Ok((
+        Range {
+            start: location.span.start,
+            end: close_end,
+        },
+        Range {
+            start: body_start,
+            end: body_end,
+        },
+    ))
 }
 pub(crate) fn remap_formula_rows(
     row: &mut Row,
@@ -2094,21 +1803,25 @@ pub(crate) fn remap_formula_rows(
         {
             let decoded = decode_xml_entities(text)?;
             let rewrite_result = rewrite_formula_cell_refs(decoded.as_ref(), |chars, start| {
-                try_parse_and_rewrite_cell_ref(
-                    chars,
-                    start,
-                    |base_col, base_row, _col_lock, row_lock| {
-                        let updated_row = if row_lock {
-                            base_row
-                        } else {
-                            resolver(base_row)?
-                        };
-                        Ok(RewrittenCellReference {
-                            col: base_col,
-                            row: updated_row,
-                        })
-                    },
-                )
+                let Some(parsed) = parse_formula_cell_ref(chars, start) else {
+                    return Ok(None);
+                };
+                let reference = parsed.reference;
+                let updated_row = if reference.row_locked {
+                    reference.row
+                } else {
+                    resolver(reference.row)?
+                };
+                if updated_row == reference.row {
+                    return Ok(None);
+                }
+                Ok(Some(FormulaRewrite {
+                    end_index: parsed.end_index,
+                    replacement: ref_with_locks(CellReference {
+                        row: updated_row,
+                        ..reference
+                    })?,
+                }))
             });
             let Some(rewritten) = rewrite_result? else {
                 continue;
@@ -2172,90 +1885,31 @@ fn push_attr_xml(out: &mut String, attr: &XmlAttr) {
     append_xml_escaped(out, &attr.value, XmlEscapeContext::Attribute);
     out.push('"');
 }
+fn parse_tag_attrs_at(
+    xml: &str,
+    location: &XmlTagLocation,
+    invalid_range_message: &'static str,
+) -> Result<Vec<XmlAttr>> {
+    let tag = xml
+        .get(location.span)
+        .ok_or_else(|| err(invalid_range_message))?;
+    parse_tag_attrs(tag)
+}
 fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr>> {
     let mut out: Vec<XmlAttr> = Vec::new();
     out.try_reserve_exact(4)
         .map_err(|source| err_with_source("XML 속성 목록 메모리 확보 실패", source))?;
-    let Some(lt) = tag.find('<') else {
-        return Err(err("XML 태그 파싱 실패: '<' 없음"));
-    };
-    let advance = |cursor: &mut usize| -> Result<()> {
-        *cursor = cursor
-            .checked_add(1)
-            .ok_or_else(|| err("XML 태그 파싱 실패: cursor overflow"))?;
-        Ok(())
-    };
-    let mut i = lt
-        .checked_add(1)
-        .ok_or_else(|| err("XML 태그 파싱 실패: cursor 시작 계산 실패"))?;
-    let bytes = tag.as_bytes();
-    while bytes
-        .get(i)
-        .is_some_and(|ch| !ch.is_ascii_whitespace() && !matches!(*ch, b'>' | b'/'))
-    {
-        advance(&mut i)?;
-    }
-    if i >= bytes.len() {
-        return Err(err("XML 태그 파싱 실패: 태그 종료 기호 없음"));
-    }
-    while i < bytes.len() {
-        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-            advance(&mut i)?;
-        }
-        if bytes.get(i).is_none_or(|ch| matches!(*ch, b'>' | b'/')) {
-            break;
-        }
+    let mut scanner = XmlAttrScanner::new(tag)?;
+    while let Some((name, value)) = scanner.next()? {
         if out.len() >= MAX_XML_ATTRIBUTE_COUNT {
             return Err(err("XML 속성 개수가 허용 한도를 초과했습니다."));
         }
-        let key_start = i;
-        while bytes
-            .get(i)
-            .is_some_and(|ch| !ch.is_ascii_whitespace() && !matches!(*ch, b'=' | b'>' | b'/'))
-        {
-            advance(&mut i)?;
-        }
-        let key_end = i;
-        if key_start == key_end {
+        if name.is_empty() {
             return Err(err("XML 속성 파싱 실패: 빈 속성 이름"));
         }
-        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-            advance(&mut i)?;
-        }
-        let Some(&equals) = bytes.get(i) else {
-            return Err(err("XML 속성 파싱 실패: '=' 없음"));
-        };
-        if equals != b'=' {
-            return Err(err("XML 속성 파싱 실패: '='가 필요합니다."));
-        }
-        advance(&mut i)?;
-        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-            advance(&mut i)?;
-        }
-        let Some(&quote) = bytes.get(i) else {
-            return Err(err("XML 속성 파싱 실패: 값 quote가 없습니다."));
-        };
-        if !matches!(quote, b'"' | b'\'') {
-            return Err(err("XML 속성 파싱 실패: 속성 값 quote 필요"));
-        }
-        advance(&mut i)?;
-        let value_start = i;
-        while bytes.get(i).is_some_and(|ch| *ch != quote) {
-            advance(&mut i)?;
-        }
-        if i >= bytes.len() {
-            return Err(err("XML 속성 파싱 실패: 닫히지 않은 quote"));
-        }
-        let key = tag
-            .get(key_start..key_end)
-            .ok_or_else(|| err("XML 속성 파싱 실패: 키 범위를 계산할 수 없습니다."))?;
-        let raw_value = tag
-            .get(value_start..i)
-            .ok_or_else(|| err("XML 속성 파싱 실패: 값 범위를 계산할 수 없습니다."))?;
-        if out.iter().any(|attr| attr.name == key) {
+        if out.iter().any(|attr| attr.name == name) {
             return Err(err("XML 태그에 중복 속성이 있습니다."));
         }
-        let value = decode_xml_entities(raw_value)?.into_owned();
         if out.len() == out.capacity() {
             reserve_xml_attrs(
                 &mut out,
@@ -2265,12 +1919,12 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr>> {
             )?;
         }
         out.push(XmlAttr {
-            name: Cow::Owned(copy_text(key, "XML 속성 이름 복사")?),
-            value,
+            name: Cow::Owned(copy_text(name, "XML 속성 이름 복사")?),
+            value: match value {
+                Cow::Borrowed(text) => copy_text(text, "XML 속성 값 복사")?,
+                Cow::Owned(text) => text,
+            },
         });
-        if i < bytes.len() {
-            advance(&mut i)?;
-        }
     }
     Ok(out)
 }
@@ -2354,100 +2008,6 @@ fn set_attr(attrs: &mut Vec<XmlAttr>, name: &'static str, value_in: impl Into<St
 fn remove_attr(attrs: &mut Vec<XmlAttr>, name: &str) {
     attrs.retain(|attr| attr.name != name);
 }
-fn parse_shared_formula_spec(inner_xml: &str) -> Result<Option<SharedFormulaSpec>> {
-    let Some(f_start) = find_start_tag(inner_xml, "f", 0) else {
-        return Ok(None);
-    };
-    let Some(f_end) = find_tag_end(inner_xml, f_start) else {
-        return Err(err("cell formula 태그가 손상되었습니다."));
-    };
-    let formula_open_span = RangeInclusive {
-        start: f_start,
-        last: f_end,
-    };
-    let open_tag = inner_xml
-        .get(formula_open_span)
-        .ok_or_else(|| err("cell formula 시작 태그 범위가 손상되었습니다."))?;
-    let mut attrs = parse_tag_attrs(open_tag)?;
-    if get_attr(&attrs, "t") != Some("shared") {
-        return Ok(None);
-    }
-    let si_index = attrs
-        .iter()
-        .position(|attr| attr.name == "si")
-        .ok_or_else(|| err("shared formula에 si 속성이 없습니다."))?;
-    let si = attrs.swap_remove(si_index).value;
-    let formula_text = if let Some(text) = extract_first_tag_text(inner_xml, "f")? {
-        let decoded = decode_xml_entities(text)?.into_owned();
-        (!decoded.is_empty()).then_some(decoded)
-    } else {
-        None
-    };
-    Ok(Some(SharedFormulaSpec { formula_text, si }))
-}
-fn replace_formula_tag_with_plain_formula(inner_xml: &str, formula: &str) -> Result<String> {
-    let mut scanner = XmlScanner::new(inner_xml);
-    let Some(f_tag) = scanner.next_start_named("f") else {
-        return Err(err("cell formula 태그를 찾지 못했습니다."));
-    };
-    let f_start = f_tag.start();
-    let f_end = f_tag.end();
-    let f_name = f_tag.name();
-    let formula_open_span = RangeInclusive {
-        start: f_start,
-        last: f_end,
-    };
-    let open_tag = inner_xml
-        .get(formula_open_span)
-        .ok_or_else(|| err("cell formula 시작 태그 범위가 손상되었습니다."))?;
-    let prefix = inner_xml
-        .get(..f_start)
-        .ok_or_else(|| err("cell formula prefix 범위가 손상되었습니다."))?;
-    let suffix = if open_tag.trim_ascii_end().ends_with("/>") {
-        let suffix_start = checked_usize_add(f_end, 1, "cell formula suffix 시작")?;
-        inner_xml
-            .get(suffix_start..)
-            .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?
-    } else {
-        let close_search_from = checked_usize_add(f_end, 1, "cell formula 종료 태그 검색 시작")?;
-        let Some(close_start) = find_end_tag(inner_xml, "f", close_search_from) else {
-            return Err(err("cell formula 종료 태그를 찾지 못했습니다."));
-        };
-        let Some(close_end) = find_tag_end(inner_xml, close_start) else {
-            return Err(err("cell formula 종료 태그가 손상되었습니다."));
-        };
-        let suffix_start = checked_usize_add(close_end, 1, "cell formula suffix 시작")?;
-        inner_xml
-            .get(suffix_start..)
-            .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?
-    };
-    let escaped_formula =
-        try_xml_escape_text(formula, XmlEscapeContext::Text, "cell formula XML escape")?;
-    let capacity = checked_capacity(&[
-        prefix.len(),
-        "<>".len(),
-        f_name.len(),
-        escaped_formula.len(),
-        "</>".len(),
-        f_name.len(),
-        suffix.len(),
-    ])
-    .ok_or_else(|| err("cell formula plain replacement 용량 계산 실패"))?;
-    let mut out = String::new();
-    out.try_reserve_exact(capacity).map_err(|source| {
-        err_with_source("cell formula plain replacement 메모리 확보 실패", source)
-    })?;
-    out.push_str(prefix);
-    out.push('<');
-    out.push_str(f_name);
-    out.push('>');
-    out.push_str(&escaped_formula);
-    out.push_str("</");
-    out.push_str(f_name);
-    out.push('>');
-    out.push_str(suffix);
-    Ok(out)
-}
 fn remove_tags_matching_attr(
     xml: &mut String,
     tag_name: &str,
@@ -2529,81 +2089,25 @@ fn remove_tags_matching(
     }
     Ok(changed)
 }
-fn qualified_name_with_prefix(
-    maybe_prefix: Option<&str>,
-    local_name: &'static str,
-    context: &str,
-) -> Result<Cow<'static, str>> {
-    let Some(prefix) = maybe_prefix else {
-        return Ok(Cow::Borrowed(local_name));
-    };
-    let capacity = checked_capacity(&[prefix.len(), ":".len(), local_name.len()])
-        .ok_or_else(|| err(format!("{context} 용량 계산 실패")))?;
-    let mut out = String::new();
-    out.try_reserve_exact(capacity)
-        .map_err(|source| err_with_source(format!("{context} 메모리 확보 실패"), source))?;
-    out.push_str(prefix);
-    out.push(':');
-    out.push_str(local_name);
-    Ok(Cow::Owned(out))
-}
-fn append_nested_text_xml(
-    out: &mut String,
-    outer_name: &str,
-    text_name: &str,
-    text: &str,
-    context: &str,
-) -> Result<()> {
-    let escaped_capacity = validated_xml_escaped_len(text, XmlEscapeContext::Text, context)?;
-    let text_attrs = if text.starts_with(' ') || text.ends_with(' ') || text.contains("  ") {
-        XML_SPACE_PRESERVE_ATTR
-    } else {
-        ""
-    };
-    let tag_markup_len = outer_name
-        .len()
-        .checked_add(text_name.len())
-        .and_then(|len| len.checked_mul(2))
-        .and_then(|len| len.checked_add("<><></></>".len()))
-        .and_then(|len| len.checked_add(text_attrs.len()))
-        .ok_or_else(|| err(format!("{context} tag 용량 계산 실패")))?;
-    let capacity = checked_usize_add(tag_markup_len, escaped_capacity, "XML text 용량 계산 실패")?;
-    out.try_reserve_exact(capacity)
-        .map_err(|source| err_with_source(format!("{context} 메모리 확보 실패"), source))?;
-    push_start_tag_name(out, outer_name, "");
-    push_start_tag_name(out, text_name, text_attrs);
-    append_xml_escaped(out, text, XmlEscapeContext::Text);
-    push_end_tag_name(out, text_name);
-    push_end_tag_name(out, outer_name);
-    Ok(())
-}
 fn append_peer_text_tag(
     xml: &mut String,
     anchor_tag_name: &str,
     tag_name: &'static str,
     text: &str,
 ) -> Result<()> {
-    let qualified_name = {
-        let mut scanner = XmlScanner::new(xml);
-        let Some(anchor_tag) = scanner.next_start_named(anchor_tag_name) else {
-            return Err(err(tag_error_message(
-                anchor_tag_name,
-                " anchor 태그를 찾지 못했습니다.",
-            )));
-        };
-        qualified_name_with_prefix(
-            anchor_tag.name().rsplit_once(':').map(|(prefix, _)| prefix),
-            tag_name,
-            &tag_error_message(tag_name, " qualified name"),
-        )?
-    };
+    if find_start_tag(xml, anchor_tag_name, 0).is_none() {
+        return Err(err(tag_error_message(
+            anchor_tag_name,
+            " anchor 태그를 찾지 못했습니다.",
+        )));
+    }
     let capacity = checked_capacity(&[
         "<".len(),
-        qualified_name.len(),
+        tag_name.len(),
         ">".len(),
         text.len(),
         "</".len(),
-        qualified_name.len(),
+        tag_name.len(),
         ">".len(),
     ])
     .ok_or_else(|| err(tag_error_message(tag_name, " text tag 용량 계산 실패")))?;
@@ -2613,9 +2117,9 @@ fn append_peer_text_tag(
             source,
         )
     })?;
-    push_start_tag_name(xml, qualified_name.as_ref(), "");
+    push_start_tag_name(xml, tag_name, "");
     xml.push_str(text);
-    push_end_tag_name(xml, qualified_name.as_ref());
+    push_end_tag_name(xml, tag_name);
     Ok(())
 }
 fn replace_first_tag_text(xml: &mut String, tag_name: &str, new_text: &str) -> Result<bool> {

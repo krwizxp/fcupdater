@@ -5,41 +5,9 @@ use std::io::{self, BufWriter, Write as _};
 use std::path::PathBuf;
 const TAR_BLOCK_LEN: usize = 512;
 const TAR_BLOCK_LEN_U64: u64 = 512;
-struct TarHeader {
-    checksum: [u8; 8],
-    mode: [u8; 8],
-    mtime: [u8; 12],
-    name: [u8; 100],
-    size: [u8; 12],
-    zero_octal: [u8; 8],
-}
-impl TarHeader {
-    const fn fields(&self) -> [&[u8]; 17] {
-        const EMPTY_12: [u8; 12] = [0; 12];
-        const EMPTY_32: [u8; 32] = [0; 32];
-        const EMPTY_100: [u8; 100] = [0; 100];
-        const EMPTY_155: [u8; 155] = [0; 155];
-        [
-            &self.name,
-            &self.mode,
-            &self.zero_octal,
-            &self.zero_octal,
-            &self.size,
-            &self.mtime,
-            &self.checksum,
-            b"0",
-            &EMPTY_100,
-            b"ustar\0",
-            b"00",
-            &EMPTY_32,
-            &EMPTY_32,
-            &self.zero_octal,
-            &self.zero_octal,
-            &EMPTY_155,
-            &EMPTY_12,
-        ]
-    }
-}
+const TAR_NAME_LEN: usize = 100;
+const ZERO_BLOCK: [u8; TAR_BLOCK_LEN] = [0; TAR_BLOCK_LEN];
+const ZERO_NAME: [u8; TAR_NAME_LEN] = [0; TAR_NAME_LEN];
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -57,9 +25,7 @@ fn octal_field<const WIDTH: usize>(value: u64) -> io::Result<[u8; WIDTH]> {
         return Err(invalid_input("tar octal value exceeds its header field"));
     }
     let mut field = [0_u8; WIDTH];
-    for (slot, byte) in field.iter_mut().zip(text.bytes()) {
-        *slot = byte;
-    }
+    field.copy_from_slice(text.as_bytes());
     Ok(field)
 }
 fn main() -> io::Result<()> {
@@ -78,9 +44,10 @@ fn main() -> io::Result<()> {
     {
         fs::create_dir_all(parent)?;
     }
+    let source_len = source.metadata()?.len();
     if destination.extension() == Some(OsStr::new("tar")) {
         if entry_name.is_empty()
-            || entry_name.len() > 100
+            || entry_name.len() > TAR_NAME_LEN
             || entry_name.contains('/')
             || entry_name.contains('\\')
         {
@@ -88,34 +55,34 @@ fn main() -> io::Result<()> {
                 "tar entry name must be a 1-100 byte file name",
             ));
         }
-        let source_len = source.metadata()?.len();
-        let mut name_field = [0_u8; 100];
-        for (slot, byte) in name_field.iter_mut().zip(entry_name.bytes()) {
-            *slot = byte;
+        let mut header = ZERO_BLOCK;
+        {
+            let mut header_writer = header.as_mut_slice();
+            header_writer.write_all(entry_name.as_bytes())?;
+            let name_padding = TAR_NAME_LEN.abs_diff(entry_name.len());
+            let (name_padding_bytes, _) = ZERO_NAME.split_at(name_padding);
+            header_writer.write_all(name_padding_bytes)?;
+            header_writer.write_all(&octal_field::<8>(0o755)?)?;
+            let zero_octal = octal_field::<8>(0)?;
+            header_writer.write_all(&zero_octal)?;
+            header_writer.write_all(&zero_octal)?;
+            header_writer.write_all(&octal_field::<12>(source_len)?)?;
+            header_writer.write_all(&octal_field::<12>(0)?)?;
+            header_writer.write_all(b"        0")?;
+            header_writer.write_all(&ZERO_NAME)?;
+            header_writer.write_all(b"ustar\x0000")?;
+            header_writer.write_all(&[0_u8; 64])?;
+            header_writer.write_all(&zero_octal)?;
+            header_writer.write_all(&zero_octal)?;
+            header_writer.write_all(&[0_u8; 167])?;
         }
-        let mut header = TarHeader {
-            checksum: [b' '; 8],
-            mode: octal_field::<8>(0o755)?,
-            mtime: octal_field::<12>(0)?,
-            name: name_field,
-            size: octal_field::<12>(source_len)?,
-            zero_octal: octal_field::<8>(0)?,
-        };
-        let checksum = header
-            .fields()
-            .into_iter()
-            .flatten()
-            .map(|byte| u64::from(*byte))
-            .sum::<u64>();
-        let checksum_text = format!("{checksum:06o}\0 ");
-        for (slot, byte) in header.checksum.iter_mut().zip(checksum_text.bytes()) {
-            *slot = byte;
-        }
+        let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+        let (_, checksum_and_tail) = header.split_at_mut(148);
+        let (checksum_field, _) = checksum_and_tail.split_at_mut(8);
+        checksum_field.copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
         let mut input = File::open(&source)?;
         let mut output = BufWriter::new(File::create(destination)?);
-        for field in header.fields() {
-            output.write_all(field)?;
-        }
+        output.write_all(&header)?;
         let copied = io::copy(&mut input, &mut output)?;
         if copied != source_len {
             return Err(io::Error::new(
@@ -125,15 +92,16 @@ fn main() -> io::Result<()> {
         }
         let remainder = source_len.rem_euclid(TAR_BLOCK_LEN_U64);
         if remainder != 0 {
-            for _ in 0..TAR_BLOCK_LEN_U64.abs_diff(remainder) {
-                output.write_all(&[0_u8])?;
-            }
+            let padding = usize::try_from(TAR_BLOCK_LEN_U64.abs_diff(remainder)).map_err(
+                |conversion_error| io::Error::new(io::ErrorKind::InvalidInput, conversion_error),
+            )?;
+            let (padding_bytes, _) = ZERO_BLOCK.split_at(padding);
+            output.write_all(padding_bytes)?;
         }
-        output.write_all(&[0_u8; TAR_BLOCK_LEN])?;
-        output.write_all(&[0_u8; TAR_BLOCK_LEN])?;
+        output.write_all(&ZERO_BLOCK)?;
+        output.write_all(&ZERO_BLOCK)?;
         output.flush()
     } else {
-        let source_len = source.metadata()?.len();
         let copied = fs::copy(source, destination)?;
         if copied == source_len {
             Ok(())

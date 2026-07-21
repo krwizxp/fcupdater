@@ -77,10 +77,7 @@ impl<'header, const CAPACITY: usize> HeaderStack<'header, CAPACITY> {
             return Err("HTTP header stack 용량을 초과했습니다.".into());
         };
         *slot = (name, value);
-        self.len = self
-            .len
-            .checked_add(1)
-            .ok_or("HTTP header stack 길이 계산 실패")?;
+        self.len = self.len.wrapping_add(1);
         Ok(())
     }
 }
@@ -117,10 +114,7 @@ impl CookieJar {
         }
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
             if cookie.value.capacity() < value.len() {
-                let additional = value
-                    .len()
-                    .checked_sub(cookie.value.len())
-                    .ok_or("Cookie 값 메모리 용량 계산 실패")?;
+                let additional = value.len().saturating_sub(cookie.value.len());
                 cookie
                     .value
                     .try_reserve_exact(additional)
@@ -278,12 +272,7 @@ impl HttpClient {
             .iter()
             .find(|jar| jar.host == host && !jar.cookies.is_empty())
         {
-            let separator_capacity = jar
-                .cookies
-                .len()
-                .checked_sub(1)
-                .and_then(|count| count.checked_mul(2))
-                .ok_or("Cookie header 용량 계산 실패")?;
+            let separator_capacity = jar.cookies.len().saturating_sub(1).saturating_mul(2);
             let capacity = jar
                 .cookies
                 .iter()

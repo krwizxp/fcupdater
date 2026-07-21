@@ -1,4 +1,4 @@
-pub(super) use self::source_reader::{SourceReader, SourceRecord, SourceRecordRef};
+pub(super) use self::source_reader::{FuelValues, SourceReader, SourceRecord, SourceRecordRef};
 use crate::diagnostic::{Result, err, err_with_source};
 use core::range::Range;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -12,6 +12,10 @@ mod xml;
 mod zip_archive;
 pub(super) const SPREADSHEETML_NAMESPACE: &str =
     "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+pub(super) const CHANGE_LOG_SHEET_NAME: &str = "변경내역";
+pub(super) const CHANGE_LOG_SHEET_PATH: &str = "xl/worksheets/sheet2.xml";
+pub(super) const MASTER_SHEET_NAME: &str = "유류비";
+pub(super) const MASTER_SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
 #[derive(Clone, Copy)]
 pub(super) enum SaveVerification {
     Skip,
@@ -33,10 +37,6 @@ struct ZipArchiveExtractor<'path> {
     archive_file: File,
     archive_path: &'path Path,
     unpack_dir: &'path Path,
-}
-struct SheetInfo {
-    name: String,
-    path: String,
 }
 fn copy_text(text: &str, context: &str) -> Result<String> {
     let mut out = String::new();
@@ -120,20 +120,4 @@ fn workbook_defined_name_content_span(
         }
     }
     matched_span.ok_or_else(|| err("유류비 _FilterDatabase definedName을 찾지 못했습니다."))
-}
-fn workbook_sheet_index_by_name(workbook_xml: &str, sheet_name: &str) -> Result<usize> {
-    let mut sheet_index = None;
-    let mut sheet_order = 0_usize;
-    let mut scanner = xml::XmlScanner::new(workbook_xml);
-    while let Some(tag) = scanner.next_start_named("sheet") {
-        if xml::extract_attr(tag.raw(), "name")?.as_deref() == Some(sheet_name)
-            && sheet_index.replace(sheet_order).is_some()
-        {
-            return Err(err("workbook.xml에 대상 시트가 중복되어 있습니다."));
-        }
-        sheet_order = sheet_order
-            .checked_add(1)
-            .ok_or_else(|| err("workbook.xml sheet 순서 계산 중 overflow가 발생했습니다."))?;
-    }
-    sheet_index.ok_or_else(|| err("workbook.xml에서 대상 시트를 찾지 못했습니다."))
 }

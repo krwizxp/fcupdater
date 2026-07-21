@@ -16,6 +16,17 @@ use core::{
 };
 use std::{io::Write as IoWrite, sync::LazyLock};
 mod sys;
+macro_rules! curl_setopt {
+    ($handle:expr, $option:expr, $value:expr) => {{
+        // SAFETY: call sites pair each option with a wrapper using its documented libcurl ABI type.
+        let code = unsafe { sys::curl_easy_setopt($handle.as_ptr(), $option, $value) };
+        if code == CURLE_OK {
+            Ok(())
+        } else {
+            Err(curl_error("curl_easy_setopt", code).into())
+        }
+    }};
+}
 const CURLE_OK: CurlCode = 0;
 const CURL_ERROR_SIZE: usize = 256;
 const CURL_GLOBAL_DEFAULT: c_long = 3;
@@ -93,53 +104,14 @@ struct CurlVersionInfoData {
     version: *const c_char,
     version_num: c_uint,
 }
-cfg_select! {
-    target_pointer_width = "64" => {
-        const _: () = assert!(
-            size_of::<CurlVersionInfoData>() == 24,
-            "libcurl version info prefix x64 size mismatch"
-        );
-        const _: () = assert!(
-            align_of::<CurlVersionInfoData>() == 8,
-            "libcurl version info prefix x64 align mismatch"
-        );
-        const _: () = assert!(
-            offset_of!(CurlVersionInfoData, age) == 0,
-            "libcurl version info prefix x64 age offset mismatch"
-        );
-        const _: () = assert!(
-            offset_of!(CurlVersionInfoData, version) == 8,
-            "libcurl version info prefix x64 version offset mismatch"
-        );
-        const _: () = assert!(
-            offset_of!(CurlVersionInfoData, version_num) == 16,
-            "libcurl version info prefix x64 version number offset mismatch"
-        );
-    }
-    target_pointer_width = "32" => {
-        const _: () = assert!(
-            size_of::<CurlVersionInfoData>() == 12,
-            "libcurl version info prefix x86 size mismatch"
-        );
-        const _: () = assert!(
-            align_of::<CurlVersionInfoData>() == 4,
-            "libcurl version info prefix x86 align mismatch"
-        );
-        const _: () = assert!(
-            offset_of!(CurlVersionInfoData, age) == 0,
-            "libcurl version info prefix x86 age offset mismatch"
-        );
-        const _: () = assert!(
-            offset_of!(CurlVersionInfoData, version) == 4,
-            "libcurl version info prefix x86 version offset mismatch"
-        );
-        const _: () = assert!(
-            offset_of!(CurlVersionInfoData, version_num) == 8,
-            "libcurl version info prefix x86 version number offset mismatch"
-        );
-    }
-    _ => {}
-}
+const _: () = assert!(
+    size_of::<CurlVersionInfoData>() == size_of::<[*const c_char; 3]>()
+        && align_of::<CurlVersionInfoData>() == align_of::<*const c_char>()
+        && offset_of!(CurlVersionInfoData, age) == 0
+        && offset_of!(CurlVersionInfoData, version) == size_of::<*const c_char>()
+        && offset_of!(CurlVersionInfoData, version_num) == size_of::<[*const c_char; 2]>(),
+    "libcurl version info prefix ABI mismatch"
+);
 #[derive(Default)]
 pub(super) struct Client {
     easy_handle: Option<EasyHandle>,
@@ -149,23 +121,8 @@ pub(super) struct Client {
 }
 #[repr(C)]
 struct CurlSlist {
-    data: *mut c_char,
-    next: *mut Self,
-}
-cfg_select! {
-    target_pointer_width = "64" => {
-        const _: () = assert!(size_of::<CurlSlist>() == 16, "libcurl slist x64 size mismatch");
-        const _: () = assert!(align_of::<CurlSlist>() == 8, "libcurl slist x64 align mismatch");
-        const _: () = assert!(offset_of!(CurlSlist, data) == 0, "libcurl slist x64 data offset mismatch");
-        const _: () = assert!(offset_of!(CurlSlist, next) == 8, "libcurl slist x64 next offset mismatch");
-    }
-    target_pointer_width = "32" => {
-        const _: () = assert!(size_of::<CurlSlist>() == 8, "libcurl slist x86 size mismatch");
-        const _: () = assert!(align_of::<CurlSlist>() == 4, "libcurl slist x86 align mismatch");
-        const _: () = assert!(offset_of!(CurlSlist, data) == 0, "libcurl slist x86 data offset mismatch");
-        const _: () = assert!(offset_of!(CurlSlist, next) == 4, "libcurl slist x86 next offset mismatch");
-    }
-    _ => {}
+    _data: (),
+    _marker: PhantomData<(*mut u8, PhantomPinned)>,
 }
 struct EasyHandle(NonNull<Curl>);
 struct HeaderList(Option<NonNull<CurlSlist>>);
@@ -178,6 +135,14 @@ struct BoundedResponseBuffer {
 enum CurlWriteTarget<'target, 'writer> {
     Buffer(&'target mut BoundedResponseBuffer),
     Stream(&'target mut StreamingBodySink<'writer>),
+}
+impl CurlWriteTarget<'_, '_> {
+    const fn take_error(&mut self) -> Option<DownloadError> {
+        match *self {
+            Self::Buffer(ref mut buffer) => buffer.error.take(),
+            Self::Stream(ref mut stream) => stream.error.take(),
+        }
+    }
 }
 impl Drop for EasyHandle {
     fn drop(&mut self) {
@@ -251,49 +216,19 @@ impl EasyHandle {
         option: CurlOption,
         value: unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize,
     ) -> DownloadResult<()> {
-        // SAFETY: value is a libcurl-compatible callback function pointer.
-        let code = unsafe { sys::curl_easy_setopt(self.as_ptr(), option, value) };
-        if code == CURLE_OK {
-            Ok(())
-        } else {
-            Err(curl_error("curl_easy_setopt", code).into())
-        }
+        curl_setopt!(self, option, value)
     }
     fn setopt_long(&self, option: CurlOption, value: c_long) -> DownloadResult<()> {
-        // SAFETY: value is a scalar option value for the given CurlOption.
-        let code = unsafe { sys::curl_easy_setopt(self.as_ptr(), option, value) };
-        if code == CURLE_OK {
-            Ok(())
-        } else {
-            Err(curl_error("curl_easy_setopt", code).into())
-        }
+        curl_setopt!(self, option, value)
     }
     fn setopt_off_t(&self, option: CurlOption, value: CurlOffT) -> DownloadResult<()> {
-        // SAFETY: value is a curl_off_t scalar option value for the given CurlOption.
-        let code = unsafe { sys::curl_easy_setopt(self.as_ptr(), option, value) };
-        if code == CURLE_OK {
-            Ok(())
-        } else {
-            Err(curl_error("curl_easy_setopt", code).into())
-        }
+        curl_setopt!(self, option, value)
     }
     fn setopt_ptr<T>(&self, option: CurlOption, value: *const T) -> DownloadResult<()> {
-        // SAFETY: value is a pointer option that remains valid for the transfer duration.
-        let code = unsafe { sys::curl_easy_setopt(self.as_ptr(), option, value) };
-        if code == CURLE_OK {
-            Ok(())
-        } else {
-            Err(curl_error("curl_easy_setopt", code).into())
-        }
+        curl_setopt!(self, option, value)
     }
     fn setopt_str(&self, option: CurlOption, value: *const c_char) -> DownloadResult<()> {
-        // SAFETY: value is a valid NUL-terminated string that outlives the setopt call.
-        let code = unsafe { sys::curl_easy_setopt(self.as_ptr(), option, value) };
-        if code == CURLE_OK {
-            Ok(())
-        } else {
-            Err(curl_error("curl_easy_setopt", code).into())
-        }
+        curl_setopt!(self, option, value)
     }
 }
 impl HeaderList {
@@ -312,79 +247,114 @@ impl HeaderList {
         };
         list.as_ptr()
     }
-    fn from_headers(
-        request_headers: &[(&str, &str)],
-        header_bytes: &mut Vec<u8>,
-    ) -> DownloadResult<Self> {
-        let mut header_list = Self(None);
-        for &(name, value) in request_headers {
-            let header_capacity = name
-                .len()
-                .checked_add(": ".len())
-                .and_then(|capacity| capacity.checked_add(value.len()))
-                .and_then(|capacity| capacity.checked_add(1))
-                .ok_or("HTTP header 용량 계산 실패")?;
-            header_bytes.clear();
-            if header_bytes.capacity() < header_capacity {
-                header_bytes.try_reserve_exact(header_capacity).map_err(|source| {
-                    download_error_with_source("HTTP header 메모리 확보 실패", source)
-                })?;
-            }
-            header_bytes.extend_from_slice(name.as_bytes());
-            header_bytes.extend_from_slice(b": ");
-            header_bytes.extend_from_slice(value.as_bytes());
-            header_bytes.push(0);
-            let header_c = CStr::from_bytes_with_nul(header_bytes)
-                .map_err(|source| download_error_with_source("HTTP header C string 해석 실패", source))?;
-            header_list.append(header_c)?;
-        }
-        Ok(header_list)
-    }
 }
 impl Client {
-    fn configure_request(
-        handle: &EasyHandle,
-        url: &CStr,
-        header_list: &HeaderList,
-        error_buffer: &mut [c_char; CURL_ERROR_SIZE],
+    fn perform_request(
+        &mut self,
         method: HttpMethod<'_>,
-    ) -> DownloadResult<()> {
-        handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
-        handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
-        handle.setopt_ptr(CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
-        handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
-        handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
-        for (option, value) in [
-            (CURLOPT_CONNECTTIMEOUT_MS, 30_000),
-            (CURLOPT_TIMEOUT_MS, 60_000),
-            (CURLOPT_FOLLOWLOCATION, 0),
-            (CURLOPT_NOSIGNAL, 1),
-            (
-                CURLOPT_SSLVERSION,
-                CURL_SSLVERSION_TLSV1_2 | CURL_SSLVERSION_MAX_DEFAULT,
-            ),
-        ] {
-            handle.setopt_long(option, value)?;
-        }
-        handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
-        let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES)
-            .map_err(|source| download_error_with_source("HTTP 본문 한도 변환 실패", source))?;
-        handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;
-        match method {
-            HttpMethod::Get => handle.setopt_long(CURLOPT_HTTPGET, 1)?,
-            HttpMethod::Post(body_bytes) => {
-                handle.setopt_long(CURLOPT_POST, 1)?;
-                let body_len = c_long::try_from(body_bytes.len()).map_err(|source| {
-                    download_error_with_source("요청 본문 길이 변환 실패", source)
-                })?;
-                handle.setopt_long(CURLOPT_POSTFIELDSIZE, body_len)?;
-                if !body_bytes.is_empty() {
-                    let post_fields = body_bytes.as_ptr().cast::<c_char>();
-                    handle.setopt_ptr(CURLOPT_POSTFIELDS, post_fields)?;
-                }
+        host: &str,
+        path: &str,
+        request_headers: &[(&str, &str)],
+        mut body_target: CurlWriteTarget<'_, '_>,
+        header_buffer: &mut BoundedResponseBuffer,
+    ) -> DownloadResult<u32> {
+        let mut url_buffer = mem::take(&mut self.url_buffer);
+        let mut header_build_buffer = mem::take(&mut self.header_build_buffer);
+        let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
+        let result = (|| {
+            let mut header_list = HeaderList(None);
+            for &(name, value) in request_headers {
+                let header = nul_terminated_buffer(
+                    &mut header_build_buffer,
+                    &[name.as_bytes(), b": ", value.as_bytes()],
+                    "HTTP header",
+                )?;
+                header_list.append(header)?;
             }
-        }
-        Ok(())
+            let url = nul_terminated_buffer(
+                &mut url_buffer,
+                &[HTTPS_SCHEME_PREFIX.as_bytes(), host.as_bytes(), path.as_bytes()],
+                "URL",
+            )?;
+            let (perform_code, response_code) = self.with_reusable_handle(|handle| {
+                handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
+                handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
+                handle.setopt_ptr(CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
+                handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
+                handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
+                for (option, value) in [
+                    (CURLOPT_CONNECTTIMEOUT_MS, 30_000),
+                    (CURLOPT_TIMEOUT_MS, 60_000),
+                    (CURLOPT_FOLLOWLOCATION, 0),
+                    (CURLOPT_NOSIGNAL, 1),
+                    (
+                        CURLOPT_SSLVERSION,
+                        CURL_SSLVERSION_TLSV1_2 | CURL_SSLVERSION_MAX_DEFAULT,
+                    ),
+                ] {
+                    handle.setopt_long(option, value)?;
+                }
+                handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
+                let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES).map_err(|source| {
+                    download_error_with_source("HTTP 본문 한도 변환 실패", source)
+                })?;
+                handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;
+                match method {
+                    HttpMethod::Get => handle.setopt_long(CURLOPT_HTTPGET, 1)?,
+                    HttpMethod::Post(body_bytes) => {
+                        handle.setopt_long(CURLOPT_POST, 1)?;
+                        let body_len = c_long::try_from(body_bytes.len()).map_err(|source| {
+                            download_error_with_source("요청 본문 길이 변환 실패", source)
+                        })?;
+                        handle.setopt_long(CURLOPT_POSTFIELDSIZE, body_len)?;
+                        if !body_bytes.is_empty() {
+                            handle.setopt_ptr(
+                                CURLOPT_POSTFIELDS,
+                                body_bytes.as_ptr().cast::<c_char>(),
+                            )?;
+                        }
+                    }
+                }
+                let mut header_target = CurlWriteTarget::Buffer(header_buffer);
+                let body_data = (&raw mut body_target).cast::<c_void>();
+                let header_data = (&raw mut header_target).cast::<c_void>();
+                handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
+                handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
+                let perform_code = handle.perform();
+                if perform_code == CURLE_OK {
+                    handle.ensure_https_scheme()?;
+                    Ok((perform_code, Some(handle.response_code()?)))
+                } else {
+                    Ok((perform_code, None))
+                }
+            })?;
+            if let Some(callback_error) = body_target
+                .take_error()
+                .or_else(|| header_buffer.error.take())
+            {
+                self.easy_handle = None;
+                return Err(callback_error);
+            }
+            if perform_code != CURLE_OK {
+                let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
+                let perform_error = if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
+                    && !message_cstr.to_bytes().is_empty()
+                {
+                    let message = message_cstr.to_string_lossy();
+                    format!("curl_easy_perform 실패: {message} ({perform_code})")
+                } else {
+                    curl_error("curl_easy_perform", perform_code)
+                };
+                self.easy_handle = None;
+                return Err(perform_error.into());
+            }
+            let raw_status = response_code.ok_or("curl response code가 비어 있습니다.")?;
+            u32::try_from(raw_status)
+                .map_err(|source| download_error_with_source("HTTP 상태 코드 변환 실패", source))
+        })();
+        self.header_build_buffer = header_build_buffer;
+        self.url_buffer = url_buffer;
+        result
     }
     pub(super) fn request(
         &mut self,
@@ -393,62 +363,20 @@ impl Client {
         path: &str,
         request_headers: &[(&str, &str)],
     ) -> DownloadResult<HttpResponse> {
-        let mut url_buffer = mem::take(&mut self.url_buffer);
-        let mut header_build_buffer = mem::take(&mut self.header_build_buffer);
-        let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
         let header_bytes = mem::take(&mut self.header_buffer);
         let mut body_buffer =
             BoundedResponseBuffer::from_bytes("본문", HTTP_MAX_BODY_BYTES, Vec::new());
         let mut header_buffer =
             BoundedResponseBuffer::from_bytes("헤더", HTTP_MAX_HEADER_BYTES, header_bytes);
         let result = (|| {
-            let header_list = HeaderList::from_headers(request_headers, &mut header_build_buffer)?;
-            let url = request_url(&mut url_buffer, HTTPS_SCHEME_PREFIX, host, path)?;
-            let (perform_code, response_code) = self.with_reusable_handle(|handle| {
-                Self::configure_request(
-                    handle,
-                    url,
-                    &header_list,
-                    &mut error_buffer,
-                    method,
-                )?;
-                let perform_code = {
-                    let mut body_target = CurlWriteTarget::Buffer(&mut body_buffer);
-                    let mut header_target = CurlWriteTarget::Buffer(&mut header_buffer);
-                    let body_data = (&raw mut body_target).cast::<c_void>();
-                    let header_data = (&raw mut header_target).cast::<c_void>();
-                    handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
-                    handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
-                    handle.perform()
-                };
-                if perform_code == CURLE_OK {
-                    Ok((
-                        perform_code,
-                        {
-                            handle.ensure_https_scheme()?;
-                            Some(handle.response_code()?)
-                        },
-                    ))
-                } else {
-                    Ok((perform_code, None))
-                }
-            })?;
-            if let Some(callback_error) = body_buffer
-                .error
-                .take()
-                .or_else(|| header_buffer.error.take())
-            {
-                self.easy_handle = None;
-                return Err(callback_error);
-            }
-            if perform_code != CURLE_OK {
-                let perform_error = curl_perform_error(error_buffer, perform_code);
-                self.easy_handle = None;
-                return Err(perform_error.into());
-            }
-            let raw_status = response_code.ok_or("curl response code가 비어 있습니다.")?;
-            let status = u32::try_from(raw_status)
-                .map_err(|source| download_error_with_source("HTTP 상태 코드 변환 실패", source))?;
+            let status = self.perform_request(
+                method,
+                host,
+                path,
+                request_headers,
+                CurlWriteTarget::Buffer(&mut body_buffer),
+                &mut header_buffer,
+            )?;
             let headers = parsed_headers_from_bytes(&header_buffer.bytes)?;
             let content_length = validated_http_content_length(&headers, HTTP_MAX_BODY_BYTES)?;
             enforce_http_body_length(body_buffer.bytes.len(), content_length)?;
@@ -460,8 +388,6 @@ impl Client {
             })
         })();
         self.header_buffer = header_buffer.into_reusable_bytes();
-        self.header_build_buffer = header_build_buffer;
-        self.url_buffer = url_buffer;
         result
     }
     pub(super) fn request_to_writer(
@@ -472,9 +398,6 @@ impl Client {
         request_headers: &[(&str, &str)],
         writer: &mut dyn IoWrite,
     ) -> DownloadResult<HttpStreamResponse> {
-        let mut url_buffer = mem::take(&mut self.url_buffer);
-        let mut header_build_buffer = mem::take(&mut self.header_build_buffer);
-        let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
         let mut body_sink = StreamingBodySink {
             error: None,
             limit: HTTP_MAX_BODY_BYTES,
@@ -488,51 +411,14 @@ impl Client {
         let mut header_buffer =
             BoundedResponseBuffer::from_bytes("헤더", HTTP_MAX_HEADER_BYTES, header_bytes);
         let result = (|| {
-            let header_list = HeaderList::from_headers(request_headers, &mut header_build_buffer)?;
-            let url = request_url(&mut url_buffer, HTTPS_SCHEME_PREFIX, host, path)?;
-            let (perform_code, response_code) = self.with_reusable_handle(|handle| {
-                Self::configure_request(
-                    handle,
-                    url,
-                    &header_list,
-                    &mut error_buffer,
-                    method,
-                )?;
-                let perform_code = {
-                    let mut body_target = CurlWriteTarget::Stream(&mut body_sink);
-                    let mut header_target = CurlWriteTarget::Buffer(&mut header_buffer);
-                    let body_data = (&raw mut body_target).cast::<c_void>();
-                    let header_data = (&raw mut header_target).cast::<c_void>();
-                    handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
-                    handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
-                    handle.perform()
-                };
-                if perform_code == CURLE_OK {
-                    Ok((
-                        perform_code,
-                        {
-                            handle.ensure_https_scheme()?;
-                            Some(handle.response_code()?)
-                        },
-                    ))
-                } else {
-                    Ok((perform_code, None))
-                }
-            })?;
-            if let Some(callback_error) =
-                body_sink.error.take().or_else(|| header_buffer.error.take())
-            {
-                self.easy_handle = None;
-                return Err(callback_error);
-            }
-            if perform_code != CURLE_OK {
-                let perform_error = curl_perform_error(error_buffer, perform_code);
-                self.easy_handle = None;
-                return Err(perform_error.into());
-            }
-            let raw_status = response_code.ok_or("curl response code가 비어 있습니다.")?;
-            let status = u32::try_from(raw_status)
-                .map_err(|source| download_error_with_source("HTTP 상태 코드 변환 실패", source))?;
+            let status = self.perform_request(
+                method,
+                host,
+                path,
+                request_headers,
+                CurlWriteTarget::Stream(&mut body_sink),
+                &mut header_buffer,
+            )?;
             let headers = parsed_headers_from_bytes(&header_buffer.bytes)?;
             let content_length = validated_http_content_length(&headers, HTTP_MAX_BODY_BYTES)?;
             enforce_http_body_length(body_sink.summary.bytes_seen, content_length)?;
@@ -543,8 +429,6 @@ impl Client {
             })
         })();
         self.header_buffer = header_buffer.into_reusable_bytes();
-        self.header_build_buffer = header_build_buffer;
-        self.url_buffer = url_buffer;
         result
     }
     fn with_reusable_handle<R>(
@@ -620,32 +504,34 @@ impl BoundedResponseBuffer {
         self.bytes
     }
 }
-fn request_url<'url>(
-    out: &'url mut Vec<u8>,
-    scheme_prefix: &str,
-    host: &str,
-    path: &str,
-) -> DownloadResult<&'url CStr> {
-    let url_capacity = scheme_prefix
-        .len()
-        .checked_add(host.len())
-        .and_then(|capacity| capacity.checked_add(path.len()))
-        .and_then(|capacity| capacity.checked_add(1))
-        .ok_or("URL 용량 계산 실패")?;
+fn nul_terminated_buffer<'buffer>(
+    out: &'buffer mut Vec<u8>,
+    parts: &[&[u8]],
+    label: &str,
+) -> DownloadResult<&'buffer CStr> {
+    let capacity = parts
+        .iter()
+        .try_fold(1_usize, |capacity, part| capacity.checked_add(part.len()))
+        .ok_or_else(|| format!("{label} 용량 계산 실패"))?;
     out.clear();
-    if out.capacity() < url_capacity {
-        out.try_reserve_exact(url_capacity)
-            .map_err(|source| download_error_with_source("URL 메모리 확보 실패", source))?;
+    if out.capacity() < capacity {
+        out.try_reserve_exact(capacity).map_err(|source| {
+            download_error_with_source(format!("{label} 메모리 확보 실패"), source)
+        })?;
     }
-    out.extend_from_slice(scheme_prefix.as_bytes());
-    out.extend_from_slice(host.as_bytes());
-    out.extend_from_slice(path.as_bytes());
+    for part in parts {
+        out.extend_from_slice(part);
+    }
     out.push(0);
-    CStr::from_bytes_with_nul(out)
-        .map_err(|source| download_error_with_source("URL에 NUL 문자가 포함되어 있습니다", source))
+    CStr::from_bytes_with_nul(out).map_err(|source| {
+        download_error_with_source(format!("{label}에 NUL 문자가 포함되어 있습니다"), source)
+    })
 }
 fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<Vec<HttpHeader>> {
-    let separator: &[u8] = if find_subslice(header_bytes, b"\r\n\r\n").is_some() {
+    let separator: &[u8] = if header_bytes
+        .array_windows::<4>()
+        .any(|window| window == b"\r\n\r\n")
+    {
         b"\r\n\r\n"
     } else {
         b"\n\n"
@@ -653,7 +539,8 @@ fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<Vec<HttpHead
     let mut selected_block = None;
     let mut rest = header_bytes;
     loop {
-        let (block, next) = match find_subslice(rest, separator) {
+        let (block, next) = match rest.windows(separator.len()).position(|window| window == separator)
+        {
             Some(index) => {
                 let block = rest
                     .get(..index)
@@ -721,12 +608,6 @@ fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<Vec<HttpHead
     }
     Ok(headers)
 }
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|window| window == needle)
-}
 fn curl_error(context: &str, code: CurlCode) -> String {
     // SAFETY: curl_easy_strerror returns either null or a static NUL-terminated message for code.
     let raw_ptr = unsafe { sys::curl_easy_strerror(code) };
@@ -737,22 +618,6 @@ fn curl_error(context: &str, code: CurlCode) -> String {
         unsafe { CStr::from_ptr(raw_ptr) }.to_string_lossy()
     };
     format!("{context} 실패: {message} ({code})")
-}
-fn curl_perform_error(
-    error_buffer: [c_char; CURL_ERROR_SIZE],
-    code: CurlCode,
-) -> Cow<'static, str> {
-    let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
-    Cow::Owned(
-        if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
-            && !message_cstr.to_bytes().is_empty()
-        {
-            let message = message_cstr.to_string_lossy();
-            format!("curl_easy_perform 실패: {message} ({code})")
-        } else {
-            curl_error("curl_easy_perform", code)
-        },
-    )
 }
 unsafe extern "C" fn write_callback(
     ptr: *mut c_char,

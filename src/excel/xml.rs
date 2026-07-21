@@ -131,10 +131,6 @@ impl<'tag> XmlAttrScanner<'tag> {
         };
         let mut cursor = checked_offset_add(tag_start, 1)
             .ok_or_else(|| err("XML 태그 속성 cursor 계산에 실패했습니다."))?;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor = checked_offset_add(cursor, 1)
-                .ok_or_else(|| err("XML 태그 이름 cursor 계산에 실패했습니다."))?;
-        }
         while bytes
             .get(cursor)
             .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/' && *byte != b'>')

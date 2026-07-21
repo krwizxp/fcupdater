@@ -59,9 +59,9 @@ impl SourceIndexBuilder {
             |(brand_count, diesel_count, gasoline_count, has_premium), record| {
                 (
                     brand_count.saturating_add(usize::from(!record.brand.is_empty())),
-                    diesel_count.saturating_add(usize::from(record.diesel.is_some())),
-                    gasoline_count.saturating_add(usize::from(record.gasoline.is_some())),
-                    has_premium || record.premium.is_some(),
+                    diesel_count.saturating_add(usize::from(record.fuels.diesel.is_some())),
+                    gasoline_count.saturating_add(usize::from(record.fuels.gasoline.is_some())),
+                    has_premium || record.fuels.premium.is_some(),
                 )
             },
         );
@@ -365,23 +365,16 @@ impl UpdateRun<'_> {
         mut book: StdWorkbook,
         today: &str,
     ) -> Result<()> {
-        let Some(()) = book.with_sheet_mut(
-            "변경내역",
-            |worksheet, shared_string_table| -> Result<()> {
-                let mut updater = ChangeLogUpdater {
-                    added: &master_update.added,
-                    changes: &master_update.changes,
-                    deleted: &master_update.deleted,
-                    shared_string_table,
-                    today,
-                    worksheet,
-                };
-                updater.update()
-            },
-        )?
-        else {
-            return Err(err("마스터 파일에 '변경내역' 시트가 없습니다"));
+        let (worksheet, shared_string_table) = book.change_log_sheet_mut();
+        let mut updater = ChangeLogUpdater {
+            added: &master_update.added,
+            changes: &master_update.changes,
+            deleted: &master_update.deleted,
+            shared_string_table,
+            today,
+            worksheet,
         };
+        updater.update()?;
         write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
         book.save(self.master_path, self.save_verification)?;
         if let Err(summary_err) = self.print_update_summary(
