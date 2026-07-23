@@ -3,7 +3,7 @@ use super::{
     GAS_STATION_LPG_CODE, HTTP_ERROR_PREVIEW_BYTES, HttpResponse, NETFUNNEL_DOWNLOAD_ACTION_ID,
     NETFUNNEL_ENTRY_ACTION_ID, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
     OIL_PRICE_DOWNLOAD_TAR_URL, OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH,
-    OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, SourceDownload, USER_AGENT,
+    OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
     download_error_with_source, push_decimal_fragment,
 };
 use crate::diagnostic::prefixed_message;
@@ -12,12 +12,10 @@ use std::{
     thread::sleep,
     time::{SystemTime, UNIX_EPOCH},
 };
-const HTTP_REQUEST_HEADER_CAPACITY: usize = 4;
-const HTTP_MERGED_HEADER_CAPACITY: usize = 2 + HTTP_REQUEST_HEADER_CAPACITY + 1;
 const MAX_COOKIE_PAIR_BYTES: usize = 4096;
 const MAX_COOKIES_PER_HOST: usize = 64;
 #[derive(Clone, Copy)]
-pub(super) enum PostHeaderProfile {
+enum PostHeaderProfile {
     Ajax,
     Standard,
 }
@@ -26,10 +24,6 @@ enum HttpHost {
     Netfunnel,
     Opinet,
 }
-struct HeaderStack<'header, const CAPACITY: usize> {
-    headers: [(&'header str, &'header str); CAPACITY],
-    len: usize,
-}
 struct Cookie {
     name: String,
     value: String,
@@ -37,34 +31,6 @@ struct Cookie {
 #[derive(Default)]
 pub(super) struct CookieJar {
     cookies: Vec<Cookie>,
-}
-impl<'header, const CAPACITY: usize> HeaderStack<'header, CAPACITY> {
-    const fn as_slice(&self) -> &[(&'header str, &'header str)] {
-        self.headers.split_at(self.len).0
-    }
-    fn extend_from_slice(
-        &mut self,
-        headers: &[(&'header str, &'header str)],
-    ) -> DownloadResult<()> {
-        for &(name, value) in headers {
-            self.push(name, value)?;
-        }
-        Ok(())
-    }
-    const fn new() -> Self {
-        Self {
-            headers: [("", ""); CAPACITY],
-            len: 0,
-        }
-    }
-    fn push(&mut self, name: &'header str, value: &'header str) -> DownloadResult<()> {
-        let Some(slot) = self.headers.get_mut(self.len) else {
-            return Err("HTTP header stack 용량을 초과했습니다.".into());
-        };
-        *slot = (name, value);
-        self.len = self.len.wrapping_add(1);
-        Ok(())
-    }
 }
 impl CookieJar {
     fn add_cookie(&mut self, name: &str, value: &str) -> DownloadResult<()> {
@@ -166,29 +132,7 @@ impl SourceDownload {
         };
         jar.add_cookie(name, value)
     }
-    fn encode_form_body_into(body: &mut String, form: &[(&str, &str)]) -> DownloadResult<()> {
-        let required_capacity = form.iter().fold(0_usize, |sum, &(name, value)| {
-            sum.saturating_add(usize::from(sum != 0))
-                .saturating_add(Self::percent_encoded_len(name.as_bytes()))
-                .saturating_add(Self::percent_encoded_len(value.as_bytes()))
-                .saturating_add(1)
-        });
-        body.clear();
-        body.try_reserve_exact(required_capacity)
-            .map_err(|source| {
-                download_error_with_source("HTTP form body 메모리 확보 실패", source)
-            })?;
-        for (index, &(name, value)) in form.iter().enumerate() {
-            if index != 0 {
-                body.push('&');
-            }
-            Self::push_percent_encoded(&mut *body, name.as_bytes());
-            body.push('=');
-            Self::push_percent_encoded(&mut *body, value.as_bytes());
-        }
-        Ok(())
-    }
-    pub(super) fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> DownloadResult<String> {
+    fn fetch_netfunnel_ticket(&mut self, action_id: &str) -> DownloadResult<String> {
         let mut current_key: Option<String> = None;
         let mut current_ttl: Option<u32> = None;
         for _ in 0..NETFUNNEL_POLL_LIMIT {
@@ -247,71 +191,20 @@ impl SourceDownload {
         }
         Ok(response)
     }
-    pub(super) fn get_text(&mut self, path: &str, referer: Option<&str>) -> DownloadResult<String> {
-        let mut headers = HeaderStack::<HTTP_REQUEST_HEADER_CAPACITY>::new();
-        headers.push(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )?;
-        if let Some(referer_value) = referer {
-            headers.push("Referer", referer_value)?;
-        }
-        let merged_headers = Self::merged_headers(
+    fn get_text(&mut self, path: &str, referer: Option<&str>) -> DownloadResult<String> {
+        let headers = Self::request_headers(
             &self.cookie_jars,
             &mut self.cookie_header_buffer,
             HttpHost::Opinet,
-            headers.as_slice(),
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            None,
+            referer,
+            false,
         )?;
-        let raw_response = self
-            .platform
-            .get(OPINET_HOST, path, merged_headers.as_slice())?;
+        let raw_response = self.platform.get(OPINET_HOST, path, headers)?;
         let response = self.finish_response(HttpHost::Opinet, raw_response)?;
         String::from_utf8(response.body)
             .map_err(|source| download_error_with_source("HTTP 응답 UTF-8 변환 실패", source))
-    }
-    fn merged_headers<'request>(
-        cookie_jars: &(CookieJar, CookieJar),
-        cookie_header: &'request mut String,
-        host: HttpHost,
-        headers: &[(&'request str, &'request str)],
-    ) -> DownloadResult<HeaderStack<'request, HTTP_MERGED_HEADER_CAPACITY>> {
-        cookie_header.clear();
-        let jar = match host {
-            HttpHost::Opinet => &cookie_jars.0,
-            HttpHost::Netfunnel => &cookie_jars.1,
-        };
-        let cookie_text = if jar.cookies.is_empty() {
-            None
-        } else {
-            let separator_capacity = jar.cookies.len().saturating_sub(1).saturating_mul(2);
-            let capacity = jar.cookies.iter().fold(separator_capacity, |sum, cookie| {
-                sum.saturating_add(cookie.name.len())
-                    .saturating_add(1)
-                    .saturating_add(cookie.value.len())
-            });
-            cookie_header
-                .try_reserve_exact(capacity)
-                .map_err(|source| {
-                    download_error_with_source("Cookie header 메모리 확보 실패", source)
-                })?;
-            for (index, cookie) in jar.cookies.iter().enumerate() {
-                if index != 0 {
-                    cookie_header.push_str("; ");
-                }
-                cookie_header.push_str(&cookie.name);
-                cookie_header.push('=');
-                cookie_header.push_str(&cookie.value);
-            }
-            Some(cookie_header.as_str())
-        };
-        let mut merged_headers = HeaderStack::<HTTP_MERGED_HEADER_CAPACITY>::new();
-        merged_headers.push("User-Agent", USER_AGENT)?;
-        merged_headers.push("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3")?;
-        merged_headers.extend_from_slice(headers)?;
-        if let Some(value) = cookie_text {
-            merged_headers.push("Cookie", value)?;
-        }
-        Ok(merged_headers)
     }
     fn percent_encoded_len(bytes: &[u8]) -> usize {
         bytes.iter().fold(0_usize, |sum, byte| {
@@ -323,7 +216,7 @@ impl SourceDownload {
             sum.saturating_add(byte_len)
         })
     }
-    pub(super) fn post_form(
+    fn post_form(
         &mut self,
         path: &str,
         form: &[(&str, &str)],
@@ -332,71 +225,41 @@ impl SourceDownload {
     ) -> DownloadResult<HttpResponse> {
         let mut body = mem::take(&mut self.form_body_buffer);
         let result = (|| {
-            Self::encode_form_body_into(&mut body, form)?;
-            let headers = Self::post_headers(referer, profile)?;
-            let merged_headers = Self::merged_headers(
+            let required_capacity = form.iter().fold(0_usize, |sum, &(name, value)| {
+                sum.saturating_add(usize::from(sum != 0))
+                    .saturating_add(Self::percent_encoded_len(name.as_bytes()))
+                    .saturating_add(Self::percent_encoded_len(value.as_bytes()))
+                    .saturating_add(1)
+            });
+            body.clear();
+            body.try_reserve_exact(required_capacity)
+                .map_err(|source| {
+                    download_error_with_source("HTTP form body 메모리 확보 실패", source)
+                })?;
+            for (index, &(name, value)) in form.iter().enumerate() {
+                if index != 0 {
+                    body.push('&');
+                }
+                Self::push_percent_encoded(&mut body, name.as_bytes());
+                body.push('=');
+                Self::push_percent_encoded(&mut body, value.as_bytes());
+            }
+            let headers = Self::request_headers(
                 &self.cookie_jars,
                 &mut self.cookie_header_buffer,
                 HttpHost::Opinet,
-                headers.as_slice(),
+                "text/html, */*; q=0.01",
+                Some("application/x-www-form-urlencoded; charset=UTF-8"),
+                referer,
+                matches!(profile, PostHeaderProfile::Ajax),
             )?;
-            let response = self.platform.post(
-                OPINET_HOST,
-                path,
-                merged_headers.as_slice(),
-                body.as_bytes(),
-            )?;
+            let response = self
+                .platform
+                .post(OPINET_HOST, path, headers, body.as_bytes())?;
             self.finish_response(HttpHost::Opinet, response)
         })();
         self.form_body_buffer = body;
         result
-    }
-    pub(super) fn post_form_body(
-        &mut self,
-        path: &str,
-        form: &[(&str, &str)],
-        referer: Option<&str>,
-        profile: PostHeaderProfile,
-    ) -> DownloadResult<Vec<u8>> {
-        let mut body = mem::take(&mut self.form_body_buffer);
-        let result = (|| {
-            Self::encode_form_body_into(&mut body, form)?;
-            let headers = Self::post_headers(referer, profile)?;
-            let merged_headers = Self::merged_headers(
-                &self.cookie_jars,
-                &mut self.cookie_header_buffer,
-                HttpHost::Opinet,
-                headers.as_slice(),
-            )?;
-            let response = self.platform.post(
-                OPINET_HOST,
-                path,
-                merged_headers.as_slice(),
-                body.as_bytes(),
-            )?;
-            self.finish_response(HttpHost::Opinet, response)
-                .map(|finished| finished.body)
-        })();
-        self.form_body_buffer = body;
-        result
-    }
-    fn post_headers(
-        referer: Option<&str>,
-        profile: PostHeaderProfile,
-    ) -> DownloadResult<HeaderStack<'_, HTTP_REQUEST_HEADER_CAPACITY>> {
-        let mut headers = HeaderStack::<HTTP_REQUEST_HEADER_CAPACITY>::new();
-        headers.push(
-            "Content-Type",
-            "application/x-www-form-urlencoded; charset=UTF-8",
-        )?;
-        headers.push("Accept", "text/html, */*; q=0.01")?;
-        if matches!(profile, PostHeaderProfile::Ajax) {
-            headers.push("X-Requested-With", "XMLHttpRequest")?;
-        }
-        if let Some(referer_value) = referer {
-            headers.push("Referer", referer_value)?;
-        }
-        Ok(headers)
     }
     fn push_percent_encoded(out: &mut String, bytes: &[u8]) {
         for byte in bytes {
@@ -460,24 +323,26 @@ impl SourceDownload {
                 PostHeaderProfile::Ajax,
             )?;
             let download_key = self.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
-            let response = self.post_form_body(
-                OPDOWNLOAD_EXCEL_PATH,
-                &[
-                    ("LPG_CD", GAS_STATION_LPG_CODE),
-                    ("DATE_DIV_CD", ""),
-                    ("PAGE_DIV", CURRENT_PRICE_PAGE_DIV),
-                    ("SIDO_NM", DEFAULT_REGION_LABEL),
-                    ("SIGUN_NM", DEFAULT_REGION_LABEL),
-                    ("API_GBN", GAS_STATION_API_GBN),
-                    ("netfunnel_key", download_key.as_str()),
-                ],
-                Some(OPDOWNLOAD_URL),
-                PostHeaderProfile::Standard,
-            )?;
+            let response = self
+                .post_form(
+                    OPDOWNLOAD_EXCEL_PATH,
+                    &[
+                        ("LPG_CD", GAS_STATION_LPG_CODE),
+                        ("DATE_DIV_CD", ""),
+                        ("PAGE_DIV", CURRENT_PRICE_PAGE_DIV),
+                        ("SIDO_NM", DEFAULT_REGION_LABEL),
+                        ("SIGUN_NM", DEFAULT_REGION_LABEL),
+                        ("API_GBN", GAS_STATION_API_GBN),
+                        ("netfunnel_key", download_key.as_str()),
+                    ],
+                    Some(OPDOWNLOAD_URL),
+                    PostHeaderProfile::Standard,
+                )?
+                .body;
             if !response.starts_with(&OLE2_SIGNATURE) {
                 let preview_len = response.len().min(HTTP_ERROR_PREVIEW_BYTES);
-                let preview =
-                    String::from_utf8_lossy(response.get(..preview_len).unwrap_or_default());
+                let (preview_bytes, _) = response.split_at(preview_len);
+                let preview = String::from_utf8_lossy(preview_bytes);
                 let error_text = prefixed_message(
                     "다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: ",
                     preview,
@@ -490,6 +355,52 @@ impl SourceDownload {
             error
                 .update_message(|message| prefixed_message("Opinet 자동 다운로드 실패: ", message));
             error
+        })
+    }
+    fn request_headers<'request>(
+        cookie_jars: &(CookieJar, CookieJar),
+        cookie_header: &'request mut String,
+        host: HttpHost,
+        accept: &'static str,
+        content_type: Option<&'static str>,
+        referer: Option<&'request str>,
+        requested_with: bool,
+    ) -> DownloadResult<RequestHeaders<'request>> {
+        cookie_header.clear();
+        let jar = match host {
+            HttpHost::Opinet => &cookie_jars.0,
+            HttpHost::Netfunnel => &cookie_jars.1,
+        };
+        let cookie_text = if jar.cookies.is_empty() {
+            None
+        } else {
+            let separator_capacity = jar.cookies.len().saturating_sub(1).saturating_mul(2);
+            let capacity = jar.cookies.iter().fold(separator_capacity, |sum, cookie| {
+                sum.saturating_add(cookie.name.len())
+                    .saturating_add(1)
+                    .saturating_add(cookie.value.len())
+            });
+            cookie_header
+                .try_reserve_exact(capacity)
+                .map_err(|source| {
+                    download_error_with_source("Cookie header 메모리 확보 실패", source)
+                })?;
+            for (index, cookie) in jar.cookies.iter().enumerate() {
+                if index != 0 {
+                    cookie_header.push_str("; ");
+                }
+                cookie_header.push_str(&cookie.name);
+                cookie_header.push('=');
+                cookie_header.push_str(&cookie.value);
+            }
+            Some(cookie_header.as_str())
+        };
+        Ok(RequestHeaders {
+            accept,
+            content_type,
+            cookie: cookie_text,
+            referer,
+            requested_with,
         })
     }
     fn request_netfunnel(
@@ -525,15 +436,16 @@ impl SourceDownload {
             path.push_str(action_id);
             path.push_str("&js=yes&");
             push_decimal_fragment(&mut path, timestamp);
-            let merged_headers = Self::merged_headers(
+            let headers = Self::request_headers(
                 &self.cookie_jars,
                 &mut self.cookie_header_buffer,
                 HttpHost::Netfunnel,
-                &[("Accept", "application/javascript,*/*;q=0.8")],
+                "application/javascript,*/*;q=0.8",
+                None,
+                None,
+                false,
             )?;
-            let response = self
-                .platform
-                .get(NETFUNNEL_HOST, &path, merged_headers.as_slice())?;
+            let response = self.platform.get(NETFUNNEL_HOST, &path, headers)?;
             self.finish_response(HttpHost::Netfunnel, response)
         };
         self.netfunnel_path_buffer = path;

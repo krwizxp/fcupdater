@@ -8,11 +8,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
       - name: Install native dependencies
@@ -20,11 +20,11 @@ jobs:
       - name: Run updater
         run: cargo run --release --locked
       - name: Prepare result artifact with Rust
-        run: cargo run --locked --example package_artifact -- fuel_cost_chungcheong.xlsx artifacts/fcupdater-result.xlsx fcupdater-result.xlsx
+        run: cargo run --locked --example package_artifact -- --workbook
       - name: Upload result artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: fcupdater-result
           path: artifacts/fcupdater-result.xlsx
+          archive: false
           if-no-files-found: error
           retention-days: 14

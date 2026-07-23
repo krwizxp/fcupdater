@@ -54,10 +54,34 @@ struct ResponseHeaders {
     set_cookies: Vec<String>,
 }
 #[derive(Debug)]
-struct HttpResponse<B = Vec<u8>> {
-    body: B,
+struct HttpResponse {
+    body: Vec<u8>,
     headers: ResponseHeaders,
     status: u32,
+}
+#[derive(Clone, Copy)]
+struct RequestHeaders<'header> {
+    accept: &'static str,
+    content_type: Option<&'static str>,
+    cookie: Option<&'header str>,
+    referer: Option<&'header str>,
+    requested_with: bool,
+}
+impl RequestHeaders<'_> {
+    fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        [
+            Some(("User-Agent", USER_AGENT)),
+            Some(("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.5,en;q=0.3")),
+            Some(("Accept", self.accept)),
+            self.content_type.map(|value| ("Content-Type", value)),
+            self.requested_with
+                .then_some(("X-Requested-With", "XMLHttpRequest")),
+            self.referer.map(|value| ("Referer", value)),
+            self.cookie.map(|value| ("Cookie", value)),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 impl ResponseHeaders {
     fn parse_content_length(&mut self, raw_value: &str, limit: usize) -> DownloadResult<()> {

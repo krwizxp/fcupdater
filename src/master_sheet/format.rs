@@ -1,5 +1,5 @@
 use super::{DECIMAL_SCALE, ScaledDecimal, ScaledSortKey};
-use crate::diagnostic::{AppError, Result, err};
+use crate::diagnostic::{Result, err};
 const UNIT_PRICE_MAX_FRAC_DIGITS: usize = 15;
 pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
     let sign = if value != 0 && (value < 0) != (scale < 0) {
@@ -63,7 +63,4 @@ pub(super) fn format_unit_price_text(
     } else {
         Ok(Some(format!("{visible_sign}{whole}.{trimmed_fraction}")))
     }
-}
-pub(super) fn missing_sort_target_row_error(row_num: u32) -> AppError {
-    err(format!("정렬 대상 행을 찾지 못했습니다: {row_num}"))
 }

@@ -108,7 +108,7 @@ impl UpdateRun<'_> {
             region_counts: [0; TARGET_REGION_COUNT],
         };
         let mut target_region_scratch = String::new();
-        let source_index_result = SourceReader { data: &source_data }
+        let source_index_result = SourceReader { data: source_data }
             .visit_xls_source(|borrowed_record| {
                 if let Some(region) = target_region(
                     borrowed_record.region,
@@ -345,21 +345,18 @@ impl UpdateRun<'_> {
         updater.update()?;
         write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
         book.save(self.master_path, self.save_verification)?;
-        if let Err(summary_err) = self.print_update_summary(
+        self.print_update_summary(
             "Opinet 자동 다운로드",
             &master_update.changes,
             &master_update.added,
             &master_update.deleted,
-        ) {
-            match write_line(
-                self.out,
-                format_args!(
-                    "마스터 파일은 저장됐지만 실행 요약 출력에 실패했습니다: {summary_err}"
-                ),
-            ) {
-                Ok(()) | Err(_) => {}
-            }
-        }
+        )
+        .map_err(|source| {
+            err_with_source(
+                "마스터 파일은 저장됐지만 실행 요약 출력에 실패했습니다.",
+                source,
+            )
+        })?;
         Ok(())
     }
 }

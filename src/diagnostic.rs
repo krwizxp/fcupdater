@@ -112,9 +112,6 @@ where
 pub(super) fn path_context_message(label: &str, path: &Path) -> String {
     format!("{label}: {}", path.display())
 }
-pub(super) fn path_pair_context_message(label: &str, from: &Path, to: &Path) -> String {
-    format!("{label}: {} -> {}", from.display(), to.display())
-}
 pub(super) const fn terminal_safe(text: &str) -> impl Display + '_ {
     TerminalSafeText { text }
 }

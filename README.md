@@ -107,4 +107,4 @@ fcupdater
 
 Linux/macOS 실행 파일은 실행 권한을 보존하는 tar로, Windows 실행 파일은 exe로 준비합니다. `main` 브랜치와 태그 push 실행은 배포용 Artifact를 생성하고, Pull Request 실행은 같은 release build를 확인합니다.
 
-`.github/workflows/update_master.yml`은 `ubuntu-latest`에서 마스터를 현행화하고 `fcupdater-result` Artifact에 `fcupdater-result.xlsx`를 담습니다.
+`.github/workflows/update_master.yml`은 `ubuntu-latest`에서 마스터를 현행화하고 `fcupdater-result.xlsx` Artifact를 생성합니다.

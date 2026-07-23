@@ -1,5 +1,5 @@
 use super::{
-    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse,
+    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
     RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE, ResponseHeaders,
     checked_http_buffer_len, download_error_with_source, enforce_http_body_length,
 };
@@ -214,13 +214,13 @@ impl Client {
         &mut self,
         host: &str,
         path: &str,
-        headers: &[(&str, &str)],
+        headers: RequestHeaders<'_>,
     ) -> DownloadResult<HttpResponse> {
         let host_wide = wide(host)?;
         let path_wide = wide(path)?;
         let mut headers_wide = mem::take(&mut self.header_buffer);
         let response = (|| {
-            let header_len = Self::request_headers_wide(&mut headers_wide, headers)?;
+            let header_len = Self::request_headers_wide(&mut headers_wide, &headers)?;
             let started = Instant::now();
             let connect = self.cached_connect_ptr(host, &host_wide)?;
             (|| {
@@ -298,14 +298,14 @@ impl Client {
         &mut self,
         host: &str,
         path: &str,
-        headers: &[(&str, &str)],
+        headers: RequestHeaders<'_>,
         body: &[u8],
     ) -> DownloadResult<HttpResponse> {
         let host_wide = wide(host)?;
         let path_wide = wide(path)?;
         let mut headers_wide = mem::take(&mut self.header_buffer);
         let response = (|| {
-            let header_len = Self::request_headers_wide(&mut headers_wide, headers)?;
+            let header_len = Self::request_headers_wide(&mut headers_wide, &headers)?;
             let started = Instant::now();
             let connect = self.cached_connect_ptr(host, &host_wide)?;
             (|| {
@@ -516,10 +516,13 @@ impl Client {
         let received = unsafe { sys::WinHttpReceiveResponse(request.as_ptr(), null_mut()) };
         Self::check_winhttp(received, "WinHttpReceiveResponse")
     }
-    fn request_headers_wide(out: &mut Vec<u16>, headers: &[(&str, &str)]) -> DownloadResult<u32> {
+    fn request_headers_wide(
+        out: &mut Vec<u16>,
+        headers: &RequestHeaders<'_>,
+    ) -> DownloadResult<u32> {
         let header_capacity = headers
             .iter()
-            .try_fold(0_usize, |acc, &(name, value)| {
+            .try_fold(0_usize, |acc, (name, value)| {
                 acc.checked_add(name.encode_utf16().count())?
                     .checked_add(value.encode_utf16().count())?
                     .checked_add(4)
@@ -532,7 +535,7 @@ impl Client {
                 download_error_with_source("요청 헤더 메모리 확보 실패", source)
             })?;
         }
-        for &(name, value) in headers {
+        for (name, value) in headers.iter() {
             out.extend(name.encode_utf16());
             out.extend_from_slice(&HEADER_SEPARATOR_WIDE);
             out.extend(value.encode_utf16());

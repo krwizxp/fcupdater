@@ -1,10 +1,8 @@
-use self::format::{format_scaled_value, format_unit_price_text, missing_sort_target_row_error};
+use self::format::{format_scaled_value, format_unit_price_text};
 use crate::{
     diagnostic::{Result, err, err_with_source},
     excel,
-    excel::writer::{
-        Row as StdRow, SharedStringTable, Workbook as StdWorkbook, remap_formula_rows,
-    },
+    excel::writer::{Row as StdRow, SharedStringTable, Workbook as StdWorkbook},
     excel::{FuelValues, SourceRecord},
     region::{
         TARGET_REGION_COUNT, TARGET_REGIONS, TargetRegion, TargetRegionPolicy,
@@ -12,9 +10,13 @@ use crate::{
     },
     sheet_util::{add_row_offset, usize_to_u32},
 };
-use alloc::{borrow::Cow, collections::BTreeMap};
-use core::{fmt::Write as _, mem, range::RangeInclusive};
-use std::collections::{HashMap, HashSet};
+use alloc::{borrow::Cow, rc::Rc};
+use core::{
+    fmt::{Arguments, Write as _},
+    mem,
+    range::RangeInclusive,
+};
+use std::collections::HashMap;
 mod format;
 const MASTER_HEADER_ROW: u32 = 14;
 const MASTER_DATA_START_ROW: u32 = 15;
@@ -40,6 +42,7 @@ const COL_REGIONAL_TOTAL: u32 = 20;
 const COL_UNIT_PRICE_WITH_CURRENCY: u32 = 21;
 const COL_UNIT_PRICE_WITHOUT_CURRENCY: u32 = 22;
 const COL_SORT_KEY: u32 = 23;
+const MASTER_FORMULA_BUFFER_CAPACITY: usize = 512;
 const USIZE_DECIMAL_TEXT_MAX_LEN: usize = 20;
 const SMART_DISCOUNT_BRAND_KEYWORD: &str = "현대오일뱅크";
 const SMART_DISCOUNT_DIRECT_KEYWORD: &str = "직영";
@@ -125,15 +128,18 @@ enum MasterRowDecision<'source> {
     Unaddressed,
 }
 struct SortableRankRow {
+    base: RankRowBase,
     key: RankSortKey,
     row: u32,
+    smart_discount_excluded: bool,
 }
 struct RankSortRefresher<'sheet, 'strings> {
     data_rows: RowRange,
-    shared_strings: &'strings [String],
+    shared_strings: &'strings [Rc<str>],
     ws: &'sheet mut excel::writer::Worksheet,
 }
 struct RankSortContext {
+    display_total_qty: Option<ScaledDecimal>,
     quantities: FuelValues<ScaledDecimal>,
     region_rates: [(TargetRegion, Option<ScaledDecimal>); TARGET_REGION_COUNT],
     smart_discount: ScaledDecimal,
@@ -167,6 +173,7 @@ struct ParsedMasterRow<'text> {
     identity: ParsedMasterIdentity<'text>,
     smart_discount_excluded: bool,
 }
+#[derive(Clone, Copy)]
 struct RankRowBase {
     adjusted_prices: AdjustedFuelPrices,
     region_rate: ScaledDecimal,
@@ -175,37 +182,10 @@ struct RankRowBase {
 struct MasterRowEvaluation<'source> {
     changes: Vec<ChangeRow<'source>>,
     deleted: Vec<StoreRow>,
+    existing_address_rows: HashMap<Cow<'source, str>, u32>,
     existing_region_counts: [usize; TARGET_REGION_COUNT],
     kept_source_rows: Vec<(u32, Option<&'source SourceRecord>)>,
     matched_existing_region_counts: [usize; TARGET_REGION_COUNT],
-    matched_source_keys: HashSet<&'source str>,
-}
-struct RowMapper<'deleted> {
-    decrease: u32,
-    deleted: &'deleted [StoreRow],
-    increase: u32,
-    old_data_rows: RowRange,
-}
-impl RowMapper<'_> {
-    fn map(&self, old_ref_row: u32) -> Result<u32> {
-        if self.old_data_rows.contains(&old_ref_row) {
-            let deleted_le = usize_to_u32(
-                self.deleted
-                    .partition_point(|row| row.old_row <= old_ref_row),
-                "삭제 행 누적 수",
-            )?;
-            return old_ref_row
-                .checked_sub(deleted_le)
-                .ok_or_else(|| err("행 참조 재배치 중 row 번호가 0 이하가 되었습니다."));
-        }
-        if old_ref_row > self.old_data_rows.last {
-            return shift_row(old_ref_row, self.increase, self.decrease, "행 참조 재배치");
-        }
-        Ok(old_ref_row)
-    }
-    fn shift(&self, row: u32) -> Result<u32> {
-        shift_row(row, self.increase, self.decrease, "비데이터 행 재배치")
-    }
 }
 impl<'text> ParsedMasterIdentity<'text> {
     fn is_empty(&self) -> bool {
@@ -214,7 +194,7 @@ impl<'text> ParsedMasterIdentity<'text> {
     fn read(
         ws: &'text excel::writer::Worksheet,
         row: u32,
-        shared_strings: &'text [String],
+        shared_strings: &'text [Rc<str>],
     ) -> Result<Self> {
         Ok(Self {
             address: trim_cow(ws.try_get_display_at(COL_ADDRESS, row, shared_strings)?),
@@ -224,22 +204,37 @@ impl<'text> ParsedMasterIdentity<'text> {
     }
 }
 impl<'text> ParsedMasterRow<'text> {
-    fn read(
-        ws: &'text excel::writer::Worksheet,
-        row: u32,
-        shared_strings: &'text [String],
-    ) -> Result<Self> {
-        let identity = ParsedMasterIdentity::read(ws, row, shared_strings)?;
-        Self::read_with_identity(identity, ws, row, shared_strings)
-    }
     fn read_with_identity(
         identity: ParsedMasterIdentity<'text>,
         ws: &'text excel::writer::Worksheet,
         row: u32,
-        shared_strings: &'text [String],
+        shared_strings: &'text [Rc<str>],
     ) -> Result<Self> {
-        let smart_discount_excluded = ws.try_get_formula_at(COL_SMART_DISCOUNT, row)?.is_none()
-            && MasterSheetUpdater::is_exact_zero_at(ws, COL_SMART_DISCOUNT, row, shared_strings)?;
+        let smart_discount_excluded = if ws.try_get_formula_at(COL_SMART_DISCOUNT, row)?.is_some() {
+            false
+        } else {
+            let display = ws.try_get_display_at(COL_SMART_DISCOUNT, row, shared_strings)?;
+            let trimmed = display.trim();
+            let digits = trimmed
+                .strip_prefix('+')
+                .or_else(|| trimmed.strip_prefix('-'))
+                .unwrap_or(trimmed);
+            let mut has_digit = false;
+            let mut has_decimal_point = false;
+            let mut is_zero = true;
+            for byte in digits.bytes() {
+                match byte {
+                    b'0' => has_digit = true,
+                    b',' => {}
+                    b'.' if !has_decimal_point => has_decimal_point = true,
+                    _ => {
+                        is_zero = false;
+                        break;
+                    }
+                }
+            }
+            is_zero && has_digit
+        };
         Ok(Self {
             fuels: FuelValues {
                 diesel: MasterSheetUpdater::normalize_fuel_price(ws.get_i32_at(
@@ -264,47 +259,6 @@ impl<'text> ParsedMasterRow<'text> {
     }
 }
 impl RankRowBase {
-    fn read(
-        row: &ParsedMasterRow<'_>,
-        currency_apply: bool,
-        sort_context: &RankSortContext,
-    ) -> Result<Self> {
-        let default_smart_discount = if row.identity.name.contains(SMART_DISCOUNT_BRAND_KEYWORD)
-            && row.identity.name.contains(SMART_DISCOUNT_DIRECT_KEYWORD)
-        {
-            sort_context.smart_discount
-        } else {
-            ScaledDecimal::ZERO
-        };
-        let smart_discount = if row.smart_discount_excluded {
-            ScaledDecimal::ZERO
-        } else {
-            default_smart_discount
-        };
-        let adjusted_prices = row.fuels.map(|price| {
-            i64::from(price?)
-                .checked_mul(DECIMAL_SCALE.as_i64())?
-                .checked_add(smart_discount.as_i64())
-                .map(ScaledDecimal)
-        });
-        let region_rate = if currency_apply {
-            sort_context
-                .region_rate(row.identity.region.as_ref())
-                .ok_or_else(|| {
-                    err(format!(
-                        "지역화폐 적용 대상 행의 적용률을 찾지 못했습니다: 지역={}",
-                        row.identity.region
-                    ))
-                })?
-        } else {
-            ScaledDecimal::ZERO
-        };
-        Ok(Self {
-            adjusted_prices,
-            region_rate,
-            smart_discount,
-        })
-    }
     fn regional_discount(
         value: ScaledSortKey,
         region_rate: ScaledDecimal,
@@ -319,13 +273,10 @@ impl RankSortRefresher<'_, '_> {
     fn build_and_write_formula_cache(
         &mut self,
         row_num: u32,
-        display_total_qty: Option<ScaledDecimal>,
+        base: RankRowBase,
         sort_context: &RankSortContext,
     ) -> Result<Option<ScaledSortKey>> {
-        let row = ParsedMasterRow::read(self.ws, row_num, self.shared_strings)?;
-        let currency_apply =
-            MasterSheetUpdater::currency_apply(self.ws, row_num, self.shared_strings)?;
-        let base = RankRowBase::read(&row, currency_apply, sort_context)?;
+        let display_total_qty = sort_context.display_total_qty;
         let prices = base.adjusted_prices;
         let total_price = display_total_qty
             .and_then(|_| MasterSheetUpdater::compute_total_price(sort_context, prices));
@@ -383,7 +334,7 @@ impl RankSortRefresher<'_, '_> {
             row_num,
             COL_FUEL_TOTAL_TEXT,
             fuel_total_text.as_deref(),
-            Some("str"),
+            true,
         )?;
         self.write_squared_value(row_num, COL_TOTAL_PRICE, total_price)?;
         self.write_decimal_value(
@@ -393,32 +344,73 @@ impl RankSortRefresher<'_, '_> {
         )?;
         self.write_squared_value(row_num, COL_REGION_DISCOUNT, regional_discount)?;
         self.write_squared_value(row_num, COL_REGIONAL_TOTAL, rank_total)?;
-        self.write_text_value(row_num, COL_SORT_KEY, Some(sort_key.as_ref()), None)?;
+        self.write_text_value(row_num, COL_SORT_KEY, Some(sort_key.as_ref()), false)?;
         self.write_text_value(
             row_num,
             COL_UNIT_PRICE_WITH_CURRENCY,
             unit_price_with_currency.as_deref(),
-            None,
+            false,
         )?;
         self.write_text_value(
             row_num,
             COL_UNIT_PRICE_WITHOUT_CURRENCY,
             unit_price_without_currency.as_deref(),
-            None,
+            false,
         )?;
         Ok(rank_total)
     }
-    fn build_sort_key(&self, row_num: u32, sort_context: &RankSortContext) -> Result<RankSortKey> {
-        let row = ParsedMasterRow::read(self.ws, row_num, self.shared_strings)?;
-        let currency_apply =
-            MasterSheetUpdater::currency_apply(self.ws, row_num, self.shared_strings)?;
-        let base = RankRowBase::read(&row, currency_apply, sort_context)?;
-        let adjusted = base.adjusted_prices;
-        let region_rate = base.region_rate;
+    fn build_sort_plan(
+        &self,
+        row_num: u32,
+        sort_context: &RankSortContext,
+    ) -> Result<SortableRankRow> {
+        let identity = ParsedMasterIdentity::read(self.ws, row_num, self.shared_strings)?;
+        let row =
+            ParsedMasterRow::read_with_identity(identity, self.ws, row_num, self.shared_strings)?;
+        let default_smart_discount = if row.identity.name.contains(SMART_DISCOUNT_BRAND_KEYWORD)
+            && row.identity.name.contains(SMART_DISCOUNT_DIRECT_KEYWORD)
+        {
+            sort_context.smart_discount
+        } else {
+            ScaledDecimal::ZERO
+        };
+        let smart_discount = if row.smart_discount_excluded {
+            ScaledDecimal::ZERO
+        } else {
+            default_smart_discount
+        };
+        let adjusted_prices = row.fuels.map(|price| {
+            i64::from(price?)
+                .checked_mul(DECIMAL_SCALE.as_i64())?
+                .checked_add(smart_discount.as_i64())
+                .map(ScaledDecimal)
+        });
+        let currency_apply = self
+            .ws
+            .try_get_display_at(COL_CURRENCY_APPLY, row_num, self.shared_strings)?
+            .trim()
+            .eq_ignore_ascii_case("Y");
+        let region_rate = if currency_apply {
+            sort_context
+                .region_rate(row.identity.region.as_ref())
+                .ok_or_else(|| {
+                    err(format!(
+                        "지역화폐 적용 대상 행의 적용률을 찾지 못했습니다: 지역={}",
+                        row.identity.region
+                    ))
+                })?
+        } else {
+            ScaledDecimal::ZERO
+        };
+        let base = RankRowBase {
+            adjusted_prices,
+            region_rate,
+            smart_discount,
+        };
         let region_multiplier = DECIMAL_SCALE
             .checked_sub(region_rate)
             .ok_or_else(|| err("지역 보정률이 100%를 초과했습니다."))?;
-        let regional_adjusted = adjusted.map(|price| {
+        let regional_adjusted = adjusted_prices.map(|price| {
             price
                 .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
                 .map(ScaledSortKey)
@@ -427,22 +419,28 @@ impl RankSortRefresher<'_, '_> {
             if total_qty == ScaledDecimal::ZERO {
                 None
             } else {
-                let total_price = MasterSheetUpdater::compute_total_price(sort_context, adjusted)?;
+                let total_price =
+                    MasterSheetUpdater::compute_total_price(sort_context, adjusted_prices)?;
                 let discount = RankRowBase::regional_discount(total_price, region_rate)?;
                 total_price.checked_sub(discount)
             }
         });
-        Ok(RankSortKey {
-            rank_total,
-            fuels: regional_adjusted.map(|value| value.unwrap_or(ScaledSortKey::MAX)),
-            region: row.identity.region.into_owned(),
-            name: row.identity.name.into_owned(),
-            address: row.identity.address.into_owned(),
+        Ok(SortableRankRow {
+            base,
+            row: row_num,
+            smart_discount_excluded: row.smart_discount_excluded,
+            key: RankSortKey {
+                rank_total,
+                fuels: regional_adjusted.map(|value| value.unwrap_or(ScaledSortKey::MAX)),
+                region: row.identity.region.into_owned(),
+                name: row.identity.name.into_owned(),
+                address: row.identity.address.into_owned(),
+            },
         })
     }
     fn collect_ranked_rows(
         &mut self,
-        display_total_qty: Option<ScaledDecimal>,
+        row_plans: &[SortableRankRow],
         sort_context: &RankSortContext,
     ) -> Result<Vec<(ScaledSortKey, u32)>> {
         let capacity = row_range_len(self.data_rows, "랭크 캐시 대상 행 수")?;
@@ -453,50 +451,100 @@ impl RankSortRefresher<'_, '_> {
                 source,
             )
         })?;
-        for row in self.data_rows {
+        for (row, plan) in self.data_rows.into_iter().zip(row_plans) {
             if let Some(rank_total) =
-                self.build_and_write_formula_cache(row, display_total_qty, sort_context)?
+                self.build_and_write_formula_cache(row, plan.base, sort_context)?
             {
                 ranked_rows.push((rank_total, row));
             } else {
                 self.ws
-                    .set_formula_cached_value_at(COL_RANK, row, None, None)?;
+                    .set_formula_cached_value_at(COL_RANK, row, None, false)?;
             }
         }
         Ok(ranked_rows)
     }
-    fn normalize_smart_discount_formulas(&mut self) -> Result<()> {
-        let smart_discount_col = COL_SMART_DISCOUNT;
-        for row in self.data_rows {
-            let canonical_formula = format!(
-                "IF(AND(IFERROR(SEARCH(\"{SMART_DISCOUNT_BRAND_KEYWORD}\",$C{row}),0)>0,IFERROR(SEARCH(\"{SMART_DISCOUNT_DIRECT_KEYWORD}\",$C{row}),0)>0),$B${SMART_DISCOUNT_INPUT_ROW},0)"
-            );
-            let has_formula = {
-                let formula = self.ws.try_get_formula_at(smart_discount_col, row)?;
-                if formula.as_deref() == Some(canonical_formula.as_str()) {
-                    continue;
-                }
-                formula.is_some()
+    fn normalize_formulas(&mut self, row_plans: &[SortableRankRow]) -> Result<()> {
+        let mut formula = String::new();
+        formula
+            .try_reserve_exact(MASTER_FORMULA_BUFFER_CAPACITY)
+            .map_err(|source| err_with_source("마스터 수식 메모리 확보 실패", source))?;
+        for (row, plan) in self.data_rows.into_iter().zip(row_plans) {
+            let mut set_formula = |col: u32, args: Arguments<'_>| -> Result<()> {
+                formula.clear();
+                formula
+                    .write_fmt(args)
+                    .map_err(|source| err_with_source("마스터 수식 작성 실패", source))?;
+                self.ws.set_formula_at(col, row, &formula)
             };
-            if !has_formula {
-                if MasterSheetUpdater::is_exact_zero_at(
-                    self.ws,
-                    smart_discount_col,
-                    row,
-                    self.shared_strings,
-                )? {
-                    self.ws.set_i32_at(smart_discount_col, row, Some(0_i32))?;
-                    continue;
-                }
-                self.ws.set_i32_at(smart_discount_col, row, None)?;
+            set_formula(
+                COL_RANK,
+                format_args!(
+                    r#"IF($T{row}="","",1+COUNTIF($W${}:$W${},"<"&W{row}))"#,
+                    self.data_rows.start, self.data_rows.last,
+                ),
+            )?;
+            if !plan.smart_discount_excluded {
+                set_formula(
+                    COL_SMART_DISCOUNT,
+                    format_args!(
+                        r#"IF(AND(IFERROR(SEARCH("{SMART_DISCOUNT_BRAND_KEYWORD}",$C{row}),0)>0,IFERROR(SEARCH("{SMART_DISCOUNT_DIRECT_KEYWORD}",$C{row}),0)>0),$B${SMART_DISCOUNT_INPUT_ROW},0)"#
+                    ),
+                )?;
             }
-            self.ws
-                .set_formula_at(smart_discount_col, row, &canonical_formula)?;
+            set_formula(
+                COL_ADJUSTED_GASOLINE,
+                format_args!(r#"IF($G{row}="","",$G{row}+$K{row})"#),
+            )?;
+            set_formula(
+                COL_ADJUSTED_PREMIUM,
+                format_args!(r#"IF($H{row}="","",$H{row}+$K{row})"#),
+            )?;
+            set_formula(
+                COL_ADJUSTED_DIESEL,
+                format_args!(r#"IF($J{row}="","",$J{row}+$K{row})"#),
+            )?;
+            set_formula(
+                COL_FUEL_TOTAL_TEXT,
+                format_args!(
+                    r##"IF($B$10=0,"",IFERROR(IF($B$4>0,"휘발유 "&TEXT(IF($L{row}="",1/0,$L{row}*$B$4),"#,##0")&"원","")&IF($B$5>0,IF($B$4>0," / ","")&"고급유 "&TEXT(IF($M{row}="",1/0,$M{row}*$B$5),"#,##0")&"원","")&IF($B$6>0,IF(OR($B$4>0,$B$5>0)," / ","")&"경유 "&TEXT(IF($N{row}="",1/0,$N{row}*$B$6),"#,##0")&"원",""),""))"##
+                ),
+            )?;
+            set_formula(
+                COL_TOTAL_PRICE,
+                format_args!(
+                    r#"IF($B$10=0,"",IFERROR(IF($B$4>0,IF($L{row}="",1/0,$L{row}*$B$4),0)+IF($B$5>0,IF($M{row}="",1/0,$M{row}*$B$5),0)+IF($B$6>0,IF($N{row}="",1/0,$N{row}*$B$6),0),""))"#
+                ),
+            )?;
+            set_formula(
+                COL_REGION_RATE,
+                format_args!(
+                    r#"IF($P{row}="","",IF($Q{row}="Y",IFERROR(VLOOKUP($B{row},$C$4:$D$13,2,FALSE()),0),0))"#
+                ),
+            )?;
+            set_formula(
+                COL_REGION_DISCOUNT,
+                format_args!(r#"IF($P{row}="","",ROUNDDOWN($P{row}*$R{row},0))"#),
+            )?;
+            set_formula(
+                COL_REGIONAL_TOTAL,
+                format_args!(r#"IF($P{row}="","",$P{row}-$S{row})"#),
+            )?;
+            set_formula(
+                COL_UNIT_PRICE_WITH_CURRENCY,
+                format_args!(r#"IF($T{row}="","",IF($B$10=0,"",$T{row}/$B$10))"#),
+            )?;
+            set_formula(
+                COL_UNIT_PRICE_WITHOUT_CURRENCY,
+                format_args!(r#"IF($P{row}="","",IF($B$10=0,"",$P{row}/$B$10))"#),
+            )?;
+            set_formula(
+                COL_SORT_KEY,
+                format_args!(r#"IF($T{row}="",1000000000000000,$T{row})"#),
+            )?;
         }
         Ok(())
     }
     fn refresh(&mut self) -> Result<()> {
-        self.normalize_smart_discount_formulas()?;
         let gasoline = MasterSheetUpdater::get_f64_at(self.ws, 2, 4, self.shared_strings)?
             .unwrap_or(ScaledDecimal::ZERO);
         let premium = MasterSheetUpdater::get_f64_at(self.ws, 2, 5, self.shared_strings)?
@@ -526,16 +574,18 @@ impl RankSortRefresher<'_, '_> {
                 }
             }
         }
-        let total_qty = MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)?
-            .filter(|value| *value != ScaledDecimal::ZERO)
-            .or_else(|| {
-                let derived_total = quantities
-                    .gasoline
-                    .checked_add(quantities.premium)?
-                    .checked_add(quantities.diesel)?;
-                (derived_total != ScaledDecimal::ZERO).then_some(derived_total)
-            });
+        let display_total_qty =
+            MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)?
+                .filter(|value| *value != ScaledDecimal::ZERO);
+        let total_qty = display_total_qty.or_else(|| {
+            let derived_total = quantities
+                .gasoline
+                .checked_add(quantities.premium)?
+                .checked_add(quantities.diesel)?;
+            (derived_total != ScaledDecimal::ZERO).then_some(derived_total)
+        });
         let sort_context = RankSortContext {
+            display_total_qty,
             quantities,
             total_qty,
             smart_discount: MasterSheetUpdater::get_f64_at(
@@ -547,16 +597,16 @@ impl RankSortRefresher<'_, '_> {
             .unwrap_or(ScaledDecimal::ZERO),
             region_rates,
         };
-        self.sort(&sort_context)?;
-        self.repair_formulas()?;
-        self.refresh_caches(&sort_context)
+        let row_plans = self.sort(&sort_context)?;
+        self.normalize_formulas(&row_plans)?;
+        self.refresh_caches(&sort_context, &row_plans)
     }
-    fn refresh_caches(&mut self, sort_context: &RankSortContext) -> Result<()> {
-        let display_total_qty = MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)
-            .map(|value| value.filter(|qty| *qty != ScaledDecimal::ZERO))?;
-        self.ws
-            .clear_formula_cached_values_in_range(self.data_rows)?;
-        let mut ranked_rows = self.collect_ranked_rows(display_total_qty, sort_context)?;
+    fn refresh_caches(
+        &mut self,
+        sort_context: &RankSortContext,
+        row_plans: &[SortableRankRow],
+    ) -> Result<()> {
+        let mut ranked_rows = self.collect_ranked_rows(row_plans, sort_context)?;
         ranked_rows.sort_unstable();
         let mut rank_text = String::new();
         rank_text
@@ -574,31 +624,11 @@ impl RankSortRefresher<'_, '_> {
                 previous_total = Some(current);
             }
             self.ws
-                .set_formula_cached_value_at(COL_RANK, row, Some(rank_text.as_str()), None)?;
+                .set_formula_cached_value_at(COL_RANK, row, Some(rank_text.as_str()), false)?;
         }
         Ok(())
     }
-    fn repair_formulas(&mut self) -> Result<()> {
-        let range_rewriter = excel::writer::AbsoluteColumnRangeRewriter::from((
-            COL_SORT_KEY,
-            self.data_rows.start,
-            self.data_rows.last,
-        ));
-        for row in self.data_rows {
-            let Some(formula) = self.ws.try_get_formula_at(COL_RANK, row)? else {
-                continue;
-            };
-            let rewrite_result = range_rewriter.rewrite(formula.as_ref())?;
-            if let Some(updated) = rewrite_result {
-                self.ws.set_formula_at(COL_RANK, row, &updated)?;
-            }
-        }
-        Ok(())
-    }
-    fn sort(&mut self, sort_context: &RankSortContext) -> Result<()> {
-        if self.data_rows.start == self.data_rows.last {
-            return Ok(());
-        }
+    fn sort(&mut self, sort_context: &RankSortContext) -> Result<Vec<SortableRankRow>> {
         let row_count = row_range_len(self.data_rows, "정렬 대상 행 수")?;
         let mut data_rows: Vec<SortableRankRow> = Vec::new();
         data_rows.try_reserve_exact(row_count).map_err(|source| {
@@ -608,14 +638,7 @@ impl RankSortRefresher<'_, '_> {
             )
         })?;
         for row_num in self.data_rows {
-            if !self.ws.has_row(row_num) {
-                return Err(missing_sort_target_row_error(row_num));
-            }
-            let sort_key = self.build_sort_key(row_num, sort_context)?;
-            data_rows.push(SortableRankRow {
-                row: row_num,
-                key: sort_key,
-            });
+            data_rows.push(self.build_sort_plan(row_num, sort_context)?);
         }
         data_rows.sort_by(|left, right| {
             let left_key = &left.key;
@@ -637,55 +660,44 @@ impl RankSortRefresher<'_, '_> {
                 .then_with(|| left_key.name.cmp(&right_key.name))
                 .then_with(|| left_key.address.cmp(&right_key.address))
         });
-        let mut row_mapping = Vec::new();
-        row_mapping.try_reserve_exact(row_count).map_err(|source| {
-            err_with_source(
-                format!("정렬 행 매핑 메모리 확보 실패: {row_count} entries"),
-                source,
-            )
-        })?;
-        row_mapping.resize(row_count, 0_u32);
-        for (index, data_row) in data_rows.iter().enumerate() {
-            let old_row = data_row.row;
-            let new_row = add_row_offset(self.data_rows.start, index, "유류비 정렬 재배치")?;
-            let row_offset = old_row
-                .checked_sub(self.data_rows.start)
-                .ok_or_else(|| err(format!("정렬 행 매핑 offset 계산 실패: {old_row}")))?;
-            let mapping_index = usize::try_from(row_offset)
-                .map_err(|source| err_with_source("정렬 행 매핑 index 변환 실패", source))?;
-            let slot = row_mapping
-                .get_mut(mapping_index)
-                .ok_or_else(|| err(format!("정렬 행 매핑 범위를 벗어났습니다: {old_row}")))?;
-            *slot = new_row;
-        }
         let mut rows = self.ws.take_rows();
-        let mut sorted_rows: Vec<StdRow> = Vec::new();
-        sorted_rows.try_reserve_exact(row_count).map_err(|source| {
-            err_with_source(
-                format!("정렬 분리 행 메모리 확보 실패: {row_count} entries"),
-                source,
-            )
-        })?;
-        for data_row in &data_rows {
-            sorted_rows.push(
-                rows.remove(&data_row.row)
-                    .ok_or_else(|| missing_sort_target_row_error(data_row.row))?,
-            );
+        let data_start_index = usize::try_from(self.data_rows.start.saturating_sub(1))
+            .map_err(|source| err_with_source("정렬 시작 row 변환 실패", source))?;
+        let data_end_index = usize::try_from(self.data_rows.last)
+            .map_err(|source| err_with_source("정렬 종료 row 변환 실패", source))?;
+        if data_start_index > data_end_index || data_end_index > rows.len() {
+            return Err(err("정렬 대상 row 범위가 worksheet를 벗어났습니다."));
         }
-        for (index, mut row) in sorted_rows.into_iter().enumerate() {
-            let new_row = add_row_offset(self.data_rows.start, index, "유류비 정렬 재배치")?;
-            remap_formula_rows(&mut row, &|old_ref_row| {
-                let mapped_row = old_ref_row
-                    .checked_sub(self.data_rows.start)
-                    .and_then(|offset| usize::try_from(offset).ok())
-                    .and_then(|mapping_index| row_mapping.get(mapping_index).copied())
-                    .unwrap_or(old_ref_row);
-                Ok(mapped_row)
+        let trailing_rows = rows.split_off(data_end_index);
+        let source_rows = rows.split_off(data_start_index);
+        let mut available_rows = Vec::new();
+        available_rows
+            .try_reserve_exact(source_rows.len())
+            .map_err(|source| {
+                err_with_source(
+                    format!("정렬 원본 행 메모리 확보 실패: {row_count} entries"),
+                    source,
+                )
             })?;
-            rows.insert(new_row, row);
+        available_rows.extend(source_rows.into_iter().map(Some));
+        rows.try_reserve(available_rows.len().saturating_add(trailing_rows.len()))
+            .map_err(|source| {
+                err_with_source(
+                    format!("정렬 결과 행 메모리 확보 실패: {row_count} entries"),
+                    source,
+                )
+            })?;
+        for data_row in &data_rows {
+            rows.push(take_row(
+                &mut available_rows,
+                data_row.row,
+                self.data_rows.start,
+                "유류비 정렬 원본",
+            )?);
         }
+        rows.extend(trailing_rows);
         self.ws.replace_rows(rows);
-        Ok(())
+        Ok(data_rows)
     }
     fn write_decimal_value(
         &mut self,
@@ -695,7 +707,7 @@ impl RankSortRefresher<'_, '_> {
     ) -> Result<()> {
         let text =
             value.map(|scaled| format_scaled_value(scaled.as_i128(), DECIMAL_SCALE.as_i128()));
-        self.write_text_value(row, col, text.as_deref(), None)
+        self.write_text_value(row, col, text.as_deref(), false)
     }
     fn write_squared_value(
         &mut self,
@@ -705,23 +717,23 @@ impl RankSortRefresher<'_, '_> {
     ) -> Result<()> {
         let text = value
             .map(|scaled| format_scaled_value(scaled.as_i128(), DECIMAL_SCALE_SQUARED.as_i128()));
-        self.write_text_value(row, col, text.as_deref(), None)
+        self.write_text_value(row, col, text.as_deref(), false)
     }
     fn write_text_value(
         &mut self,
         row: u32,
         col: u32,
         value: Option<&str>,
-        value_type: Option<&'static str>,
+        string_value: bool,
     ) -> Result<()> {
         self.ws
-            .set_formula_cached_value_at(col, row, value, value_type)
+            .set_formula_cached_value_at(col, row, value, string_value)
     }
 }
 impl<'source> MasterSheetUpdater<'source> {
     fn collect_new_sources(
         &self,
-        matched_source_keys: &HashSet<&str>,
+        existing_address_rows: &HashMap<Cow<'source, str>, u32>,
     ) -> Result<Vec<&'source SourceRecord>> {
         let mut new_sources: Vec<&'source SourceRecord> = Vec::new();
         new_sources
@@ -736,7 +748,7 @@ impl<'source> MasterSheetUpdater<'source> {
         new_sources.extend(
             self.source_index
                 .iter()
-                .filter(|&(key, _rec)| !matched_source_keys.contains(key.as_str()))
+                .filter(|&(key, _rec)| !existing_address_rows.contains_key(key.as_str()))
                 .map(|(_key, rec)| rec),
         );
         new_sources.sort_unstable_by(|left, right| {
@@ -765,21 +777,11 @@ impl<'source> MasterSheetUpdater<'source> {
         }
         Some(total)
     }
-    fn currency_apply(
-        ws: &excel::writer::Worksheet,
-        row: u32,
-        shared_strings: &[String],
-    ) -> Result<bool> {
-        Ok(ws
-            .try_get_display_at(COL_CURRENCY_APPLY, row, shared_strings)?
-            .trim()
-            .eq_ignore_ascii_case("Y"))
-    }
     fn evaluate_master_row(
         &self,
         identity: ParsedMasterIdentity<'_>,
         ws: &excel::writer::Worksheet,
-        shared_strings: &[String],
+        shared_strings: &[Rc<str>],
         old_row: u32,
         address_key_scratch: &mut String,
     ) -> Result<MasterRowDecision<'source>> {
@@ -857,18 +859,9 @@ impl<'source> MasterSheetUpdater<'source> {
     fn evaluate_master_rows(
         &self,
         ws: &excel::writer::Worksheet,
-        shared_strings: &[String],
+        shared_strings: &[Rc<str>],
     ) -> Result<MasterRowEvaluation<'source>> {
         let row_count = ws.row_count();
-        let mut matched_source_keys: HashSet<&str> = HashSet::new();
-        matched_source_keys
-            .try_reserve(row_count)
-            .map_err(|source| {
-                err_with_source(
-                    format!("매칭 소스 키 집합 메모리 확보 실패: {row_count} entries"),
-                    source,
-                )
-            })?;
         let mut master_address_rows: HashMap<Cow<'source, str>, u32> = HashMap::new();
         master_address_rows
             .try_reserve(row_count)
@@ -884,7 +877,7 @@ impl<'source> MasterSheetUpdater<'source> {
         let mut existing_region_counts = [0_usize; TARGET_REGION_COUNT];
         let mut matched_existing_region_counts = [0_usize; TARGET_REGION_COUNT];
         let mut target_region_scratch = String::new();
-        for old_row in ws.row_numbers_from(MASTER_DATA_START_ROW) {
+        for old_row in ws.row_numbers_from(MASTER_DATA_START_ROW)? {
             let identity = ParsedMasterIdentity::read(ws, old_row, shared_strings)?;
             if identity.is_empty() {
                 continue;
@@ -926,7 +919,6 @@ impl<'source> MasterSheetUpdater<'source> {
                     src,
                 } => {
                     record_address(Cow::Borrowed(matched_key))?;
-                    matched_source_keys.insert(matched_key);
                     increment_optional_target_region_count(
                         &mut matched_existing_region_counts,
                         existing_region,
@@ -942,17 +934,17 @@ impl<'source> MasterSheetUpdater<'source> {
         Ok(MasterRowEvaluation {
             changes,
             deleted,
+            existing_address_rows: master_address_rows,
             existing_region_counts,
             kept_source_rows,
             matched_existing_region_counts,
-            matched_source_keys,
         })
     }
     fn get_f64_at(
         ws: &excel::writer::Worksheet,
         col: u32,
         row: u32,
-        shared_strings: &[String],
+        shared_strings: &[Rc<str>],
     ) -> Result<Option<ScaledDecimal>> {
         let display_text = ws.try_get_display_at(col, row, shared_strings)?;
         let trimmed = display_text.trim();
@@ -1025,30 +1017,6 @@ impl<'source> MasterSheetUpdater<'source> {
             .map(Some)
             .ok_or_else(invalid_value)
     }
-    fn is_exact_zero_at(
-        ws: &excel::writer::Worksheet,
-        col: u32,
-        row: u32,
-        shared_strings: &[String],
-    ) -> Result<bool> {
-        let display = ws.try_get_display_at(col, row, shared_strings)?;
-        let trimmed = display.trim();
-        let digits = trimmed
-            .strip_prefix('+')
-            .or_else(|| trimmed.strip_prefix('-'))
-            .unwrap_or(trimmed);
-        let mut has_digit = false;
-        let mut has_decimal_point = false;
-        for byte in digits.bytes() {
-            match byte {
-                b'0' => has_digit = true,
-                b',' => {}
-                b'.' if !has_decimal_point => has_decimal_point = true,
-                _ => return Ok(false),
-            }
-        }
-        Ok(has_digit)
-    }
     fn normalize_fuel_price(value: Option<i32>) -> Option<i32> {
         value.filter(|price| *price > 0_i32)
     }
@@ -1058,7 +1026,7 @@ impl<'source> MasterSheetUpdater<'source> {
     ) -> Result<MasterSheetUpdateResult<'source>> {
         let (ws, shared_strings) = book.master_sheet_mut();
         let evaluation = self.evaluate_master_rows(ws, shared_strings.values())?;
-        let added = self.collect_new_sources(&evaluation.matched_source_keys)?;
+        let added = self.collect_new_sources(&evaluation.existing_address_rows)?;
         let existing_count = evaluation
             .kept_source_rows
             .len()
@@ -1073,72 +1041,68 @@ impl<'source> MasterSheetUpdater<'source> {
             start: MASTER_DATA_START_ROW,
             last: last_old_row.unwrap_or(MASTER_HEADER_ROW),
         };
-        let mut original_rows = ws.take_rows();
         let final_count = evaluation
             .kept_source_rows
             .len()
             .checked_add(added.len())
             .ok_or_else(|| err("최종 마스터 행 수 계산 중 overflow가 발생했습니다."))?;
-        let old_count_u32 = usize_to_u32(existing_count, "기존 유류비 행 수")?;
         let final_count_u32 = usize_to_u32(final_count, "최종 유류비 행 수")?;
-        let row_mapper = RowMapper {
-            decrease: old_count_u32.saturating_sub(final_count_u32),
-            deleted: &evaluation.deleted,
-            increase: final_count_u32.saturating_sub(old_count_u32),
-            old_data_rows,
-        };
+        let mut original_rows = ws.take_rows();
         let template_row_num = last_old_row.unwrap_or(MASTER_DATA_START_ROW);
-        let mut new_rows_map = BTreeMap::new();
+        let mut added_template_rows = Vec::new();
         if !added.is_empty() {
-            let template_row = original_rows.get(&template_row_num).ok_or_else(|| {
+            let template_index = usize::try_from(template_row_num.saturating_sub(1))
+                .map_err(|source| err_with_source("유류비 template row 변환 실패", source))?;
+            let template_row = original_rows.get(template_index).ok_or_else(|| {
                 err(format!(
                     "유류비 신규행 template이 없습니다: row={template_row_num}"
                 ))
             })?;
-            for i in 0..added.len() {
-                let offset = evaluation
-                    .kept_source_rows
-                    .len()
-                    .checked_add(i)
-                    .ok_or_else(|| err("유류비 신규행 오프셋 계산 중 overflow가 발생했습니다."))?;
-                let new_row = add_row_offset(MASTER_DATA_START_ROW, offset, "유류비 신규행 추가")?;
-                let resolver = |old_ref_row: u32| {
-                    if old_ref_row == template_row_num {
-                        Ok(new_row)
-                    } else {
-                        row_mapper.map(old_ref_row)
-                    }
-                };
-                new_rows_map.insert(new_row, template_row.copy_with_row_mapping(&resolver)?);
+            added_template_rows
+                .try_reserve_exact(added.len())
+                .map_err(|source| err_with_source("유류비 신규행 메모리 확보 실패", source))?;
+            for _ in &added {
+                added_template_rows.push(template_row.try_copy()?);
             }
         }
-        for (row_num, mut row_obj) in
-            original_rows.extract_if(.., |row_num, _| !old_data_rows.contains(row_num))
-        {
-            let new_row_num = if row_num < old_data_rows.start {
-                row_num
-            } else {
-                row_mapper.shift(row_num)?
-            };
-            remap_formula_rows(&mut row_obj, &|old_ref_row| row_mapper.map(old_ref_row))?;
-            new_rows_map.insert(new_row_num, row_obj);
+        let data_start_index = usize::try_from(MASTER_HEADER_ROW)
+            .map_err(|source| err_with_source("유류비 데이터 시작 index 변환 실패", source))?;
+        let trailing_start_index = usize::try_from(last_old_row.unwrap_or(MASTER_HEADER_ROW))
+            .map_err(|source| {
+                err_with_source("유류비 trailing row 시작 index 변환 실패", source)
+            })?;
+        if data_start_index > trailing_start_index || trailing_start_index > original_rows.len() {
+            return Err(err(
+                "유류비 기존 데이터 row 범위가 worksheet를 벗어났습니다.",
+            ));
         }
-        for (i, &(old_row, _)) in evaluation.kept_source_rows.iter().enumerate() {
-            let new_row = add_row_offset(MASTER_DATA_START_ROW, i, "유류비 기존행 재배치")?;
-            let mut row_obj = original_rows
-                .remove(&old_row)
-                .ok_or_else(|| err(format!("유류비 기존행 XML이 없습니다: row={old_row}")))?;
-            let resolver = |old_ref_row: u32| {
-                if old_ref_row == old_row {
-                    Ok(new_row)
-                } else {
-                    row_mapper.map(old_ref_row)
-                }
-            };
-            remap_formula_rows(&mut row_obj, &resolver)?;
-            new_rows_map.insert(new_row, row_obj);
+        let trailing_rows = original_rows.split_off(trailing_start_index);
+        let source_rows = original_rows.split_off(data_start_index);
+        let mut available_rows = Vec::new();
+        available_rows
+            .try_reserve_exact(source_rows.len())
+            .map_err(|source| err_with_source("유류비 기존행 메모리 확보 실패", source))?;
+        available_rows.extend(source_rows.into_iter().map(Some));
+        original_rows
+            .try_reserve(
+                evaluation
+                    .kept_source_rows
+                    .len()
+                    .saturating_add(added_template_rows.len())
+                    .saturating_add(trailing_rows.len()),
+            )
+            .map_err(|source| err_with_source("유류비 결과행 메모리 확보 실패", source))?;
+        for &(old_row, _) in &evaluation.kept_source_rows {
+            original_rows.push(take_row(
+                &mut available_rows,
+                old_row,
+                MASTER_DATA_START_ROW,
+                "유류비 기존행",
+            )?);
         }
-        ws.replace_rows(new_rows_map);
+        original_rows.extend(added_template_rows);
+        original_rows.extend(trailing_rows);
+        ws.replace_rows(original_rows);
         for (i, &(_, source)) in evaluation.kept_source_rows.iter().enumerate() {
             let new_row = add_row_offset(MASTER_DATA_START_ROW, i, "유류비 기존행 재배치")?;
             if let Some(src) = source {
@@ -1259,6 +1223,20 @@ fn row_range_len(rows: RowRange, context: &'static str) -> Result<usize> {
     usize::try_from(row_count)
         .map_err(|source| err_with_source(format!("{context} 변환 실패"), source))
 }
+fn take_row(
+    rows: &mut [Option<StdRow>],
+    row: u32,
+    first_row: u32,
+    context: &str,
+) -> Result<StdRow> {
+    let index = row
+        .checked_sub(first_row)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or_else(|| err(format!("{context} row 번호가 범위를 벗어났습니다: {row}")))?;
+    rows.get_mut(index)
+        .and_then(Option::take)
+        .ok_or_else(|| err(format!("{context} XML이 없습니다: row={row}")))
+}
 const fn increment_optional_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],
     maybe_region: Option<TargetRegion>,
@@ -1296,21 +1274,4 @@ fn trim_cow(value: Cow<'_, str>) -> Cow<'_, str> {
 }
 fn same_trimmed(left: &str, right: &str) -> bool {
     left.trim() == right.trim()
-}
-fn shift_row(row: u32, increase: u32, decrease: u32, context: &str) -> Result<u32> {
-    if increase > 0 {
-        row.checked_add(increase).ok_or_else(|| {
-            err(format!(
-                "{context} 중 행 번호 overflow가 발생했습니다. ({row} + {increase})"
-            ))
-        })
-    } else {
-        row.checked_sub(decrease)
-            .filter(|shifted| *shifted >= 1)
-            .ok_or_else(|| {
-                err(format!(
-                    "{context} 중 행 번호가 1보다 작아졌습니다. ({row} - {decrease})"
-                ))
-            })
-    }
 }

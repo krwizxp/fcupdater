@@ -1,5 +1,5 @@
 use super::{
-    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse,
+    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
     RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE, ResponseHeaders,
     download_error_with_source, enforce_http_body_length,
 };
@@ -241,7 +241,7 @@ impl Client {
         request_body: Option<&[u8]>,
         host: &str,
         path: &str,
-        request_headers: &[(&str, &str)],
+        request_headers: &RequestHeaders<'_>,
         body_buffer: &mut BoundedResponseBuffer,
         header_buffer: &mut BoundedResponseBuffer,
     ) -> DownloadResult<u32> {
@@ -250,7 +250,7 @@ impl Client {
         let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
         let result = (|| {
             let mut header_list = HeaderList(None);
-            for &(name, value) in request_headers {
+            for (name, value) in request_headers.iter() {
                 let header = nul_terminated_buffer(
                     &mut header_build_buffer,
                     &[name.as_bytes(), b": ", value.as_bytes()],
@@ -369,7 +369,7 @@ impl Client {
         &mut self,
         host: &str,
         path: &str,
-        request_headers: &[(&str, &str)],
+        request_headers: RequestHeaders<'_>,
     ) -> DownloadResult<HttpResponse> {
         let header_bytes = mem::take(&mut self.header_buffer);
         let mut body_buffer =
@@ -381,7 +381,7 @@ impl Client {
                 None,
                 host,
                 path,
-                request_headers,
+                &request_headers,
                 &mut body_buffer,
                 &mut header_buffer,
             )?;
@@ -401,7 +401,7 @@ impl Client {
         &mut self,
         host: &str,
         path: &str,
-        request_headers: &[(&str, &str)],
+        request_headers: RequestHeaders<'_>,
         body: &[u8],
     ) -> DownloadResult<HttpResponse> {
         let header_bytes = mem::take(&mut self.header_buffer);
@@ -414,7 +414,7 @@ impl Client {
                 Some(body),
                 host,
                 path,
-                request_headers,
+                &request_headers,
                 &mut body_buffer,
                 &mut header_buffer,
             )?;

@@ -113,8 +113,8 @@ struct BiffWorkbookReader<'workbook> {
 struct CfbDataParser<'data> {
     data: &'data [u8],
 }
-pub(crate) struct SourceReader<'source> {
-    pub data: &'source [u8],
+pub(crate) struct SourceReader {
+    pub data: Vec<u8>,
 }
 #[derive(Default)]
 struct SourceRow<'strings> {
@@ -358,9 +358,9 @@ impl CfbDataParser<'_> {
         read_stream_from_fat_chain(self.data, fat, start_sector, Some(stream_size), "Workbook")
     }
 }
-impl SourceReader<'_> {
-    fn open(&self) -> Result<Vec<u8>> {
-        let parser = CfbDataParser { data: self.data };
+impl SourceReader {
+    fn open(self) -> Result<Vec<u8>> {
+        let parser = CfbDataParser { data: &self.data };
         let header = parser.parse_cfb_header()?;
         let max_sector_count = parser
             .data

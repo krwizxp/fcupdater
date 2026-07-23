@@ -1,12 +1,28 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 const TAR_BLOCK_LEN: usize = 512;
 const TAR_BLOCK_LEN_U64: u64 = 512;
 const ZERO_BLOCK: [u8; TAR_BLOCK_LEN] = [0; TAR_BLOCK_LEN];
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+fn copy_verified(
+    source: &Path,
+    destination: &Path,
+    source_len: u64,
+    changed_message: &'static str,
+) -> io::Result<()> {
+    let copied = fs::copy(source, destination)?;
+    if copied == source_len {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            changed_message,
+        ))
+    }
 }
 fn write_octal(field: &mut [u8], mut value: u64) -> io::Result<()> {
     field.fill(b'0');
@@ -35,6 +51,18 @@ fn main() -> io::Result<()> {
     if args.next().is_some() {
         return Err(invalid_input("unexpected package artifact argument"));
     }
+    let artifact_dir = Path::new("artifacts");
+    if entry_name == "--workbook" {
+        fs::create_dir_all(artifact_dir)?;
+        let source = Path::new("fuel_cost_chungcheong.xlsx");
+        let source_len = source.metadata()?.len();
+        return copy_verified(
+            source,
+            &artifact_dir.join("fcupdater-result.xlsx"),
+            source_len,
+            "source workbook changed while copying",
+        );
+    }
     if entry_name.is_empty()
         || entry_name.len() > 100
         || entry_name.contains('/')
@@ -44,28 +72,24 @@ fn main() -> io::Result<()> {
             "artifact entry name must be a 1-100 byte file name",
         ));
     }
+    fs::create_dir_all(artifact_dir)?;
     let source = PathBuf::from("target").join("release").join(format!(
         "{}{}",
         env!("CARGO_PKG_NAME"),
         env::consts::EXE_SUFFIX
     ));
-    let artifact_dir = PathBuf::from("artifacts");
-    fs::create_dir_all(&artifact_dir)?;
     let destination = artifact_dir.join(format!(
         "{entry_name}.{}",
         if cfg!(windows) { "exe" } else { "tar" }
     ));
     let source_len = source.metadata()?.len();
     if cfg!(windows) {
-        let copied = fs::copy(source, destination)?;
-        return if copied == source_len {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "source binary changed while copying",
-            ))
-        };
+        return copy_verified(
+            &source,
+            &destination,
+            source_len,
+            "source binary changed while copying",
+        );
     }
     let mut header = ZERO_BLOCK;
     let Some(name_field) = header

@@ -101,7 +101,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         let mut last_row = None;
         for row in self
             .worksheet
-            .row_numbers_from(CHANGELOG_DATA_START_ROW)
+            .row_numbers_from(CHANGELOG_DATA_START_ROW)?
+            .into_iter()
             .rev()
         {
             if self

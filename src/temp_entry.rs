@@ -2,22 +2,12 @@ use core::time::Duration;
 use std::{
     fs, io,
     path::Path,
-    process, thread,
+    process,
     time::{SystemTime, UNIX_EPOCH},
 };
 const STALE_TEMP_ENTRY_AGE: Duration = Duration::from_hours(24);
 const TEMP_ENTRY_RESERVATION_ATTEMPTS: u32 = 1024;
-const TEMP_ENTRY_RESERVATION_DELAY: Duration = Duration::from_micros(50);
-#[derive(Clone, Copy)]
-pub(crate) enum TempEntryKind {
-    Directory,
-    File,
-}
-pub(crate) fn cleanup_stale_temp_entries(
-    parent: &Path,
-    prefix: &str,
-    kind: TempEntryKind,
-) -> io::Result<usize> {
+pub(crate) fn cleanup_stale_temp_files(parent: &Path, prefix: &str) -> io::Result<usize> {
     let now_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -54,13 +44,11 @@ pub(crate) fn cleanup_stale_temp_entries(
             continue;
         }
         let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            continue;
+        }
         let path = entry.path();
-        let remove_result = match kind {
-            TempEntryKind::Directory if file_type.is_dir() => fs::remove_dir_all(&path),
-            TempEntryKind::File if !file_type.is_dir() => fs::remove_file(&path),
-            TempEntryKind::Directory | TempEntryKind::File => continue,
-        };
-        match remove_result {
+        match fs::remove_file(&path) {
             Ok(()) => {
                 removed = removed.saturating_add(1);
             }
@@ -89,9 +77,7 @@ pub(crate) fn reserve_unique_temp_entry<T>(
         let path = parent.join(format!("{prefix}{pid}_{nanos}_{sequence}"));
         match create_entry(&path) {
             Ok(entry) => return Ok(entry),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                thread::sleep(TEMP_ENTRY_RESERVATION_DELAY);
-            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
