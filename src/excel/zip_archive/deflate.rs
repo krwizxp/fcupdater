@@ -4,7 +4,7 @@ use super::{
     HASH_SIZE, LENGTH_BASES, LENGTH_EXTRA_BITS, LITERAL_LENGTH_SYMBOLS, MAX_CHAIN, MAX_MATCH,
     MIN_MATCH, ZipResult, read_u16, zip_static, zip_with_source,
 };
-use core::{array::from_fn, cmp::Ordering, iter::repeat_n, mem, range::Range};
+use core::{array::from_fn, iter::repeat_n, mem, range::Range};
 use std::io::Write as IoWrite;
 #[cfg(target_arch = "x86_64")]
 macro_rules! matching_prefix_16 {
@@ -71,20 +71,15 @@ struct BitReader<'bytes> {
     bytes: &'bytes [u8],
     cursor: usize,
 }
-trait BitOutput {
-    fn byte_len(&self) -> usize;
-    fn finish(&mut self) -> ZipResult<()>;
-    fn write_byte(&mut self, byte: u8) -> ZipResult<()>;
+struct BitCounter {
+    bit_len: usize,
 }
-struct BitWriter<O: BitOutput> {
+trait BitSink {
+    fn write_bits(&mut self, value: u16, count: u8) -> ZipResult<()>;
+}
+struct BitWriter<'writer> {
     bit_buffer: u8,
     bit_count: u8,
-    output: O,
-}
-struct CountOutput {
-    len: usize,
-}
-struct StreamOutput<'writer> {
     buffer: [u8; DEFLATE_STREAM_BUFFER_LEN],
     buffered_len: usize,
     len: usize,
@@ -117,10 +112,6 @@ struct CodeLengthToken {
     extra_bits: u8,
     symbol: u8,
 }
-struct HuffmanBuildNode {
-    freq: u64,
-    parent: Option<usize>,
-}
 struct HuffmanLeafLength {
     freq: u32,
     len: usize,
@@ -152,9 +143,6 @@ pub(super) struct DeflatePlan {
 struct CodeLengthTokenizer<'lengths> {
     lengths: &'lengths [u8],
 }
-struct DynamicDeflateWriter<'tokens> {
-    tokens: &'tokens [DeflateToken],
-}
 struct DynamicDeflatePlan {
     code_huffman: WriteHuffman,
     code_length_count: usize,
@@ -164,16 +152,6 @@ struct DynamicDeflatePlan {
     literal_count: usize,
     literal_huffman: WriteHuffman,
 }
-struct DynamicBlockHeaderWriter<'writer, 'lengths, O: BitOutput> {
-    code_length_count: usize,
-    code_lengths: &'lengths [u8],
-    distance_count: usize,
-    literal_count: usize,
-    writer: &'writer mut BitWriter<O>,
-}
-struct DynamicFrequencyCounter<'tokens> {
-    tokens: &'tokens [DeflateToken],
-}
 struct DynamicFrequencies {
     distance: [u32; DISTANCE_SYMBOLS],
     literal: [u32; LITERAL_LENGTH_SYMBOLS],
@@ -181,11 +159,6 @@ struct DynamicFrequencies {
 struct DynamicTrees {
     distance: Option<Huffman>,
     literal: Huffman,
-}
-struct DynamicTokenWriter<'writer, 'huffman, O: BitOutput> {
-    distance_huffman: &'huffman WriteHuffman,
-    literal_huffman: &'huffman WriteHuffman,
-    writer: &'writer mut BitWriter<O>,
 }
 #[derive(Clone, Copy)]
 struct DeflateProfile {
@@ -205,30 +178,14 @@ enum DeflateMatchSearch {
     BudgetExhausted,
     Complete(Option<DeflateMatch>),
 }
-struct FixedDeflateWriter<'tokens> {
-    tokens: &'tokens [DeflateToken],
-}
-struct FixedTokenWriter<'writer, O: BitOutput> {
-    writer: &'writer mut BitWriter<O>,
-}
-struct FixedHuffmanCode {
-    bit_count: u8,
-    code: u16,
-}
 struct HuffmanLengthBuilder<'frequencies> {
     frequencies: &'frequencies [u32],
     max_bits: u8,
 }
 struct HuffmanLeafRef {
+    freq: u32,
     node_index: usize,
     symbol: usize,
-}
-struct LimitedHuffmanLengthAssigner<'counts> {
-    length_counts: &'counts [usize],
-    max_bit_count: usize,
-}
-struct LimitedLengthCountReducer<'counts> {
-    length_counts: &'counts mut [usize],
 }
 impl BitReader<'_> {
     const fn align_to_byte(&mut self) {
@@ -270,27 +227,70 @@ impl BitReader<'_> {
         Ok(bytes)
     }
 }
-impl BitOutput for CountOutput {
-    fn byte_len(&self) -> usize {
-        self.len
+impl BitCounter {
+    const fn byte_len(&self) -> usize {
+        self.bit_len.div_ceil(8)
     }
-    fn finish(&mut self) -> ZipResult<()> {
-        Ok(())
+    const fn counting() -> Self {
+        Self { bit_len: 0 }
     }
-    fn write_byte(&mut self, _byte: u8) -> ZipResult<()> {
-        self.len = self
-            .len
-            .checked_add(1)
-            .ok_or_else(|| zip_static("deflate 출력 길이 계산 실패"))?;
+}
+impl BitSink for BitCounter {
+    fn write_bits(&mut self, _value: u16, count: u8) -> ZipResult<()> {
+        self.bit_len = self
+            .bit_len
+            .checked_add(usize::from(count))
+            .ok_or_else(|| zip_static("deflate 출력 bit 길이 계산 실패"))?;
         Ok(())
     }
 }
-impl BitOutput for StreamOutput<'_> {
-    fn byte_len(&self) -> usize {
-        self.len
+impl BitSink for BitWriter<'_> {
+    fn write_bits(&mut self, mut value: u16, count: u8) -> ZipResult<()> {
+        for _ in 0_u8..count {
+            if value & 1_u16 != 0 {
+                self.bit_buffer |= 1_u8 << self.bit_count;
+            }
+            value >>= 1_u8;
+            self.bit_count = self.bit_count.saturating_add(1);
+            if self.bit_count == 8 {
+                self.write_byte(self.bit_buffer)?;
+                self.bit_buffer = 0;
+                self.bit_count = 0;
+            }
+        }
+        Ok(())
     }
-    fn finish(&mut self) -> ZipResult<()> {
-        self.flush_buffer()
+}
+impl<'writer> BitWriter<'writer> {
+    fn finish_stream(mut self) -> ZipResult<usize> {
+        if self.bit_count > 0 {
+            self.write_byte(self.bit_buffer)?;
+        }
+        self.flush_buffer()?;
+        Ok(self.len)
+    }
+    fn flush_buffer(&mut self) -> ZipResult<()> {
+        if self.buffered_len == 0 {
+            return Ok(());
+        }
+        let Some(buffered) = self.buffer.get(..self.buffered_len) else {
+            return Err(zip_static("deflate stream buffer 범위 오류"));
+        };
+        self.writer
+            .write_all(buffered)
+            .map_err(|source| zip_with_source("deflate stream 쓰기 실패", source))?;
+        self.buffered_len = 0;
+        Ok(())
+    }
+    fn streaming(writer: &'writer mut dyn IoWrite) -> Self {
+        Self {
+            bit_buffer: 0,
+            bit_count: 0,
+            buffer: [0; DEFLATE_STREAM_BUFFER_LEN],
+            buffered_len: 0,
+            len: 0,
+            writer,
+        }
     }
     fn write_byte(&mut self, byte: u8) -> ZipResult<()> {
         if self.buffered_len == self.buffer.len() {
@@ -306,68 +306,6 @@ impl BitOutput for StreamOutput<'_> {
             .checked_add(1)
             .ok_or_else(|| zip_static("deflate 출력 길이 계산 실패"))?;
         Ok(())
-    }
-}
-impl StreamOutput<'_> {
-    fn flush_buffer(&mut self) -> ZipResult<()> {
-        if self.buffered_len == 0 {
-            return Ok(());
-        }
-        let Some(buffered) = self.buffer.get(..self.buffered_len) else {
-            return Err(zip_static("deflate stream buffer 범위 오류"));
-        };
-        self.writer
-            .write_all(buffered)
-            .map_err(|source| zip_with_source("deflate stream 쓰기 실패", source))?;
-        self.buffered_len = 0;
-        Ok(())
-    }
-}
-impl<O: BitOutput> BitWriter<O> {
-    fn finish(mut self) -> ZipResult<O> {
-        if self.bit_count > 0 {
-            self.output.write_byte(self.bit_buffer)?;
-        }
-        self.output.finish()?;
-        Ok(self.output)
-    }
-    fn write_bits(&mut self, mut value: u16, count: u8) -> ZipResult<()> {
-        for _ in 0_u8..count {
-            if value & 1_u16 != 0 {
-                self.bit_buffer |= 1_u8 << self.bit_count;
-            }
-            value >>= 1_u8;
-            self.bit_count = self.bit_count.saturating_add(1);
-            if self.bit_count == 8 {
-                self.output.write_byte(self.bit_buffer)?;
-                self.bit_buffer = 0;
-                self.bit_count = 0;
-            }
-        }
-        Ok(())
-    }
-}
-impl BitWriter<CountOutput> {
-    const fn counting() -> Self {
-        Self {
-            bit_buffer: 0,
-            bit_count: 0,
-            output: CountOutput { len: 0 },
-        }
-    }
-}
-impl<'writer> BitWriter<StreamOutput<'writer>> {
-    fn streaming(writer: &'writer mut dyn IoWrite) -> Self {
-        Self {
-            bit_buffer: 0,
-            bit_count: 0,
-            output: StreamOutput {
-                buffer: [0; DEFLATE_STREAM_BUFFER_LEN],
-                buffered_len: 0,
-                len: 0,
-                writer,
-            },
-        }
     }
 }
 impl Huffman {
@@ -494,9 +432,9 @@ impl WriteHuffman {
         }
         Ok(Self { codes, lengths })
     }
-    fn write_symbol<O>(&self, writer: &mut BitWriter<O>, symbol: u16) -> ZipResult<()>
+    fn write_symbol<W>(&self, writer: &mut W, symbol: u16) -> ZipResult<()>
     where
-        O: BitOutput,
+        W: BitSink,
     {
         let index = usize::from(symbol);
         let Some(&len) = self.lengths.get(index) else {
@@ -834,31 +772,18 @@ impl CodeLengthTokenizer<'_> {
         Ok(tokens)
     }
 }
-impl DynamicDeflateWriter<'_> {
-    fn plan(&self) -> ZipResult<Option<DynamicDeflatePlan>> {
-        let Some(frequencies) = (DynamicFrequencyCounter {
-            tokens: self.tokens,
-        })
-        .count()?
-        else {
-            return Ok(None);
-        };
-        let Some(literal_lengths) = (HuffmanLengthBuilder {
-            frequencies: &frequencies.literal,
+impl DynamicFrequencies {
+    fn plan(self) -> ZipResult<DynamicDeflatePlan> {
+        let literal_lengths = (HuffmanLengthBuilder {
+            frequencies: &self.literal,
             max_bits: DEFLATE_MAX_BITS_U8,
         })
-        .build()?
-        else {
-            return Ok(None);
-        };
-        let Some(distance_lengths) = (HuffmanLengthBuilder {
-            frequencies: &frequencies.distance,
+        .build()?;
+        let distance_lengths = (HuffmanLengthBuilder {
+            frequencies: &self.distance,
             max_bits: DEFLATE_MAX_BITS_U8,
         })
-        .build()?
-        else {
-            return Ok(None);
-        };
+        .build()?;
         let literal_count = literal_lengths
             .iter()
             .rposition(|&len| len != 0)
@@ -892,14 +817,11 @@ impl DynamicDeflateWriter<'_> {
             };
             *freq = freq.saturating_add(1);
         }
-        let Some(code_lengths) = (HuffmanLengthBuilder {
+        let code_lengths = (HuffmanLengthBuilder {
             frequencies: &code_length_freq,
             max_bits: 7,
         })
-        .build()?
-        else {
-            return Ok(None);
-        };
+        .build()?;
         let mut code_length_count = 4_usize;
         for (index, &symbol) in CODE_LENGTH_ORDER.iter().enumerate().rev() {
             let len = code_lengths
@@ -914,7 +836,7 @@ impl DynamicDeflateWriter<'_> {
         let literal_huffman = WriteHuffman::from_lengths(literal_lengths)?;
         let distance_huffman = WriteHuffman::from_lengths(distance_lengths)?;
         let code_huffman = WriteHuffman::from_lengths(code_lengths)?;
-        Ok(Some(DynamicDeflatePlan {
+        Ok(DynamicDeflatePlan {
             code_huffman,
             code_length_count,
             code_length_tokens,
@@ -922,27 +844,45 @@ impl DynamicDeflateWriter<'_> {
             distance_huffman,
             literal_count,
             literal_huffman,
-        }))
+        })
     }
 }
 impl DynamicDeflatePlan {
     fn deflated_len(&self, tokens: &[DeflateToken]) -> ZipResult<usize> {
-        let mut writer = BitWriter::counting();
-        self.write(tokens, &mut writer)?;
-        Ok(writer.finish()?.byte_len())
+        let mut counter = BitCounter::counting();
+        self.write(tokens, &mut counter)?;
+        Ok(counter.byte_len())
     }
-    fn write<O>(&self, tokens: &[DeflateToken], writer: &mut BitWriter<O>) -> ZipResult<()>
+    fn write<W>(&self, tokens: &[DeflateToken], writer: &mut W) -> ZipResult<()>
     where
-        O: BitOutput,
+        W: BitSink,
     {
-        DynamicBlockHeaderWriter {
-            code_length_count: self.code_length_count,
-            code_lengths: &self.code_huffman.lengths,
-            distance_count: self.distance_count,
-            literal_count: self.literal_count,
-            writer,
+        writer.write_bits(1, 1)?;
+        writer.write_bits(2, 2)?;
+        writer.write_bits(
+            u16::try_from(self.literal_count.saturating_sub(257))
+                .map_err(|source| zip_with_source("deflate HLIT 변환 실패", source))?,
+            5,
+        )?;
+        writer.write_bits(
+            u16::try_from(self.distance_count.saturating_sub(1))
+                .map_err(|source| zip_with_source("deflate HDIST 변환 실패", source))?,
+            5,
+        )?;
+        writer.write_bits(
+            u16::try_from(self.code_length_count.saturating_sub(4))
+                .map_err(|source| zip_with_source("deflate HCLEN 변환 실패", source))?,
+            4,
+        )?;
+        for &symbol in CODE_LENGTH_ORDER.iter().take(self.code_length_count) {
+            let len = self
+                .code_huffman
+                .lengths
+                .get(symbol)
+                .copied()
+                .ok_or_else(|| zip_static("deflate code length 쓰기 범위 오류"))?;
+            writer.write_bits(u16::from(len), 3)?;
         }
-        .write()?;
         for &token in &self.code_length_tokens {
             self.code_huffman
                 .write_symbol(writer, u16::from(token.symbol))?;
@@ -950,265 +890,107 @@ impl DynamicDeflatePlan {
                 writer.write_bits(token.extra, token.extra_bits)?;
             }
         }
-        let mut token_writer = DynamicTokenWriter {
-            distance_huffman: &self.distance_huffman,
-            literal_huffman: &self.literal_huffman,
-            writer,
-        };
         for &token in tokens {
-            token_writer.write(token)?;
-        }
-        self.literal_huffman.write_symbol(token_writer.writer, 256)
-    }
-}
-impl<O: BitOutput> DynamicBlockHeaderWriter<'_, '_, O> {
-    fn write(&mut self) -> ZipResult<()> {
-        self.writer.write_bits(1, 1)?;
-        self.writer.write_bits(2, 2)?;
-        self.writer.write_bits(
-            u16::try_from(self.literal_count.saturating_sub(257))
-                .map_err(|source| zip_with_source("deflate HLIT 변환 실패", source))?,
-            5,
-        )?;
-        self.writer.write_bits(
-            u16::try_from(self.distance_count.saturating_sub(1))
-                .map_err(|source| zip_with_source("deflate HDIST 변환 실패", source))?,
-            5,
-        )?;
-        self.writer.write_bits(
-            u16::try_from(self.code_length_count.saturating_sub(4))
-                .map_err(|source| zip_with_source("deflate HCLEN 변환 실패", source))?,
-            4,
-        )?;
-        for &symbol in CODE_LENGTH_ORDER.iter().take(self.code_length_count) {
-            let len = self
-                .code_lengths
-                .get(symbol)
-                .copied()
-                .ok_or_else(|| zip_static("deflate code length 쓰기 범위 오류"))?;
-            self.writer.write_bits(u16::from(len), 3)?;
-        }
-        Ok(())
-    }
-}
-impl DynamicFrequencyCounter<'_> {
-    fn count(&self) -> ZipResult<Option<DynamicFrequencies>> {
-        let mut literal_freq = [0_u32; LITERAL_LENGTH_SYMBOLS];
-        let mut distance_freq = [0_u32; DISTANCE_SYMBOLS];
-        let Some(end_freq) = literal_freq.get_mut(256) else {
-            return Err(zip_static("deflate end symbol 범위 오류"));
-        };
-        *end_freq = 1;
-        let mut has_distance = false;
-        for &token in self.tokens {
             match token {
-                DeflateToken::Literal(byte) => {
-                    let Some(freq) = literal_freq.get_mut(usize::from(byte)) else {
-                        return Err(zip_static("deflate literal frequency 범위 오류"));
-                    };
-                    *freq = freq.saturating_add(1);
-                }
+                DeflateToken::Literal(byte) => self.literal_huffman.write_symbol(writer, byte)?,
                 DeflateToken::Match { distance, length } => {
                     let Some(length_code) = DeflateWriter::length_symbol(length) else {
                         return Err(zip_static("deflate length 범위 오류"));
                     };
-                    let Some(length_freq) = literal_freq.get_mut(usize::from(length_code.symbol))
-                    else {
-                        return Err(zip_static("deflate length frequency 범위 오류"));
-                    };
-                    *length_freq = length_freq.saturating_add(1);
+                    self.literal_huffman
+                        .write_symbol(writer, length_code.symbol)?;
+                    if length_code.extra_bits > 0 {
+                        writer.write_bits(length_code.extra, length_code.extra_bits)?;
+                    }
                     let Some(distance_code) = DeflateWriter::distance_symbol(distance) else {
                         return Err(zip_static("deflate distance 범위 오류"));
                     };
-                    let Some(distance_freq_slot) =
-                        distance_freq.get_mut(usize::from(distance_code.symbol))
-                    else {
-                        return Err(zip_static("deflate distance frequency 범위 오류"));
-                    };
-                    *distance_freq_slot = distance_freq_slot.saturating_add(1);
-                    has_distance = true;
+                    self.distance_huffman
+                        .write_symbol(writer, distance_code.symbol)?;
+                    if distance_code.extra_bits > 0 {
+                        writer.write_bits(distance_code.extra, distance_code.extra_bits)?;
+                    }
                 }
             }
         }
-        Ok(has_distance.then_some(DynamicFrequencies {
-            distance: distance_freq,
-            literal: literal_freq,
-        }))
-    }
-}
-impl<O: BitOutput> DynamicTokenWriter<'_, '_, O> {
-    fn write(&mut self, token: DeflateToken) -> ZipResult<()> {
-        match token {
-            DeflateToken::Literal(byte) => self.literal_huffman.write_symbol(self.writer, byte),
-            DeflateToken::Match { distance, length } => {
-                let Some(length_code) = DeflateWriter::length_symbol(length) else {
-                    return Err(zip_static("deflate length 범위 오류"));
-                };
-                self.literal_huffman
-                    .write_symbol(self.writer, length_code.symbol)?;
-                if length_code.extra_bits > 0 {
-                    self.writer
-                        .write_bits(length_code.extra, length_code.extra_bits)?;
-                }
-                let Some(distance_code) = DeflateWriter::distance_symbol(distance) else {
-                    return Err(zip_static("deflate distance 범위 오류"));
-                };
-                self.distance_huffman
-                    .write_symbol(self.writer, distance_code.symbol)?;
-                if distance_code.extra_bits > 0 {
-                    self.writer
-                        .write_bits(distance_code.extra, distance_code.extra_bits)?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-impl FixedDeflateWriter<'_> {
-    fn deflated_len(&self) -> ZipResult<usize> {
-        let mut writer = BitWriter::counting();
-        self.write_into(&mut writer)?;
-        Ok(writer.finish()?.byte_len())
-    }
-    fn write_into<O>(&self, writer: &mut BitWriter<O>) -> ZipResult<()>
-    where
-        O: BitOutput,
-    {
-        writer.write_bits(1, 1)?;
-        writer.write_bits(1, 2)?;
-        let mut token_writer = FixedTokenWriter { writer };
-        for &token in self.tokens {
-            token_writer.write_token(token)?;
-        }
-        token_writer.write_symbol(256)
-    }
-    fn write_to(&self, writer: &mut dyn IoWrite) -> ZipResult<usize> {
-        let mut bit_writer = BitWriter::streaming(writer);
-        self.write_into(&mut bit_writer)?;
-        Ok(bit_writer.finish()?.byte_len())
-    }
-}
-impl<O: BitOutput> FixedTokenWriter<'_, O> {
-    fn write_distance(&mut self, distance: u16) -> ZipResult<()> {
-        let Some(distance_code) = DeflateWriter::distance_symbol(distance) else {
-            return Err(zip_static("deflate distance 범위 오류"));
-        };
-        self.writer
-            .write_bits(reverse_low_bits(distance_code.symbol, 5), 5)?;
-        if distance_code.extra_bits > 0 {
-            self.writer
-                .write_bits(distance_code.extra, distance_code.extra_bits)?;
-        }
-        Ok(())
-    }
-    fn write_length(&mut self, length: u16) -> ZipResult<()> {
-        let Some(length_code) = DeflateWriter::length_symbol(length) else {
-            return Err(zip_static("deflate length 범위 오류"));
-        };
-        self.write_symbol(length_code.symbol)?;
-        if length_code.extra_bits > 0 {
-            self.writer
-                .write_bits(length_code.extra, length_code.extra_bits)?;
-        }
-        Ok(())
-    }
-    fn write_symbol(&mut self, symbol: u16) -> ZipResult<()> {
-        let encoded = match symbol {
-            0..=143 => FixedHuffmanCode {
-                bit_count: 8,
-                code: 0x30_u16.saturating_add(symbol),
-            },
-            144..=255 => FixedHuffmanCode {
-                bit_count: 9,
-                code: 0x190_u16.saturating_add(symbol.saturating_sub(144)),
-            },
-            256..=279 => FixedHuffmanCode {
-                bit_count: 7,
-                code: symbol.saturating_sub(256),
-            },
-            280..=287 => FixedHuffmanCode {
-                bit_count: 8,
-                code: 0xc0_u16.saturating_add(symbol.saturating_sub(280)),
-            },
-            _ => return Err(zip_static("deflate fixed symbol 범위 오류")),
-        };
-        self.writer.write_bits(
-            reverse_low_bits(encoded.code, encoded.bit_count),
-            encoded.bit_count,
-        )
-    }
-    fn write_token(&mut self, token: DeflateToken) -> ZipResult<()> {
-        match token {
-            DeflateToken::Literal(byte) => self.write_symbol(byte),
-            DeflateToken::Match { distance, length } => {
-                self.write_length(length)?;
-                self.write_distance(distance)
-            }
-        }
+        self.literal_huffman.write_symbol(writer, 256)
     }
 }
 impl HuffmanLengthBuilder<'_> {
-    fn build(&self) -> ZipResult<Option<Vec<u8>>> {
+    fn build(&self) -> ZipResult<Vec<u8>> {
         let mut lengths = Vec::new();
         lengths
             .try_reserve_exact(self.frequencies.len())
             .map_err(|source| zip_with_source("deflate Huffman length 메모리 확보 실패", source))?;
         lengths.resize(self.frequencies.len(), 0_u8);
-        let Some(mut leaf_lengths) = self.leaf_lengths()? else {
-            return Ok(None);
-        };
-        if leaf_lengths.is_empty() {
-            return Ok(None);
-        }
+        let mut leaf_lengths = self.leaf_lengths()?;
         if leaf_lengths.len() == 1 {
-            let Some(symbol) = leaf_lengths.first().map(|leaf| leaf.symbol) else {
-                return Ok(None);
-            };
-            let Some(slot) = lengths.get_mut(symbol) else {
-                return Ok(None);
-            };
+            let leaf = leaf_lengths
+                .first()
+                .ok_or_else(|| zip_static("deflate Huffman 단일 symbol이 없습니다."))?;
+            let slot = lengths
+                .get_mut(leaf.symbol)
+                .ok_or_else(|| zip_static("deflate Huffman 단일 symbol 범위 오류"))?;
             *slot = 1;
-            return Ok(Some(lengths));
+            return Ok(lengths);
         }
-        let Some(longest_len) = leaf_lengths.iter().map(|leaf| leaf.len).max() else {
-            return Ok(None);
-        };
+        let longest_len = leaf_lengths
+            .iter()
+            .fold(0_usize, |longest, leaf| longest.max(leaf.len));
         let max_bit_count = usize::from(self.max_bits);
         if longest_len <= max_bit_count {
             for leaf in leaf_lengths {
-                let Some(slot) = lengths.get_mut(leaf.symbol) else {
-                    return Ok(None);
-                };
-                let Ok(bit_len) = u8::try_from(leaf.len) else {
-                    return Ok(None);
-                };
+                let slot = lengths
+                    .get_mut(leaf.symbol)
+                    .ok_or_else(|| zip_static("deflate Huffman symbol 범위 오류"))?;
+                let bit_len = u8::try_from(leaf.len).map_err(|source| {
+                    zip_with_source("deflate Huffman bit 길이 변환 실패", source)
+                })?;
                 *slot = bit_len;
             }
-            return Ok(Some(lengths));
+            return Ok(lengths);
         }
-        let Some(length_counts) = self.limited_length_counts(&leaf_lengths, longest_len)? else {
-            return Ok(None);
-        };
-        LimitedHuffmanLengthAssigner {
-            length_counts: &length_counts,
-            max_bit_count,
+        let length_counts = self.limited_length_counts(&leaf_lengths, longest_len)?;
+        leaf_lengths.sort_unstable_by(|left, right| {
+            left.freq
+                .cmp(&right.freq)
+                .then_with(|| right.symbol.cmp(&left.symbol))
+        });
+        let mut symbol_index = 0_usize;
+        for bit_len in (1..=max_bit_count).rev() {
+            let count = length_counts
+                .get(bit_len)
+                .copied()
+                .ok_or_else(|| zip_static("deflate limited Huffman count 범위 오류"))?;
+            let assigned_len = u8::try_from(bit_len).map_err(|source| {
+                zip_with_source("deflate limited Huffman bit 길이 변환 실패", source)
+            })?;
+            for _ in 0..count {
+                let leaf = leaf_lengths
+                    .get(symbol_index)
+                    .ok_or_else(|| zip_static("deflate limited Huffman leaf 범위 오류"))?;
+                let slot = lengths
+                    .get_mut(leaf.symbol)
+                    .ok_or_else(|| zip_static("deflate limited Huffman symbol 범위 오류"))?;
+                *slot = assigned_len;
+                symbol_index = symbol_index.saturating_add(1);
+            }
         }
-        .assign(&mut lengths, &mut leaf_lengths)
-        .ok_or_else(|| zip_static("deflate limited Huffman length 할당 실패"))?;
-        Ok(Some(lengths))
+        if symbol_index != leaf_lengths.len() {
+            return Err(zip_static("deflate limited Huffman length 할당 실패"));
+        }
+        Ok(lengths)
     }
-    fn leaf_lengths(&self) -> ZipResult<Option<Vec<HuffmanLeafLength>>> {
+    fn leaf_lengths(&self) -> ZipResult<Vec<HuffmanLeafLength>> {
         let mut nodes = Vec::new();
         let mut leaves = Vec::new();
         let mut active = Vec::new();
-        let Some(node_capacity) = self
+        let node_capacity = self
             .frequencies
             .len()
             .checked_mul(2)
             .map(|len| len.saturating_sub(1))
-        else {
-            return Ok(None);
-        };
+            .ok_or_else(|| zip_static("deflate Huffman node 용량 계산 실패"))?;
         nodes
             .try_reserve_exact(node_capacity)
             .map_err(|source| zip_with_source("deflate Huffman node 메모리 확보 실패", source))?;
@@ -1225,78 +1007,57 @@ impl HuffmanLengthBuilder<'_> {
                 continue;
             }
             let node_index = nodes.len();
-            nodes.push(HuffmanBuildNode {
-                freq: u64::from(freq),
-                parent: None,
+            nodes.push(None);
+            leaves.push(HuffmanLeafRef {
+                freq,
+                node_index,
+                symbol,
             });
-            leaves.push(HuffmanLeafRef { node_index, symbol });
-            active.push(node_index);
+            active.push((u64::from(freq), node_index));
+        }
+        if active.is_empty() {
+            return Err(zip_static("deflate Huffman frequency가 비어 있습니다."));
         }
         if active.len() == 1 {
-            let Some(symbol) = leaves.first().map(|leaf| leaf.symbol) else {
-                return Ok(None);
-            };
-            let Some(&freq) = self.frequencies.get(symbol) else {
-                return Ok(None);
-            };
+            let leaf = leaves
+                .first()
+                .ok_or_else(|| zip_static("deflate Huffman 단일 leaf가 없습니다."))?;
             let mut leaf_lengths = Vec::new();
             leaf_lengths.try_reserve_exact(1).map_err(|source| {
                 zip_with_source("deflate Huffman single leaf 메모리 확보 실패", source)
             })?;
             leaf_lengths.push(HuffmanLeafLength {
-                freq,
+                freq: leaf.freq,
                 len: 1,
-                symbol,
+                symbol: leaf.symbol,
             });
-            return Ok(Some(leaf_lengths));
+            return Ok(leaf_lengths);
         }
         while active.len() > 1 {
-            active.sort_unstable_by(|&left, &right| {
-                let Some(right_node) = nodes.get(right) else {
-                    return Ordering::Equal;
-                };
-                let Some(left_node) = nodes.get(left) else {
-                    return Ordering::Equal;
-                };
-                right_node
-                    .freq
-                    .cmp(&left_node.freq)
-                    .then_with(|| right.cmp(&left))
+            active.sort_unstable_by(|&(left_freq, left), &(right_freq, right)| {
+                right_freq.cmp(&left_freq).then_with(|| right.cmp(&left))
             });
-            let Some(left) = active.pop() else {
-                return Ok(None);
-            };
-            let Some(right) = active.pop() else {
-                return Ok(None);
-            };
+            let (left_freq, left) = active
+                .pop()
+                .ok_or_else(|| zip_static("deflate Huffman left node가 없습니다."))?;
+            let (right_freq, right) = active
+                .pop()
+                .ok_or_else(|| zip_static("deflate Huffman right node가 없습니다."))?;
             let parent = nodes.len();
-            let Some(left_source_node) = nodes.get(left) else {
-                return Ok(None);
-            };
-            let Some(right_source_node) = nodes.get(right) else {
-                return Ok(None);
-            };
-            let Some(freq) = left_source_node.freq.checked_add(right_source_node.freq) else {
-                return Ok(None);
-            };
-            nodes.push(HuffmanBuildNode { freq, parent: None });
-            let Some(left_child_node) = nodes.get_mut(left) else {
-                return Ok(None);
-            };
-            left_child_node.parent = Some(parent);
-            let Some(right_child_node) = nodes.get_mut(right) else {
-                return Ok(None);
-            };
-            right_child_node.parent = Some(parent);
-            active.push(parent);
+            let freq = left_freq
+                .checked_add(right_freq)
+                .ok_or_else(|| zip_static("deflate Huffman frequency 계산 실패"))?;
+            nodes.push(None);
+            let left_child_node = nodes
+                .get_mut(left)
+                .ok_or_else(|| zip_static("deflate Huffman left node 범위 오류"))?;
+            *left_child_node = Some(parent);
+            let right_child_node = nodes
+                .get_mut(right)
+                .ok_or_else(|| zip_static("deflate Huffman right node 범위 오류"))?;
+            *right_child_node = Some(parent);
+            active.push((freq, parent));
         }
-        self.leaf_lengths_from_nodes(&leaves, &nodes)
-    }
-    fn leaf_lengths_from_nodes(
-        &self,
-        leaves: &[HuffmanLeafRef],
-        nodes: &[HuffmanBuildNode],
-    ) -> ZipResult<Option<Vec<HuffmanLeafLength>>> {
         let mut leaf_lengths = Vec::new();
         leaf_lengths
             .try_reserve_exact(leaves.len())
@@ -1306,36 +1067,34 @@ impl HuffmanLengthBuilder<'_> {
         for leaf in leaves {
             let mut bit_len = 0_usize;
             let mut cursor = leaf.node_index;
-            let Some(mut node) = nodes.get(cursor) else {
-                return Ok(None);
-            };
-            while let Some(parent) = node.parent {
+            let mut parent = nodes
+                .get(cursor)
+                .copied()
+                .ok_or_else(|| zip_static("deflate Huffman leaf node 범위 오류"))?;
+            while let Some(parent_index) = parent {
                 bit_len = bit_len.saturating_add(1);
-                cursor = parent;
-                let Some(next_node) = nodes.get(cursor) else {
-                    return Ok(None);
-                };
-                node = next_node;
+                cursor = parent_index;
+                parent = nodes
+                    .get(cursor)
+                    .copied()
+                    .ok_or_else(|| zip_static("deflate Huffman parent node 범위 오류"))?;
             }
             if bit_len == 0 {
-                return Ok(None);
+                return Err(zip_static("deflate Huffman leaf 길이가 0입니다."));
             }
-            let Some(&freq) = self.frequencies.get(leaf.symbol) else {
-                return Ok(None);
-            };
             leaf_lengths.push(HuffmanLeafLength {
-                freq,
+                freq: leaf.freq,
                 len: bit_len,
                 symbol: leaf.symbol,
             });
         }
-        Ok(Some(leaf_lengths))
+        Ok(leaf_lengths)
     }
     fn limited_length_counts(
         &self,
         leaf_lengths: &[HuffmanLeafLength],
         longest_len: usize,
-    ) -> ZipResult<Option<Vec<usize>>> {
+    ) -> ZipResult<Vec<usize>> {
         let max_bit_count = usize::from(self.max_bits);
         let mut length_counts = Vec::new();
         length_counts
@@ -1343,70 +1102,57 @@ impl HuffmanLengthBuilder<'_> {
             .map_err(|source| zip_with_source("deflate length count 메모리 확보 실패", source))?;
         length_counts.resize(longest_len.saturating_add(1), 0_usize);
         for leaf in leaf_lengths {
-            let Some(count) = length_counts.get_mut(leaf.len) else {
-                return Ok(None);
-            };
+            let count = length_counts
+                .get_mut(leaf.len)
+                .ok_or_else(|| zip_static("deflate Huffman length count 범위 오류"))?;
             *count = count.saturating_add(1);
         }
         let mut current_bits = longest_len;
         while current_bits > max_bit_count {
             while {
-                let Some(count) = length_counts.get(current_bits) else {
-                    return Ok(None);
-                };
+                let count = length_counts
+                    .get(current_bits)
+                    .ok_or_else(|| zip_static("deflate Huffman current length 범위 오류"))?;
                 *count > 0
             } {
-                LimitedLengthCountReducer {
-                    length_counts: &mut length_counts,
-                }
-                .reduce(current_bits)
-                .ok_or_else(|| zip_static("deflate length count 축소 실패"))?;
+                let shorter_bits = (1..current_bits.saturating_sub(1))
+                    .rev()
+                    .find(|&bits| length_counts.get(bits).is_some_and(|&count| count != 0))
+                    .ok_or_else(|| zip_static("deflate shorter Huffman length가 없습니다."))?;
+                let current_count = length_counts
+                    .get_mut(current_bits)
+                    .ok_or_else(|| zip_static("deflate current Huffman length 범위 오류"))?;
+                *current_count = current_count
+                    .checked_sub(2)
+                    .ok_or_else(|| zip_static("deflate current Huffman count 축소 실패"))?;
+                let previous_bits = current_bits
+                    .checked_sub(1)
+                    .ok_or_else(|| zip_static("deflate previous Huffman length 계산 실패"))?;
+                let previous_count = length_counts
+                    .get_mut(previous_bits)
+                    .ok_or_else(|| zip_static("deflate previous Huffman length 범위 오류"))?;
+                *previous_count = previous_count
+                    .checked_add(1)
+                    .ok_or_else(|| zip_static("deflate previous Huffman count 증가 실패"))?;
+                let split_bits = shorter_bits.saturating_add(1);
+                let split_count = length_counts
+                    .get_mut(split_bits)
+                    .ok_or_else(|| zip_static("deflate split Huffman length 범위 오류"))?;
+                *split_count = split_count
+                    .checked_add(2)
+                    .ok_or_else(|| zip_static("deflate split Huffman count 증가 실패"))?;
+                let shorter_count = length_counts
+                    .get_mut(shorter_bits)
+                    .ok_or_else(|| zip_static("deflate shorter Huffman length 범위 오류"))?;
+                *shorter_count = shorter_count
+                    .checked_sub(1)
+                    .ok_or_else(|| zip_static("deflate shorter Huffman count 축소 실패"))?;
             }
-            let Some(next_bits) = current_bits.checked_sub(1) else {
-                return Ok(None);
-            };
-            current_bits = next_bits;
+            current_bits = current_bits
+                .checked_sub(1)
+                .ok_or_else(|| zip_static("deflate Huffman current length 계산 실패"))?;
         }
-        Ok(Some(length_counts))
-    }
-}
-impl LimitedHuffmanLengthAssigner<'_> {
-    fn assign(&self, lengths: &mut [u8], leaf_lengths: &mut [HuffmanLeafLength]) -> Option<()> {
-        leaf_lengths.sort_unstable_by(|left, right| {
-            left.freq
-                .cmp(&right.freq)
-                .then_with(|| right.symbol.cmp(&left.symbol))
-        });
-        let mut symbol_index = 0_usize;
-        for bit_len in (1..=self.max_bit_count).rev() {
-            let count = self.length_counts.get(bit_len).copied()?;
-            for _ in 0..count {
-                let leaf = leaf_lengths.get(symbol_index)?;
-                *lengths.get_mut(leaf.symbol)? = u8::try_from(bit_len).ok()?;
-                symbol_index = symbol_index.saturating_add(1);
-            }
-        }
-        (symbol_index == leaf_lengths.len()).then_some(())
-    }
-}
-impl LimitedLengthCountReducer<'_> {
-    fn reduce(&mut self, current_bits: usize) -> Option<()> {
-        let mut shorter_bits = current_bits.checked_sub(2)?;
-        while shorter_bits > 0 && self.length_counts.get(shorter_bits).copied()? == 0 {
-            shorter_bits = shorter_bits.checked_sub(1)?;
-        }
-        if shorter_bits == 0 {
-            return None;
-        }
-        let count = self.length_counts.get_mut(current_bits)?;
-        *count = count.checked_sub(2)?;
-        let previous_count = self.length_counts.get_mut(current_bits.checked_sub(1)?)?;
-        *previous_count = previous_count.checked_add(1)?;
-        let split_count = self.length_counts.get_mut(shorter_bits.saturating_add(1))?;
-        *split_count = split_count.checked_add(2)?;
-        let shorter_count = self.length_counts.get_mut(shorter_bits)?;
-        *shorter_count = shorter_count.checked_sub(1)?;
-        Some(())
+        Ok(length_counts)
     }
 }
 impl DeflatePlan {
@@ -1417,12 +1163,11 @@ impl DeflatePlan {
         if let Some(plan) = self.dynamic_plan.as_ref() {
             let mut bit_writer = BitWriter::streaming(writer);
             plan.write(&self.tokens, &mut bit_writer)?;
-            return Ok(bit_writer.finish()?.byte_len());
+            return bit_writer.finish_stream();
         }
-        FixedDeflateWriter {
-            tokens: &self.tokens,
-        }
-        .write_to(writer)
+        let mut bit_writer = BitWriter::streaming(writer);
+        write_fixed(&self.tokens, &mut bit_writer)?;
+        bit_writer.finish_stream()
     }
 }
 impl Default for DeflateWorkBudget {
@@ -1628,15 +1373,61 @@ impl DeflateWriter<'_, '_> {
         else {
             return Ok(None);
         };
-        let fixed_writer = FixedDeflateWriter { tokens: &tokens };
-        let fixed_len = fixed_writer.deflated_len()?;
-        let dynamic_writer = DynamicDeflateWriter { tokens: &tokens };
-        if let Some(dynamic_plan) = dynamic_writer.plan()? {
-            let dynamic_len = dynamic_plan.deflated_len(&tokens)?;
+        let mut fixed_counter = BitCounter::counting();
+        write_fixed(&tokens, &mut fixed_counter)?;
+        let fixed_len = fixed_counter.byte_len();
+        let mut frequencies = DynamicFrequencies {
+            distance: [0_u32; DISTANCE_SYMBOLS],
+            literal: [0_u32; LITERAL_LENGTH_SYMBOLS],
+        };
+        let Some(end_freq) = frequencies.literal.get_mut(256) else {
+            return Err(zip_static("deflate end symbol 범위 오류"));
+        };
+        *end_freq = 1;
+        let mut has_distance = false;
+        for &token in &tokens {
+            match token {
+                DeflateToken::Literal(byte) => {
+                    let Some(freq) = frequencies.literal.get_mut(usize::from(byte)) else {
+                        return Err(zip_static("deflate literal frequency 범위 오류"));
+                    };
+                    *freq = freq.saturating_add(1);
+                }
+                DeflateToken::Match { distance, length } => {
+                    let Some(length_code) = Self::length_symbol(length) else {
+                        return Err(zip_static("deflate length 범위 오류"));
+                    };
+                    let Some(length_freq) =
+                        frequencies.literal.get_mut(usize::from(length_code.symbol))
+                    else {
+                        return Err(zip_static("deflate length frequency 범위 오류"));
+                    };
+                    *length_freq = length_freq.saturating_add(1);
+                    let Some(distance_code) = Self::distance_symbol(distance) else {
+                        return Err(zip_static("deflate distance 범위 오류"));
+                    };
+                    let Some(distance_freq_slot) = frequencies
+                        .distance
+                        .get_mut(usize::from(distance_code.symbol))
+                    else {
+                        return Err(zip_static("deflate distance frequency 범위 오류"));
+                    };
+                    *distance_freq_slot = distance_freq_slot.saturating_add(1);
+                    has_distance = true;
+                }
+            }
+        }
+        let dynamic_plan = if has_distance {
+            Some(frequencies.plan()?)
+        } else {
+            None
+        };
+        if let Some(chosen_dynamic_plan) = dynamic_plan {
+            let dynamic_len = chosen_dynamic_plan.deflated_len(&tokens)?;
             if dynamic_len < fixed_len {
                 return Ok(Some(DeflatePlan {
                     compressed_len: dynamic_len,
-                    dynamic_plan: Some(dynamic_plan),
+                    dynamic_plan: Some(chosen_dynamic_plan),
                     tokens,
                 }));
             }
@@ -1787,4 +1578,46 @@ fn reverse_low_bits(value: u16, count: u8) -> u16 {
     value
         .reverse_bits()
         .unbounded_shr(u16::BITS.saturating_sub(u32::from(count)))
+}
+fn write_fixed<W>(tokens: &[DeflateToken], writer: &mut W) -> ZipResult<()>
+where
+    W: BitSink,
+{
+    writer.write_bits(1, 1)?;
+    writer.write_bits(1, 2)?;
+    for &token in tokens {
+        match token {
+            DeflateToken::Literal(byte) => write_fixed_symbol(writer, byte)?,
+            DeflateToken::Match { distance, length } => {
+                let Some(length_code) = DeflateWriter::length_symbol(length) else {
+                    return Err(zip_static("deflate length 범위 오류"));
+                };
+                write_fixed_symbol(writer, length_code.symbol)?;
+                if length_code.extra_bits > 0 {
+                    writer.write_bits(length_code.extra, length_code.extra_bits)?;
+                }
+                let Some(distance_code) = DeflateWriter::distance_symbol(distance) else {
+                    return Err(zip_static("deflate distance 범위 오류"));
+                };
+                writer.write_bits(reverse_low_bits(distance_code.symbol, 5), 5)?;
+                if distance_code.extra_bits > 0 {
+                    writer.write_bits(distance_code.extra, distance_code.extra_bits)?;
+                }
+            }
+        }
+    }
+    write_fixed_symbol(writer, 256)
+}
+fn write_fixed_symbol<W>(writer: &mut W, symbol: u16) -> ZipResult<()>
+where
+    W: BitSink,
+{
+    let (code, bit_count) = match symbol {
+        0..=143 => (0x30_u16.saturating_add(symbol), 8),
+        144..=255 => (0x190_u16.saturating_add(symbol.saturating_sub(144)), 9),
+        256..=279 => (symbol.saturating_sub(256), 7),
+        280..=287 => (0xc0_u16.saturating_add(symbol.saturating_sub(280)), 8),
+        _ => return Err(zip_static("deflate fixed symbol 범위 오류")),
+    };
+    writer.write_bits(reverse_low_bits(code, bit_count), bit_count)
 }

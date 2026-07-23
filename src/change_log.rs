@@ -1,6 +1,9 @@
 use crate::{
     diagnostic::{Result, err, err_with_source},
-    excel::{FuelValues, SourceRecord, writer::Worksheet},
+    excel::{
+        FuelValues, SourceRecord,
+        writer::{SharedStringTable, Worksheet},
+    },
     master_sheet::{ChangeRow, StoreRow},
     sheet_util::add_row_offset,
 };
@@ -31,7 +34,7 @@ pub(super) struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
     pub added: &'data [&'source SourceRecord],
     pub changes: &'data [ChangeRow<'source>],
     pub deleted: &'data [StoreRow],
-    pub shared_string_table: &'shared [String],
+    pub shared_string_table: &'shared mut SharedStringTable,
     pub today: &'data str,
     pub worksheet: &'sheet mut Worksheet,
 }
@@ -47,6 +50,7 @@ impl ChangeLogRowValues<'_> {
     fn write_to(
         &self,
         worksheet: &mut Worksheet,
+        shared_strings: &mut SharedStringTable,
         row: u32,
         formula_buffer: &mut String,
     ) -> Result<()> {
@@ -56,7 +60,7 @@ impl ChangeLogRowValues<'_> {
             (CHANGELOG_COL_ADDRESS, self.address),
             (CHANGELOG_COL_REASON, self.reason),
         ] {
-            worksheet.set_string_at(col, row, value)?;
+            shared_strings.set_cell(worksheet, col, row, value)?;
         }
         for (col, value) in [
             (CHANGELOG_COL_OLD_GAS, self.old_fuels.gasoline),
@@ -102,7 +106,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         {
             if self
                 .worksheet
-                .row_has_any_data(row, &cols, self.shared_string_table)?
+                .row_has_any_data(row, &cols, self.shared_string_table.values())?
             {
                 last_row = Some(row);
                 break;
@@ -161,7 +165,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             return Err(err("변경내역 243행에 고정 style template이 없습니다."));
         }
         let date_text = format!("현행화 일자: {}", self.today);
-        self.worksheet.set_string_at(1, 2, &date_text)?;
+        self.shared_string_table
+            .set_cell(self.worksheet, 1, 2, &date_text)?;
         let old_data_rows = self.clear_existing_rows()?;
         self.write_entries(CHANGELOG_STYLE_TEMPLATE_ROW, old_data_rows)?;
         self.worksheet.update_dimension()?;
@@ -175,9 +180,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         let entry_count = self
             .changes
             .len()
-            .checked_add(self.added.len())
-            .and_then(|count| count.checked_add(self.deleted.len()))
-            .ok_or_else(|| err("변경내역 entry 수 계산 중 overflow가 발생했습니다."))?;
+            .saturating_add(self.added.len())
+            .saturating_add(self.deleted.len());
         if entry_count == 0 {
             let last_change_row =
                 self.extend_entry_conditional_formats(old_data_rows, entry_count)?;
@@ -211,9 +215,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         });
         let mut formula_buffer = String::new();
         let formula_capacity = ROW_DECIMAL_TEXT_MAX_LEN
-            .checked_mul(4)
-            .and_then(|row_digits| row_digits.checked_add("IF(OR(E=\"\",F=\"\"),\"\",F-E)".len()))
-            .ok_or_else(|| err("변경내역 delta formula 용량 계산 실패"))?;
+            .saturating_mul(4)
+            .saturating_add("IF(OR(E=\"\",F=\"\"),\"\",F-E)".len());
         formula_buffer
             .try_reserve_exact(formula_capacity)
             .map_err(|source| err_with_source("변경내역 delta formula 메모리 확보 실패", source))?;
@@ -227,7 +230,12 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             if row > style_template_row {
                 worksheet.copy_row_style(style_template_row, row, CHANGELOG_COL_DELTA_DIESEL)?;
             }
-            values.write_to(worksheet, row, &mut formula_buffer)?;
+            values.write_to(
+                worksheet,
+                self.shared_string_table,
+                row,
+                &mut formula_buffer,
+            )?;
         }
         let last_change_row = self.extend_entry_conditional_formats(old_data_rows, entry_count)?;
         self.worksheet

@@ -49,46 +49,26 @@ pub(super) fn path_to_slashes<D>(path: &Path, context: D) -> Result<String>
 where
     D: Display,
 {
-    let mut capacity = 0_usize;
-    let mut component_count = 0_usize;
-    for component in path.components() {
-        let text = normal_component_text(component, &context)?;
-        let separator_len = usize::from(component_count != 0);
-        capacity = capacity
-            .checked_add(separator_len)
-            .and_then(|len| len.checked_add(text.len()))
-            .ok_or_else(|| err("상대 경로 길이 계산 중 overflow가 발생했습니다."))?;
-        component_count = component_count
-            .checked_add(1)
-            .ok_or_else(|| err("상대 경로 component 개수 계산 중 overflow가 발생했습니다."))?;
-    }
     let mut out = String::new();
-    out.try_reserve_exact(capacity)
+    out.try_reserve_exact(path.as_os_str().len())
         .map_err(|source| err_with_source("상대 경로 메모리 확보 실패", source))?;
     for component in path.components() {
-        let text = normal_component_text(component, &context)?;
+        let Component::Normal(part) = component else {
+            return Err(err(prefixed_message(
+                "상대 경로에 허용되지 않은 component가 있습니다: ",
+                &context,
+            )));
+        };
+        let Some(text) = part.to_str() else {
+            return Err(err(prefixed_message(
+                "상대 경로 component가 UTF-8이 아닙니다: ",
+                &context,
+            )));
+        };
         if !out.is_empty() {
             out.push('/');
         }
         out.push_str(text);
     }
     Ok(out)
-}
-fn normal_component_text<'path, D>(component: Component<'path>, context: &D) -> Result<&'path str>
-where
-    D: Display,
-{
-    let Component::Normal(part) = component else {
-        return Err(err(prefixed_message(
-            "상대 경로에 허용되지 않은 component가 있습니다: ",
-            context,
-        )));
-    };
-    let Some(text) = part.to_str() else {
-        return Err(err(prefixed_message(
-            "상대 경로 component가 UTF-8이 아닙니다: ",
-            context,
-        )));
-    };
-    Ok(text)
 }

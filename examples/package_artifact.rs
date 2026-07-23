@@ -1,115 +1,115 @@
 use std::env;
-use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write as _};
 use std::path::PathBuf;
 const TAR_BLOCK_LEN: usize = 512;
 const TAR_BLOCK_LEN_U64: u64 = 512;
-const TAR_NAME_LEN: usize = 100;
 const ZERO_BLOCK: [u8; TAR_BLOCK_LEN] = [0; TAR_BLOCK_LEN];
-const ZERO_NAME: [u8; TAR_NAME_LEN] = [0; TAR_NAME_LEN];
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-fn required_arg(args: &mut impl Iterator<Item = OsString>) -> io::Result<OsString> {
-    args.next()
-        .ok_or_else(|| invalid_input("source, destination, entry name arguments are required"))
-}
-fn octal_field<const WIDTH: usize>(value: u64) -> io::Result<[u8; WIDTH]> {
-    let digit_count = const {
-        assert!(WIDTH > 0, "tar octal field width must be positive");
-        WIDTH - 1
+fn write_octal(field: &mut [u8], mut value: u64) -> io::Result<()> {
+    field.fill(b'0');
+    let Some((terminator, digits)) = field.split_last_mut() else {
+        return Err(invalid_input("tar octal field must not be empty"));
     };
-    let text = format!("{value:0digit_count$o}\0");
-    if text.len() != WIDTH {
-        return Err(invalid_input("tar octal value exceeds its header field"));
+    *terminator = 0;
+    for digit in digits.iter_mut().rev() {
+        *digit |= value.to_le_bytes()[0] & 7;
+        value >>= 3_u32;
     }
-    let mut field = [0_u8; WIDTH];
-    field.copy_from_slice(text.as_bytes());
-    Ok(field)
+    if value == 0 {
+        Ok(())
+    } else {
+        Err(invalid_input("tar octal value exceeds its header field"))
+    }
 }
 fn main() -> io::Result<()> {
     let mut args = env::args_os().skip(1);
-    let source = PathBuf::from(required_arg(&mut args)?);
-    let destination = PathBuf::from(required_arg(&mut args)?);
-    let Ok(entry_name) = required_arg(&mut args)?.into_string() else {
+    let Some(raw_entry_name) = args.next() else {
+        return Err(invalid_input("artifact entry name is required"));
+    };
+    let Ok(entry_name) = raw_entry_name.into_string() else {
         return Err(invalid_input("artifact entry name must be valid UTF-8"));
     };
     if args.next().is_some() {
         return Err(invalid_input("unexpected package artifact argument"));
     }
-    if let Some(parent) = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
+    if entry_name.is_empty()
+        || entry_name.len() > 100
+        || entry_name.contains('/')
+        || entry_name.contains('\\')
     {
-        fs::create_dir_all(parent)?;
+        return Err(invalid_input(
+            "artifact entry name must be a 1-100 byte file name",
+        ));
     }
+    let source = PathBuf::from("target").join("release").join(format!(
+        "{}{}",
+        env!("CARGO_PKG_NAME"),
+        env::consts::EXE_SUFFIX
+    ));
+    let artifact_dir = PathBuf::from("artifacts");
+    fs::create_dir_all(&artifact_dir)?;
+    let destination = artifact_dir.join(format!(
+        "{entry_name}.{}",
+        if cfg!(windows) { "exe" } else { "tar" }
+    ));
     let source_len = source.metadata()?.len();
-    if destination.extension() == Some(OsStr::new("tar")) {
-        if entry_name.is_empty()
-            || entry_name.len() > TAR_NAME_LEN
-            || entry_name.contains('/')
-            || entry_name.contains('\\')
-        {
-            return Err(invalid_input(
-                "tar entry name must be a 1-100 byte file name",
-            ));
-        }
-        let mut header = ZERO_BLOCK;
-        {
-            let mut header_writer = header.as_mut_slice();
-            header_writer.write_all(entry_name.as_bytes())?;
-            let name_padding = TAR_NAME_LEN.abs_diff(entry_name.len());
-            let (name_padding_bytes, _) = ZERO_NAME.split_at(name_padding);
-            header_writer.write_all(name_padding_bytes)?;
-            header_writer.write_all(&octal_field::<8>(0o755)?)?;
-            let zero_octal = octal_field::<8>(0)?;
-            header_writer.write_all(&zero_octal)?;
-            header_writer.write_all(&zero_octal)?;
-            header_writer.write_all(&octal_field::<12>(source_len)?)?;
-            header_writer.write_all(&octal_field::<12>(0)?)?;
-            header_writer.write_all(b"        0")?;
-            header_writer.write_all(&ZERO_NAME)?;
-            header_writer.write_all(b"ustar\x0000")?;
-            header_writer.write_all(&[0_u8; 64])?;
-            header_writer.write_all(&zero_octal)?;
-            header_writer.write_all(&zero_octal)?;
-            header_writer.write_all(&[0_u8; 167])?;
-        }
-        let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
-        let (_, checksum_and_tail) = header.split_at_mut(148);
-        let (checksum_field, _) = checksum_and_tail.split_at_mut(8);
-        checksum_field.copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
-        let mut input = File::open(&source)?;
-        let mut output = BufWriter::new(File::create(destination)?);
-        output.write_all(&header)?;
-        let copied = io::copy(&mut input, &mut output)?;
-        if copied != source_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "source binary changed while packaging",
-            ));
-        }
-        let remainder = source_len.rem_euclid(TAR_BLOCK_LEN_U64);
-        if remainder != 0 {
-            let padding = usize::try_from(TAR_BLOCK_LEN_U64.abs_diff(remainder)).map_err(
-                |conversion_error| io::Error::new(io::ErrorKind::InvalidInput, conversion_error),
-            )?;
-            let (padding_bytes, _) = ZERO_BLOCK.split_at(padding);
-            output.write_all(padding_bytes)?;
-        }
-        output.write_all(&ZERO_BLOCK)?;
-        output.write_all(&ZERO_BLOCK)?;
-        output.flush()
-    } else {
+    if cfg!(windows) {
         let copied = fs::copy(source, destination)?;
-        if copied == source_len {
+        return if copied == source_len {
             Ok(())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "source binary changed while copying",
             ))
-        }
+        };
     }
+    let mut header = ZERO_BLOCK;
+    let Some(name_field) = header
+        .get_mut(..100)
+        .and_then(|field| field.get_mut(..entry_name.len()))
+    else {
+        return Err(invalid_input(
+            "tar entry name must be a 1-100 byte file name",
+        ));
+    };
+    name_field.copy_from_slice(entry_name.as_bytes());
+    write_octal(&mut header[100..108], 0o755)?;
+    write_octal(&mut header[108..116], 0)?;
+    write_octal(&mut header[116..124], 0)?;
+    write_octal(&mut header[124..136], source_len)?;
+    write_octal(&mut header[136..148], 0)?;
+    header[148..156].fill(b' ');
+    header[156] = b'0';
+    header[257..265].copy_from_slice(b"ustar\x0000");
+    write_octal(&mut header[329..337], 0)?;
+    write_octal(&mut header[337..345], 0)?;
+    let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+    write_octal(&mut header[148..155], checksum)?;
+    header[155] = b' ';
+    let mut input = File::open(&source)?;
+    let mut output = BufWriter::new(File::create(destination)?);
+    output.write_all(&header)?;
+    let copied = io::copy(&mut input, &mut output)?;
+    if copied != source_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "source binary changed while packaging",
+        ));
+    }
+    let remainder = source_len.rem_euclid(TAR_BLOCK_LEN_U64);
+    if remainder != 0 {
+        let remainder_usize = usize::try_from(remainder).map_err(|conversion_error| {
+            io::Error::new(io::ErrorKind::InvalidInput, conversion_error)
+        })?;
+        let padding = TAR_BLOCK_LEN.abs_diff(remainder_usize);
+        let (padding_bytes, _) = ZERO_BLOCK.split_at(padding);
+        output.write_all(padding_bytes)?;
+    }
+    output.write_all(&ZERO_BLOCK)?;
+    output.write_all(&ZERO_BLOCK)?;
+    output.flush()
 }

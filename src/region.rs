@@ -16,11 +16,6 @@ const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
     ("대전광역시", "대전"),
     ("세종특별자치시", "세종"),
 ];
-#[derive(Clone, Copy)]
-pub(super) enum TargetRegionPolicy {
-    Flexible,
-    StrictSource,
-}
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum TargetRegion {
     Asan,
@@ -30,6 +25,11 @@ pub(super) enum TargetRegion {
     Daejeon,
     Gongju,
     Sejong,
+}
+#[derive(Clone, Copy)]
+pub(super) enum TargetRegionPolicy {
+    Flexible,
+    StrictSource,
 }
 impl TargetRegion {
     pub(super) const fn label(self) -> &'static str {
@@ -47,12 +47,7 @@ impl TargetRegion {
 const fn ignored_address_key_char(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
 }
-pub(super) fn normalize_address_key(addr: &str) -> Result<String> {
-    let mut out = String::new();
-    normalize_address_key_into(addr, &mut out)?;
-    Ok(out)
-}
-fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
+pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     let mut rest = addr.trim();
     let capacity = rest.len();
     out.clear();
@@ -187,11 +182,10 @@ fn daejeon_region(district: &str) -> Option<TargetRegion> {
         .contains(&district)
         .then_some(TargetRegion::Daejeon)
 }
-pub(super) fn increment_target_region_count(
+pub(super) const fn increment_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],
     region: TargetRegion,
-    context: &'static str,
-) -> Result<()> {
+) {
     let &mut [
         ref mut daejeon,
         ref mut sejong,
@@ -210,10 +204,7 @@ pub(super) fn increment_target_region_count(
         TargetRegion::Asan => asan,
         TargetRegion::Cheonan => cheonan,
     };
-    *region_count = region_count
-        .checked_add(1)
-        .ok_or_else(|| err(format!("{context} 계산 중 overflow가 발생했습니다.")))?;
-    Ok(())
+    *region_count = region_count.saturating_add(1);
 }
 fn target_region_from_normalized(text: &str) -> Option<TargetRegion> {
     if text.strip_prefix("대전").is_some_and(|tail| {

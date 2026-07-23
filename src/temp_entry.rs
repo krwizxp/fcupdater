@@ -62,9 +62,7 @@ pub(crate) fn cleanup_stale_temp_entries(
         };
         match remove_result {
             Ok(()) => {
-                removed = removed.checked_add(1).ok_or_else(|| {
-                    io::Error::other("정리한 임시 항목 수 계산 중 overflow가 발생했습니다.")
-                })?;
+                removed = removed.saturating_add(1);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {

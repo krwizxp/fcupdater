@@ -2,16 +2,18 @@ use self::format::{format_scaled_value, format_unit_price_text, missing_sort_tar
 use crate::{
     diagnostic::{Result, err, err_with_source},
     excel,
-    excel::writer::{Row as StdRow, Workbook as StdWorkbook, remap_formula_rows},
+    excel::writer::{
+        Row as StdRow, SharedStringTable, Workbook as StdWorkbook, remap_formula_rows,
+    },
     excel::{FuelValues, SourceRecord},
     region::{
         TARGET_REGION_COUNT, TARGET_REGIONS, TargetRegion, TargetRegionPolicy,
-        increment_target_region_count, normalize_address_key, target_region,
+        increment_target_region_count, normalize_address_key_into, target_region,
     },
     sheet_util::{add_row_offset, usize_to_u32},
 };
 use alloc::{borrow::Cow, collections::BTreeMap};
-use core::{fmt::Write as _, range::RangeInclusive};
+use core::{fmt::Write as _, mem, range::RangeInclusive};
 use std::collections::{HashMap, HashSet};
 mod format;
 const MASTER_HEADER_ROW: u32 = 14;
@@ -121,13 +123,6 @@ enum MasterRowDecision<'source> {
         src: &'source SourceRecord,
     },
     Unaddressed,
-}
-struct MasterRowsRebuilder<'sheet, 'strings, 'deleted, 'kept, 'sources, 'source> {
-    deleted: &'deleted [StoreRow],
-    kept_source_rows: &'kept [(u32, Option<&'source SourceRecord>)],
-    new_sources: &'sources [&'source SourceRecord],
-    shared_strings: &'strings [String],
-    ws: &'sheet mut excel::writer::Worksheet,
 }
 struct SortableRankRow {
     key: RankSortKey,
@@ -320,206 +315,7 @@ impl RankRowBase {
             .checked_mul(DECIMAL_SCALE_SQUARED)
     }
 }
-impl MasterRowsRebuilder<'_, '_, '_, '_, '_, '_> {
-    fn finish_rebuild(&mut self, old_data_rows: RowRange, filter_end_row: u32) -> Result<u32> {
-        self.ws.update_auto_filter_ref(filter_end_row)?;
-        self.ws
-            .prune_empty_style_artifacts_after_col(COL_SORT_KEY)?;
-        self.ws.update_dimension()?;
-        let target_cols = [COL_RANK];
-        self.ws.extend_conditional_formats(
-            old_data_rows,
-            RowRange {
-                start: MASTER_DATA_START_ROW,
-                last: filter_end_row,
-            },
-            &target_cols,
-        )?;
-        Ok(filter_end_row)
-    }
-    fn rebuild(&mut self, existing_count: usize) -> Result<u32> {
-        let last_old_row = self
-            .kept_source_rows
-            .last()
-            .map(|&(row, _)| row)
-            .max(self.deleted.last().map(|row| row.old_row));
-        let old_end_row = last_old_row.unwrap_or(MASTER_HEADER_ROW);
-        let old_data_rows = RowRange {
-            start: MASTER_DATA_START_ROW,
-            last: old_end_row,
-        };
-        let original_rows = self.ws.take_rows();
-        let final_count = self
-            .kept_source_rows
-            .len()
-            .checked_add(self.new_sources.len())
-            .ok_or_else(|| err("최종 마스터 행 수 계산 중 overflow가 발생했습니다."))?;
-        let old_count_u32 = usize_to_u32(existing_count, "기존 유류비 행 수")?;
-        let final_count_u32 = usize_to_u32(final_count, "최종 유류비 행 수")?;
-        let increase = final_count_u32.saturating_sub(old_count_u32);
-        let decrease = old_count_u32.saturating_sub(final_count_u32);
-        let row_mapper = RowMapper {
-            decrease,
-            deleted: self.deleted,
-            increase,
-            old_data_rows,
-        };
-        let template_row_num = last_old_row.unwrap_or(MASTER_DATA_START_ROW);
-        let new_rows_map =
-            self.rebuild_rows(original_rows, &row_mapper, old_data_rows, template_row_num)?;
-        self.ws.replace_rows(new_rows_map);
-        for (i, &(_, source)) in self.kept_source_rows.iter().enumerate() {
-            let new_row = add_row_offset(MASTER_DATA_START_ROW, i, "유류비 기존행 재배치")?;
-            if let Some(src) = source {
-                MasterSheetUpdater::write_master_row_from_source(self.ws, new_row, src)?;
-            }
-        }
-        for (i, &source) in self.new_sources.iter().enumerate() {
-            let offset = self
-                .kept_source_rows
-                .len()
-                .checked_add(i)
-                .ok_or_else(|| err("유류비 신규행 오프셋 계산 중 overflow가 발생했습니다."))?;
-            let new_row = add_row_offset(MASTER_DATA_START_ROW, offset, "유류비 신규행 추가")?;
-            MasterSheetUpdater::write_master_row_from_source(self.ws, new_row, source)?;
-            self.ws.set_i32_at(COL_SMART_DISCOUNT, new_row, None)?;
-        }
-        let filter_end_row = MASTER_DATA_START_ROW
-            .checked_add(final_count_u32.saturating_sub(1))
-            .ok_or_else(|| err("유류비 마지막 행 계산 중 overflow가 발생했습니다."))?;
-        if final_count > 0 {
-            RankSortRefresher {
-                data_rows: RowRange {
-                    start: MASTER_DATA_START_ROW,
-                    last: filter_end_row,
-                },
-                shared_strings: self.shared_strings,
-                ws: self.ws,
-            }
-            .refresh()?;
-        }
-        self.finish_rebuild(old_data_rows, filter_end_row)
-    }
-    fn rebuild_rows(
-        &self,
-        mut original_rows: BTreeMap<u32, StdRow>,
-        row_mapper: &RowMapper<'_>,
-        old_data_rows: RowRange,
-        template_row_num: u32,
-    ) -> Result<BTreeMap<u32, StdRow>> {
-        let data_start_row = MASTER_DATA_START_ROW;
-        let mut new_rows_map = BTreeMap::new();
-        if !self.new_sources.is_empty() {
-            let template_row = original_rows.get(&template_row_num).ok_or_else(|| {
-                err(format!(
-                    "유류비 신규행 template이 없습니다: row={template_row_num}"
-                ))
-            })?;
-            for i in 0..self.new_sources.len() {
-                let offset =
-                    self.kept_source_rows.len().checked_add(i).ok_or_else(|| {
-                        err("유류비 신규행 오프셋 계산 중 overflow가 발생했습니다.")
-                    })?;
-                let new_row = add_row_offset(data_start_row, offset, "유류비 신규행 추가")?;
-                let resolver = |old_ref_row: u32| {
-                    if old_ref_row == template_row_num {
-                        Ok(new_row)
-                    } else {
-                        row_mapper.map(old_ref_row)
-                    }
-                };
-                let row_obj = template_row.copy_with_row_mapping(&resolver)?;
-                new_rows_map.insert(new_row, row_obj);
-            }
-        }
-        for (row_num, mut row_obj) in
-            original_rows.extract_if(.., |row_num, _| !old_data_rows.contains(row_num))
-        {
-            let new_row_num = if row_num < old_data_rows.start {
-                row_num
-            } else {
-                row_mapper.shift(row_num)?
-            };
-            remap_formula_rows(&mut row_obj, &|old_ref_row| row_mapper.map(old_ref_row))?;
-            new_rows_map.insert(new_row_num, row_obj);
-        }
-        for (i, &(old_row, _)) in self.kept_source_rows.iter().enumerate() {
-            let new_row = add_row_offset(data_start_row, i, "유류비 기존행 재배치")?;
-            let mut row_obj = original_rows
-                .remove(&old_row)
-                .ok_or_else(|| err(format!("유류비 기존행 XML이 없습니다: row={old_row}")))?;
-            let resolver = |old_ref_row: u32| {
-                if old_ref_row == old_row {
-                    Ok(new_row)
-                } else {
-                    row_mapper.map(old_ref_row)
-                }
-            };
-            remap_formula_rows(&mut row_obj, &resolver)?;
-            new_rows_map.insert(new_row, row_obj);
-        }
-        Ok(new_rows_map)
-    }
-}
 impl RankSortRefresher<'_, '_> {
-    fn apply_sorted_rows(
-        &mut self,
-        data_rows: Vec<SortableRankRow>,
-        row_mapping: &[Option<u32>],
-    ) -> Result<()> {
-        let mut detached_rows: Vec<Option<StdRow>> = Vec::new();
-        detached_rows
-            .try_reserve_exact(data_rows.len())
-            .map_err(|source| {
-                let data_row_count = data_rows.len();
-                err_with_source(
-                    format!("정렬 분리 행 메모리 확보 실패: {data_row_count} entries"),
-                    source,
-                )
-            })?;
-        let mut rows = self.ws.take_rows();
-        let row_count = row_range_len(self.data_rows, "정렬 분리 행 수")?;
-        let mut expected_row = self.data_rows.start;
-        for (old_row, row) in rows.extract_if(self.data_rows, |_, _| true) {
-            if old_row != expected_row {
-                return Err(missing_sort_target_row_error(expected_row));
-            }
-            detached_rows.push(Some(row));
-            if old_row != self.data_rows.last {
-                expected_row = old_row
-                    .checked_add(1)
-                    .ok_or_else(|| err("정렬 분리 행 번호 계산 실패"))?;
-            }
-        }
-        if detached_rows.len() != row_count {
-            return Err(missing_sort_target_row_error(expected_row));
-        }
-        for data_row in data_rows {
-            let old_row = data_row.row;
-            let Some(new_row) = mapped_contiguous_row(row_mapping, self.data_rows.start, old_row)
-            else {
-                return Err(err(format!("정렬 후 행 매핑을 찾지 못했습니다: {old_row}")));
-            };
-            let row_offset = old_row
-                .checked_sub(self.data_rows.start)
-                .ok_or_else(|| err(format!("정렬 분리 행 offset 계산 실패: {old_row}")))?;
-            let index = usize::try_from(row_offset)
-                .map_err(|source| err_with_source("정렬 분리 행 index 변환 실패", source))?;
-            let mut row = detached_rows
-                .get_mut(index)
-                .and_then(Option::take)
-                .ok_or_else(|| missing_sort_target_row_error(old_row))?;
-            remap_formula_rows(&mut row, &|old_ref_row| {
-                Ok(
-                    mapped_contiguous_row(row_mapping, self.data_rows.start, old_ref_row)
-                        .unwrap_or(old_ref_row),
-                )
-            })?;
-            rows.insert(new_row, row);
-        }
-        self.ws.replace_rows(rows);
-        Ok(())
-    }
     fn build_and_write_formula_cache(
         &mut self,
         row_num: u32,
@@ -701,19 +497,59 @@ impl RankSortRefresher<'_, '_> {
     }
     fn refresh(&mut self) -> Result<()> {
         self.normalize_smart_discount_formulas()?;
-        let sort_context =
-            MasterSheetUpdater::build_rank_sort_context(self.ws, self.shared_strings)?;
+        let gasoline = MasterSheetUpdater::get_f64_at(self.ws, 2, 4, self.shared_strings)?
+            .unwrap_or(ScaledDecimal::ZERO);
+        let premium = MasterSheetUpdater::get_f64_at(self.ws, 2, 5, self.shared_strings)?
+            .unwrap_or(ScaledDecimal::ZERO);
+        let diesel = MasterSheetUpdater::get_f64_at(self.ws, 2, 6, self.shared_strings)?
+            .unwrap_or(ScaledDecimal::ZERO);
+        let quantities = FuelValues {
+            diesel,
+            gasoline,
+            premium,
+        };
+        let mut region_rates = TARGET_REGIONS.map(|region| (region, None));
+        for row in 4..=13 {
+            let region_display = self.ws.try_get_display_at(3, row, self.shared_strings)?;
+            let region = region_display.trim();
+            if region.is_empty() {
+                continue;
+            }
+            if let Some(rate) =
+                MasterSheetUpdater::get_f64_at(self.ws, 4, row, self.shared_strings)?
+            {
+                for &mut (target, ref mut slot) in &mut region_rates {
+                    if target.label() == region {
+                        *slot = Some(rate);
+                        break;
+                    }
+                }
+            }
+        }
+        let total_qty = MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)?
+            .filter(|value| *value != ScaledDecimal::ZERO)
+            .or_else(|| {
+                let derived_total = quantities
+                    .gasoline
+                    .checked_add(quantities.premium)?
+                    .checked_add(quantities.diesel)?;
+                (derived_total != ScaledDecimal::ZERO).then_some(derived_total)
+            });
+        let sort_context = RankSortContext {
+            quantities,
+            total_qty,
+            smart_discount: MasterSheetUpdater::get_f64_at(
+                self.ws,
+                SMART_DISCOUNT_INPUT_COL,
+                SMART_DISCOUNT_INPUT_ROW,
+                self.shared_strings,
+            )?
+            .unwrap_or(ScaledDecimal::ZERO),
+            region_rates,
+        };
         self.sort(&sort_context)?;
         self.repair_formulas()?;
-        let refreshed_sort_context;
-        let cache_sort_context = if (4..=13).any(|row| self.data_rows.contains(&row)) {
-            refreshed_sort_context =
-                MasterSheetUpdater::build_rank_sort_context(self.ws, self.shared_strings)?;
-            &refreshed_sort_context
-        } else {
-            &sort_context
-        };
-        self.refresh_caches(cache_sort_context)
+        self.refresh_caches(&sort_context)
     }
     fn refresh_caches(&mut self, sort_context: &RankSortContext) -> Result<()> {
         let display_total_qty = MasterSheetUpdater::get_f64_at(self.ws, 2, 10, self.shared_strings)
@@ -759,53 +595,10 @@ impl RankSortRefresher<'_, '_> {
         }
         Ok(())
     }
-    fn row_mapping(&self, data_rows: &[SortableRankRow]) -> Result<Vec<Option<u32>>> {
-        let mut row_mapping: Vec<Option<u32>> = Vec::new();
-        row_mapping
-            .try_reserve_exact(data_rows.len())
-            .map_err(|source| {
-                let data_row_count = data_rows.len();
-                err_with_source(
-                    format!("정렬 행 매핑 메모리 확보 실패: {data_row_count} entries"),
-                    source,
-                )
-            })?;
-        row_mapping.resize(data_rows.len(), None);
-        let mut filled_count = 0_usize;
-        for (index, data_row) in data_rows.iter().enumerate() {
-            let old_row = data_row.row;
-            let new_row = add_row_offset(self.data_rows.start, index, "유류비 정렬 재배치")?;
-            let row_offset = old_row
-                .checked_sub(self.data_rows.start)
-                .ok_or_else(|| err(format!("정렬 행 매핑 offset 계산 실패: {old_row}")))?;
-            let mapping_index = usize::try_from(row_offset)
-                .map_err(|source| err_with_source("정렬 행 매핑 index 변환 실패", source))?;
-            let Some(slot) = row_mapping.get_mut(mapping_index) else {
-                return Err(err(format!("정렬 행 매핑 범위를 벗어났습니다: {old_row}")));
-            };
-            if slot.replace(new_row).is_none() {
-                filled_count = filled_count
-                    .checked_add(1)
-                    .ok_or_else(|| err("정렬 행 매핑 채움 수 계산 실패"))?;
-            }
-        }
-        if filled_count != row_mapping.len() {
-            let data_row_count = data_rows.len();
-            return Err(err(format!(
-                "정렬 행 매핑에 누락된 항목이 있습니다: {data_row_count} entries"
-            )));
-        }
-        Ok(row_mapping)
-    }
     fn sort(&mut self, sort_context: &RankSortContext) -> Result<()> {
-        if self.data_rows.start >= self.data_rows.last {
+        if self.data_rows.start == self.data_rows.last {
             return Ok(());
         }
-        let data_rows = self.sorted_data_rows(sort_context)?;
-        let row_mapping = self.row_mapping(&data_rows)?;
-        self.apply_sorted_rows(data_rows, &row_mapping)
-    }
-    fn sorted_data_rows(&self, sort_context: &RankSortContext) -> Result<Vec<SortableRankRow>> {
         let row_count = row_range_len(self.data_rows, "정렬 대상 행 수")?;
         let mut data_rows: Vec<SortableRankRow> = Vec::new();
         data_rows.try_reserve_exact(row_count).map_err(|source| {
@@ -844,7 +637,55 @@ impl RankSortRefresher<'_, '_> {
                 .then_with(|| left_key.name.cmp(&right_key.name))
                 .then_with(|| left_key.address.cmp(&right_key.address))
         });
-        Ok(data_rows)
+        let mut row_mapping = Vec::new();
+        row_mapping.try_reserve_exact(row_count).map_err(|source| {
+            err_with_source(
+                format!("정렬 행 매핑 메모리 확보 실패: {row_count} entries"),
+                source,
+            )
+        })?;
+        row_mapping.resize(row_count, 0_u32);
+        for (index, data_row) in data_rows.iter().enumerate() {
+            let old_row = data_row.row;
+            let new_row = add_row_offset(self.data_rows.start, index, "유류비 정렬 재배치")?;
+            let row_offset = old_row
+                .checked_sub(self.data_rows.start)
+                .ok_or_else(|| err(format!("정렬 행 매핑 offset 계산 실패: {old_row}")))?;
+            let mapping_index = usize::try_from(row_offset)
+                .map_err(|source| err_with_source("정렬 행 매핑 index 변환 실패", source))?;
+            let slot = row_mapping
+                .get_mut(mapping_index)
+                .ok_or_else(|| err(format!("정렬 행 매핑 범위를 벗어났습니다: {old_row}")))?;
+            *slot = new_row;
+        }
+        let mut rows = self.ws.take_rows();
+        let mut sorted_rows: Vec<StdRow> = Vec::new();
+        sorted_rows.try_reserve_exact(row_count).map_err(|source| {
+            err_with_source(
+                format!("정렬 분리 행 메모리 확보 실패: {row_count} entries"),
+                source,
+            )
+        })?;
+        for data_row in &data_rows {
+            sorted_rows.push(
+                rows.remove(&data_row.row)
+                    .ok_or_else(|| missing_sort_target_row_error(data_row.row))?,
+            );
+        }
+        for (index, mut row) in sorted_rows.into_iter().enumerate() {
+            let new_row = add_row_offset(self.data_rows.start, index, "유류비 정렬 재배치")?;
+            remap_formula_rows(&mut row, &|old_ref_row| {
+                let mapped_row = old_ref_row
+                    .checked_sub(self.data_rows.start)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .and_then(|mapping_index| row_mapping.get(mapping_index).copied())
+                    .unwrap_or(old_ref_row);
+                Ok(mapped_row)
+            })?;
+            rows.insert(new_row, row);
+        }
+        self.ws.replace_rows(rows);
+        Ok(())
     }
     fn write_decimal_value(
         &mut self,
@@ -878,56 +719,6 @@ impl RankSortRefresher<'_, '_> {
     }
 }
 impl<'source> MasterSheetUpdater<'source> {
-    fn build_rank_sort_context(
-        ws: &excel::writer::Worksheet,
-        shared_strings: &[String],
-    ) -> Result<RankSortContext> {
-        let gasoline = Self::get_f64_at(ws, 2, 4, shared_strings)?.unwrap_or(ScaledDecimal::ZERO);
-        let premium = Self::get_f64_at(ws, 2, 5, shared_strings)?.unwrap_or(ScaledDecimal::ZERO);
-        let diesel = Self::get_f64_at(ws, 2, 6, shared_strings)?.unwrap_or(ScaledDecimal::ZERO);
-        let quantities = FuelValues {
-            diesel,
-            gasoline,
-            premium,
-        };
-        let mut region_rates = TARGET_REGIONS.map(|region| (region, None));
-        for row in 4..=13 {
-            let region_display = ws.try_get_display_at(3, row, shared_strings)?;
-            let region = region_display.trim();
-            if region.is_empty() {
-                continue;
-            }
-            if let Some(rate) = Self::get_f64_at(ws, 4, row, shared_strings)? {
-                for &mut (target, ref mut slot) in &mut region_rates {
-                    if target.label() == region {
-                        *slot = Some(rate);
-                        break;
-                    }
-                }
-            }
-        }
-        let total_qty = Self::get_f64_at(ws, 2, 10, shared_strings)?
-            .filter(|value| *value != ScaledDecimal::ZERO)
-            .or_else(|| {
-                let derived_total = quantities
-                    .gasoline
-                    .checked_add(quantities.premium)?
-                    .checked_add(quantities.diesel)?;
-                (derived_total != ScaledDecimal::ZERO).then_some(derived_total)
-            });
-        Ok(RankSortContext {
-            quantities,
-            total_qty,
-            smart_discount: Self::get_f64_at(
-                ws,
-                SMART_DISCOUNT_INPUT_COL,
-                SMART_DISCOUNT_INPUT_ROW,
-                shared_strings,
-            )?
-            .unwrap_or(ScaledDecimal::ZERO),
-            region_rates,
-        })
-    }
     fn collect_new_sources(
         &self,
         matched_source_keys: &HashSet<&str>,
@@ -990,12 +781,16 @@ impl<'source> MasterSheetUpdater<'source> {
         ws: &excel::writer::Worksheet,
         shared_strings: &[String],
         old_row: u32,
+        address_key_scratch: &mut String,
     ) -> Result<MasterRowDecision<'source>> {
         if identity.address.is_empty() {
             return Ok(MasterRowDecision::Unaddressed);
         }
-        let key = normalize_address_key(identity.address.as_ref())?;
-        let Some((matched_key, src)) = self.source_index.get_key_value(&key) else {
+        normalize_address_key_into(identity.address.as_ref(), address_key_scratch)?;
+        let Some((matched_key, src)) = self
+            .source_index
+            .get_key_value(address_key_scratch.as_str())
+        else {
             let row = ParsedMasterRow::read_with_identity(identity, ws, old_row, shared_strings)?;
             let ParsedMasterIdentity {
                 address,
@@ -1003,7 +798,7 @@ impl<'source> MasterSheetUpdater<'source> {
                 region,
             } = row.identity;
             return Ok(MasterRowDecision::Deleted {
-                normalized_address: key,
+                normalized_address: mem::take(address_key_scratch),
                 row: StoreRow {
                     address: address.into_owned(),
                     fuels: row.fuels,
@@ -1100,12 +895,14 @@ impl<'source> MasterSheetUpdater<'source> {
                 &mut target_region_scratch,
                 TargetRegionPolicy::Flexible,
             )?;
-            increment_optional_target_region_count(
-                &mut existing_region_counts,
-                existing_region,
-                "마스터 지역별 건수",
+            increment_optional_target_region_count(&mut existing_region_counts, existing_region);
+            let decision = self.evaluate_master_row(
+                identity,
+                ws,
+                shared_strings,
+                old_row,
+                &mut target_region_scratch,
             )?;
-            let decision = self.evaluate_master_row(identity, ws, shared_strings, old_row)?;
             let mut record_address = |key: Cow<'source, str>| -> Result<()> {
                 if let Some(first_row) = master_address_rows.get(&key) {
                     return Err(err(format!(
@@ -1133,8 +930,7 @@ impl<'source> MasterSheetUpdater<'source> {
                     increment_optional_target_region_count(
                         &mut matched_existing_region_counts,
                         existing_region,
-                        "마스터 지역별 기존 주소 일치 건수",
-                    )?;
+                    );
                     if let Some(row_change) = change {
                         changes.push(row_change);
                     }
@@ -1197,17 +993,8 @@ impl<'source> MasterSheetUpdater<'source> {
                 if fraction_digit_count >= 6 {
                     continue;
                 }
-                let Some(next_fraction) = fraction
-                    .checked_mul(10)
-                    .and_then(|value| value.checked_add(digit))
-                else {
-                    return Err(invalid_value());
-                };
-                fraction = next_fraction;
-                let Some(next_digit_count) = fraction_digit_count.checked_add(1) else {
-                    return Err(invalid_value());
-                };
-                fraction_digit_count = next_digit_count;
+                fraction = fraction.saturating_mul(10).saturating_add(digit);
+                fraction_digit_count = fraction_digit_count.saturating_add(1);
             } else {
                 has_whole_digit = true;
                 let Some(next_whole) = whole
@@ -1223,14 +1010,8 @@ impl<'source> MasterSheetUpdater<'source> {
             return Err(invalid_value());
         }
         while fraction_digit_count < 6 {
-            let Some(next_fraction) = fraction.checked_mul(10) else {
-                return Err(invalid_value());
-            };
-            fraction = next_fraction;
-            let Some(next_digit_count) = fraction_digit_count.checked_add(1) else {
-                return Err(invalid_value());
-            };
-            fraction_digit_count = next_digit_count;
+            fraction = fraction.saturating_mul(10);
+            fraction_digit_count = fraction_digit_count.saturating_add(1);
         }
         let Some(whole_scaled) = whole.checked_mul(DECIMAL_SCALE.as_i64()) else {
             return Err(invalid_value());
@@ -1276,21 +1057,129 @@ impl<'source> MasterSheetUpdater<'source> {
         book: &mut StdWorkbook,
     ) -> Result<MasterSheetUpdateResult<'source>> {
         let (ws, shared_strings) = book.master_sheet_mut();
-        let evaluation = self.evaluate_master_rows(ws, shared_strings)?;
+        let evaluation = self.evaluate_master_rows(ws, shared_strings.values())?;
         let added = self.collect_new_sources(&evaluation.matched_source_keys)?;
         let existing_count = evaluation
             .kept_source_rows
             .len()
             .checked_add(evaluation.deleted.len())
             .ok_or_else(|| err("기존 유류비 행 수 계산 중 overflow가 발생했습니다."))?;
-        let last_data_row = MasterRowsRebuilder {
-            ws,
-            shared_strings,
+        let last_old_row = evaluation
+            .kept_source_rows
+            .last()
+            .map(|&(row, _)| row)
+            .max(evaluation.deleted.last().map(|row| row.old_row));
+        let old_data_rows = RowRange {
+            start: MASTER_DATA_START_ROW,
+            last: last_old_row.unwrap_or(MASTER_HEADER_ROW),
+        };
+        let mut original_rows = ws.take_rows();
+        let final_count = evaluation
+            .kept_source_rows
+            .len()
+            .checked_add(added.len())
+            .ok_or_else(|| err("최종 마스터 행 수 계산 중 overflow가 발생했습니다."))?;
+        let old_count_u32 = usize_to_u32(existing_count, "기존 유류비 행 수")?;
+        let final_count_u32 = usize_to_u32(final_count, "최종 유류비 행 수")?;
+        let row_mapper = RowMapper {
+            decrease: old_count_u32.saturating_sub(final_count_u32),
             deleted: &evaluation.deleted,
-            kept_source_rows: &evaluation.kept_source_rows,
-            new_sources: &added,
+            increase: final_count_u32.saturating_sub(old_count_u32),
+            old_data_rows,
+        };
+        let template_row_num = last_old_row.unwrap_or(MASTER_DATA_START_ROW);
+        let mut new_rows_map = BTreeMap::new();
+        if !added.is_empty() {
+            let template_row = original_rows.get(&template_row_num).ok_or_else(|| {
+                err(format!(
+                    "유류비 신규행 template이 없습니다: row={template_row_num}"
+                ))
+            })?;
+            for i in 0..added.len() {
+                let offset = evaluation
+                    .kept_source_rows
+                    .len()
+                    .checked_add(i)
+                    .ok_or_else(|| err("유류비 신규행 오프셋 계산 중 overflow가 발생했습니다."))?;
+                let new_row = add_row_offset(MASTER_DATA_START_ROW, offset, "유류비 신규행 추가")?;
+                let resolver = |old_ref_row: u32| {
+                    if old_ref_row == template_row_num {
+                        Ok(new_row)
+                    } else {
+                        row_mapper.map(old_ref_row)
+                    }
+                };
+                new_rows_map.insert(new_row, template_row.copy_with_row_mapping(&resolver)?);
+            }
         }
-        .rebuild(existing_count)?;
+        for (row_num, mut row_obj) in
+            original_rows.extract_if(.., |row_num, _| !old_data_rows.contains(row_num))
+        {
+            let new_row_num = if row_num < old_data_rows.start {
+                row_num
+            } else {
+                row_mapper.shift(row_num)?
+            };
+            remap_formula_rows(&mut row_obj, &|old_ref_row| row_mapper.map(old_ref_row))?;
+            new_rows_map.insert(new_row_num, row_obj);
+        }
+        for (i, &(old_row, _)) in evaluation.kept_source_rows.iter().enumerate() {
+            let new_row = add_row_offset(MASTER_DATA_START_ROW, i, "유류비 기존행 재배치")?;
+            let mut row_obj = original_rows
+                .remove(&old_row)
+                .ok_or_else(|| err(format!("유류비 기존행 XML이 없습니다: row={old_row}")))?;
+            let resolver = |old_ref_row: u32| {
+                if old_ref_row == old_row {
+                    Ok(new_row)
+                } else {
+                    row_mapper.map(old_ref_row)
+                }
+            };
+            remap_formula_rows(&mut row_obj, &resolver)?;
+            new_rows_map.insert(new_row, row_obj);
+        }
+        ws.replace_rows(new_rows_map);
+        for (i, &(_, source)) in evaluation.kept_source_rows.iter().enumerate() {
+            let new_row = add_row_offset(MASTER_DATA_START_ROW, i, "유류비 기존행 재배치")?;
+            if let Some(src) = source {
+                Self::write_master_row_from_source(ws, shared_strings, new_row, src)?;
+            }
+        }
+        for (i, &source) in added.iter().enumerate() {
+            let offset = evaluation
+                .kept_source_rows
+                .len()
+                .checked_add(i)
+                .ok_or_else(|| err("유류비 신규행 오프셋 계산 중 overflow가 발생했습니다."))?;
+            let new_row = add_row_offset(MASTER_DATA_START_ROW, offset, "유류비 신규행 추가")?;
+            Self::write_master_row_from_source(ws, shared_strings, new_row, source)?;
+            ws.set_i32_at(COL_SMART_DISCOUNT, new_row, None)?;
+        }
+        let last_data_row = MASTER_DATA_START_ROW
+            .checked_add(final_count_u32.saturating_sub(1))
+            .ok_or_else(|| err("유류비 마지막 행 계산 중 overflow가 발생했습니다."))?;
+        if final_count > 0 {
+            RankSortRefresher {
+                data_rows: RowRange {
+                    start: MASTER_DATA_START_ROW,
+                    last: last_data_row,
+                },
+                shared_strings: shared_strings.values(),
+                ws,
+            }
+            .refresh()?;
+        }
+        ws.update_auto_filter_ref(last_data_row)?;
+        ws.prune_empty_style_artifacts_after_col(COL_SORT_KEY)?;
+        ws.update_dimension()?;
+        ws.extend_conditional_formats(
+            old_data_rows,
+            RowRange {
+                start: MASTER_DATA_START_ROW,
+                last: last_data_row,
+            },
+            &[COL_RANK],
+        )?;
         book.update_filter_database_defined_name(last_data_row)?;
         Ok(MasterSheetUpdateResult {
             added,
@@ -1303,14 +1192,19 @@ impl<'source> MasterSheetUpdater<'source> {
     }
     fn write_master_row_from_source(
         ws: &mut excel::writer::Worksheet,
+        shared_strings: &mut SharedStringTable,
         row: u32,
         src: &SourceRecord,
     ) -> Result<()> {
-        ws.set_string_at(COL_REGION, row, src.region)?;
-        ws.set_string_at(COL_NAME, row, &src.name)?;
-        ws.set_string_at(COL_BRAND, row, &src.brand)?;
-        ws.set_string_at(COL_SELF_YN, row, &src.self_yn)?;
-        ws.set_string_at(COL_ADDRESS, row, &src.address)?;
+        for (col, value) in [
+            (COL_REGION, src.region),
+            (COL_NAME, src.name.as_str()),
+            (COL_BRAND, src.brand.as_str()),
+            (COL_SELF_YN, src.self_yn.as_str()),
+            (COL_ADDRESS, src.address.as_str()),
+        ] {
+            shared_strings.set_cell(ws, col, row, value)?;
+        }
         ws.set_i32_at(COL_GASOLINE, row, src.fuels.gasoline)?;
         ws.set_i32_at(COL_PREMIUM, row, src.fuels.premium)?;
         ws.set_i32_at(COL_DIESEL, row, src.fuels.diesel)?;
@@ -1357,9 +1251,6 @@ fn append_fuel_total_text(
     Ok(true)
 }
 fn row_range_len(rows: RowRange, context: &'static str) -> Result<usize> {
-    if rows.start > rows.last {
-        return Ok(0);
-    }
     let row_count = rows
         .last
         .checked_sub(rows.start)
@@ -1368,15 +1259,13 @@ fn row_range_len(rows: RowRange, context: &'static str) -> Result<usize> {
     usize::try_from(row_count)
         .map_err(|source| err_with_source(format!("{context} 변환 실패"), source))
 }
-fn increment_optional_target_region_count(
+const fn increment_optional_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],
     maybe_region: Option<TargetRegion>,
-    context: &'static str,
-) -> Result<()> {
+) {
     if let Some(region) = maybe_region {
-        increment_target_region_count(counts, region, context)?;
+        increment_target_region_count(counts, region);
     }
-    Ok(())
 }
 fn reserved_row_vec<T>(row_count: usize, label: &str) -> Result<Vec<T>> {
     let mut rows = Vec::new();
@@ -1387,15 +1276,6 @@ fn reserved_row_vec<T>(row_count: usize, label: &str) -> Result<Vec<T>> {
         )
     })?;
     Ok(rows)
-}
-fn mapped_contiguous_row(
-    row_mapping: &[Option<u32>],
-    data_start_row: u32,
-    old_row: u32,
-) -> Option<u32> {
-    let offset = old_row.checked_sub(data_start_row)?;
-    let index = usize::try_from(offset).ok()?;
-    row_mapping.get(index).copied().flatten()
 }
 fn trim_cow(value: Cow<'_, str>) -> Cow<'_, str> {
     match value {

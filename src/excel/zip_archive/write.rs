@@ -23,23 +23,13 @@ const STORE_WITHOUT_DEFLATE_EXTENSIONS: [&str; 10] = [
     ".bin", ".gif", ".jpeg", ".jpg", ".mp3", ".mp4", ".png", ".webp", ".zip", ".zst",
 ];
 struct WriteEntry {
-    compressed_size: usize,
+    compressed_size: u32,
     crc32: u32,
     local_header_offset: u32,
     method: u16,
     name: String,
-    uncompressed_size: usize,
-}
-#[derive(Clone, Copy)]
-enum ZipFileHeader<'entry> {
-    Central(&'entry WriteEntry),
-    Local {
-        crc32: u32,
-        compressed_len: usize,
-        method: u16,
-        name: &'entry str,
-        uncompressed_len: usize,
-    },
+    name_len: u16,
+    uncompressed_size: u32,
 }
 struct StreamingZipWriter<'path> {
     archive_path: &'path Path,
@@ -76,28 +66,39 @@ impl StreamingZipWriter<'_> {
         let central_dir_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 offset 변환 실패", source))?;
         let entries = mem::take(&mut self.entries);
-        let Some((max_header_capacity, central_dir_size_usize)) =
-            entries.iter().try_fold((0_usize, 0_usize), |plan, entry| {
-                let header_len = CENTRAL_FILE_HEADER_BASE_LEN.checked_add(entry.name.len())?;
-                Some((plan.0.max(header_len), plan.1.checked_add(header_len)?))
-            })
-        else {
-            return Err(err(
-                "ZIP 중앙 디렉터리 크기 계산 중 overflow가 발생했습니다.",
-            ));
-        };
-        let central_dir_size = u32::try_from(central_dir_size_usize)
-            .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
+        let (max_header_capacity, central_dir_size_usize) =
+            entries.iter().fold((0_usize, 0_usize), |plan, entry| {
+                let header_len = CENTRAL_FILE_HEADER_BASE_LEN.saturating_add(entry.name.len());
+                (plan.0.max(header_len), plan.1.saturating_add(header_len))
+            });
         let entry_count_u16 = u16::try_from(entries.len())
             .map_err(|source| err_with_source("ZIP entry 수 변환 실패", source))?;
-        let central_output_size = central_dir_size_usize
-            .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
-            .ok_or_else(|| err("ZIP 중앙 디렉터리 전체 크기 계산 중 overflow가 발생했습니다."))?;
+        let central_output_size =
+            central_dir_size_usize.saturating_add(END_OF_CENTRAL_DIRECTORY_LEN);
         self.ensure_output_limit(central_output_size, "ZIP 중앙 디렉터리 출력 크기 계산")?;
+        let central_dir_size = u32::try_from(central_dir_size_usize)
+            .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
         self.prepare_header_buffer(max_header_capacity, "ZIP 중앙 header 메모리 확보 실패")?;
         for entry in &entries {
             self.header_buffer.clear();
-            write_file_header(&mut self.header_buffer, ZipFileHeader::Central(entry))?;
+            write_u32(&mut self.header_buffer, CENTRAL_DIRECTORY_SIGNATURE);
+            write_u16(&mut self.header_buffer, VERSION_NEEDED);
+            write_u16(&mut self.header_buffer, VERSION_NEEDED);
+            write_u16(&mut self.header_buffer, GENERAL_PURPOSE_UTF8_FLAG);
+            write_u16(&mut self.header_buffer, entry.method);
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, DOS_DATE_1980_01_01);
+            write_u32(&mut self.header_buffer, entry.crc32);
+            write_u32(&mut self.header_buffer, entry.compressed_size);
+            write_u32(&mut self.header_buffer, entry.uncompressed_size);
+            write_u16(&mut self.header_buffer, entry.name_len);
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, 0);
+            write_u32(&mut self.header_buffer, 0);
+            write_u32(&mut self.header_buffer, entry.local_header_offset);
+            self.header_buffer.extend_from_slice(entry.name.as_bytes());
             self.write_header_buffer("xlsx 압축 중앙 디렉터리 쓰기 실패")?;
         }
         self.prepare_header_buffer(
@@ -142,56 +143,57 @@ impl StreamingZipWriter<'_> {
             });
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
-        let local_header_capacity = LOCAL_FILE_HEADER_LEN
-            .checked_add(file.name.len())
-            .ok_or_else(|| err("ZIP local header 크기 계산 중 overflow가 발생했습니다."))?;
-        let entry_output_size = local_header_capacity
-            .checked_add(compressed_size)
-            .ok_or_else(|| err("ZIP entry 출력 크기 계산 중 overflow가 발생했습니다."))?;
-        self.ensure_output_limit(entry_output_size, "ZIP entry 출력 크기 계산")?;
+        let compressed_size_u32 = u32::try_from(compressed_size)
+            .map_err(|source| err_with_source("ZIP entry 압축 크기 변환 실패", source))?;
+        let name_len = u16::try_from(file.name.len())
+            .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?;
+        let uncompressed_size_u32 = u32::try_from(uncompressed_size)
+            .map_err(|source| err_with_source("ZIP entry 원본 크기 변환 실패", source))?;
+        let local_header_capacity = LOCAL_FILE_HEADER_LEN.saturating_add(file.name.len());
+        let entry_output_size = local_header_capacity.saturating_add(compressed_size);
+        let entry_end = self.ensure_output_limit(entry_output_size, "ZIP entry 출력 크기 계산")?;
         self.prepare_header_buffer(local_header_capacity, "ZIP local header 메모리 확보 실패")?;
-        write_file_header(
-            &mut self.header_buffer,
-            ZipFileHeader::Local {
-                crc32,
-                compressed_len: compressed_size,
-                method,
-                name: &file.name,
-                uncompressed_len: uncompressed_size,
-            },
-        )?;
+        write_u32(&mut self.header_buffer, LOCAL_FILE_HEADER_SIGNATURE);
+        write_u16(&mut self.header_buffer, VERSION_NEEDED);
+        write_u16(&mut self.header_buffer, GENERAL_PURPOSE_UTF8_FLAG);
+        write_u16(&mut self.header_buffer, method);
+        write_u16(&mut self.header_buffer, 0);
+        write_u16(&mut self.header_buffer, DOS_DATE_1980_01_01);
+        write_u32(&mut self.header_buffer, crc32);
+        write_u32(&mut self.header_buffer, compressed_size_u32);
+        write_u32(&mut self.header_buffer, uncompressed_size_u32);
+        write_u16(&mut self.header_buffer, name_len);
+        write_u16(&mut self.header_buffer, 0);
+        self.header_buffer.extend_from_slice(file.name.as_bytes());
         self.write_header_buffer("xlsx 압축 local header 쓰기 실패")?;
-        if let Some(plan) = compressed_plan {
-            let next_bytes_written =
-                self.ensure_output_limit(compressed_size, "ZIP deflated byte count 계산")?;
-            let actual_written = plan.write_to(&mut self.file)?;
-            if actual_written != compressed_size {
-                return Err(err(format!(
-                    "ZIP deflate 출력 크기가 계획과 다릅니다: expected={compressed_size}, actual={actual_written}"
-                )));
-            }
-            self.bytes_written = next_bytes_written;
+        let actual_written = if let Some(plan) = compressed_plan {
+            plan.write_to(&mut self.file)?
         } else {
-            let next_bytes_written =
-                self.ensure_output_limit(compressed_size, "ZIP stored byte count 계산")?;
             IoWrite::write_all(&mut self.file, &self.part_buffer).map_err(|source_err| {
                 err_with_source(
                     path_context_message("xlsx 압축 파일 데이터 쓰기 실패", self.archive_path),
                     source_err,
                 )
             })?;
-            self.bytes_written = next_bytes_written;
+            compressed_size
+        };
+        if actual_written != compressed_size {
+            return Err(err(format!(
+                "ZIP deflate 출력 크기가 계획과 다릅니다: expected={compressed_size}, actual={actual_written}"
+            )));
         }
+        self.bytes_written = entry_end;
         if let Some(plan) = deflate_plan {
             self.deflate_workspace.recycle(plan);
         }
         self.entries.push(WriteEntry {
-            compressed_size,
+            compressed_size: compressed_size_u32,
             crc32,
             local_header_offset,
             method,
             name: file.name,
-            uncompressed_size,
+            name_len,
+            uncompressed_size: uncompressed_size_u32,
         });
         Ok(())
     }
@@ -214,11 +216,9 @@ impl StreamingZipWriter<'_> {
     }
     fn prepare_header_buffer(&mut self, capacity: usize, context: &'static str) -> Result<()> {
         self.header_buffer.clear();
-        if self.header_buffer.capacity() < capacity {
-            self.header_buffer
-                .try_reserve_exact(capacity)
-                .map_err(|source| err_with_source(context, source))?;
-        }
+        self.header_buffer
+            .try_reserve_exact(capacity)
+            .map_err(|source| err_with_source(context, source))?;
         Ok(())
     }
     fn read_part_bytes(&mut self, file: &PendingFile) -> Result<()> {
@@ -238,7 +238,17 @@ impl StreamingZipWriter<'_> {
                 source_err,
             )
         })?;
-        let part_len = usize::try_from(metadata.len()).map_err(|source| {
+        let metadata_len = metadata.len();
+        let entry_limit = u64::try_from(ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES)
+            .map_err(|source| err_with_source("xlsx 파트 크기 한도 변환 실패", source))?;
+        if metadata_len > entry_limit {
+            return Err(err(format!(
+                "xlsx 파트 크기가 허용 한도({ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} bytes)를 초과했습니다: {} -> {}",
+                self.archive_path.display(),
+                file.path.display()
+            )));
+        }
+        let part_len = usize::try_from(metadata_len).map_err(|source| {
             err_with_source(
                 path_pair_context_message(
                     "xlsx 파트 크기 변환 실패",
@@ -248,23 +258,11 @@ impl StreamingZipWriter<'_> {
                 source,
             )
         })?;
-        if part_len > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES {
-            return Err(err(format!(
-                "xlsx 파트 크기가 허용 한도({ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} bytes)를 초과했습니다: {} -> {}",
-                self.archive_path.display(),
-                file.path.display()
-            )));
-        }
         self.part_buffer.clear();
-        if self.part_buffer.capacity() < part_len {
-            self.part_buffer
-                .try_reserve_exact(part_len)
-                .map_err(|source| err_with_source("xlsx 파트 메모리 확보 실패", source))?;
-        }
-        let read_limit = u64::try_from(ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| err("xlsx 파트 읽기 한도 계산 실패"))?;
+        self.part_buffer
+            .try_reserve_exact(part_len)
+            .map_err(|source| err_with_source("xlsx 파트 메모리 확보 실패", source))?;
+        let read_limit = entry_limit.saturating_add(1);
         let mut limited = source_file.take(read_limit);
         IoRead::read_to_end(&mut limited, &mut self.part_buffer).map_err(|source_err| {
             err_with_source(
@@ -328,65 +326,6 @@ impl StreamingZipWriter<'_> {
         self.bytes_written = next_bytes_written;
         Ok(())
     }
-}
-fn write_file_header(out: &mut Vec<u8>, header: ZipFileHeader<'_>) -> Result<()> {
-    match header {
-        ZipFileHeader::Central(entry) => {
-            let name = entry.name.as_bytes();
-            let name_len = u16::try_from(name.len())
-                .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?;
-            let compressed_size = u32::try_from(entry.compressed_size)
-                .map_err(|source| err_with_source("ZIP entry 압축 크기 변환 실패", source))?;
-            let uncompressed_size = u32::try_from(entry.uncompressed_size)
-                .map_err(|source| err_with_source("ZIP entry 원본 크기 변환 실패", source))?;
-            write_u32(out, CENTRAL_DIRECTORY_SIGNATURE);
-            write_u16(out, VERSION_NEEDED);
-            write_u16(out, VERSION_NEEDED);
-            write_u16(out, GENERAL_PURPOSE_UTF8_FLAG);
-            write_u16(out, entry.method);
-            write_u16(out, 0);
-            write_u16(out, DOS_DATE_1980_01_01);
-            write_u32(out, entry.crc32);
-            write_u32(out, compressed_size);
-            write_u32(out, uncompressed_size);
-            write_u16(out, name_len);
-            write_u16(out, 0);
-            write_u16(out, 0);
-            write_u16(out, 0);
-            write_u16(out, 0);
-            write_u32(out, 0);
-            write_u32(out, entry.local_header_offset);
-            out.extend_from_slice(name);
-        }
-        ZipFileHeader::Local {
-            compressed_len,
-            crc32,
-            method,
-            name,
-            uncompressed_len,
-        } => {
-            let name_bytes = name.as_bytes();
-            let name_len = u16::try_from(name_bytes.len())
-                .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?;
-            let compressed_size = u32::try_from(compressed_len)
-                .map_err(|source| err_with_source("ZIP entry 압축 크기 변환 실패", source))?;
-            let uncompressed_size = u32::try_from(uncompressed_len)
-                .map_err(|source| err_with_source("ZIP entry 원본 크기 변환 실패", source))?;
-            write_u32(out, LOCAL_FILE_HEADER_SIGNATURE);
-            write_u16(out, VERSION_NEEDED);
-            write_u16(out, GENERAL_PURPOSE_UTF8_FLAG);
-            write_u16(out, method);
-            write_u16(out, 0);
-            write_u16(out, DOS_DATE_1980_01_01);
-            write_u32(out, crc32);
-            write_u32(out, compressed_size);
-            write_u32(out, uncompressed_size);
-            write_u16(out, name_len);
-            write_u16(out, 0);
-            out.extend_from_slice(name_bytes);
-        }
-    }
-    Ok(())
 }
 fn write_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());

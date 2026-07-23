@@ -599,11 +599,9 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<PendingFile>) -> Resul
                     .strip_prefix(root)
                     .map_err(|source| err_with_source("xlsx 상대 경로 계산 실패", source))?;
                 let name = path_to_slashes(rel, rel.display())?;
-                if files.len() == files.capacity() {
-                    files.try_reserve(1).map_err(|source| {
-                        err_with_source("xlsx 파트 목록 메모리 확보 실패", source)
-                    })?;
-                }
+                files
+                    .try_reserve(1)
+                    .map_err(|source| err_with_source("xlsx 파트 목록 메모리 확보 실패", source))?;
                 files.push(PendingFile { name, path });
             }
             (false, false) => {}

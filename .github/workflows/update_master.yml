@@ -16,9 +16,7 @@ jobs:
         with:
           toolchain: 1.97.1
       - name: Install native dependencies
-        run: sudo apt-get update
-      - name: Install libcurl headers
-        run: sudo apt-get install -y libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - name: Run updater
         run: cargo run --release --locked
       - name: Prepare result artifact with Rust

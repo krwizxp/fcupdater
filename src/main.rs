@@ -67,40 +67,35 @@ fn main() -> Result<()> {
     let save_verification = match raw_args.next() {
         None => SaveVerification::Skip,
         Some(token) => {
-            if token == OsStr::new("-h") || token == OsStr::new("--help") {
-                if let Some(extra) = raw_args.next() {
-                    return Err(err(format!(
-                        "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
-                        extra.to_string_lossy()
-                    )));
-                }
-                write_line(&mut out, format_args!("{HELP_TEXT}"))?;
-                return Ok(());
-            }
-            if token == OsStr::new("--version") {
-                if let Some(extra) = raw_args.next() {
-                    return Err(err(format!(
-                        "알 수 없는 --version 옵션: {}\n\n{HELP_TEXT}",
-                        extra.to_string_lossy()
-                    )));
-                }
-                write_line(&mut out, format_args!("{APP_NAME} {APP_VERSION}"))?;
-                return Ok(());
-            }
-            if token == OsStr::new("--verify") {
-                if let Some(extra) = raw_args.next() {
-                    return Err(err(format!(
-                        "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
-                        extra.to_string_lossy()
-                    )));
-                }
-                SaveVerification::Verify
-            } else {
+            let is_help = token == OsStr::new("-h") || token == OsStr::new("--help");
+            let is_verify = token == OsStr::new("--verify");
+            let is_version = token == OsStr::new("--version");
+            if !(is_help || is_verify || is_version) {
                 return Err(err(format!(
                     "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
                     token.to_string_lossy()
                 )));
             }
+            if let Some(extra) = raw_args.next() {
+                let context = if is_version {
+                    "알 수 없는 --version 옵션"
+                } else {
+                    "알 수 없는 옵션"
+                };
+                return Err(err(format!(
+                    "{context}: {}\n\n{HELP_TEXT}",
+                    extra.to_string_lossy()
+                )));
+            }
+            if is_help {
+                write_line(&mut out, format_args!("{HELP_TEXT}"))?;
+                return Ok(());
+            }
+            if is_version {
+                write_line(&mut out, format_args!("{APP_NAME} {APP_VERSION}"))?;
+                return Ok(());
+            }
+            SaveVerification::Verify
         }
     };
     let mut lock_options = File::options();
@@ -139,9 +134,4 @@ fn main() -> Result<()> {
 fn write_line(output: &mut dyn Write, args: Arguments<'_>) -> io::Result<()> {
     output.write_fmt(args)?;
     output.write_all(b"\n")
-}
-fn write_line_best_effort(output: &mut dyn Write, args: Arguments<'_>) {
-    match write_line(output, args) {
-        Ok(()) | Err(_) => {}
-    }
 }

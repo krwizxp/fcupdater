@@ -1,10 +1,7 @@
 use super::{
-    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpHeader, HttpHeaderKind,
-    HttpResponse, HttpStreamResponse, RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE,
-    StreamedBodySummary, StreamingBodySink,
+    DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse,
+    RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE, ResponseHeaders,
     checked_http_buffer_len, download_error_with_source, enforce_http_body_length,
-    validated_http_content_length,
-    http_client::HttpMethod,
 };
 use alloc::{string::String, vec::Vec};
 use core::{
@@ -17,7 +14,6 @@ use core::{
 };
 use std::{
     ffi::OsStr,
-    io::Write as IoWrite,
     os::windows::ffi::OsStrExt as WindowsOsStrExt,
     time::Instant,
 };
@@ -214,6 +210,39 @@ impl Client {
             Ok(())
         }
     }
+    pub(super) fn get(
+        &mut self,
+        host: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> DownloadResult<HttpResponse> {
+        let host_wide = wide(host)?;
+        let path_wide = wide(path)?;
+        let mut headers_wide = mem::take(&mut self.header_buffer);
+        let response = (|| {
+            let header_len = Self::request_headers_wide(&mut headers_wide, headers)?;
+            let started = Instant::now();
+            let connect = self.cached_connect_ptr(host, &host_wide)?;
+            (|| {
+                let request = Self::open_request(connect, &METHOD_GET_WIDE, &path_wide)?;
+                Self::send_request(&request, &headers_wide, header_len, &[])?;
+                Self::receive_response(&request)?;
+                let status = Self::query_status(&request)?;
+                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
+                let response_body =
+                    self.read_body(&request, response_headers.content_length, started)?;
+                enforce_http_body_length(response_body.len(), response_headers.content_length)?;
+                Ok(HttpResponse {
+                    body: response_body,
+                    headers: response_headers,
+                    status,
+                })
+            })()
+            .inspect_err(|_| self.session_cache = None)
+        })();
+        self.header_buffer = headers_wide;
+        response
+    }
     fn last_error_code() -> u32 {
         // SAFETY: GetLastError has no preconditions.
         unsafe { sys::GetLastError() }
@@ -229,19 +258,14 @@ impl Client {
     }
     fn open_request(
         connect: HInternet,
-        method: HttpMethod<'_>,
+        method: &[u16],
         path: &[u16],
     ) -> DownloadResult<Handle> {
-        let method_wide: &[u16] = if matches!(method, HttpMethod::Post(_)) {
-            &METHOD_POST_WIDE
-        } else {
-            &METHOD_GET_WIDE
-        };
         // SAFETY: method and path are NUL-terminated and connect is valid.
         let raw_request = unsafe {
             sys::WinHttpOpenRequest(
                 connect,
-                method_wide.as_ptr(),
+                method.as_ptr(),
                 path.as_ptr(),
                 null(),
                 null(),
@@ -270,10 +294,44 @@ impl Client {
         )?;
         Ok(request)
     }
+    pub(super) fn post(
+        &mut self,
+        host: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> DownloadResult<HttpResponse> {
+        let host_wide = wide(host)?;
+        let path_wide = wide(path)?;
+        let mut headers_wide = mem::take(&mut self.header_buffer);
+        let response = (|| {
+            let header_len = Self::request_headers_wide(&mut headers_wide, headers)?;
+            let started = Instant::now();
+            let connect = self.cached_connect_ptr(host, &host_wide)?;
+            (|| {
+                let request = Self::open_request(connect, &METHOD_POST_WIDE, &path_wide)?;
+                Self::send_request(&request, &headers_wide, header_len, body)?;
+                Self::receive_response(&request)?;
+                let status = Self::query_status(&request)?;
+                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
+                let response_body =
+                    self.read_body(&request, response_headers.content_length, started)?;
+                enforce_http_body_length(response_body.len(), response_headers.content_length)?;
+                Ok(HttpResponse {
+                    body: response_body,
+                    headers: response_headers,
+                    status,
+                })
+            })()
+            .inspect_err(|_| self.session_cache = None)
+        })();
+        self.header_buffer = headers_wide;
+        response
+    }
     fn query_headers(
         request: &Handle,
         buffer: &mut Vec<u16>,
-    ) -> DownloadResult<Vec<HttpHeader>> {
+    ) -> DownloadResult<ResponseHeaders> {
         let mut bytes = 0_u32;
         let mut index = 0_u32;
         // SAFETY: request is valid; this first call probes the required buffer size.
@@ -288,7 +346,7 @@ impl Client {
             )
         };
         if probe_ok != 0_i32 {
-            return Ok(Vec::new());
+            return Ok(ResponseHeaders::default());
         }
         let last_error = Self::last_error_code();
         if last_error != ERROR_INSUFFICIENT_BUFFER {
@@ -322,7 +380,7 @@ impl Client {
         };
         Self::check_winhttp(fetch_ok, "WinHttpQueryHeaders")?;
         while buffer.pop_if(|value| *value == 0).is_some() {}
-        let mut parsed = Vec::new();
+        let mut parsed = ResponseHeaders::default();
         for raw_line in buffer.split(|unit| *unit == u16::from(b'\n')).skip(1) {
             let trimmed_line = trim_ascii_utf16(
                 raw_line
@@ -341,25 +399,19 @@ impl Client {
             };
             let name = trim_ascii_utf16(raw_name);
             let value = trim_ascii_utf16(raw_value);
-            let kind = if header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH) {
-                HttpHeaderKind::ContentLength
-            } else if header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_SET_COOKIE) {
-                HttpHeaderKind::SetCookie
-            } else {
+            if !(header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH)
+                || header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_SET_COOKIE))
+            {
                 continue;
-            };
-            if parsed.len() == parsed.capacity() {
-                parsed.try_reserve(1).map_err(|source| {
-                    download_error_with_source("응답 header 목록 메모리 확보 실패", source)
-                })?;
             }
             let header_value = String::from_utf16(value).map_err(|source| {
                 download_error_with_source("응답 header 값 UTF-16 변환 실패", source)
             })?;
-            parsed.push(HttpHeader {
-                kind,
-                value: header_value,
-            });
+            if header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH) {
+                parsed.parse_content_length(&header_value, HTTP_MAX_BODY_BYTES)?;
+            } else {
+                parsed.push_set_cookie(&header_value)?;
+            }
         }
         Ok(parsed)
     }
@@ -408,23 +460,6 @@ impl Client {
             Ok(())
         })?;
         Ok(body)
-    }
-    fn read_body_to_writer(
-        &mut self,
-        request: &Handle,
-        writer: &mut dyn IoWrite,
-        started: Instant,
-    ) -> DownloadResult<StreamedBodySummary> {
-        let mut sink = StreamingBodySink {
-            limit: HTTP_MAX_BODY_BYTES,
-            summary: StreamedBodySummary {
-                bytes_seen: 0,
-                preview: Vec::new(),
-            },
-            writer,
-        };
-        self.read_response_body(request, started, |read_chunk| sink.append(read_chunk))?;
-        Ok(sink.summary)
     }
     fn read_response_body(
         &mut self,
@@ -481,45 +516,6 @@ impl Client {
         let received = unsafe { sys::WinHttpReceiveResponse(request.as_ptr(), null_mut()) };
         Self::check_winhttp(received, "WinHttpReceiveResponse")
     }
-    pub(super) fn request(
-        &mut self,
-        method: HttpMethod<'_>,
-        host: &str,
-        path: &str,
-        headers: &[(&str, &str)],
-    ) -> DownloadResult<HttpResponse> {
-        let host_wide = wide(host)?;
-        let path_wide = wide(path)?;
-        let mut headers_wide = mem::take(&mut self.header_buffer);
-        let response = (|| {
-            let header_len = Self::request_headers_wide(&mut headers_wide, headers)?;
-            let body_slice = match method {
-                HttpMethod::Get => &[],
-                HttpMethod::Post(body) => body,
-            };
-            let started = Instant::now();
-            let connect = self.cached_connect_ptr(host, &host_wide)?;
-            (|| {
-                let request = Self::open_request(connect, method, &path_wide)?;
-                Self::send_request(&request, &headers_wide, header_len, body_slice)?;
-                Self::receive_response(&request)?;
-                let status = Self::query_status(&request)?;
-                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
-                let content_length =
-                    validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
-                let response_body = self.read_body(&request, content_length, started)?;
-                enforce_http_body_length(response_body.len(), content_length)?;
-                Ok(HttpResponse {
-                    body: response_body,
-                    headers: response_headers,
-                    status,
-                })
-            })()
-            .inspect_err(|_| self.session_cache = None)
-        })();
-        self.header_buffer = headers_wide;
-        response
-    }
     fn request_headers_wide(out: &mut Vec<u16>, headers: &[(&str, &str)]) -> DownloadResult<u32> {
         let header_capacity = headers
             .iter()
@@ -547,46 +543,6 @@ impl Client {
         })?;
         out.push(0);
         Ok(header_len)
-    }
-    pub(super) fn request_to_writer(
-        &mut self,
-        method: HttpMethod<'_>,
-        host: &str,
-        path: &str,
-        headers: &[(&str, &str)],
-        writer: &mut dyn IoWrite,
-    ) -> DownloadResult<HttpStreamResponse> {
-        let host_wide = wide(host)?;
-        let path_wide = wide(path)?;
-        let mut headers_wide = mem::take(&mut self.header_buffer);
-        let response = (|| {
-            let header_len = Self::request_headers_wide(&mut headers_wide, headers)?;
-            let body_slice = match method {
-                HttpMethod::Get => &[],
-                HttpMethod::Post(body) => body,
-            };
-            let started = Instant::now();
-            let connect = self.cached_connect_ptr(host, &host_wide)?;
-            (|| {
-                let request = Self::open_request(connect, method, &path_wide)?;
-                Self::send_request(&request, &headers_wide, header_len, body_slice)?;
-                Self::receive_response(&request)?;
-                let status = Self::query_status(&request)?;
-                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
-                let content_length =
-                    validated_http_content_length(&response_headers, HTTP_MAX_BODY_BYTES)?;
-                let response_body = self.read_body_to_writer(&request, writer, started)?;
-                enforce_http_body_length(response_body.bytes_seen, content_length)?;
-                Ok(HttpStreamResponse {
-                    body: response_body,
-                    headers: response_headers,
-                    status,
-                })
-            })()
-            .inspect_err(|_| self.session_cache = None)
-        })();
-        self.header_buffer = headers_wide;
-        response
     }
     fn send_request(
         request: &Handle,
