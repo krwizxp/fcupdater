@@ -20,7 +20,7 @@ jobs:
       - name: Run updater
         run: cargo run --release --locked
       - name: Prepare result artifact with Rust
-        run: cargo run --locked --example package_artifact -- --workbook
+        run: cargo run --release --locked --example package_artifact -- --workbook
       - name: Upload result artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

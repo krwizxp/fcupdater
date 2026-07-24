@@ -72,14 +72,33 @@ impl ChangeLogRowValues<'_> {
         ] {
             worksheet.set_i32_at(col, row, value)?;
         }
-        for &(old_col, new_col, target_col) in &DELTA_FORMULA_COLUMNS {
+        for (&(old_col, new_col, target_col), (old_value, new_value)) in
+            DELTA_FORMULA_COLUMNS.iter().zip([
+                (self.old_fuels.gasoline, self.new_fuels.gasoline),
+                (self.old_fuels.premium, self.new_fuels.premium),
+                (self.old_fuels.diesel, self.new_fuels.diesel),
+            ])
+        {
             formula_buffer.clear();
             write!(
                 formula_buffer,
                 "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
             )
             .map_err(|source| err_with_source("변경내역 delta formula 작성 실패", source))?;
-            worksheet.set_formula_at(target_col, row, formula_buffer)?;
+            let cached = old_value
+                .zip(new_value)
+                .map(|(old, new)| {
+                    new.checked_sub(old)
+                        .ok_or_else(|| err("변경내역 delta cache 계산 실패"))
+                })
+                .transpose()?
+                .map(|value| value.to_string());
+            worksheet.set_formula_at_with_cache(
+                target_col,
+                row,
+                formula_buffer,
+                cached.as_deref(),
+            )?;
         }
         Ok(())
     }

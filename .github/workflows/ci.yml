@@ -44,7 +44,7 @@ jobs:
         run: cargo build --release --locked
       - name: Prepare binary artifact with Rust
         if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
-        run: cargo run --locked --example package_artifact -- "${{ matrix.binary_name }}"
+        run: cargo run --release --locked --example package_artifact -- "${{ matrix.binary_name }}"
       - name: Upload Binary Artifact
         if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

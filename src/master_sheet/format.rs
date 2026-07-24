@@ -18,8 +18,9 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
         return format!("{sign}{whole}");
     }
     let width = usize::from(scale_abs.ilog10().to_le_bytes()[0]);
-    let frac_text = format!("{frac:0width$}");
-    format!("{sign}{whole}.{}", frac_text.trim_end_matches('0'))
+    let mut text = format!("{sign}{whole}.{frac:0width$}");
+    text.truncate(text.trim_end_matches('0').len());
+    text
 }
 pub(super) fn format_unit_price_text(
     total: ScaledSortKey,
@@ -45,22 +46,24 @@ pub(super) fn format_unit_price_text(
     if remainder == 0 {
         return Ok(Some(format!("{sign}{whole}")));
     }
-    let mut fraction = String::new();
-    while fraction.len() < UNIT_PRICE_MAX_FRAC_DIGITS && remainder != 0 {
+    let mut text = format!("{sign}{whole}");
+    let integer_end = text.len();
+    text.push('.');
+    for _ in 0..UNIT_PRICE_MAX_FRAC_DIGITS {
+        if remainder == 0 {
+            break;
+        }
         remainder = remainder.wrapping_mul(10);
         let digit = remainder.div_euclid(denominator).to_le_bytes()[0];
-        fraction.push(char::from(b'0'.wrapping_add(digit)));
+        text.push(char::from(b'0'.wrapping_add(digit)));
         remainder = remainder.rem_euclid(denominator);
     }
-    let trimmed_fraction = fraction.trim_end_matches('0');
-    let visible_sign = if trimmed_fraction.is_empty() && whole == 0 {
-        ""
-    } else {
-        sign
-    };
-    if trimmed_fraction.is_empty() {
-        Ok(Some(format!("{visible_sign}{whole}")))
-    } else {
-        Ok(Some(format!("{visible_sign}{whole}.{trimmed_fraction}")))
+    text.truncate(text.trim_end_matches('0').len());
+    if text.ends_with('.') {
+        text.truncate(integer_end);
+        if whole == 0 && text.starts_with('-') {
+            text.replace_range(..1, "");
+        }
     }
+    Ok(Some(text))
 }

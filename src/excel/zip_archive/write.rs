@@ -1,8 +1,10 @@
 use super::super::{PackagePart, ZipArchiveBuilder};
 use super::{
-    DATA_DESCRIPTOR_LEN, DATA_DESCRIPTOR_SIGNATURE, END_OF_CENTRAL_DIRECTORY_LEN,
-    END_OF_CENTRAL_DIRECTORY_SIGNATURE, LOCAL_FILE_HEADER_LEN, ZIP_MAX_ARCHIVE_BYTES,
-    ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, crc32, deflate, read_u32,
+    CENTRAL_DIRECTORY_HEADER_LEN, CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_LEN,
+    END_OF_CENTRAL_DIRECTORY_SIGNATURE, EXCEL_ENTRY_FLAGS, LOCAL_FILE_HEADER_LEN,
+    LOCAL_FILE_HEADER_SIGNATURE, METHOD_DEFLATE, VERSION_MADE_BY, VERSION_NEEDED,
+    ZIP_MAX_ARCHIVE_BYTES, ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, crc32, deflate, excel_local_extra,
+    read_u32,
 };
 use crate::diagnostic::{Result, err, err_with_source, path_context_message};
 use core::mem;
@@ -55,12 +57,9 @@ impl<'part> StreamingZipWriter<'part, '_> {
         let entries = mem::take(&mut self.entries);
         let mut central_dir_size_usize = 0_usize;
         for entry in &entries {
-            let record = self
-                .source_bytes
-                .get(entry.part.central_record)
-                .ok_or_else(|| err("ZIP 원본 중앙 디렉터리 범위 오류"))?;
             central_dir_size_usize = central_dir_size_usize
-                .checked_add(record.len())
+                .checked_add(CENTRAL_DIRECTORY_HEADER_LEN)
+                .and_then(|size| size.checked_add(entry.part.name.len()))
                 .ok_or_else(|| err("ZIP 중앙 디렉터리 크기 계산 실패"))?;
         }
         let entry_count_u16 = u16::try_from(entries.len())
@@ -72,16 +71,33 @@ impl<'part> StreamingZipWriter<'part, '_> {
         let central_dir_size = u32::try_from(central_dir_size_usize)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
         for entry in &entries {
-            let central_record = self
-                .source_bytes
-                .get(entry.part.central_record)
-                .ok_or_else(|| err("ZIP 원본 중앙 디렉터리 범위 오류"))?;
-            self.prepare_header_buffer(central_record.len(), "ZIP 중앙 디렉터리 메모리 확보 실패")?;
-            self.header_buffer.extend_from_slice(central_record);
-            replace_u32(&mut self.header_buffer, 16, entry.crc32)?;
-            replace_u32(&mut self.header_buffer, 20, entry.compressed_size)?;
-            replace_u32(&mut self.header_buffer, 24, entry.uncompressed_size)?;
-            replace_u32(&mut self.header_buffer, 42, entry.local_header_offset)?;
+            let record_len = CENTRAL_DIRECTORY_HEADER_LEN
+                .checked_add(entry.part.name.len())
+                .ok_or_else(|| err("ZIP 중앙 디렉터리 entry 길이 계산 실패"))?;
+            self.prepare_header_buffer(record_len, "ZIP 중앙 디렉터리 메모리 확보 실패")?;
+            write_u32(&mut self.header_buffer, CENTRAL_DIRECTORY_SIGNATURE);
+            write_u16(&mut self.header_buffer, VERSION_MADE_BY);
+            write_u16(&mut self.header_buffer, VERSION_NEEDED);
+            write_u16(&mut self.header_buffer, EXCEL_ENTRY_FLAGS);
+            write_u16(&mut self.header_buffer, METHOD_DEFLATE);
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, 0x0021);
+            write_u32(&mut self.header_buffer, entry.crc32);
+            write_u32(&mut self.header_buffer, entry.compressed_size);
+            write_u32(&mut self.header_buffer, entry.uncompressed_size);
+            write_u16(
+                &mut self.header_buffer,
+                u16::try_from(entry.part.name.len())
+                    .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?,
+            );
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, 0);
+            write_u16(&mut self.header_buffer, 0);
+            write_u32(&mut self.header_buffer, 0);
+            write_u32(&mut self.header_buffer, entry.local_header_offset);
+            self.header_buffer
+                .extend_from_slice(entry.part.name.as_bytes());
             self.write_header_buffer("xlsx 압축 중앙 디렉터리 쓰기 실패")?;
         }
         self.prepare_header_buffer(
@@ -111,7 +127,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
             bytes: &part.bytes,
             workspace: &mut self.deflate_workspace,
         })
-        .plan()?
+        .plan(part.name)?
         else {
             return Err(err(format!(
                 "고정 XLSX part 압축 작업 한도를 초과했습니다: {}",
@@ -126,21 +142,47 @@ impl<'part> StreamingZipWriter<'part, '_> {
         let crc32 = crc32(&part.bytes)?;
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
+        let local_extra = excel_local_extra(part.name);
+        let local_extra_len = local_extra.map_or(0, |(len, _)| len);
         let local_header_len = LOCAL_FILE_HEADER_LEN
             .checked_add(part.name.len())
+            .and_then(|len| len.checked_add(local_extra_len))
             .ok_or_else(|| err("ZIP local header 길이 계산 실패"))?;
         let entry_output_size = local_header_len
             .checked_add(compressed_size)
-            .and_then(|size| size.checked_add(DATA_DESCRIPTOR_LEN))
             .ok_or_else(|| err("ZIP entry 출력 크기 계산 실패"))?;
         self.ensure_output_limit(entry_output_size, "ZIP entry 출력 크기 계산")?;
-        let source_local = self
-            .source_bytes
-            .get(part.local_record)
-            .and_then(|record| record.get(..local_header_len))
-            .ok_or_else(|| err("ZIP 원본 local header 범위 오류"))?;
         self.prepare_header_buffer(local_header_len, "ZIP local header 메모리 확보 실패")?;
-        self.header_buffer.extend_from_slice(source_local);
+        write_u32(&mut self.header_buffer, LOCAL_FILE_HEADER_SIGNATURE);
+        write_u16(&mut self.header_buffer, VERSION_NEEDED);
+        write_u16(&mut self.header_buffer, EXCEL_ENTRY_FLAGS);
+        write_u16(&mut self.header_buffer, METHOD_DEFLATE);
+        write_u16(&mut self.header_buffer, 0);
+        write_u16(&mut self.header_buffer, 0x0021);
+        write_u32(&mut self.header_buffer, crc32);
+        write_u32(&mut self.header_buffer, compressed_size_u32);
+        write_u32(&mut self.header_buffer, uncompressed_size_u32);
+        write_u16(
+            &mut self.header_buffer,
+            u16::try_from(part.name.len())
+                .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?,
+        );
+        write_u16(
+            &mut self.header_buffer,
+            u16::try_from(local_extra_len)
+                .map_err(|source| err_with_source("ZIP local extra 길이 변환 실패", source))?,
+        );
+        self.header_buffer.extend_from_slice(part.name.as_bytes());
+        if let Some((extra_len, header)) = local_extra {
+            self.header_buffer.extend_from_slice(&header);
+            self.header_buffer.resize(
+                self.header_buffer
+                    .len()
+                    .checked_add(extra_len.saturating_sub(header.len()))
+                    .ok_or_else(|| err("ZIP local extra 크기 계산 실패"))?,
+                0,
+            );
+        }
         self.write_header_buffer("xlsx 압축 local header 쓰기 실패")?;
         let actual_written = plan.write_to(&mut self.file)?;
         if actual_written != compressed_size {
@@ -150,12 +192,6 @@ impl<'part> StreamingZipWriter<'part, '_> {
         }
         self.bytes_written =
             self.ensure_output_limit(compressed_size, "ZIP 압축 데이터 출력 크기 계산")?;
-        self.prepare_header_buffer(DATA_DESCRIPTOR_LEN, "ZIP data descriptor 메모리 확보 실패")?;
-        write_u32(&mut self.header_buffer, DATA_DESCRIPTOR_SIGNATURE);
-        write_u32(&mut self.header_buffer, crc32);
-        write_u32(&mut self.header_buffer, compressed_size_u32);
-        write_u32(&mut self.header_buffer, uncompressed_size_u32);
-        self.write_header_buffer("xlsx 압축 data descriptor 쓰기 실패")?;
         self.deflate_workspace.recycle(plan);
         Ok(WriteEntry {
             compressed_size: compressed_size_u32,
@@ -258,16 +294,6 @@ impl<'part> StreamingZipWriter<'part, '_> {
         self.bytes_written = next_bytes_written;
         Ok(())
     }
-}
-fn replace_u32(out: &mut [u8], offset: usize, value: u32) -> Result<()> {
-    let Some(target) = out
-        .get_mut(offset..)
-        .and_then(|tail| tail.first_chunk_mut::<4>())
-    else {
-        return Err(err("ZIP 중앙 디렉터리 필드 범위 오류"));
-    };
-    *target = value.to_le_bytes();
-    Ok(())
 }
 fn write_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());

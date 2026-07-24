@@ -275,6 +275,7 @@ impl RankSortRefresher<'_, '_> {
         row_num: u32,
         base: RankRowBase,
         sort_context: &RankSortContext,
+        fuel_text: &mut String,
     ) -> Result<Option<ScaledSortKey>> {
         let display_total_qty = sort_context.display_total_qty;
         let prices = base.adjusted_prices;
@@ -291,27 +292,27 @@ impl RankSortRefresher<'_, '_> {
         let rank_total = total_price
             .zip(regional_discount)
             .and_then(|(total, discount)| total.checked_sub(discount));
-        let mut fuel_total_parts = String::new();
+        fuel_text.clear();
         let has_fuel_total_text = display_total_qty.is_some()
             && append_fuel_total_text(
-                &mut fuel_total_parts,
+                fuel_text,
                 sort_context.quantities.gasoline,
                 prices.gasoline,
                 "휘발유",
             )?
             && append_fuel_total_text(
-                &mut fuel_total_parts,
+                fuel_text,
                 sort_context.quantities.premium,
                 prices.premium,
                 "고급유",
             )?
             && append_fuel_total_text(
-                &mut fuel_total_parts,
+                fuel_text,
                 sort_context.quantities.diesel,
                 prices.diesel,
                 "경유",
             )?;
-        let fuel_total_text = has_fuel_total_text.then_some(fuel_total_parts);
+        let fuel_total_text = has_fuel_total_text.then_some(fuel_text.as_str());
         let unit_price_with_currency = match rank_total.zip(display_total_qty) {
             Some((value, qty)) => format_unit_price_text(value, qty)?,
             None => None,
@@ -330,12 +331,7 @@ impl RankSortRefresher<'_, '_> {
         self.write_decimal_value(row_num, COL_ADJUSTED_GASOLINE, prices.gasoline)?;
         self.write_decimal_value(row_num, COL_ADJUSTED_PREMIUM, prices.premium)?;
         self.write_decimal_value(row_num, COL_ADJUSTED_DIESEL, prices.diesel)?;
-        self.write_text_value(
-            row_num,
-            COL_FUEL_TOTAL_TEXT,
-            fuel_total_text.as_deref(),
-            true,
-        )?;
+        self.write_text_value(row_num, COL_FUEL_TOTAL_TEXT, fuel_total_text, true)?;
         self.write_squared_value(row_num, COL_TOTAL_PRICE, total_price)?;
         self.write_decimal_value(
             row_num,
@@ -451,9 +447,10 @@ impl RankSortRefresher<'_, '_> {
                 source,
             )
         })?;
+        let mut fuel_text = String::new();
         for (row, plan) in self.data_rows.into_iter().zip(row_plans) {
             if let Some(rank_total) =
-                self.build_and_write_formula_cache(row, plan.base, sort_context)?
+                self.build_and_write_formula_cache(row, plan.base, sort_context, &mut fuel_text)?
             {
                 ranked_rows.push((rank_total, row));
             } else {

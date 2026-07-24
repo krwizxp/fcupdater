@@ -1,27 +1,27 @@
 # fcupdater
 
-`fuel_cost_chungcheong.xlsx`를 Opinet 전국 현재 판매가격(주유소) 자료에 맞춰 현행화하는 CLI 도구입니다. Excel 설치 없이 Windows, Linux, macOS에서 실행할 수 있습니다.
+`fuel_cost_chungcheong.xlsx`를 Opinet 전국 현재 판매가격 자료에 맞춰 현행화하는 명령행 도구입니다. Windows, Linux, macOS에서 같은 방식으로 사용할 수 있습니다.
 
 ## 주요 기능
 
-- Opinet 전국 판매가격 `.xls` 자동 다운로드
-- 주소 기준 기존 주유소 정보와 가격 갱신
+- Opinet 주유소 판매가격 자료 다운로드
+- 주소 기준 주유소 정보와 유종별 가격 갱신
 - 신규·폐업 주유소 반영
+- 지역, 상호, 상표, 셀프 여부 변경 반영
+- 지역화폐와 스마트주유 할인 적용
 - `변경내역` 시트 갱신
-- XLSX 파일 직접 읽기와 저장
-- 기본 빠른 저장 및 `--verify` 저장 결과 확인
+- 저장 결과 검증
 
-## 실행 환경
+## 지원 환경
 
 - Rust 1.97.1 이상
 - Windows 10 22H2 이상 또는 Windows 11
-- Linux 빌드: `libcurl4-openssl-dev`
-- Linux 실행: `libcurl4`
-- Linux/macOS libcurl 7.85.0 이상
+- Linux 및 macOS
+- Linux/macOS의 libcurl 7.85.0 이상
 
-Windows는 WinHTTP, Linux와 macOS는 native libcurl을 사용합니다. 현행화 날짜는 실행 환경의 시간대와 관계없이 KST 기준으로 기록합니다.
+Linux에서 직접 빌드할 때는 배포판의 libcurl 개발 패키지를 사용합니다. 현행화 날짜는 KST 기준으로 기록됩니다.
 
-## 빌드와 실행
+## 빌드
 
 ```bash
 cargo build --release --locked
@@ -32,39 +32,31 @@ cargo build --release --locked
 - Windows: `target\release\fcupdater.exe`
 - Linux/macOS: `target/release/fcupdater`
 
-실행 파일과 `fuel_cost_chungcheong.xlsx`를 같은 폴더에 두고 실행합니다.
+## 사용 방법
+
+실행 파일과 저장소에서 제공하는 `fuel_cost_chungcheong.xlsx`를 같은 폴더에 둔 뒤 실행합니다.
 
 ```bash
 fcupdater
 ```
 
-프로그램이 Opinet 자료를 내려받아 7개 대상 지역을 반영하고 같은 마스터 파일을 현행화합니다.
+프로그램은 Opinet 자료를 내려받아 대상 지역의 주유소 정보를 갱신하고 같은 워크북에 저장합니다. 저장을 시작하기 전에 워크북 구성과 주요 데이터 형식을 확인하며, 원본 상태를 확인한 뒤 안전하게 교체합니다.
 
-## 옵션
+### 옵션
 
 - `-h`, `--help`: 도움말 표시
-- `--verify`: 임시 XLSX를 저장하고 재열기 검증을 마친 뒤 마스터 파일에 반영
+- `--verify`: 저장 결과를 다시 열어 확인한 뒤 워크북에 반영
 - `--version`: 버전 표시
 
-## 마스터와 소스 형식
+## 워크북
 
-마스터는 저장소에서 제공하는 `fuel_cost_chungcheong.xlsx` 템플릿을 사용합니다. 템플릿 구성은 다음과 같습니다.
+저장소에서 제공하는 워크북은 다음 두 시트로 구성됩니다.
 
-- 시트: `유류비`, `변경내역` 순서의 2개
-- `유류비`: 14행 A~W 헤더
-- `변경내역`: 3행 A~M 헤더
-- OOXML: 기본 SpreadsheetML namespace와 표준 `r:id`
-- 셀 표현: shared string cell과 일반 수식
+- `유류비`: 현재 주유소 정보, 가격, 할인과 순위
+- `변경내역`: 가격과 주유소 정보의 변경 이력
 
-프로그램은 현행화를 시작하기 전에 템플릿 구조와 주소·상호·셀프 구분, 가격 형식·범위·완전성을 확인합니다. Opinet 소스는 다음 형식으로 읽습니다.
-
-- OLE2/BIFF `.xls`
-- `CODEPAGE = 1200`
-- worksheet 1개
-- `LABELSST` 문자열 셀
-- Opinet 판매가격 열 구조
-
-다운로드 자료는 지정된 HTTPS 호스트의 직접 응답에서 가져옵니다. 기본 실행은 빠른 저장을 사용하고, `--verify`는 저장 결과를 다시 열어 OOXML 구조를 확인합니다.
+현행화 과정에서는 수식과 계산값, 서식, 변경 이력의 일관성을 함께 관리합니다. `--verify` 옵션은 생성된 워크북을 다시 열어 구조와 주요 내용을 한 번 더 확인합니다.
+Microsoft Excel 또는 LibreOffice Calc로 저장한 제공 워크북을 사용할 수 있으며, 현행화 결과는 Microsoft Excel 형식으로 일관되게 저장됩니다.
 
 ## 대상 지역
 
@@ -76,35 +68,24 @@ fcupdater
 - 충청남도 아산시
 - 충청남도 천안시
 
+대전광역시는 하나의 지역으로 통합하여 지역 검증과 할인율을 적용합니다.
+
 ## 변경내역
 
-`변경내역` 시트의 3행 A~M 헤더는 다음과 같습니다.
+`변경내역` 시트에는 다음 항목이 기록됩니다.
 
-- A: `지역`
-- B: `상호`
-- C: `주소`
-- D: `변경내용`
-- E: `휘발유(이전)`
-- F: `휘발유(신규)`
-- G: `휘발유 Δ`
-- H: `고급유(이전)`
-- I: `고급유(신규)`
-- J: `고급유 Δ`
-- K: `경유(이전)`
-- L: `경유(신규)`
-- M: `경유 Δ`
+- 가격변동
+- 지역정정
+- 상호변경
+- 상표변경
+- 셀프여부변경
+- 신규
+- 폐업
 
-변경내용은 `가격변동`, `지역정정`, `상호변경`, `상표변경`, `셀프여부변경`, `신규`, `폐업`으로 기록합니다.
+휘발유, 고급휘발유, 경유의 이전 가격과 신규 가격, 변동액을 함께 확인할 수 있습니다.
 
 ## GitHub Actions
 
-`.github/workflows/ci.yml`은 다음 4개 환경에서 release build를 확인합니다.
+CI 워크플로는 Windows, Linux, Intel Mac, Apple Silicon Mac용 release build를 확인합니다. `main` 브랜치와 태그 실행에서는 배포용 Artifact를 제공하며, Pull Request에서는 같은 환경의 빌드를 검증합니다.
 
-- `ubuntu-latest`: `fcupdater-linux-x64.tar`
-- `macos-26-intel`: `fcupdater-macos-x64.tar`
-- `macos-26`: `fcupdater-macos-arm64.tar`
-- `windows-latest`: `fcupdater-windows-x64.exe`
-
-Linux/macOS 실행 파일은 실행 권한을 보존하는 tar로, Windows 실행 파일은 exe로 준비합니다. `main` 브랜치와 태그 push 실행은 배포용 Artifact를 생성하고, Pull Request 실행은 같은 release build를 확인합니다.
-
-`.github/workflows/update_master.yml`은 `ubuntu-latest`에서 마스터를 현행화하고 `fcupdater-result.xlsx` Artifact를 생성합니다.
+워크북 현행화 워크플로는 최신 Opinet 자료를 반영한 `fcupdater-result.xlsx`를 Artifact로 제공합니다.

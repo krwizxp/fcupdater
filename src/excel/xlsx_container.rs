@@ -1,7 +1,7 @@
 use super::{
-    ArchiveFingerprint, CHANGE_LOG_SHEET_NAME, MASTER_SHEET_NAME, PackagePart,
-    SPREADSHEETML_NAMESPACE, SaveVerification, XLSX_PART_NAMES, ZipArchiveBuilder,
-    ZipPackageReader,
+    ArchiveFingerprint, CALC_CHAIN_PATH, CHANGE_LOG_SHEET_NAME, EXCEL_XLSX_PART_NAMES,
+    MASTER_SHEET_NAME, PackagePart, SPREADSHEETML_NAMESPACE, SaveVerification, XlsxPackageKind,
+    ZipArchiveBuilder, ZipPackageReader,
     xml::{XmlAttrScanner, XmlScanner},
     zip_archive::scan_open_archive,
 };
@@ -9,7 +9,7 @@ use crate::diagnostic::{AppError, Result, err, err_with_source, path_context_mes
 use crate::temp_entry::{cleanup_stale_temp_files, reserve_unique_temp_entry};
 use crate::validate_regular_file;
 use alloc::borrow::Cow;
-use core::{mem, str};
+use core::{mem, range::Range, str};
 use std::{
     fs,
     io::{self, Write as _, stderr},
@@ -37,17 +37,95 @@ const WORKBOOK_PART_NAME: &str = "/xl/workbook.xml";
 const WORKBOOK_REL_TARGET: &str = "xl/workbook.xml";
 const WORKSHEET_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
-const WORKBOOK_LOEXT_FRAGMENT: &str = concat!(
-    "<extLst><ext xmlns:loext=\"http://schemas.libreoffice.org/\" ",
-    "uri=\"{7626C862-2A13-11E5-B345-FEFF819CDC9F}\">",
-    "<loext:extCalcPr stringRefSyntax=\"CalcA1ExcelA1\"/></ext></extLst>",
-);
-const WORKBOOK_LOEXT_OPEN_TAG: &str = concat!(
-    "<ext xmlns:loext=\"http://schemas.libreoffice.org/\" ",
-    "uri=\"{7626C862-2A13-11E5-B345-FEFF819CDC9F}\">",
-);
+const RICH_DATA2_NAMESPACE: &str =
+    "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata2";
 const WORKBOOK_LOEXT_VALUE_TAG: &str = "<loext:extCalcPr stringRefSyntax=\"CalcA1ExcelA1\"/>";
-const CONTENT_TYPE_DEFAULTS: [(&str, &str); 5] = [
+const EXCEL_CONTENT_TYPE_DEFAULTS: [(&str, &str); 3] = [
+    ("emf", "image/x-emf"),
+    (
+        "rels",
+        "application/vnd.openxmlformats-package.relationships+xml",
+    ),
+    ("xml", "application/xml"),
+];
+const EXCEL_CONTENT_TYPE_OVERRIDES: [(&str, &str); 9] = [
+    (WORKBOOK_PART_NAME, WORKBOOK_CONTENT_TYPE),
+    (
+        "/xl/worksheets/sheet1.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+    ),
+    (
+        "/xl/worksheets/sheet2.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+    ),
+    (
+        "/xl/theme/theme1.xml",
+        "application/vnd.openxmlformats-officedocument.theme+xml",
+    ),
+    (
+        "/xl/styles.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+    ),
+    (
+        "/xl/sharedStrings.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+    ),
+    (
+        "/xl/calcChain.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml",
+    ),
+    (
+        "/docProps/core.xml",
+        "application/vnd.openxmlformats-package.core-properties+xml",
+    ),
+    (
+        "/docProps/app.xml",
+        "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+    ),
+];
+const EXCEL_ROOT_RELATIONSHIPS: [(&str, &str, &str); 4] = [
+    (
+        "rId3",
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
+        "docProps/core.xml",
+    ),
+    (
+        "rId2",
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail",
+        "docProps/thumbnail.emf",
+    ),
+    ("rId1", OFFICE_DOCUMENT_REL_TYPE, WORKBOOK_REL_TARGET),
+    (
+        "rId4",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
+        "docProps/app.xml",
+    ),
+];
+const EXCEL_WORKBOOK_RELATIONSHIPS: [(&str, &str, &str); 6] = [
+    (
+        "rId3",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+        "theme/theme1.xml",
+    ),
+    ("rId2", WORKSHEET_REL_TYPE, "worksheets/sheet2.xml"),
+    ("rId1", WORKSHEET_REL_TYPE, "worksheets/sheet1.xml"),
+    (
+        "rId6",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain",
+        "calcChain.xml",
+    ),
+    (
+        "rId5",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
+        "sharedStrings.xml",
+    ),
+    (
+        "rId4",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+        "styles.xml",
+    ),
+];
+const LIBREOFFICE_CONTENT_TYPE_DEFAULTS: [(&str, &str); 5] = [
     ("fntdata", "application/x-fontdata"),
     ("jpeg", "image/jpeg"),
     ("png", "image/png"),
@@ -57,7 +135,7 @@ const CONTENT_TYPE_DEFAULTS: [(&str, &str); 5] = [
     ),
     ("xml", "application/xml"),
 ];
-const CONTENT_TYPE_OVERRIDES: [(&str, &str); 10] = [
+const LIBREOFFICE_CONTENT_TYPE_OVERRIDES: [(&str, &str); 10] = [
     (
         "/docProps/custom.xml",
         "application/vnd.openxmlformats-officedocument.custom-properties+xml",
@@ -96,7 +174,7 @@ const CONTENT_TYPE_OVERRIDES: [(&str, &str); 10] = [
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
     ),
 ];
-const ROOT_RELATIONSHIPS: [(&str, &str, &str); 4] = [
+const LIBREOFFICE_ROOT_RELATIONSHIPS: [(&str, &str, &str); 4] = [
     ("rId1", OFFICE_DOCUMENT_REL_TYPE, WORKBOOK_REL_TARGET),
     (
         "rId2",
@@ -114,7 +192,7 @@ const ROOT_RELATIONSHIPS: [(&str, &str, &str); 4] = [
         "docProps/custom.xml",
     ),
 ];
-const WORKBOOK_RELATIONSHIPS: [(&str, &str, &str); 5] = [
+const LIBREOFFICE_WORKBOOK_RELATIONSHIPS: [(&str, &str, &str); 5] = [
     (
         "rId1",
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
@@ -133,9 +211,86 @@ const WORKBOOK_RELATIONSHIPS: [(&str, &str, &str); 5] = [
         "sharedStrings.xml",
     ),
 ];
+const LIBREOFFICE_SHEET_RELATIONSHIPS: [(&str, &str, &str); 1] = [(
+    "rId1",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
+    "../drawings/drawing1.xml",
+)];
+const EXCEL_CONTENT_TYPES_XML: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n",
+    "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+    "<Default Extension=\"emf\" ContentType=\"image/x-emf\"/>",
+    "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>",
+    "<Default Extension=\"xml\" ContentType=\"application/xml\"/>",
+    "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>",
+    "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+    "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+    "<Override PartName=\"/xl/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/>",
+    "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
+    "<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>",
+    "<Override PartName=\"/xl/calcChain.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml\"/>",
+    "<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>",
+    "<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>",
+    "</Types>",
+);
+const EXCEL_ROOT_RELATIONSHIPS_XML: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n",
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+    "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>",
+    "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail\" Target=\"docProps/thumbnail.emf\"/>",
+    "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>",
+    "<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>",
+    "</Relationships>",
+);
+const EXCEL_WORKBOOK_RELATIONSHIPS_XML: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n",
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+    "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" Target=\"theme/theme1.xml\"/>",
+    "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/>",
+    "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>",
+    "<Relationship Id=\"rId6\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain\" Target=\"calcChain.xml\"/>",
+    "<Relationship Id=\"rId5\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>",
+    "<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
+    "</Relationships>",
+);
+const BLANK_EXCEL_THUMBNAIL_DWORDS: [u32; 32] = [
+    1,
+    108,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    26,
+    26,
+    0x464d_4520,
+    0x0001_0000,
+    128,
+    2,
+    1,
+    0,
+    0,
+    0,
+    96,
+    96,
+    25,
+    25,
+    0,
+    0,
+    0,
+    25_000,
+    25_000,
+    14,
+    20,
+    0,
+    0,
+    20,
+];
 #[derive(Debug)]
 pub(crate) struct XlsxContainer {
-    parts: [PackagePart; XLSX_PART_NAMES.len()],
+    package_kind: XlsxPackageKind,
+    parts: Vec<PackagePart>,
     source_bytes: Vec<u8>,
     source_fingerprint: ArchiveFingerprint,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -305,36 +460,21 @@ impl TempArchivePromotion<'_> {
         if let Err(validation_error) = self.validate_displaced_original(displaced_file) {
             return self.rollback_after_validation_failure(validation_error);
         }
-        if let Err(cleanup_error) = self.cleanup_displaced_original(displaced_file) {
-            let mut error_output = stderr().lock();
-            match writeln!(
-                &mut error_output,
-                "경고: xlsx 저장은 완료됐지만 교체된 원본 정리에 실패했습니다: {cleanup_error}"
-            ) {
-                Ok(()) | Err(_) => {}
-            }
-        }
+        self.temp_archive.disable_drop_cleanup();
+        self.backup_archive.disable_drop_cleanup();
+        self.cleanup_displaced_original(displaced_file)?;
         cfg_select! {
             any(target_os = "linux", target_os = "macos") => {
-                if let Err(source_err) = fs::OpenOptions::new()
-                    .read(true)
-                    .open(self.target_xlsx)
-                    .and_then(|file| file.sync_all())
-                {
-                    write_path_warning(
-                        "저장 내구성 동기화 실패(파일)",
-                        self.target_xlsx,
-                        &source_err,
-                    );
-                }
+                sync_saved_path(
+                    self.target_xlsx,
+                    "xlsx 저장 완료 후 파일 내구성 동기화 실패",
+                )?;
                 let parent = self
                     .target_xlsx
                     .parent()
                     .filter(|path| !path.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."));
-                if let Err(source_err) = fs::File::open(parent).and_then(|dir| dir.sync_all()) {
-                    write_path_warning("저장 내구성 동기화 실패(폴더)", parent, &source_err);
-                }
+                sync_saved_path(parent, "xlsx 저장 완료 후 폴더 내구성 동기화 실패")?;
             }
             _ => {}
         }
@@ -385,8 +525,11 @@ impl TempArchivePromotion<'_> {
     }
 }
 impl XlsxContainer {
-    pub(super) fn ensure_fixed_sheet_catalog(&mut self, workbook_xml: &str) -> Result<()> {
-        if workbook_xml.match_indices(WORKBOOK_LOEXT_FRAGMENT).count() != 1 {
+    pub(super) fn ensure_fixed_sheet_catalog(
+        &mut self,
+        workbook_xml: &mut String,
+    ) -> Result<Option<String>> {
+        if workbook_xml.match_indices(WORKBOOK_LOEXT_VALUE_TAG).count() != 1 {
             return Err(err(
                 "workbook.xml의 LibreOffice 확장 표현이 고정 스키마와 다릅니다.",
             ));
@@ -403,91 +546,158 @@ impl XlsxContainer {
         {
             return Err(err("workbook.xml의 root namespace가 올바르지 않습니다."));
         }
-        let mut extension_open_seen = false;
-        let mut extension_value_seen = false;
-        while let Some(tag) = namespace_scanner.next_tag() {
-            if !tag.is_start() {
-                continue;
-            }
-            if tag.raw() == WORKBOOK_LOEXT_OPEN_TAG {
-                if mem::replace(&mut extension_open_seen, true) {
-                    return Err(err(
-                        "workbook.xml에 LibreOffice namespace 선언이 여러 개 있습니다.",
-                    ));
-                }
-                continue;
-            }
-            if tag.raw() == WORKBOOK_LOEXT_VALUE_TAG {
-                if mem::replace(&mut extension_value_seen, true) {
-                    return Err(err(
-                        "workbook.xml에 LibreOffice 확장 값이 여러 개 있습니다.",
-                    ));
-                }
-                continue;
-            }
-            if tag.name() != tag.local_name() {
-                return Err(err(format!(
-                    "workbook.xml의 prefixed core element는 지원하지 않습니다: {}",
-                    tag.name()
-                )));
-            }
-            reject_namespace_declaration(tag.raw(), "workbook.xml")?;
-        }
-        if !extension_open_seen || !extension_value_seen {
-            return Err(err(
-                "workbook.xml의 LibreOffice namespace 표현이 고정 스키마와 다릅니다.",
-            ));
-        }
-        if XmlScanner::new(workbook_xml)
-            .next_start_named("fileRecoveryPr")
-            .is_some()
-        {
-            return Err(err(
-                "workbook.xml의 fileRecoveryPr 복구 표현은 지원하지 않습니다.",
-            ));
-        }
-        let workbook_relationships = self.take_text("xl/_rels/workbook.xml.rels")?;
-        validate_relationship_catalog(
-            &workbook_relationships,
-            &WORKBOOK_RELATIONSHIPS,
-            "workbook.xml.rels",
-        )?;
-        let mut workbook_scanner = XmlScanner::new(workbook_xml);
-        let workbook_tag = workbook_scanner
-            .next_start_named("workbook")
-            .ok_or_else(|| err("workbook.xml의 workbook 시작 태그를 찾지 못했습니다."))?;
-        let workbook_open_tag = workbook_tag.raw();
-        if required_xml_attr(workbook_open_tag, "xmlns:r", "workbook.xml workbook")?.as_ref()
+        if required_xml_attr(root.raw(), "xmlns:r", "workbook.xml")?.as_ref()
             != OFFICE_DOCUMENT_REL_NAMESPACE
         {
             return Err(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."));
         }
+        for (tag_name, message) in [
+            (
+                "fileRecoveryPr",
+                "workbook.xml의 fileRecoveryPr 복구 표현은 지원하지 않습니다.",
+            ),
+            (
+                "externalReferences",
+                "workbook.xml의 외부 workbook 관계는 지원하지 않습니다.",
+            ),
+            (
+                "connections",
+                "workbook.xml의 외부 데이터 연결은 지원하지 않습니다.",
+            ),
+        ] {
+            if XmlScanner::new(workbook_xml)
+                .next_start_named(tag_name)
+                .is_some()
+            {
+                return Err(err(message));
+            }
+        }
+        let workbook_relationships = self.take_text("xl/_rels/workbook.xml.rels")?;
+        let workbook_relationship_catalog = match self.package_kind {
+            XlsxPackageKind::Excel => EXCEL_WORKBOOK_RELATIONSHIPS.as_slice(),
+            XlsxPackageKind::LibreOffice => LIBREOFFICE_WORKBOOK_RELATIONSHIPS.as_slice(),
+        };
+        validate_relationship_catalog(
+            &workbook_relationships,
+            workbook_relationship_catalog,
+            "workbook.xml.rels",
+        )?;
+        let calc_chain_xml = if self.package_kind == XlsxPackageKind::Excel {
+            let xml = self.take_text(CALC_CHAIN_PATH)?;
+            let children =
+                direct_xml_children(&xml, "calcChain", SPREADSHEETML_NAMESPACE, "calcChain.xml")?;
+            if children.is_empty() {
+                return Err(err("calcChain.xml에 formula cell이 없습니다."));
+            }
+            if children.iter().any(|child| child.local_name != "c") {
+                return Err(err("calcChain.xml에 고정 스키마 외 요소가 있습니다."));
+            }
+            Some(xml)
+        } else {
+            None
+        };
+        let mut workbook_scanner = XmlScanner::new(workbook_xml);
         workbook_scanner
             .next_start_named("sheets")
             .ok_or_else(|| err("workbook.xml의 sheets 시작 태그를 찾지 못했습니다."))?;
-        for (expected_name, expected_sheet_id, expected_rid) in [
-            (MASTER_SHEET_NAME, "1", "rId3"),
-            (CHANGE_LOG_SHEET_NAME, "2", "rId4"),
-        ] {
+        let sheet_ids = match self.package_kind {
+            XlsxPackageKind::Excel => ["rId1", "rId2"],
+            XlsxPackageKind::LibreOffice => ["rId3", "rId4"],
+        };
+        for ((expected_name, expected_sheet_id), expected_rid) in
+            [(MASTER_SHEET_NAME, "1"), (CHANGE_LOG_SHEET_NAME, "2")]
+                .into_iter()
+                .zip(sheet_ids)
+        {
             let sheet_tag = workbook_scanner
                 .next_start_named("sheet")
                 .ok_or_else(|| err("workbook sheet 수가 고정 스키마의 2개보다 적습니다."))?;
             let tag = sheet_tag.raw();
-            validate_exact_attrs(
-                tag,
-                &[
-                    ("name", expected_name),
-                    ("sheetId", expected_sheet_id),
-                    ("state", "visible"),
-                    ("r:id", expected_rid),
-                ],
-                "workbook.xml sheet",
-            )?;
+            match self.package_kind {
+                XlsxPackageKind::Excel => validate_exact_attrs(
+                    tag,
+                    &[
+                        ("name", expected_name),
+                        ("sheetId", expected_sheet_id),
+                        ("r:id", expected_rid),
+                    ],
+                    "workbook.xml sheet",
+                )?,
+                XlsxPackageKind::LibreOffice => validate_exact_attrs(
+                    tag,
+                    &[
+                        ("name", expected_name),
+                        ("sheetId", expected_sheet_id),
+                        ("state", "visible"),
+                        ("r:id", expected_rid),
+                    ],
+                    "workbook.xml sheet",
+                )?,
+            }
         }
         if workbook_scanner.next_start_named("sheet").is_some() {
             return Err(err("workbook sheet 수가 고정 스키마의 2개보다 많습니다."));
         }
-        Ok(())
+        if self.package_kind == XlsxPackageKind::LibreOffice {
+            replace_single_self_closing_tag(
+                workbook_xml,
+                "fileVersion",
+                "<fileVersion appName=\"xl\" lastEdited=\"7\" lowestEdited=\"7\" rupBuild=\"27932\"/>",
+            )?;
+            replace_single_self_closing_tag(workbook_xml, "workbookPr", "<workbookPr/>")?;
+            let mut defined_name_scanner = XmlScanner::new(workbook_xml);
+            let defined_name = defined_name_scanner
+                .next_start_named("definedName")
+                .filter(|tag| tag.name() == "definedName" && !tag.self_closing())
+                .ok_or_else(|| {
+                    err("LibreOffice workbook의 _FilterDatabase 태그가 올바르지 않습니다.")
+                })?;
+            validate_exact_attrs(
+                defined_name.raw(),
+                &[
+                    ("function", "false"),
+                    ("hidden", "true"),
+                    ("localSheetId", "0"),
+                    ("name", "_xlnm._FilterDatabase"),
+                    ("vbProcedure", "false"),
+                ],
+                "LibreOffice workbook _FilterDatabase",
+            )?;
+            let defined_name_span = defined_name.start()
+                ..defined_name
+                    .end()
+                    .checked_add(1)
+                    .ok_or_else(|| err("LibreOffice _FilterDatabase 태그 끝 계산 실패"))?;
+            workbook_xml.replace_range(
+                defined_name_span,
+                "<definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">",
+            );
+            let mut sheet_scanner = XmlScanner::new(workbook_xml);
+            let mut sheet_spans = [0..0, 0..0];
+            for span in &mut sheet_spans {
+                let tag = sheet_scanner
+                    .next_start_named("sheet")
+                    .ok_or_else(|| err("LibreOffice workbook sheet 태그가 없습니다."))?;
+                if !tag.self_closing() {
+                    return Err(err("LibreOffice workbook sheet 태그가 올바르지 않습니다."));
+                }
+                *span = tag.start()
+                    ..tag
+                        .end()
+                        .checked_add(1)
+                        .ok_or_else(|| err("workbook sheet 태그 끝 계산 실패"))?;
+            }
+            let [master_sheet_span, change_log_sheet_span] = sheet_spans;
+            workbook_xml.replace_range(
+                change_log_sheet_span,
+                "<sheet name=\"변경내역\" sheetId=\"2\" r:id=\"rId2\"/>",
+            );
+            workbook_xml.replace_range(
+                master_sheet_span,
+                "<sheet name=\"유류비\" sheetId=\"1\" r:id=\"rId1\"/>",
+            );
+        }
+        Ok(calc_chain_xml)
     }
     pub(crate) fn open(source_xlsx: &Path) -> Result<Self> {
         let mut source_options = fs::File::options();
@@ -508,12 +718,13 @@ impl XlsxContainer {
         let source_permissions = source_metadata?.permissions();
         #[cfg(target_os = "windows")]
         source_metadata?;
-        let (source_fingerprint, source_bytes, parts) = ZipPackageReader {
+        let (source_fingerprint, source_bytes, package_kind, parts) = ZipPackageReader {
             archive_file: source_file,
             archive_path: source_xlsx,
         }
         .read()?;
         let mut container = Self {
+            package_kind,
             parts,
             source_bytes,
             source_fingerprint,
@@ -522,22 +733,88 @@ impl XlsxContainer {
         };
         container.validate_content_types()?;
         container.validate_root_relationships()?;
+        container.validate_libreoffice_companion_parts()?;
         container.part_mut("[Content_Types].xml")?.bytes = Vec::new();
         container.part_mut("_rels/.rels")?.bytes = Vec::new();
         Ok(container)
     }
+    pub(crate) fn package_prepare_excel_output(&mut self) -> Result<()> {
+        if self.package_kind == XlsxPackageKind::Excel {
+            return Ok(());
+        }
+        let mut source_parts = mem::take(&mut self.parts);
+        let mut output_parts = Vec::new();
+        output_parts
+            .try_reserve_exact(EXCEL_XLSX_PART_NAMES.len())
+            .map_err(|source| {
+                err_with_source("Excel package part 목록 메모리 확보 실패", source)
+            })?;
+        for name in EXCEL_XLSX_PART_NAMES {
+            let bytes = match name {
+                "[Content_Types].xml" => EXCEL_CONTENT_TYPES_XML.as_bytes().to_vec(),
+                "_rels/.rels" => EXCEL_ROOT_RELATIONSHIPS_XML.as_bytes().to_vec(),
+                "xl/_rels/workbook.xml.rels" => {
+                    EXCEL_WORKBOOK_RELATIONSHIPS_XML.as_bytes().to_vec()
+                }
+                "docProps/thumbnail.emf" => {
+                    let thumbnail_len = BLANK_EXCEL_THUMBNAIL_DWORDS
+                        .len()
+                        .checked_mul(size_of::<u32>())
+                        .ok_or_else(|| err("Excel thumbnail 크기 계산 실패"))?;
+                    let mut bytes = Vec::new();
+                    bytes.try_reserve_exact(thumbnail_len).map_err(|source| {
+                        err_with_source("Excel thumbnail 메모리 확보 실패", source)
+                    })?;
+                    for value in BLANK_EXCEL_THUMBNAIL_DWORDS {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                    bytes
+                }
+                CALC_CHAIN_PATH => Vec::new(),
+                _ => {
+                    let part = source_parts
+                        .iter_mut()
+                        .find(|part| part.name == name)
+                        .ok_or_else(|| {
+                            err(format!(
+                                "LibreOffice 입력에서 Excel 공통 part를 찾지 못했습니다: {name}"
+                            ))
+                        })?;
+                    let bytes = mem::take(&mut part.bytes);
+                    if name == "docProps/app.xml" {
+                        let mut xml = String::from_utf8(bytes).map_err(|source_error| {
+                            err_with_source("LibreOffice app.xml UTF-8 해석 실패", source_error)
+                        })?;
+                        replace_exact_element_text(&mut xml, "Application", "Microsoft Excel")?;
+                        replace_exact_element_text(&mut xml, "AppVersion", "16.0300")?;
+                        xml.into_bytes()
+                    } else {
+                        bytes
+                    }
+                }
+            };
+            output_parts.push(PackagePart {
+                bytes,
+                central_record: Range { start: 0, end: 0 },
+                changed: true,
+                local_record: Range { start: 0, end: 0 },
+                name,
+            });
+        }
+        self.parts = output_parts;
+        self.package_kind = XlsxPackageKind::Excel;
+        Ok(())
+    }
     fn part(&self, name: &str) -> Result<&PackagePart> {
-        XLSX_PART_NAMES
+        self.parts
             .iter()
-            .position(|part_name| *part_name == name)
-            .and_then(|index| self.parts.get(index))
+            .find(|part| part.name == name)
             .ok_or_else(|| err(format!("xlsx part를 찾지 못했습니다: {name}")))
     }
     fn part_mut(&mut self, name: &str) -> Result<&mut PackagePart> {
-        XLSX_PART_NAMES
-            .iter()
-            .zip(&mut self.parts)
-            .find_map(|(part_name, part)| (*part_name == name).then_some(part))
+        self.parts
+            .iter_mut()
+            .find(|part| part.name == name)
             .ok_or_else(|| err(format!("xlsx part를 찾지 못했습니다: {name}")))
     }
     pub(super) fn put_text(&mut self, name: &str, content: String) -> Result<()> {
@@ -662,7 +939,11 @@ impl XlsxContainer {
                 )));
             }
             if tag.is_start() {
-                reject_namespace_declaration(tag.raw(), "sharedStrings.xml")?;
+                validate_descendant_namespace_declaration(
+                    tag.name(),
+                    tag.raw(),
+                    "sharedStrings.xml",
+                )?;
             }
         }
         Ok(xml)
@@ -678,6 +959,94 @@ impl XlsxContainer {
         String::from_utf8(bytes)
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
     }
+    pub(super) fn take_worksheet_text(&mut self, name: &str, sheet_name: &str) -> Result<String> {
+        let mut xml = self.take_text(name)?;
+        if self.package_kind == XlsxPackageKind::LibreOffice && name == super::MASTER_SHEET_PATH {
+            let mut scanner = XmlScanner::new(&xml);
+            let drawing = scanner
+                .next_start_named("drawing")
+                .filter(|tag| tag.name() == "drawing" && tag.self_closing())
+                .ok_or_else(|| {
+                    err("LibreOffice sheet1.xml의 빈 drawing 참조를 찾지 못했습니다.")
+                })?;
+            validate_exact_attrs(
+                drawing.raw(),
+                &[("r:id", "rId1")],
+                "LibreOffice sheet1.xml drawing",
+            )?;
+            let span = drawing.start()
+                ..drawing
+                    .end()
+                    .checked_add(1)
+                    .ok_or_else(|| err("LibreOffice drawing 참조 끝 계산 실패"))?;
+            scanner.skip_to(span.end);
+            if scanner.next_start_named("drawing").is_some() {
+                return Err(err(
+                    "LibreOffice sheet1.xml에 drawing 참조가 여러 개 있습니다.",
+                ));
+            }
+            xml.replace_range(span, "");
+        }
+        let context = format!("worksheet XML namespace 검증: {sheet_name}");
+        let mut scanner = XmlScanner::new(&xml);
+        let root = scanner
+            .next_tag()
+            .ok_or_else(|| err(format!("{context}에 root 태그가 없습니다.")))?;
+        if !root.is_start()
+            || root.name() != "worksheet"
+            || root.local_name() != "worksheet"
+            || root.self_closing()
+        {
+            return Err(err(format!("{context}의 root 태그가 올바르지 않습니다.")));
+        }
+        if required_xml_attr(root.raw(), "xmlns", &context)?.as_ref() != SPREADSHEETML_NAMESPACE {
+            return Err(err(format!(
+                "{context}의 worksheet namespace가 올바르지 않습니다."
+            )));
+        }
+        let mut ancestors = Vec::new();
+        ancestors.try_reserve_exact(8).map_err(|source| {
+            err_with_source(format!("{context} stack 메모리 확보 실패"), source)
+        })?;
+        ancestors.push(root.name());
+        while let Some(tag) = scanner.next_tag() {
+            if ancestors.is_empty() {
+                return Err(err(format!("{context}에 root 밖의 XML 요소가 있습니다.")));
+            }
+            if tag.is_start() {
+                if tag.name() != tag.local_name() {
+                    return Err(err(format!(
+                        "{context}의 prefixed core element는 지원하지 않습니다: {}",
+                        tag.name()
+                    )));
+                }
+                validate_descendant_namespace_declaration(tag.name(), tag.raw(), &context)?;
+                if !tag.self_closing() {
+                    if ancestors.len() == ancestors.capacity() {
+                        ancestors.try_reserve(1).map_err(|source| {
+                            err_with_source(format!("{context} stack 메모리 확보 실패"), source)
+                        })?;
+                    }
+                    ancestors.push(tag.name());
+                }
+                continue;
+            }
+            let open = ancestors
+                .pop()
+                .ok_or_else(|| err(format!("{context}의 종료 태그 순서가 올바르지 않습니다.")))?;
+            if open != tag.name() {
+                return Err(err(format!(
+                    "{context}의 XML 태그 쌍이 일치하지 않습니다: {} / {}",
+                    open,
+                    tag.name()
+                )));
+            }
+        }
+        if !ancestors.is_empty() {
+            return Err(err(format!("{context}에 닫히지 않은 XML 요소가 있습니다.")));
+        }
+        Ok(xml)
+    }
     fn text(&self, name: &str) -> Result<&str> {
         let part = self.part(name)?;
         if part.bytes.len() > MAX_XLSX_TEXT_PART_BYTES {
@@ -691,6 +1060,16 @@ impl XlsxContainer {
     }
     fn validate_content_types(&self) -> Result<()> {
         let content_types_xml = self.text("[Content_Types].xml")?;
+        let (defaults, overrides) = match self.package_kind {
+            XlsxPackageKind::Excel => (
+                EXCEL_CONTENT_TYPE_DEFAULTS.as_slice(),
+                EXCEL_CONTENT_TYPE_OVERRIDES.as_slice(),
+            ),
+            XlsxPackageKind::LibreOffice => (
+                LIBREOFFICE_CONTENT_TYPE_DEFAULTS.as_slice(),
+                LIBREOFFICE_CONTENT_TYPE_OVERRIDES.as_slice(),
+            ),
+        };
         let children = direct_xml_children(
             content_types_xml,
             "Types",
@@ -698,7 +1077,7 @@ impl XlsxContainer {
             "[Content_Types].xml",
         )?;
         let mut child_iter = children.iter();
-        for (extension, content_type) in CONTENT_TYPE_DEFAULTS {
+        for &(extension, content_type) in defaults {
             let child = child_iter
                 .next()
                 .ok_or_else(|| err("[Content_Types].xml Default 항목이 부족합니다."))?;
@@ -711,7 +1090,7 @@ impl XlsxContainer {
                 "[Content_Types].xml Default",
             )?;
         }
-        for (part_name, content_type) in CONTENT_TYPE_OVERRIDES {
+        for &(part_name, content_type) in overrides {
             let child = child_iter
                 .next()
                 .ok_or_else(|| err("[Content_Types].xml Override 항목이 부족합니다."))?;
@@ -731,74 +1110,65 @@ impl XlsxContainer {
         }
         Ok(())
     }
-    fn validate_root_relationships(&self) -> Result<()> {
+    fn validate_libreoffice_companion_parts(&mut self) -> Result<()> {
+        if self.package_kind != XlsxPackageKind::LibreOffice {
+            return Ok(());
+        }
         validate_relationship_catalog(
-            self.text("_rels/.rels")?,
-            &ROOT_RELATIONSHIPS,
-            "_rels/.rels",
-        )
-    }
-}
-pub(super) fn validate_worksheet_core_namespaces(sheet_xml: &str, sheet_name: &str) -> Result<()> {
-    let context = format!("worksheet XML namespace 검증: {sheet_name}");
-    let mut scanner = XmlScanner::new(sheet_xml);
-    let root = scanner
-        .next_tag()
-        .ok_or_else(|| err(format!("{context}에 root 태그가 없습니다.")))?;
-    if !root.is_start()
-        || root.name() != "worksheet"
-        || root.local_name() != "worksheet"
-        || root.self_closing()
-    {
-        return Err(err(format!("{context}의 root 태그가 올바르지 않습니다.")));
-    }
-    if required_xml_attr(root.raw(), "xmlns", &context)?.as_ref() != SPREADSHEETML_NAMESPACE {
-        return Err(err(format!(
-            "{context}의 worksheet namespace가 올바르지 않습니다."
-        )));
-    }
-    let mut ancestors = Vec::new();
-    ancestors
-        .try_reserve_exact(8)
-        .map_err(|source| err_with_source(format!("{context} stack 메모리 확보 실패"), source))?;
-    ancestors.push(root.name());
-    while let Some(tag) = scanner.next_tag() {
-        if ancestors.is_empty() {
-            return Err(err(format!("{context}에 root 밖의 XML 요소가 있습니다.")));
+            self.text("xl/worksheets/_rels/sheet1.xml.rels")?,
+            &LIBREOFFICE_SHEET_RELATIONSHIPS,
+            "sheet1.xml.rels",
+        )?;
+        validate_empty_xml_root(
+            self.text("docProps/custom.xml")?,
+            "Properties",
+            &[
+                (
+                    "xmlns",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties",
+                ),
+                (
+                    "xmlns:vt",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes",
+                ),
+            ],
+            "custom.xml",
+        )?;
+        validate_empty_xml_root(
+            self.text("xl/drawings/drawing1.xml")?,
+            "xdr:wsDr",
+            &[
+                (
+                    "xmlns:xdr",
+                    "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+                ),
+                (
+                    "xmlns:a",
+                    "http://schemas.openxmlformats.org/drawingml/2006/main",
+                ),
+                (
+                    "xmlns:r",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                ),
+            ],
+            "drawing1.xml",
+        )?;
+        for name in [
+            "docProps/custom.xml",
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "xl/drawings/drawing1.xml",
+        ] {
+            self.part_mut(name)?.bytes = Vec::new();
         }
-        if tag.is_start() {
-            if tag.name() != tag.local_name() {
-                return Err(err(format!(
-                    "{context}의 prefixed core element는 지원하지 않습니다: {}",
-                    tag.name()
-                )));
-            }
-            reject_namespace_declaration(tag.raw(), &context)?;
-            if !tag.self_closing() {
-                if ancestors.len() == ancestors.capacity() {
-                    ancestors.try_reserve(1).map_err(|source| {
-                        err_with_source(format!("{context} stack 메모리 확보 실패"), source)
-                    })?;
-                }
-                ancestors.push(tag.name());
-            }
-            continue;
-        }
-        let open = ancestors
-            .pop()
-            .ok_or_else(|| err(format!("{context}의 종료 태그 순서가 올바르지 않습니다.")))?;
-        if open != tag.name() {
-            return Err(err(format!(
-                "{context}의 XML 태그 쌍이 일치하지 않습니다: {} / {}",
-                open,
-                tag.name()
-            )));
-        }
+        Ok(())
     }
-    if !ancestors.is_empty() {
-        return Err(err(format!("{context}에 닫히지 않은 XML 요소가 있습니다.")));
+    fn validate_root_relationships(&self) -> Result<()> {
+        let catalog = match self.package_kind {
+            XlsxPackageKind::Excel => EXCEL_ROOT_RELATIONSHIPS.as_slice(),
+            XlsxPackageKind::LibreOffice => LIBREOFFICE_ROOT_RELATIONSHIPS.as_slice(),
+        };
+        validate_relationship_catalog(self.text("_rels/.rels")?, catalog, "_rels/.rels")
     }
-    Ok(())
 }
 fn create_reserved_temp_archive(path: &Path) -> io::Result<ReservedTempArchive> {
     let mut options = fs::File::options();
@@ -892,6 +1262,105 @@ fn validate_relationship_catalog(
     }
     Ok(())
 }
+fn validate_empty_xml_root(
+    xml: &str,
+    expected_name: &str,
+    expected_attrs: &[(&str, &str)],
+    context: &str,
+) -> Result<()> {
+    let mut scanner = XmlScanner::new(xml);
+    let root = scanner
+        .next_tag()
+        .ok_or_else(|| err(format!("{context}의 XML root 태그가 없습니다.")))?;
+    if !root.is_start() || root.name() != expected_name {
+        return Err(err(format!(
+            "{context}의 XML root 태그가 올바르지 않습니다."
+        )));
+    }
+    let leading = xml
+        .get(..root.start())
+        .ok_or_else(|| err(format!("{context}의 XML root 범위가 손상되었습니다.")))?;
+    if !xml_misc_only(leading, true) {
+        return Err(err(format!(
+            "{context}의 XML root 앞 내용이 올바르지 않습니다."
+        )));
+    }
+    validate_exact_attrs(root.raw(), expected_attrs, context)?;
+    let root_end = root
+        .end()
+        .checked_add(1)
+        .ok_or_else(|| err(format!("{context}의 XML root 끝 계산 실패")))?;
+    let document_end = if root.self_closing() {
+        root_end
+    } else {
+        let close = scanner
+            .next_tag()
+            .filter(|tag| !tag.is_start() && tag.name() == expected_name)
+            .ok_or_else(|| err(format!("{context}의 XML root가 비어 있지 않습니다.")))?;
+        close
+            .end()
+            .checked_add(1)
+            .ok_or_else(|| err(format!("{context}의 XML root 종료 계산 실패")))?
+    };
+    if scanner.next_tag().is_some()
+        || !xml
+            .get(document_end..)
+            .is_some_and(|trailing| xml_misc_only(trailing, false))
+    {
+        return Err(err(format!(
+            "{context}의 XML root 뒤 내용이 올바르지 않습니다."
+        )));
+    }
+    Ok(())
+}
+fn replace_exact_element_text(xml: &mut String, name: &str, replacement: &str) -> Result<()> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let body_start = xml
+        .find(&open)
+        .and_then(|start| start.checked_add(open.len()))
+        .ok_or_else(|| err(format!("app.xml의 {name} 태그를 찾지 못했습니다.")))?;
+    let relative_end = xml
+        .get(body_start..)
+        .and_then(|tail| tail.find(&close))
+        .ok_or_else(|| err(format!("app.xml의 {name} 종료 태그를 찾지 못했습니다.")))?;
+    let body_end = body_start
+        .checked_add(relative_end)
+        .ok_or_else(|| err(format!("app.xml의 {name} 범위 계산 실패")))?;
+    let trailing = body_end
+        .checked_add(close.len())
+        .and_then(|after| xml.get(after..))
+        .ok_or_else(|| err(format!("app.xml의 {name} 종료 범위 계산 실패")))?;
+    if trailing.contains(&open) {
+        return Err(err(format!("app.xml에 {name} 태그가 여러 개 있습니다.")));
+    }
+    xml.replace_range(body_start..body_end, replacement);
+    Ok(())
+}
+fn replace_single_self_closing_tag(xml: &mut String, name: &str, replacement: &str) -> Result<()> {
+    let mut scanner = XmlScanner::new(xml);
+    let tag = scanner
+        .next_start_named(name)
+        .filter(|tag| tag.name() == name && tag.self_closing())
+        .ok_or_else(|| {
+            err(format!(
+                "LibreOffice workbook의 {name} 태그가 올바르지 않습니다."
+            ))
+        })?;
+    let span = tag.start()
+        ..tag
+            .end()
+            .checked_add(1)
+            .ok_or_else(|| err(format!("LibreOffice workbook의 {name} 태그 끝 계산 실패")))?;
+    scanner.skip_to(span.end);
+    if scanner.next_start_named(name).is_some() {
+        return Err(err(format!(
+            "LibreOffice workbook에 {name} 태그가 여러 개 있습니다."
+        )));
+    }
+    xml.replace_range(span, replacement);
+    Ok(())
+}
 fn required_xml_attr<'tag>(
     tag: &'tag str,
     attr_name: &str,
@@ -908,10 +1377,20 @@ fn required_xml_attr<'tag>(
     }
     value.ok_or_else(|| err(format!("{context}에 {attr_name} 속성이 없습니다.")))
 }
-fn reject_namespace_declaration(tag: &str, context: &str) -> Result<()> {
+fn validate_descendant_namespace_declaration(
+    tag_name: &str,
+    tag: &str,
+    context: &str,
+) -> Result<()> {
     let mut attributes = XmlAttrScanner::new(tag)?;
-    while let Some((name, _)) = attributes.next()? {
+    while let Some((name, value)) = attributes.next()? {
         if name == "xmlns" || name.starts_with("xmlns:") {
+            if tag_name == "sortState"
+                && name == "xmlns:xlrd2"
+                && value.as_ref() == RICH_DATA2_NAMESPACE
+            {
+                continue;
+            }
             return Err(err(format!(
                 "{context}의 descendant namespace 재정의는 지원하지 않습니다."
             )));
@@ -1027,4 +1506,10 @@ fn write_path_warning(context: &str, path: &Path, source: &io::Error) {
     ) {
         Ok(()) | Err(_) => {}
     }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn sync_saved_path(path: &Path, context: &str) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| err_with_source(path_context_message(context, path), source))
 }

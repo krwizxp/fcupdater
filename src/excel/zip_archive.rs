@@ -1,4 +1,4 @@
-use super::{ArchiveFingerprint, PackagePart, XLSX_PART_NAMES, ZipPackageReader};
+use super::{ArchiveFingerprint, PackagePart, XlsxPackageKind, ZipPackageReader};
 use crate::diagnostic::{
     AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
     err_with_source as zip_with_source, path_context_message,
@@ -28,23 +28,24 @@ const CRC32_TABLE: [u32; 256] = {
     table
 };
 const DEFLATE_MAX_BITS: usize = 15;
-const DATA_DESCRIPTOR_FLAG: u16 = 0x0008;
+const DEFLATE_MAX_BITS_U8: u8 = 15;
 const DATA_DESCRIPTOR_LEN: usize = 16;
 const DATA_DESCRIPTOR_SIGNATURE: u32 = 0x0807_4b50;
+const DISTANCE_SYMBOLS: usize = 30;
 const END_OF_CENTRAL_DIRECTORY_LEN: usize = 22;
 const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0605_4b50;
 const FIXED_DISTANCE_SYMBOLS: usize = 32;
 const FIXED_LITERAL_SYMBOLS: usize = 288;
-const GENERAL_PURPOSE_UTF8_FLAG: u16 = 0x0800;
-const XLSX_ENTRY_FLAGS: u16 = DATA_DESCRIPTOR_FLAG | GENERAL_PURPOSE_UTF8_FLAG;
+const EXCEL_ENTRY_FLAGS: u16 = 0x0006;
 const HASH_SIZE: usize = 0x8000;
 const LITERAL_LENGTH_SYMBOLS: usize = 286;
 const LOCAL_FILE_HEADER_LEN: usize = 30;
-const MAX_CHAIN: usize = 4096;
+const MAX_CHAIN: usize = 8;
 const MAX_MATCH: usize = 258;
 const MIN_MATCH: usize = 3;
 const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
 const METHOD_DEFLATE: u16 = 8;
+const VERSION_MADE_BY: u16 = 45;
 const VERSION_NEEDED: u16 = 20;
 const ZIP_COMMENT_MAX_LEN: usize = 0xffff;
 const ZIP_BAD_CRC_MESSAGE: &str = "ZIP CRC가 일치하지 않습니다";
@@ -114,10 +115,16 @@ struct ZipCentralDirectory<'bytes> {
     bytes: &'bytes [u8],
     cursor: usize,
     end: usize,
+    package_kind: XlsxPackageKind,
     remaining_entries: usize,
 }
 impl ZipEntry<'_> {
-    fn data(&self, bytes: &[u8], expected_len: usize) -> Result<(Vec<u8>, Range<usize>)> {
+    fn data(
+        &self,
+        bytes: &[u8],
+        expected_len: usize,
+        package_kind: XlsxPackageKind,
+    ) -> Result<(Vec<u8>, Range<usize>)> {
         let local_offset = usize::try_from(self.local_header_offset)
             .map_err(|source| err_with_source("ZIP local header offset 변환 실패", source))?;
         let (local_header, _) = split_header_at::<LOCAL_FILE_HEADER_LEN>(
@@ -140,7 +147,7 @@ impl ZipEntry<'_> {
             ));
         }
         let local_flags = read_u16(local_header, 6)?;
-        if local_flags != self.flags || local_flags != XLSX_ENTRY_FLAGS {
+        if local_flags != self.flags || local_flags != package_kind.entry_flags() {
             return Err(local_mismatch(
                 "ZIP local header flags가 중앙 디렉터리와 다릅니다",
             ));
@@ -157,36 +164,68 @@ impl ZipEntry<'_> {
                 "ZIP local header 수정 시각이 중앙 디렉터리와 다릅니다",
             ));
         }
-        if read_u32(local_header, 14)? != 0 {
-            return Err(local_mismatch(
-                "ZIP data descriptor 표현의 local CRC는 0이어야 합니다",
-            ));
-        }
-        if read_u32(local_header, 18)? != 0 || read_u32(local_header, 22)? != 0 {
-            return Err(local_mismatch(
-                "ZIP data descriptor 표현의 local 크기는 0이어야 합니다",
-            ));
+        match package_kind {
+            XlsxPackageKind::Excel => {
+                if read_u32(local_header, 14)? != self.crc32
+                    || read_u32(local_header, 18)? != self.compressed_size
+                    || read_u32(local_header, 22)? != self.uncompressed_size
+                {
+                    return Err(local_mismatch(
+                        "ZIP local CRC 또는 크기가 중앙 디렉터리와 다릅니다",
+                    ));
+                }
+            }
+            XlsxPackageKind::LibreOffice => {
+                if read_u32(local_header, 14)? != 0
+                    || read_u32(local_header, 18)? != 0
+                    || read_u32(local_header, 22)? != 0
+                {
+                    return Err(local_mismatch(
+                        "LibreOffice ZIP data descriptor local 필드가 0이 아닙니다",
+                    ));
+                }
+            }
         }
         let name_len = usize::from(read_u16(local_header, 26)?);
         let extra_len = usize::from(read_u16(local_header, 28)?);
-        if extra_len != 0 {
-            return Err(local_mismatch(
-                "ZIP local header extra field는 지원하지 않습니다",
-            ));
-        }
         let name_start = local_offset
             .checked_add(LOCAL_FILE_HEADER_LEN)
             .ok_or_else(|| zip_static("ZIP local entry 이름 시작 계산 실패"))?;
-        let data_start = name_start
+        let extra_start = name_start
             .checked_add(name_len)
-            .ok_or_else(|| zip_static("ZIP data offset 계산 실패"))?;
+            .ok_or_else(|| zip_static("ZIP local extra offset 계산 실패"))?;
         let local_name = bytes
-            .get(name_start..data_start)
+            .get(name_start..extra_start)
             .ok_or_else(|| zip_static("ZIP local header 이름 범위 오류"))?;
         if local_name != self.name.as_bytes() {
             return Err(local_mismatch(
                 "ZIP local header 이름이 중앙 디렉터리와 다릅니다",
             ));
+        }
+        let data_start = extra_start
+            .checked_add(extra_len)
+            .ok_or_else(|| zip_static("ZIP data offset 계산 실패"))?;
+        let local_extra = bytes
+            .get(extra_start..data_start)
+            .ok_or_else(|| zip_static("ZIP local extra 범위 오류"))?;
+        let extra_is_valid = match package_kind {
+            XlsxPackageKind::Excel => excel_local_extra(self.name).map_or_else(
+                || local_extra.is_empty(),
+                |(len, header)| {
+                    local_extra.len() == len
+                        && local_extra.get(..header.len()) == Some(header.as_slice())
+                        && local_extra
+                            .get(header.len()..)
+                            .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
+                },
+            ),
+            XlsxPackageKind::LibreOffice => local_extra.is_empty(),
+        };
+        if !extra_is_valid {
+            return Err(err(zip_entry_message(
+                "ZIP local extra가 고정 package 표현과 다릅니다",
+                self.name,
+            )));
         }
         let compressed_len = usize::try_from(self.compressed_size)
             .map_err(|source| err_with_source("ZIP 압축 크기 변환 실패", source))?;
@@ -202,23 +241,28 @@ impl ZipEntry<'_> {
                 self.method, self.name
             )));
         }
-        let (descriptor, _) = split_header_at::<DATA_DESCRIPTOR_LEN>(
-            bytes,
-            data_end,
-            "ZIP data descriptor 범위 오류",
-        )?;
-        if read_u32(descriptor, 0)? != DATA_DESCRIPTOR_SIGNATURE
-            || read_u32(descriptor, 4)? != self.crc32
-            || read_u32(descriptor, 8)? != self.compressed_size
-            || read_u32(descriptor, 12)? != self.uncompressed_size
-        {
-            return Err(local_mismatch(
-                "ZIP data descriptor가 중앙 디렉터리와 다릅니다",
-            ));
-        }
-        let local_end = data_end
-            .checked_add(DATA_DESCRIPTOR_LEN)
-            .ok_or_else(|| zip_static("ZIP local record 끝 계산 실패"))?;
+        let local_end = match package_kind {
+            XlsxPackageKind::Excel => data_end,
+            XlsxPackageKind::LibreOffice => {
+                let (descriptor, _) = split_header_at::<DATA_DESCRIPTOR_LEN>(
+                    bytes,
+                    data_end,
+                    "ZIP data descriptor 범위 오류",
+                )?;
+                if read_u32(descriptor, 0)? != DATA_DESCRIPTOR_SIGNATURE
+                    || read_u32(descriptor, 4)? != self.crc32
+                    || read_u32(descriptor, 8)? != self.compressed_size
+                    || read_u32(descriptor, 12)? != self.uncompressed_size
+                {
+                    return Err(local_mismatch(
+                        "ZIP data descriptor가 중앙 디렉터리와 다릅니다",
+                    ));
+                }
+                data_end
+                    .checked_add(DATA_DESCRIPTOR_LEN)
+                    .ok_or_else(|| zip_static("ZIP local record 끝 계산 실패"))?
+            }
+        };
         let output = deflate::DeflateInflater {
             bytes: compressed,
             expected_len,
@@ -256,15 +300,24 @@ impl ZipCentralDirectory<'_> {
         if read_u32(header, 0)? != CENTRAL_DIRECTORY_SIGNATURE {
             return Err(zip_static(ZIP_BAD_CENTRAL_SIGNATURE_MESSAGE));
         }
-        if read_u16(header, 4)? != VERSION_NEEDED || read_u16(header, 6)? != VERSION_NEEDED {
+        if read_u16(header, 4)? != self.package_kind.version_made_by()
+            || read_u16(header, 6)? != VERSION_NEEDED
+        {
             return Err(zip_static("ZIP entry version이 지원 표현과 다릅니다."));
         }
         let flags = read_u16(header, 8)?;
-        if flags != XLSX_ENTRY_FLAGS {
+        if flags != self.package_kind.entry_flags() {
             return Err(zip_static("ZIP entry flags가 지원 표현과 다릅니다."));
         }
         if read_u16(header, 10)? != METHOD_DEFLATE {
             return Err(zip_static("ZIP entry 압축 방식이 지원 표현과 다릅니다."));
+        }
+        if self.package_kind == XlsxPackageKind::Excel
+            && (read_u16(header, 12)? != 0 || read_u16(header, 14)? != 0x0021)
+        {
+            return Err(zip_static(
+                "ZIP entry 수정 시각이 Excel 고정 표현과 다릅니다.",
+            ));
         }
         let name_len = usize::from(read_u16(header, 28)?);
         let extra_len = usize::from(read_u16(header, 30)?);
@@ -325,7 +378,8 @@ impl ZipPackageReader<'_> {
     ) -> Result<(
         ArchiveFingerprint,
         Vec<u8>,
-        [PackagePart; XLSX_PART_NAMES.len()],
+        XlsxPackageKind,
+        Vec<PackagePart>,
     )> {
         let mut archive_bytes = Vec::new();
         let fingerprint = scan_open_archive(
@@ -388,12 +442,16 @@ impl ZipPackageReader<'_> {
             return Err(zip_static("분할 ZIP archive는 지원하지 않습니다."));
         }
         let entry_count = usize::from(entries_total);
-        if entry_count != XLSX_PART_NAMES.len() {
-            return Err(err(format!(
-                "ZIP entry 수가 고정 스키마와 다릅니다: {entry_count} != {}",
-                XLSX_PART_NAMES.len()
-            )));
-        }
+        let package_kind = match entry_count {
+            13 => XlsxPackageKind::Excel,
+            14 => XlsxPackageKind::LibreOffice,
+            _ => {
+                return Err(err(format!(
+                    "ZIP entry 수가 지원하는 Excel/LibreOffice 고정 스키마와 다릅니다: {entry_count} (13 또는 14 필요)"
+                )));
+            }
+        };
+        let part_names = package_kind.part_names();
         if read_u16(eocd, 20)? != 0 {
             return Err(zip_static("ZIP archive comment는 지원하지 않습니다."));
         }
@@ -413,15 +471,16 @@ impl ZipPackageReader<'_> {
             bytes: archive_bytes.as_slice(),
             cursor: central_dir_offset,
             end: central_dir_end,
+            package_kind,
             remaining_entries: entry_count,
         };
         let mut total_uncompressed = 0_usize;
         let mut expected_local_offset = 0_usize;
         let mut parts = Vec::new();
         parts
-            .try_reserve_exact(XLSX_PART_NAMES.len())
+            .try_reserve_exact(part_names.len())
             .map_err(|source| err_with_source("ZIP package part 목록 메모리 확보 실패", source))?;
-        for expected_name in XLSX_PART_NAMES {
+        for &expected_name in part_names {
             let entry = central_directory
                 .next_entry()?
                 .ok_or_else(|| zip_static("ZIP entry가 고정 스키마보다 적습니다."))?;
@@ -448,23 +507,27 @@ impl ZipPackageReader<'_> {
                 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES,
                 entry.name,
             )?;
-            let (mut bytes, local_record) = entry.data(archive_bytes.as_slice(), expected_len)?;
+            let (mut bytes, local_record) =
+                entry.data(archive_bytes.as_slice(), expected_len, package_kind)?;
             if local_record.start != expected_local_offset {
                 return Err(err(format!(
                     "ZIP local record가 연속된 고정 순서가 아닙니다: {expected_name}"
                 )));
             }
             expected_local_offset = local_record.end;
-            if !matches!(
-                expected_name,
-                "[Content_Types].xml"
-                    | "_rels/.rels"
-                    | "xl/_rels/workbook.xml.rels"
-                    | "xl/workbook.xml"
-                    | "xl/sharedStrings.xml"
-                    | "xl/worksheets/sheet1.xml"
-                    | "xl/worksheets/sheet2.xml"
-            ) {
+            if package_kind == XlsxPackageKind::Excel
+                && !matches!(
+                    expected_name,
+                    "[Content_Types].xml"
+                        | "_rels/.rels"
+                        | "xl/_rels/workbook.xml.rels"
+                        | "xl/workbook.xml"
+                        | "xl/sharedStrings.xml"
+                        | "xl/calcChain.xml"
+                        | "xl/worksheets/sheet1.xml"
+                        | "xl/worksheets/sheet2.xml"
+                )
+            {
                 bytes = Vec::new();
             }
             parts.push(PackagePart {
@@ -481,10 +544,18 @@ impl ZipPackageReader<'_> {
                 "ZIP local/central record 범위가 고정 package 표현과 다릅니다.",
             ));
         }
-        let fixed_parts = parts.try_into().map_err(|_parts| {
-            zip_static("ZIP package part 수가 고정 스키마와 일치하지 않습니다.")
-        })?;
-        Ok((fingerprint, archive_bytes, fixed_parts))
+        Ok((fingerprint, archive_bytes, package_kind, parts))
+    }
+}
+pub(super) fn excel_local_extra(name: &str) -> Option<(usize, [u8; 8])> {
+    match name {
+        "[Content_Types].xml" | "_rels/.rels" => {
+            Some((520, [0x20, 0xa2, 0x04, 0x02, 0x28, 0xa0, 0x00, 0x02]))
+        }
+        "xl/_rels/workbook.xml.rels" | "docProps/core.xml" | "docProps/app.xml" => {
+            Some((264, [0x20, 0xa2, 0x04, 0x01, 0x28, 0xa0, 0x00, 0x01]))
+        }
+        _ => None,
     }
 }
 pub(super) fn scan_open_archive(

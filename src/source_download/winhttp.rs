@@ -1,7 +1,7 @@
 use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
     RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE, ResponseHeaders,
-    checked_http_buffer_len, download_error_with_source, enforce_http_body_length,
+    checked_http_buffer_len, download_error_with_source,
 };
 use alloc::{string::String, vec::Vec};
 use core::{
@@ -101,6 +101,120 @@ impl Handle {
     }
 }
 impl Client {
+    fn begin_request(
+        &mut self,
+        host: &str,
+        path: &str,
+        headers: &RequestHeaders<'_>,
+        method: &[u16],
+        body: &[u8],
+        header_buffer: &mut Vec<u16>,
+    ) -> DownloadResult<(Handle, u32, Instant)> {
+        let host_wide = wide(host)?;
+        let path_wide = wide(path)?;
+        let header_capacity = headers
+            .iter()
+            .try_fold(0_usize, |acc, (name, value)| {
+                acc.checked_add(name.encode_utf16().count())?
+                    .checked_add(value.encode_utf16().count())?
+                    .checked_add(4)
+            })
+            .and_then(|capacity| capacity.checked_add(1))
+            .ok_or("요청 헤더 용량 계산 실패")?;
+        header_buffer.clear();
+        if header_buffer.capacity() < header_capacity {
+            header_buffer
+                .try_reserve_exact(header_capacity)
+                .map_err(|source| {
+                    download_error_with_source("요청 헤더 메모리 확보 실패", source)
+                })?;
+        }
+        for (name, value) in headers.iter() {
+            header_buffer.extend(name.encode_utf16());
+            header_buffer.extend_from_slice(&HEADER_SEPARATOR_WIDE);
+            header_buffer.extend(value.encode_utf16());
+            header_buffer.extend_from_slice(&HEADER_TERMINATOR_WIDE);
+        }
+        let header_len = u32::try_from(header_buffer.len()).map_err(|source| {
+            download_error_with_source("요청 헤더 길이 변환 실패", source)
+        })?;
+        header_buffer.push(0);
+        let started = Instant::now();
+        let connect = self.cached_connect_ptr(host, &host_wide)?;
+        (|| {
+            // SAFETY: method and path are NUL-terminated and connect is valid.
+            let raw_request = unsafe {
+                sys::WinHttpOpenRequest(
+                    connect,
+                    method.as_ptr(),
+                    path_wide.as_ptr(),
+                    null(),
+                    null(),
+                    null(),
+                    WINHTTP_FLAG_SECURE,
+                )
+            };
+            let request = Self::non_null_handle(raw_request, "WinHttpOpenRequest")?;
+            Self::set_dword_option(
+                &request,
+                WINHTTP_OPTION_ENABLE_FEATURE,
+                WINHTTP_ENABLE_SSL_REVOCATION,
+                "WinHttpSetOption ENABLE_FEATURE",
+            )?;
+            Self::set_dword_option(
+                &request,
+                WINHTTP_OPTION_DISABLE_FEATURE,
+                WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS,
+                "WinHttpSetOption DISABLE_FEATURE",
+            )?;
+            Self::set_dword_option(
+                &request,
+                WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
+                HTTP_MAX_HEADER_BYTES_DWORD,
+                "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
+            )?;
+            let body_len = u32::try_from(body.len()).map_err(|source| {
+                download_error_with_source("요청 본문 길이 변환 실패", source)
+            })?;
+            let body_ptr = if body.is_empty() {
+                null()
+            } else {
+                body.as_ptr().cast::<c_void>()
+            };
+            // SAFETY: request is valid, header_buffer is NUL-terminated, and body_ptr is null or points to body.
+            let sent = unsafe {
+                sys::WinHttpSendRequest(
+                    request.as_ptr(),
+                    header_buffer.as_ptr(),
+                    header_len,
+                    body_ptr,
+                    body_len,
+                    body_len,
+                    0,
+                )
+            };
+            Self::check_winhttp(sent, "WinHttpSendRequest")?;
+            // SAFETY: request is a valid request handle and no reserved pointer is required.
+            let received = unsafe { sys::WinHttpReceiveResponse(request.as_ptr(), null_mut()) };
+            Self::check_winhttp(received, "WinHttpReceiveResponse")?;
+            let mut status = 0_u32;
+            let mut bytes = DWORD_BYTE_SIZE;
+            // SAFETY: status and bytes are valid output buffers for the numeric status query.
+            let queried = unsafe {
+                sys::WinHttpQueryHeaders(
+                    request.as_ptr(),
+                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    null(),
+                    (&raw mut status).cast::<c_void>(),
+                    &raw mut bytes,
+                    null_mut(),
+                )
+            };
+            Self::check_winhttp(queried, "WinHttpQueryHeaders status")?;
+            Ok((request, status, started))
+        })()
+        .inspect_err(|_| self.session_cache = None)
+    }
     fn cached_connect_ptr(
         &mut self,
         host: &str,
@@ -210,38 +324,132 @@ impl Client {
             Ok(())
         }
     }
+    fn complete_request(
+        &mut self,
+        request: &Handle,
+        status: u32,
+        started: Instant,
+        header_buffer: &mut Vec<u16>,
+    ) -> DownloadResult<HttpResponse> {
+        (|| {
+            let mut bytes = 0_u32;
+            let mut index = 0_u32;
+            // SAFETY: request is valid; this first call probes the required buffer size.
+            let probe_ok = unsafe {
+                sys::WinHttpQueryHeaders(
+                    request.as_ptr(),
+                    WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                    null(),
+                    null_mut(),
+                    &raw mut bytes,
+                    &raw mut index,
+                )
+            };
+            let mut headers = ResponseHeaders::default();
+            if probe_ok == 0_i32 {
+                let last_error = Self::last_error_code();
+                if last_error != ERROR_INSUFFICIENT_BUFFER {
+                    return Err(
+                        Self::windows_error_message("WinHttpQueryHeaders", last_error).into(),
+                    );
+                }
+                let header_bytes = usize::try_from(bytes).map_err(|source| {
+                    download_error_with_source("응답 헤더 길이 변환 실패", source)
+                })?;
+                checked_http_buffer_len("헤더", 0, header_bytes, HTTP_MAX_HEADER_BYTES)?;
+                if !header_bytes.is_multiple_of(2) {
+                    return Err(
+                        "응답 헤더 UTF-16 버퍼 길이가 2바이트 단위가 아닙니다.".into(),
+                    );
+                }
+                let units = header_bytes.div_euclid(2);
+                header_buffer.clear();
+                if header_buffer.capacity() < units {
+                    header_buffer.try_reserve_exact(units).map_err(|source| {
+                        download_error_with_source("응답 헤더 버퍼 메모리 확보 실패", source)
+                    })?;
+                }
+                header_buffer.resize(units, 0_u16);
+                index = 0;
+                // SAFETY: buffer has the size requested by WinHTTP and request is valid.
+                let fetch_ok = unsafe {
+                    sys::WinHttpQueryHeaders(
+                        request.as_ptr(),
+                        WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                        null(),
+                        header_buffer.as_mut_ptr().cast::<c_void>(),
+                        &raw mut bytes,
+                        &raw mut index,
+                    )
+                };
+                Self::check_winhttp(fetch_ok, "WinHttpQueryHeaders")?;
+                while header_buffer.pop_if(|value| *value == 0).is_some() {}
+                for raw_line in header_buffer
+                    .split(|unit| *unit == u16::from(b'\n'))
+                    .skip(1)
+                {
+                    let trimmed_line = trim_ascii_utf16(
+                        raw_line
+                            .strip_suffix(&[u16::from(b'\r')])
+                            .unwrap_or(raw_line),
+                    );
+                    let Some(colon) = trimmed_line
+                        .iter()
+                        .position(|unit| *unit == u16::from(b':'))
+                    else {
+                        continue;
+                    };
+                    let (raw_name, tail) = trimmed_line.split_at(colon);
+                    let Some((_, raw_value)) = tail.split_first() else {
+                        continue;
+                    };
+                    let name = trim_ascii_utf16(raw_name);
+                    let value = trim_ascii_utf16(raw_value);
+                    let is_content_length =
+                        header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH);
+                    if !(is_content_length
+                        || header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_SET_COOKIE))
+                    {
+                        continue;
+                    }
+                    let header_value = String::from_utf16(value).map_err(|source| {
+                        download_error_with_source(
+                            "응답 header 값 UTF-16 변환 실패",
+                            source,
+                        )
+                    })?;
+                    if is_content_length {
+                        headers.parse_content_length(&header_value, HTTP_MAX_BODY_BYTES)?;
+                    } else {
+                        headers.push_set_cookie(&header_value)?;
+                    }
+                }
+            }
+            let body = self.read_body(request, headers.content_length, started)?;
+            if let Some(expected_len) = headers.content_length
+                && body.len() != expected_len
+            {
+                return Err(format!(
+                    "HTTP 응답 본문 길이가 Content-Length와 다릅니다: expected={expected_len}, actual={}",
+                    body.len()
+                )
+                .into());
+            }
+            Ok(HttpResponse {
+                body,
+                headers,
+                status,
+            })
+        })()
+        .inspect_err(|_| self.session_cache = None)
+    }
     pub(super) fn get(
         &mut self,
         host: &str,
         path: &str,
         headers: RequestHeaders<'_>,
     ) -> DownloadResult<HttpResponse> {
-        let host_wide = wide(host)?;
-        let path_wide = wide(path)?;
-        let mut headers_wide = mem::take(&mut self.header_buffer);
-        let response = (|| {
-            let header_len = Self::request_headers_wide(&mut headers_wide, &headers)?;
-            let started = Instant::now();
-            let connect = self.cached_connect_ptr(host, &host_wide)?;
-            (|| {
-                let request = Self::open_request(connect, &METHOD_GET_WIDE, &path_wide)?;
-                Self::send_request(&request, &headers_wide, header_len, &[])?;
-                Self::receive_response(&request)?;
-                let status = Self::query_status(&request)?;
-                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
-                let response_body =
-                    self.read_body(&request, response_headers.content_length, started)?;
-                enforce_http_body_length(response_body.len(), response_headers.content_length)?;
-                Ok(HttpResponse {
-                    body: response_body,
-                    headers: response_headers,
-                    status,
-                })
-            })()
-            .inspect_err(|_| self.session_cache = None)
-        })();
-        self.header_buffer = headers_wide;
-        response
+        self.request(host, path, headers, &METHOD_GET_WIDE, &[])
     }
     fn last_error_code() -> u32 {
         // SAFETY: GetLastError has no preconditions.
@@ -256,44 +464,6 @@ impl Client {
             .map(Handle)
             .ok_or_else(|| Self::last_error_message(context))?)
     }
-    fn open_request(
-        connect: HInternet,
-        method: &[u16],
-        path: &[u16],
-    ) -> DownloadResult<Handle> {
-        // SAFETY: method and path are NUL-terminated and connect is valid.
-        let raw_request = unsafe {
-            sys::WinHttpOpenRequest(
-                connect,
-                method.as_ptr(),
-                path.as_ptr(),
-                null(),
-                null(),
-                null(),
-                WINHTTP_FLAG_SECURE,
-            )
-        };
-        let request = Self::non_null_handle(raw_request, "WinHttpOpenRequest")?;
-        Self::set_dword_option(
-            &request,
-            WINHTTP_OPTION_ENABLE_FEATURE,
-            WINHTTP_ENABLE_SSL_REVOCATION,
-            "WinHttpSetOption ENABLE_FEATURE",
-        )?;
-        Self::set_dword_option(
-            &request,
-            WINHTTP_OPTION_DISABLE_FEATURE,
-            WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS,
-            "WinHttpSetOption DISABLE_FEATURE",
-        )?;
-        Self::set_dword_option(
-            &request,
-            WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
-            HTTP_MAX_HEADER_BYTES_DWORD,
-            "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
-        )?;
-        Ok(request)
-    }
     pub(super) fn post(
         &mut self,
         host: &str,
@@ -301,136 +471,7 @@ impl Client {
         headers: RequestHeaders<'_>,
         body: &[u8],
     ) -> DownloadResult<HttpResponse> {
-        let host_wide = wide(host)?;
-        let path_wide = wide(path)?;
-        let mut headers_wide = mem::take(&mut self.header_buffer);
-        let response = (|| {
-            let header_len = Self::request_headers_wide(&mut headers_wide, &headers)?;
-            let started = Instant::now();
-            let connect = self.cached_connect_ptr(host, &host_wide)?;
-            (|| {
-                let request = Self::open_request(connect, &METHOD_POST_WIDE, &path_wide)?;
-                Self::send_request(&request, &headers_wide, header_len, body)?;
-                Self::receive_response(&request)?;
-                let status = Self::query_status(&request)?;
-                let response_headers = Self::query_headers(&request, &mut headers_wide)?;
-                let response_body =
-                    self.read_body(&request, response_headers.content_length, started)?;
-                enforce_http_body_length(response_body.len(), response_headers.content_length)?;
-                Ok(HttpResponse {
-                    body: response_body,
-                    headers: response_headers,
-                    status,
-                })
-            })()
-            .inspect_err(|_| self.session_cache = None)
-        })();
-        self.header_buffer = headers_wide;
-        response
-    }
-    fn query_headers(
-        request: &Handle,
-        buffer: &mut Vec<u16>,
-    ) -> DownloadResult<ResponseHeaders> {
-        let mut bytes = 0_u32;
-        let mut index = 0_u32;
-        // SAFETY: request is valid; this first call probes the required buffer size.
-        let probe_ok = unsafe {
-            sys::WinHttpQueryHeaders(
-                request.as_ptr(),
-                WINHTTP_QUERY_RAW_HEADERS_CRLF,
-                null(),
-                null_mut(),
-                &raw mut bytes,
-                &raw mut index,
-            )
-        };
-        if probe_ok != 0_i32 {
-            return Ok(ResponseHeaders::default());
-        }
-        let last_error = Self::last_error_code();
-        if last_error != ERROR_INSUFFICIENT_BUFFER {
-            return Err(Self::windows_error_message("WinHttpQueryHeaders", last_error).into());
-        }
-        let header_bytes = usize::try_from(bytes)
-            .map_err(|source| download_error_with_source("응답 헤더 길이 변환 실패", source))?;
-        checked_http_buffer_len("헤더", 0, header_bytes, HTTP_MAX_HEADER_BYTES)?;
-        if !header_bytes.is_multiple_of(2) {
-            return Err("응답 헤더 UTF-16 버퍼 길이가 2바이트 단위가 아닙니다.".into());
-        }
-        let units = header_bytes.div_euclid(2);
-        buffer.clear();
-        if buffer.capacity() < units {
-            buffer.try_reserve_exact(units).map_err(|source| {
-                download_error_with_source("응답 헤더 버퍼 메모리 확보 실패", source)
-            })?;
-        }
-        buffer.resize(units, 0_u16);
-        index = 0;
-        // SAFETY: buffer has the size requested by WinHTTP and request is valid.
-        let fetch_ok = unsafe {
-            sys::WinHttpQueryHeaders(
-                request.as_ptr(),
-                WINHTTP_QUERY_RAW_HEADERS_CRLF,
-                null(),
-                buffer.as_mut_ptr().cast::<c_void>(),
-                &raw mut bytes,
-                &raw mut index,
-            )
-        };
-        Self::check_winhttp(fetch_ok, "WinHttpQueryHeaders")?;
-        while buffer.pop_if(|value| *value == 0).is_some() {}
-        let mut parsed = ResponseHeaders::default();
-        for raw_line in buffer.split(|unit| *unit == u16::from(b'\n')).skip(1) {
-            let trimmed_line = trim_ascii_utf16(
-                raw_line
-                    .strip_suffix(&[u16::from(b'\r')])
-                    .unwrap_or(raw_line),
-            );
-            let Some(colon) = trimmed_line
-                .iter()
-                .position(|unit| *unit == u16::from(b':'))
-            else {
-                continue;
-            };
-            let (raw_name, tail) = trimmed_line.split_at(colon);
-            let Some((_, raw_value)) = tail.split_first() else {
-                continue;
-            };
-            let name = trim_ascii_utf16(raw_name);
-            let value = trim_ascii_utf16(raw_value);
-            if !(header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH)
-                || header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_SET_COOKIE))
-            {
-                continue;
-            }
-            let header_value = String::from_utf16(value).map_err(|source| {
-                download_error_with_source("응답 header 값 UTF-16 변환 실패", source)
-            })?;
-            if header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH) {
-                parsed.parse_content_length(&header_value, HTTP_MAX_BODY_BYTES)?;
-            } else {
-                parsed.push_set_cookie(&header_value)?;
-            }
-        }
-        Ok(parsed)
-    }
-    fn query_status(request: &Handle) -> DownloadResult<u32> {
-        let mut status = 0_u32;
-        let mut bytes = DWORD_BYTE_SIZE;
-        // SAFETY: status and bytes are valid output buffers for the numeric status query.
-        let ok = unsafe {
-            sys::WinHttpQueryHeaders(
-                request.as_ptr(),
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                null(),
-                (&raw mut status).cast::<c_void>(),
-                &raw mut bytes,
-                null_mut(),
-            )
-        };
-        Self::check_winhttp(ok, "WinHttpQueryHeaders status")?;
-        Ok(status)
+        self.request(host, path, headers, &METHOD_POST_WIDE, body)
     }
     fn read_body(
         &mut self,
@@ -511,69 +552,28 @@ impl Client {
         self.read_buffer = chunk_buffer;
         result
     }
-    fn receive_response(request: &Handle) -> DownloadResult<()> {
-        // SAFETY: request is a valid request handle and no reserved pointer is required.
-        let received = unsafe { sys::WinHttpReceiveResponse(request.as_ptr(), null_mut()) };
-        Self::check_winhttp(received, "WinHttpReceiveResponse")
-    }
-    fn request_headers_wide(
-        out: &mut Vec<u16>,
-        headers: &RequestHeaders<'_>,
-    ) -> DownloadResult<u32> {
-        let header_capacity = headers
-            .iter()
-            .try_fold(0_usize, |acc, (name, value)| {
-                acc.checked_add(name.encode_utf16().count())?
-                    .checked_add(value.encode_utf16().count())?
-                    .checked_add(4)
-            })
-            .and_then(|capacity| capacity.checked_add(1))
-            .ok_or("요청 헤더 용량 계산 실패")?;
-        out.clear();
-        if out.capacity() < header_capacity {
-            out.try_reserve_exact(header_capacity).map_err(|source| {
-                download_error_with_source("요청 헤더 메모리 확보 실패", source)
-            })?;
-        }
-        for (name, value) in headers.iter() {
-            out.extend(name.encode_utf16());
-            out.extend_from_slice(&HEADER_SEPARATOR_WIDE);
-            out.extend(value.encode_utf16());
-            out.extend_from_slice(&HEADER_TERMINATOR_WIDE);
-        }
-        let header_len = u32::try_from(out.len()).map_err(|source| {
-            download_error_with_source("요청 헤더 길이 변환 실패", source)
-        })?;
-        out.push(0);
-        Ok(header_len)
-    }
-    fn send_request(
-        request: &Handle,
-        headers: &[u16],
-        header_len: u32,
+    fn request(
+        &mut self,
+        host: &str,
+        path: &str,
+        headers: RequestHeaders<'_>,
+        method: &[u16],
         body: &[u8],
-    ) -> DownloadResult<()> {
-        let body_len = u32::try_from(body.len()).map_err(|source| {
-            download_error_with_source("요청 본문 길이 변환 실패", source)
-        })?;
-        let body_ptr = if body.is_empty() {
-            null()
-        } else {
-            body.as_ptr().cast::<c_void>()
-        };
-        // SAFETY: request is valid, headers are NUL-terminated, and body_ptr is null or points to body.
-        let sent = unsafe {
-            sys::WinHttpSendRequest(
-                request.as_ptr(),
-                headers.as_ptr(),
-                header_len,
-                body_ptr,
-                body_len,
-                body_len,
-                0,
-            )
-        };
-        Self::check_winhttp(sent, "WinHttpSendRequest")
+    ) -> DownloadResult<HttpResponse> {
+        let mut header_buffer = mem::take(&mut self.header_buffer);
+        let response = (|| {
+            let (request, status, started) = self.begin_request(
+                host,
+                path,
+                &headers,
+                method,
+                body,
+                &mut header_buffer,
+            )?;
+            self.complete_request(&request, status, started, &mut header_buffer)
+        })();
+        self.header_buffer = header_buffer;
+        response
     }
     fn set_dword_option(
         handle: &Handle,

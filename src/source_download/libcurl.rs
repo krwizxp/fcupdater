@@ -1,7 +1,7 @@
 use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
     RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE, ResponseHeaders,
-    download_error_with_source, enforce_http_body_length,
+    download_error_with_source,
 };
 use crate::diagnostic::AppError as DownloadError;
 use alloc::{borrow::Cow, string::String, vec::Vec};
@@ -371,31 +371,7 @@ impl Client {
         path: &str,
         request_headers: RequestHeaders<'_>,
     ) -> DownloadResult<HttpResponse> {
-        let header_bytes = mem::take(&mut self.header_buffer);
-        let mut body_buffer =
-            BoundedResponseBuffer::from_bytes("본문", HTTP_MAX_BODY_BYTES, Vec::new());
-        let mut header_buffer =
-            BoundedResponseBuffer::from_bytes("헤더", HTTP_MAX_HEADER_BYTES, header_bytes);
-        let result = (|| {
-            let status = self.execute_request(
-                None,
-                host,
-                path,
-                &request_headers,
-                &mut body_buffer,
-                &mut header_buffer,
-            )?;
-            let headers = parsed_headers_from_bytes(&header_buffer.bytes)?;
-            enforce_http_body_length(body_buffer.bytes.len(), headers.content_length)?;
-            let response_body = mem::take(&mut body_buffer.bytes);
-            Ok(HttpResponse {
-                body: response_body,
-                headers,
-                status,
-            })
-        })();
-        self.header_buffer = header_buffer.into_reusable_bytes();
-        result
+        self.request(None, host, path, request_headers)
     }
     pub(super) fn post(
         &mut self,
@@ -404,25 +380,114 @@ impl Client {
         request_headers: RequestHeaders<'_>,
         body: &[u8],
     ) -> DownloadResult<HttpResponse> {
-        let header_bytes = mem::take(&mut self.header_buffer);
+        self.request(Some(body), host, path, request_headers)
+    }
+    fn request(
+        &mut self,
+        request_body: Option<&[u8]>,
+        host: &str,
+        path: &str,
+        request_headers: RequestHeaders<'_>,
+    ) -> DownloadResult<HttpResponse> {
+        let reusable_header_bytes = mem::take(&mut self.header_buffer);
         let mut body_buffer =
             BoundedResponseBuffer::from_bytes("본문", HTTP_MAX_BODY_BYTES, Vec::new());
         let mut header_buffer =
-            BoundedResponseBuffer::from_bytes("헤더", HTTP_MAX_HEADER_BYTES, header_bytes);
+            BoundedResponseBuffer::from_bytes(
+                "헤더",
+                HTTP_MAX_HEADER_BYTES,
+                reusable_header_bytes,
+            );
         let result = (|| {
             let status = self.execute_request(
-                Some(body),
+                request_body,
                 host,
                 path,
                 &request_headers,
                 &mut body_buffer,
                 &mut header_buffer,
             )?;
-            let headers = parsed_headers_from_bytes(&header_buffer.bytes)?;
-            enforce_http_body_length(body_buffer.bytes.len(), headers.content_length)?;
-            let response_body = mem::take(&mut body_buffer.bytes);
+            let header_bytes = header_buffer.bytes.as_slice();
+            let separator: &[u8] = if header_bytes
+                .array_windows::<4>()
+                .any(|window| window == b"\r\n\r\n")
+            {
+                b"\r\n\r\n"
+            } else {
+                b"\n\n"
+            };
+            let mut selected_block = None;
+            let mut rest = header_bytes;
+            loop {
+                let (block, next) =
+                    match rest.windows(separator.len()).position(|window| window == separator) {
+                        Some(index) => {
+                            let block = rest
+                                .get(..index)
+                                .ok_or("HTTP header block 범위 계산 실패")?;
+                            let next_start = index
+                                .checked_add(separator.len())
+                                .ok_or("HTTP header block cursor 계산 실패")?;
+                            let next = rest
+                                .get(next_start..)
+                                .ok_or("HTTP header block cursor 범위 계산 실패")?;
+                            (block, next)
+                        }
+                        None => (rest, &[][..]),
+                    };
+                if block
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .is_some_and(|line| line.starts_with(b"HTTP/"))
+                {
+                    selected_block = Some(block);
+                }
+                if next.is_empty() {
+                    break;
+                }
+                rest = next;
+            }
+            let mut headers = ResponseHeaders::default();
+            if let Some(header_block) = selected_block {
+                for raw_line in header_block.split(|byte| *byte == b'\n').skip(1) {
+                    let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line).trim_ascii();
+                    let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                        continue;
+                    };
+                    let (raw_name, tail) = line.split_at(colon);
+                    let Some((_, raw_value_tail)) = tail.split_first() else {
+                        continue;
+                    };
+                    let name = raw_name.trim_ascii();
+                    let raw_value = raw_value_tail.trim_ascii();
+                    let is_content_length =
+                        name.eq_ignore_ascii_case(RESPONSE_HEADER_CONTENT_LENGTH);
+                    if !(is_content_length
+                        || name.eq_ignore_ascii_case(RESPONSE_HEADER_SET_COOKIE))
+                    {
+                        continue;
+                    }
+                    let value = str::from_utf8(raw_value).map_err(|source| {
+                        download_error_with_source("HTTP header 값 UTF-8 변환 실패", source)
+                    })?;
+                    if is_content_length {
+                        headers.parse_content_length(value, HTTP_MAX_BODY_BYTES)?;
+                    } else {
+                        headers.push_set_cookie(value)?;
+                    }
+                }
+            }
+            if let Some(expected_len) = headers.content_length
+                && body_buffer.bytes.len() != expected_len
+            {
+                return Err(format!(
+                    "HTTP 응답 본문 길이가 Content-Length와 다릅니다: expected={expected_len}, actual={}",
+                    body_buffer.bytes.len()
+                )
+                .into());
+            }
             Ok(HttpResponse {
-                body: response_body,
+                body: mem::take(&mut body_buffer.bytes),
                 headers,
                 status,
             })
@@ -497,76 +562,6 @@ fn nul_terminated_buffer<'buffer>(
     CStr::from_bytes_with_nul(out).map_err(|source| {
         download_error_with_source(format!("{label}에 NUL 문자가 포함되어 있습니다"), source)
     })
-}
-fn parsed_headers_from_bytes(header_bytes: &[u8]) -> DownloadResult<ResponseHeaders> {
-    let separator: &[u8] = if header_bytes
-        .array_windows::<4>()
-        .any(|window| window == b"\r\n\r\n")
-    {
-        b"\r\n\r\n"
-    } else {
-        b"\n\n"
-    };
-    let mut selected_block = None;
-    let mut rest = header_bytes;
-    loop {
-        let (block, next) = match rest.windows(separator.len()).position(|window| window == separator)
-        {
-            Some(index) => {
-                let block = rest
-                    .get(..index)
-                    .ok_or("HTTP header block 범위 계산 실패")?;
-                let next_start = index
-                    .checked_add(separator.len())
-                    .ok_or("HTTP header block cursor 계산 실패")?;
-                let next = rest
-                    .get(next_start..)
-                    .ok_or("HTTP header block cursor 범위 계산 실패")?;
-                (block, next)
-            }
-            None => (rest, &[][..]),
-        };
-        if block
-            .split(|byte| *byte == b'\n')
-            .next()
-            .is_some_and(|line| line.starts_with(b"HTTP/"))
-        {
-            selected_block = Some(block);
-        }
-        if next.is_empty() {
-            break;
-        }
-        rest = next;
-    }
-    let Some(header_block) = selected_block else {
-        return Ok(ResponseHeaders::default());
-    };
-    let mut headers = ResponseHeaders::default();
-    for raw_line in header_block.split(|byte| *byte == b'\n').skip(1) {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line).trim_ascii();
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        let (raw_name, tail) = line.split_at(colon);
-        let Some((_, raw_value_tail)) = tail.split_first() else {
-            continue;
-        };
-        let name = raw_name.trim_ascii();
-        let raw_value = raw_value_tail.trim_ascii();
-        if !(name.eq_ignore_ascii_case(RESPONSE_HEADER_CONTENT_LENGTH)
-            || name.eq_ignore_ascii_case(RESPONSE_HEADER_SET_COOKIE))
-        {
-            continue;
-        }
-        let value = str::from_utf8(raw_value)
-            .map_err(|source| download_error_with_source("HTTP header 값 UTF-8 변환 실패", source))?;
-        if name.eq_ignore_ascii_case(RESPONSE_HEADER_CONTENT_LENGTH) {
-            headers.parse_content_length(value, HTTP_MAX_BODY_BYTES)?;
-        } else {
-            headers.push_set_cookie(value)?;
-        }
-    }
-    Ok(headers)
 }
 fn curl_error(context: &str, code: CurlCode) -> String {
     // SAFETY: curl_easy_strerror returns either null or a static NUL-terminated message for code.

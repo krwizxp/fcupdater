@@ -157,14 +157,3 @@ cfg_select! {
     }
     _ => {}
 }
-fn enforce_http_body_length(actual: usize, expected: Option<usize>) -> DownloadResult<()> {
-    if let Some(expected_len) = expected
-        && actual != expected_len
-    {
-        return Err(format!(
-            "HTTP 응답 본문 길이가 Content-Length와 다릅니다: expected={expected_len}, actual={actual}"
-        )
-        .into());
-    }
-    Ok(())
-}

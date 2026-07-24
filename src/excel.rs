@@ -15,11 +15,28 @@ pub(super) const CHANGE_LOG_SHEET_NAME: &str = "변경내역";
 pub(super) const CHANGE_LOG_SHEET_PATH: &str = "xl/worksheets/sheet2.xml";
 pub(super) const MASTER_SHEET_NAME: &str = "유류비";
 pub(super) const MASTER_SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
-const XLSX_PART_NAMES: [&str; 14] = [
+pub(super) const CALC_CHAIN_PATH: &str = "xl/calcChain.xml";
+const EXCEL_XLSX_PART_NAMES: [&str; 13] = [
+    "[Content_Types].xml",
+    "_rels/.rels",
+    "xl/workbook.xml",
+    "xl/_rels/workbook.xml.rels",
+    "xl/worksheets/sheet1.xml",
+    "xl/worksheets/sheet2.xml",
+    "xl/theme/theme1.xml",
+    "xl/styles.xml",
+    "xl/sharedStrings.xml",
+    "docProps/thumbnail.emf",
+    CALC_CHAIN_PATH,
+    "docProps/core.xml",
+    "docProps/app.xml",
+];
+const LIBREOFFICE_XLSX_PART_NAMES: [&str; 14] = [
     "docProps/custom.xml",
     "docProps/core.xml",
     "docProps/app.xml",
     "xl/worksheets/sheet1.xml",
+    "xl/worksheets/sheet2.xml",
     "xl/worksheets/_rels/sheet1.xml.rels",
     "xl/drawings/drawing1.xml",
     "xl/styles.xml",
@@ -29,8 +46,32 @@ const XLSX_PART_NAMES: [&str; 14] = [
     "_rels/.rels",
     "[Content_Types].xml",
     "xl/sharedStrings.xml",
-    "xl/worksheets/sheet2.xml",
 ];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum XlsxPackageKind {
+    Excel,
+    LibreOffice,
+}
+impl XlsxPackageKind {
+    const fn entry_flags(self) -> u16 {
+        match self {
+            Self::Excel => 0x0006,
+            Self::LibreOffice => 0x0808,
+        }
+    }
+    const fn part_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Excel => &EXCEL_XLSX_PART_NAMES,
+            Self::LibreOffice => &LIBREOFFICE_XLSX_PART_NAMES,
+        }
+    }
+    const fn version_made_by(self) -> u16 {
+        match self {
+            Self::Excel => 45,
+            Self::LibreOffice => 20,
+        }
+    }
+}
 #[derive(Clone, Copy)]
 pub(super) enum SaveVerification {
     Skip,
