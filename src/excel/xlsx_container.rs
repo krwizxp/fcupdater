@@ -795,10 +795,12 @@ impl XlsxContainer {
             };
             output_parts.push(PackagePart {
                 bytes,
-                central_record: Range { start: 0, end: 0 },
                 changed: true,
+                compressed_size: 0,
+                crc32: 0,
                 local_record: Range { start: 0, end: 0 },
                 name,
+                uncompressed_size: 0,
             });
         }
         self.parts = output_parts;

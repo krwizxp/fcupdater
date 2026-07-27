@@ -1,4 +1,4 @@
-pub(super) use self::source_reader::{FuelValues, SourceReader, SourceRecord, SourceRecordRef};
+pub(super) use self::source_reader::{FuelValues, SourceReader, SourceRecord};
 use crate::diagnostic::{Result, err_with_source};
 use core::range::Range;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -36,7 +36,6 @@ const LIBREOFFICE_XLSX_PART_NAMES: [&str; 14] = [
     "docProps/core.xml",
     "docProps/app.xml",
     "xl/worksheets/sheet1.xml",
-    "xl/worksheets/sheet2.xml",
     "xl/worksheets/_rels/sheet1.xml.rels",
     "xl/drawings/drawing1.xml",
     "xl/styles.xml",
@@ -46,6 +45,7 @@ const LIBREOFFICE_XLSX_PART_NAMES: [&str; 14] = [
     "_rels/.rels",
     "[Content_Types].xml",
     "xl/sharedStrings.xml",
+    "xl/worksheets/sheet2.xml",
 ];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum XlsxPackageKind {
@@ -85,10 +85,12 @@ struct ArchiveFingerprint {
 #[derive(Debug)]
 struct PackagePart {
     bytes: Vec<u8>,
-    central_record: Range<usize>,
     changed: bool,
+    compressed_size: u32,
+    crc32: u32,
     local_record: Range<usize>,
     name: &'static str,
+    uncompressed_size: u32,
 }
 struct ZipArchiveBuilder<'part, 'path> {
     archive_path: &'path Path,

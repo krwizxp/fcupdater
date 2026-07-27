@@ -8,22 +8,6 @@ const ZERO_BLOCK: [u8; TAR_BLOCK_LEN] = [0; TAR_BLOCK_LEN];
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-fn copy_verified(
-    source: &Path,
-    destination: &Path,
-    source_len: u64,
-    changed_message: &'static str,
-) -> io::Result<()> {
-    let copied = fs::copy(source, destination)?;
-    if copied == source_len {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            changed_message,
-        ))
-    }
-}
 fn write_octal(field: &mut [u8], mut value: u64) -> io::Result<()> {
     field.fill(b'0');
     let Some((terminator, digits)) = field.split_last_mut() else {
@@ -52,17 +36,6 @@ fn main() -> io::Result<()> {
         return Err(invalid_input("unexpected package artifact argument"));
     }
     let artifact_dir = Path::new("artifacts");
-    if entry_name == "--workbook" {
-        fs::create_dir_all(artifact_dir)?;
-        let source = Path::new("fuel_cost_chungcheong.xlsx");
-        let source_len = source.metadata()?.len();
-        return copy_verified(
-            source,
-            &artifact_dir.join("fcupdater-result.xlsx"),
-            source_len,
-            "source workbook changed while copying",
-        );
-    }
     if entry_name.is_empty()
         || entry_name.len() > 100
         || entry_name.contains('/')
@@ -84,12 +57,15 @@ fn main() -> io::Result<()> {
     ));
     let source_len = source.metadata()?.len();
     if cfg!(windows) {
-        return copy_verified(
-            &source,
-            &destination,
-            source_len,
-            "source binary changed while copying",
-        );
+        let copied = fs::copy(source, destination)?;
+        return if copied == source_len {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "source binary changed while copying",
+            ))
+        };
     }
     let mut header = ZERO_BLOCK;
     let Some(name_field) = header

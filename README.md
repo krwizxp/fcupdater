@@ -86,6 +86,6 @@ Microsoft Excel 또는 LibreOffice Calc로 저장한 제공 워크북을 사용�
 
 ## GitHub Actions
 
-CI 워크플로는 Windows, Linux, Intel Mac, Apple Silicon Mac용 release build를 확인합니다. `main` 브랜치와 태그 실행에서는 배포용 Artifact를 제공하며, Pull Request에서는 같은 환경의 빌드를 검증합니다.
+CI 워크플로는 `main` 브랜치와 태그에서 Windows, Linux, Intel Mac, Apple Silicon Mac용 release Artifact를 제공합니다.
 
-워크북 현행화 워크플로는 최신 Opinet 자료를 반영한 `fcupdater-result.xlsx`를 Artifact로 제공합니다.
+워크북 현행화 워크플로는 최신 Opinet 자료를 반영한 `fuel_cost_chungcheong.xlsx`를 Artifact로 제공합니다.

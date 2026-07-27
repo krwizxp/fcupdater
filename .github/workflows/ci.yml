@@ -5,16 +5,14 @@ on:
       - main
     tags:
       - "*"
-  pull_request:
-  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   build:
-    name: ${{ matrix.os }} / rust-1.97.1
+    name: ${{ matrix.os }} / latest stable Rust
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -33,20 +31,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.97.1
+      - name: Install latest stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Update Linux package index
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update
       - name: Install Linux native dependencies
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Build Release Binary
-        run: cargo build --release --locked
+        run: cargo +stable build --release --frozen --bin fcupdater
       - name: Prepare binary artifact with Rust
-        if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
-        run: cargo run --release --locked --example package_artifact -- "${{ matrix.binary_name }}"
+        run: cargo +stable run --release --frozen --example package_artifact -- "${{ matrix.binary_name }}"
       - name: Upload Binary Artifact
-        if: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           path: artifacts/${{ matrix.binary_name }}.*

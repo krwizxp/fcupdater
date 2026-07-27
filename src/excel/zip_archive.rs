@@ -100,7 +100,6 @@ const _: () = assert!(
     "ZIP total limit must cover at least one entry"
 );
 struct ZipEntry<'zip> {
-    central_record: Range<usize>,
     compressed_size: u32,
     crc32: u32,
     flags: u16,
@@ -291,7 +290,6 @@ impl ZipCentralDirectory<'_> {
             }
             return Ok(None);
         }
-        let entry_start = self.cursor;
         let (header, tail) = split_header_at::<CENTRAL_DIRECTORY_HEADER_LEN>(
             self.bytes,
             self.cursor,
@@ -356,10 +354,6 @@ impl ZipCentralDirectory<'_> {
             .checked_sub(1)
             .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 entry 개수 계산 실패"))?;
         Ok(Some(ZipEntry {
-            central_record: Range {
-                start: entry_start,
-                end: next_cursor,
-            },
             compressed_size: read_u32(header, 20)?,
             crc32: read_u32(header, 16)?,
             flags,
@@ -532,10 +526,12 @@ impl ZipPackageReader<'_> {
             }
             parts.push(PackagePart {
                 bytes,
-                central_record: entry.central_record,
                 changed: false,
+                compressed_size: entry.compressed_size,
+                crc32: entry.crc32,
                 local_record,
                 name: expected_name,
+                uncompressed_size: entry.uncompressed_size,
             });
         }
         if central_directory.next_entry()?.is_some() || expected_local_offset != central_dir_offset

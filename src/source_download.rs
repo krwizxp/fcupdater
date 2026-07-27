@@ -1,5 +1,6 @@
-use crate::diagnostic::{Result as DownloadResult, err_with_source as download_error_with_source};
-use core::fmt::Write as FmtWrite;
+use crate::diagnostic::{
+    Result as DownloadResult, append_fmt, err_with_source as download_error_with_source,
+};
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         use self::libcurl::Client as PlatformHttpClient;
@@ -130,9 +131,7 @@ impl ResponseHeaders {
     }
 }
 fn push_decimal_fragment(out: &mut String, value: u128) {
-    match FmtWrite::write_fmt(out, format_args!("{value}")) {
-        Ok(()) | Err(_) => {}
-    }
+    append_fmt(out, format_args!("{value}"));
 }
 cfg_select! {
     windows => {

@@ -1,6 +1,6 @@
 use self::format::{format_scaled_value, format_unit_price_text};
 use crate::{
-    diagnostic::{Result, err, err_with_source},
+    diagnostic::{Result, append_fmt, err, err_with_source},
     excel,
     excel::writer::{Row as StdRow, SharedStringTable, Workbook as StdWorkbook},
     excel::{FuelValues, SourceRecord},
@@ -11,11 +11,7 @@ use crate::{
     sheet_util::{add_row_offset, usize_to_u32},
 };
 use alloc::{borrow::Cow, rc::Rc};
-use core::{
-    fmt::{Arguments, Write as _},
-    mem,
-    range::RangeInclusive,
-};
+use core::{fmt::Arguments, mem, range::RangeInclusive};
 use std::collections::HashMap;
 mod format;
 const MASTER_HEADER_ROW: u32 = 14;
@@ -128,8 +124,12 @@ enum MasterRowDecision<'source> {
     Unaddressed,
 }
 struct SortableRankRow {
+    address: String,
     base: RankRowBase,
-    key: RankSortKey,
+    fuels: FuelValues<ScaledSortKey>,
+    name: String,
+    rank_total: Option<ScaledSortKey>,
+    region: String,
     row: u32,
     smart_discount_excluded: bool,
 }
@@ -154,13 +154,6 @@ impl RankSortContext {
         }
         None
     }
-}
-struct RankSortKey {
-    address: String,
-    fuels: FuelValues<ScaledSortKey>,
-    name: String,
-    rank_total: Option<ScaledSortKey>,
-    region: String,
 }
 type AdjustedFuelPrices = FuelValues<Option<ScaledDecimal>>;
 struct ParsedMasterIdentity<'text> {
@@ -422,16 +415,14 @@ impl RankSortRefresher<'_, '_> {
             }
         });
         Ok(SortableRankRow {
+            address: row.identity.address.into_owned(),
             base,
+            fuels: regional_adjusted.map(|value| value.unwrap_or(ScaledSortKey::MAX)),
+            name: row.identity.name.into_owned(),
+            rank_total,
+            region: row.identity.region.into_owned(),
             row: row_num,
             smart_discount_excluded: row.smart_discount_excluded,
-            key: RankSortKey {
-                rank_total,
-                fuels: regional_adjusted.map(|value| value.unwrap_or(ScaledSortKey::MAX)),
-                region: row.identity.region.into_owned(),
-                name: row.identity.name.into_owned(),
-                address: row.identity.address.into_owned(),
-            },
         })
     }
     fn collect_ranked_rows(
@@ -468,9 +459,7 @@ impl RankSortRefresher<'_, '_> {
         for (row, plan) in self.data_rows.into_iter().zip(row_plans) {
             let mut set_formula = |col: u32, args: Arguments<'_>| -> Result<()> {
                 formula.clear();
-                formula
-                    .write_fmt(args)
-                    .map_err(|source| err_with_source("마스터 수식 작성 실패", source))?;
+                append_fmt(&mut formula, args);
                 self.ws.set_formula_at(col, row, &formula)
             };
             set_formula(
@@ -616,8 +605,7 @@ impl RankSortRefresher<'_, '_> {
                     .checked_add(1)
                     .ok_or_else(|| err("지역화폐 순위 계산 중 overflow가 발생했습니다."))?;
                 rank_text.clear();
-                write!(&mut rank_text, "{rank}")
-                    .map_err(|source| err_with_source("지역화폐 순위 문자열 작성 실패", source))?;
+                append_fmt(&mut rank_text, format_args!("{rank}"));
                 previous_total = Some(current);
             }
             self.ws
@@ -638,24 +626,20 @@ impl RankSortRefresher<'_, '_> {
             data_rows.push(self.build_sort_plan(row_num, sort_context)?);
         }
         data_rows.sort_by(|left, right| {
-            let left_key = &left.key;
-            let right_key = &right.key;
-            left_key
-                .rank_total
+            left.rank_total
                 .is_none()
-                .cmp(&right_key.rank_total.is_none())
-                .then_with(|| left_key.rank_total.cmp(&right_key.rank_total))
+                .cmp(&right.rank_total.is_none())
+                .then_with(|| left.rank_total.cmp(&right.rank_total))
                 .then_with(|| {
-                    left_key
-                        .fuels
+                    left.fuels
                         .gasoline
-                        .cmp(&right_key.fuels.gasoline)
-                        .then_with(|| left_key.fuels.premium.cmp(&right_key.fuels.premium))
-                        .then_with(|| left_key.fuels.diesel.cmp(&right_key.fuels.diesel))
+                        .cmp(&right.fuels.gasoline)
+                        .then_with(|| left.fuels.premium.cmp(&right.fuels.premium))
+                        .then_with(|| left.fuels.diesel.cmp(&right.fuels.diesel))
                 })
-                .then_with(|| left_key.region.cmp(&right_key.region))
-                .then_with(|| left_key.name.cmp(&right_key.name))
-                .then_with(|| left_key.address.cmp(&right_key.address))
+                .then_with(|| left.region.cmp(&right.region))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.address.cmp(&right.address))
         });
         let mut rows = self.ws.take_rows();
         let data_start_index = usize::try_from(self.data_rows.start.saturating_sub(1))
@@ -1195,18 +1179,18 @@ fn append_fuel_total_text(
         .as_i128()
         .div_euclid(DECIMAL_SCALE_SQUARED.as_i128());
     let sign = if rounded < 0 { "-" } else { "" };
-    let digits = rounded.unsigned_abs().to_string();
     if !parts.is_empty() {
         parts.push_str(" / ");
     }
     parts.push_str(label);
     parts.push(' ');
     parts.push_str(sign);
-    for (index, digit) in digits.chars().enumerate() {
-        if index != 0 && digits.len().saturating_sub(index).is_multiple_of(3) {
-            parts.push(',');
-        }
-        parts.push(digit);
+    let digits_start = parts.len();
+    append_fmt(parts, format_args!("{}", rounded.unsigned_abs()));
+    let mut separator = parts.len().saturating_sub(3);
+    while separator > digits_start {
+        parts.insert(separator, ',');
+        separator = separator.saturating_sub(3);
     }
     parts.push('원');
     Ok(true)

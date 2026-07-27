@@ -4,7 +4,6 @@ use super::{
     END_OF_CENTRAL_DIRECTORY_SIGNATURE, EXCEL_ENTRY_FLAGS, LOCAL_FILE_HEADER_LEN,
     LOCAL_FILE_HEADER_SIGNATURE, METHOD_DEFLATE, VERSION_MADE_BY, VERSION_NEEDED,
     ZIP_MAX_ARCHIVE_BYTES, ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, crc32, deflate, excel_local_extra,
-    read_u32,
 };
 use crate::diagnostic::{Result, err, err_with_source, path_context_message};
 use core::mem;
@@ -205,17 +204,13 @@ impl<'part> StreamingZipWriter<'part, '_> {
         let entry = if part.changed {
             self.append_changed(part)?
         } else {
-            let central_record = self
-                .source_bytes
-                .get(part.central_record)
-                .ok_or_else(|| err("ZIP 원본 중앙 디렉터리 범위 오류"))?;
             let entry = WriteEntry {
-                compressed_size: read_u32(central_record, 20)?,
-                crc32: read_u32(central_record, 16)?,
+                compressed_size: part.compressed_size,
+                crc32: part.crc32,
                 local_header_offset: u32::try_from(self.bytes_written)
                     .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?,
                 part,
-                uncompressed_size: read_u32(central_record, 24)?,
+                uncompressed_size: part.uncompressed_size,
             };
             let local_record = self
                 .source_bytes

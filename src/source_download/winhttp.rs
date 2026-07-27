@@ -485,31 +485,8 @@ impl Client {
                 download_error_with_source("응답 본문 메모리 선확보 실패", source)
             })?;
         }
-        self.read_response_body(request, started, |read_chunk| {
-            let next_len = checked_http_buffer_len(
-                "본문",
-                body.len(),
-                read_chunk.len(),
-                HTTP_MAX_BODY_BYTES,
-            )?;
-            if body.capacity() < next_len {
-                body.try_reserve(read_chunk.len()).map_err(|source| {
-                    download_error_with_source("응답 본문 메모리 확보 실패", source)
-                })?;
-            }
-            body.extend_from_slice(read_chunk);
-            Ok(())
-        })?;
-        Ok(body)
-    }
-    fn read_response_body(
-        &mut self,
-        request: &Handle,
-        started: Instant,
-        mut append: impl FnMut(&[u8]) -> DownloadResult<()>,
-    ) -> DownloadResult<()> {
         let mut chunk_buffer = mem::take(&mut self.read_buffer);
-        let result = (|| {
+        let result: DownloadResult<()> = (|| {
             if chunk_buffer.capacity() < WINHTTP_READ_BUFFER_BYTES {
                 chunk_buffer
                     .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
@@ -545,12 +522,24 @@ impl Client {
                 let read_chunk = chunk_buffer
                     .get(..read_len)
                     .ok_or("응답 본문 chunk 범위 계산 실패")?;
-                append(read_chunk)?;
+                let next_len = checked_http_buffer_len(
+                    "본문",
+                    body.len(),
+                    read_chunk.len(),
+                    HTTP_MAX_BODY_BYTES,
+                )?;
+                if body.capacity() < next_len {
+                    body.try_reserve(read_chunk.len()).map_err(|source| {
+                        download_error_with_source("응답 본문 메모리 확보 실패", source)
+                    })?;
+                }
+                body.extend_from_slice(read_chunk);
             }
             Ok(())
         })();
         self.read_buffer = chunk_buffer;
-        result
+        result?;
+        Ok(body)
     }
     fn request(
         &mut self,

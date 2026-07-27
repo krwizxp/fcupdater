@@ -492,7 +492,8 @@ impl Client {
                 status,
             })
         })();
-        self.header_buffer = header_buffer.into_reusable_bytes();
+        header_buffer.bytes.clear();
+        self.header_buffer = header_buffer.bytes;
         result
     }
 }
@@ -534,10 +535,6 @@ impl BoundedResponseBuffer {
             label,
             limit,
         }
-    }
-    fn into_reusable_bytes(mut self) -> Vec<u8> {
-        self.bytes.clear();
-        self.bytes
     }
 }
 fn nul_terminated_buffer<'buffer>(

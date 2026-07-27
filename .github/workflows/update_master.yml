@@ -3,6 +3,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: update-master
+  cancel-in-progress: true
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -11,20 +14,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: 1.97.1
+      - name: Install latest stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Update Linux package index
+        run: sudo apt-get update
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Run updater
-        run: cargo run --release --locked
-      - name: Prepare result artifact with Rust
-        run: cargo run --release --locked --example package_artifact -- --workbook
+        run: cargo +stable run --release --frozen -- --verify
       - name: Upload result artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          path: artifacts/fcupdater-result.xlsx
+          path: fuel_cost_chungcheong.xlsx
           archive: false
           if-no-files-found: error
           retention-days: 14

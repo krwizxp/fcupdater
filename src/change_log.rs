@@ -1,5 +1,5 @@
 use crate::{
-    diagnostic::{Result, err, err_with_source},
+    diagnostic::{Result, append_fmt, err, err_with_source},
     excel::{
         FuelValues, SourceRecord,
         writer::{SharedStringTable, Worksheet},
@@ -7,7 +7,7 @@ use crate::{
     master_sheet::{ChangeRow, StoreRow},
     sheet_util::add_row_offset,
 };
-use core::{fmt::Write as _, range::RangeInclusive};
+use core::range::RangeInclusive;
 const CHANGELOG_HEADER_ROW: u32 = 3;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
 const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
@@ -80,11 +80,12 @@ impl ChangeLogRowValues<'_> {
             ])
         {
             formula_buffer.clear();
-            write!(
+            append_fmt(
                 formula_buffer,
-                "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
-            )
-            .map_err(|source| err_with_source("변경내역 delta formula 작성 실패", source))?;
+                format_args!(
+                    "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
+                ),
+            );
             let cached = old_value
                 .zip(new_value)
                 .map(|(old, new)| {

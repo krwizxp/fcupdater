@@ -11,23 +11,16 @@ pub(super) struct AppError {
     message: Cow<'static, str>,
     source: Option<BoxError>,
 }
-struct ControlEscapingWriter<'formatter, 'output> {
-    formatter: &'formatter mut fmt::Formatter<'output>,
-}
-struct TerminalSafeText<'text> {
-    text: &'text str,
-}
+struct ControlEscapingWriter<'formatter, 'output>(&'formatter mut fmt::Formatter<'output>);
+struct TerminalSafeText<'text>(&'text str);
 impl AppError {
-    pub(super) fn context(
-        context: impl Into<Cow<'static, str>>,
-        source: impl Into<BoxError>,
-    ) -> Self {
+    fn context(context: impl Into<Cow<'static, str>>, source: impl Into<BoxError>) -> Self {
         Self {
             message: context.into(),
             source: Some(source.into()),
         }
     }
-    pub(super) fn message(message: impl Into<Cow<'static, str>>) -> Self {
+    fn message(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             message: message.into(),
             source: None,
@@ -42,19 +35,19 @@ impl Display for AppError {
         write_control_escaped(f, self.message.as_ref())?;
         if let Some(source) = self.source.as_ref() {
             f.write_str(": ")?;
-            write!(&mut ControlEscapingWriter { formatter: f }, "{source}")?;
+            write!(&mut ControlEscapingWriter(f), "{source}")?;
         }
         Ok(())
     }
 }
 impl fmt::Write for ControlEscapingWriter<'_, '_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        write_control_escaped(self.formatter, s)
+        write_control_escaped(self.0, s)
     }
 }
 impl Display for TerminalSafeText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_control_escaped(f, self.text)
+        write_control_escaped(f, self.0)
     }
 }
 impl fmt::Debug for AppError {
@@ -64,15 +57,9 @@ impl fmt::Debug for AppError {
 }
 impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_deref().map(|source| {
-            let source_ref: &(dyn Error + 'static) = source;
-            source_ref
-        })
-    }
-}
-impl From<Cow<'static, str>> for AppError {
-    fn from(value: Cow<'static, str>) -> Self {
-        Self::message(value)
+        self.source
+            .as_deref()
+            .map(|source| -> &(dyn Error + 'static) { source })
     }
 }
 impl From<String> for AppError {
@@ -90,30 +77,26 @@ impl From<IoError> for AppError {
         Self::context("I/O 오류", value)
     }
 }
-pub(super) fn err<M>(msg: M) -> AppError
-where
-    M: Into<Cow<'static, str>>,
-{
+pub(super) fn err(msg: impl Into<Cow<'static, str>>) -> AppError {
     AppError::message(msg)
 }
-pub(super) fn err_with_source<M, E>(context: M, source: E) -> AppError
-where
-    M: Into<Cow<'static, str>>,
-    E: Into<BoxError>,
-{
+pub(super) fn err_with_source(
+    context: impl Into<Cow<'static, str>>,
+    source: impl Into<BoxError>,
+) -> AppError {
     AppError::context(context, source)
-}
-pub(super) fn prefixed_message<D>(prefix: &str, detail: D) -> String
-where
-    D: Display,
-{
-    format!("{prefix}{detail}")
 }
 pub(super) fn path_context_message(label: &str, path: &Path) -> String {
     format!("{label}: {}", path.display())
 }
+pub(super) fn append_fmt(target: &mut String, args: fmt::Arguments<'_>) {
+    assert!(
+        target.write_fmt(args).is_ok(),
+        "String formatting must be infallible"
+    );
+}
 pub(super) const fn terminal_safe(text: &str) -> impl Display + '_ {
-    TerminalSafeText { text }
+    TerminalSafeText(text)
 }
 fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     for character in text.chars() {

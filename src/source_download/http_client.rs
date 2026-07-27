@@ -6,7 +6,6 @@ use super::{
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
     download_error_with_source, push_decimal_fragment,
 };
-use crate::diagnostic::prefixed_message;
 use core::{mem, time::Duration};
 use std::{
     thread::sleep,
@@ -140,7 +139,7 @@ impl SourceDownload {
             self.add_cookie_for_host(HttpHost::Netfunnel, "NetFunnel_ID", &result)?;
             self.add_cookie_for_host(HttpHost::Opinet, "NetFunnel_ID", &result)?;
             let Some((_opcode, code_tail)) = result.split_once(':') else {
-                return Err(prefixed_message("NetFunnel 코드 없음: ", result).into());
+                return Err(format!("NetFunnel 코드 없음: {result}").into());
             };
             let code_text = split_head_or_all(code_tail, ':');
             let code = parse_netfunnel_u32(code_text, "NetFunnel 코드 파싱 실패")?;
@@ -160,8 +159,8 @@ impl SourceDownload {
                     current_key = Some(take_netfunnel_key(result)?);
                     sleep(Duration::from_secs(u64::from(wait_secs)));
                 }
-                302 => return Err(prefixed_message("NetFunnel IP 차단: ", result).into()),
-                _ => return Err(prefixed_message("NetFunnel 응답 오류: ", result).into()),
+                302 => return Err(format!("NetFunnel IP 차단: {result}").into()),
+                _ => return Err(format!("NetFunnel 응답 오류: {result}").into()),
             }
         }
         Err("NetFunnel 대기 횟수를 초과했습니다.".into())
@@ -343,17 +342,14 @@ impl SourceDownload {
                 let preview_len = response.len().min(HTTP_ERROR_PREVIEW_BYTES);
                 let (preview_bytes, _) = response.split_at(preview_len);
                 let preview = String::from_utf8_lossy(preview_bytes);
-                let error_text = prefixed_message(
-                    "다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: ",
-                    preview,
-                );
+                let error_text =
+                    format!("다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: {preview}");
                 return Err(error_text.into());
             }
             Ok(response)
         })();
         result.map_err(|mut error| {
-            error
-                .update_message(|message| prefixed_message("Opinet 자동 다운로드 실패: ", message));
+            error.update_message(|message| format!("Opinet 자동 다운로드 실패: {message}"));
             error
         })
     }
@@ -454,10 +450,10 @@ impl SourceDownload {
             download_error_with_source("NetFunnel 응답 UTF-8 변환 실패", source)
         })?;
         let Some((_, value_tail)) = text.split_once("result='") else {
-            return Err(prefixed_message("NetFunnel result 파싱 실패: ", text).into());
+            return Err(format!("NetFunnel result 파싱 실패: {text}").into());
         };
         let Some((value, _)) = value_tail.split_once('\'') else {
-            return Err(prefixed_message("NetFunnel result 파싱 실패: ", text).into());
+            return Err(format!("NetFunnel result 파싱 실패: {text}").into());
         };
         let value_start = text.len().saturating_sub(value_tail.len());
         let value_end = value_start.saturating_add(value.len());
@@ -478,11 +474,11 @@ const fn is_url_form_literal(byte: u8) -> bool {
 }
 fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     let Some((_, value_tail)) = result.split_once("key=") else {
-        return Err(prefixed_message("NetFunnel key 없음: ", result).into());
+        return Err(format!("NetFunnel key 없음: {result}").into());
     };
     let value = split_head_or_all(value_tail, '&');
     if value.is_empty() {
-        return Err(prefixed_message("NetFunnel key 비어 있음: ", result).into());
+        return Err(format!("NetFunnel key 비어 있음: {result}").into());
     }
     let value_start = result.len().saturating_sub(value_tail.len());
     let value_end = value_start.saturating_add(value.len());

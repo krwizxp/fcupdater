@@ -1,12 +1,12 @@
 use crate::{
     change_log::ChangeLogUpdater,
     diagnostic::{Result, err, err_with_source, terminal_safe},
-    excel::{SaveVerification, SourceReader, SourceRecord, SourceRecordRef},
+    excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::{ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, StoreRow},
     region::{
-        TARGET_REGION_COUNT, TARGET_REGIONS, TargetRegion, TargetRegionPolicy,
-        increment_target_region_count, normalize_address_key_into, target_region,
+        TARGET_REGION_COUNT, TARGET_REGIONS, TargetRegionPolicy, increment_target_region_count,
+        normalize_address_key_into, target_region,
     },
     source_download::SourceDownload,
     write_line,
@@ -69,30 +69,6 @@ impl LoadedSource {
         }
         Ok(())
     }
-    fn insert(
-        &mut self,
-        key: String,
-        borrowed_record: SourceRecordRef<'_>,
-        region: TargetRegion,
-    ) -> Result<()> {
-        self.index
-            .try_reserve(1)
-            .map_err(|source| err_with_source("소스 index 맵 추가 메모리 확보 실패", source))?;
-        match self.index.entry(key) {
-            Entry::Vacant(vacant_entry) => {
-                vacant_entry.insert(borrowed_record.into_owned_with_region(region.label())?);
-                increment_target_region_count(&mut self.region_counts, region);
-                Ok(())
-            }
-            Entry::Occupied(occupied_entry) => {
-                let existing = occupied_entry.get();
-                Err(err(format!(
-                    "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
-                    existing.address, existing.name, borrowed_record.name
-                )))
-            }
-        }
-    }
 }
 pub(super) struct UpdateRun<'out> {
     pub master_path: &'out Path,
@@ -121,7 +97,22 @@ impl UpdateRun<'_> {
                         &mut target_region_scratch,
                     )?;
                     let key = mem::take(&mut target_region_scratch);
-                    loaded_source.insert(key, borrowed_record, region)?;
+                    loaded_source.index.try_reserve(1).map_err(|source| {
+                        err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
+                    })?;
+                    match loaded_source.index.entry(key) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(borrowed_record.into_owned_with_region(region.label())?);
+                            increment_target_region_count(&mut loaded_source.region_counts, region);
+                        }
+                        Entry::Occupied(entry) => {
+                            let existing = entry.get();
+                            return Err(err(format!(
+                                "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
+                                existing.address, existing.name, borrowed_record.name
+                            )));
+                        }
+                    }
                 }
                 Ok(())
             })
@@ -141,11 +132,21 @@ impl UpdateRun<'_> {
             source_index: &loaded_source.index,
         }
         .update(&mut book)?;
-        self.print_region_count_summary(
-            &master_update.existing_region_counts,
-            &master_update.matched_existing_region_counts,
-            &loaded_source.region_counts,
-        )?;
+        write_line(self.out, format_args!("대상 지역별 건수 확인:"))?;
+        for (((region, existing_count), matched_existing_count), source_count) in TARGET_REGIONS
+            .iter()
+            .zip(master_update.existing_region_counts.iter())
+            .zip(master_update.matched_existing_region_counts.iter())
+            .zip(loaded_source.region_counts.iter())
+        {
+            let label = region.label();
+            write_line(
+                self.out,
+                format_args!(
+                    "  {label}: 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
+                ),
+            )?;
+        }
         for (((region, existing_count), matched_existing_count), source_count) in TARGET_REGIONS
             .iter()
             .zip(master_update.existing_region_counts.iter())
@@ -173,29 +174,6 @@ impl UpdateRun<'_> {
             )));
         }
         Ok((book, master_update))
-    }
-    fn print_region_count_summary(
-        &mut self,
-        existing_counts: &[usize; TARGET_REGION_COUNT],
-        matched_existing_counts: &[usize; TARGET_REGION_COUNT],
-        source_counts: &[usize; TARGET_REGION_COUNT],
-    ) -> Result<()> {
-        write_line(self.out, format_args!("대상 지역별 건수 확인:"))?;
-        for (((region, existing_count), matched_existing_count), source_count) in TARGET_REGIONS
-            .iter()
-            .zip(existing_counts.iter())
-            .zip(matched_existing_counts.iter())
-            .zip(source_counts.iter())
-        {
-            let label = region.label();
-            write_line(
-                self.out,
-                format_args!(
-                    "  {label}: 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
-                ),
-            )?;
-        }
-        Ok(())
     }
     fn print_summary_rows<'row>(
         &mut self,

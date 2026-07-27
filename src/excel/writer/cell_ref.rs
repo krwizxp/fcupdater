@@ -42,20 +42,17 @@ fn col_name_text(mut col: u32, buffer: &mut [u8; COL_NAME_BUF_LEN]) -> Result<&s
 pub(super) fn parse_range_token(token: &str) -> (&str, &str) {
     token.split_once(':').unwrap_or((token, token))
 }
-const fn advance_index(index: &mut usize, step: usize) {
-    *index = index.wrapping_add(step);
-}
 fn parse_ref_prefix(reference: &str) -> Option<(CellReference, usize)> {
     let bytes = reference.as_bytes();
     let mut index = 0_usize;
     let mut col_locked = false;
     if bytes.get(index) == Some(&b'$') {
         col_locked = true;
-        advance_index(&mut index, 1);
+        index = index.wrapping_add(1);
     }
     let col_start = index;
     while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
-        advance_index(&mut index, 1);
+        index = index.wrapping_add(1);
     }
     if index == col_start {
         return None;
@@ -77,11 +74,11 @@ fn parse_ref_prefix(reference: &str) -> Option<(CellReference, usize)> {
     let mut row_locked = false;
     if bytes.get(index) == Some(&b'$') {
         row_locked = true;
-        advance_index(&mut index, 1);
+        index = index.wrapping_add(1);
     }
     let row_start = index;
     while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        advance_index(&mut index, 1);
+        index = index.wrapping_add(1);
     }
     if index == row_start {
         return None;
@@ -223,6 +220,10 @@ pub(super) fn shift_formula(
         {
             continue;
         }
+        while chars
+            .next_if(|&(next_index, _)| next_index < reference_end)
+            .is_some()
+        {}
         let shifted_col = if reference.col_locked {
             reference.col
         } else {
@@ -253,10 +254,6 @@ pub(super) fn shift_formula(
         );
         out.push_str(&replacement);
         copy_start = reference_end;
-        while chars
-            .next_if(|&(next_index, _)| next_index < copy_start)
-            .is_some()
-        {}
     }
     if let Some(out) = output.as_mut() {
         out.push_str(

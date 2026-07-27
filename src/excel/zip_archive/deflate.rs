@@ -4,7 +4,8 @@ use super::{
     HASH_SIZE, LENGTH_BASES, LENGTH_EXTRA_BITS, LITERAL_LENGTH_SYMBOLS, MAX_CHAIN, MAX_MATCH,
     MIN_MATCH, ZipResult, read_u16, zip_static, zip_with_source,
 };
-use core::{array::from_fn, iter::repeat_n, mem, range::Range};
+use alloc::collections::BinaryHeap;
+use core::{array::from_fn, cmp::Reverse, iter::repeat_n, mem, range::Range};
 use std::io::Write as IoWrite;
 #[cfg(target_arch = "x86_64")]
 macro_rules! matching_prefix_16 {
@@ -687,34 +688,27 @@ impl DynamicFrequencies {
             .iter()
             .rposition(|&len| len != 0)
             .map_or(1, |index| index.saturating_add(1));
-        let mut combined_lengths = Vec::new();
-        combined_lengths
-            .try_reserve_exact(literal_count.saturating_add(distance_count))
-            .map_err(|source| {
-                zip_with_source("deflate combined length 메모리 확보 실패", source)
-            })?;
         let Some(literal_prefix) = literal_lengths.get(..literal_count) else {
             return Err(zip_static("deflate literal length 범위 오류"));
         };
         let Some(distance_prefix) = distance_lengths.get(..distance_count) else {
             return Err(zip_static("deflate distance length 범위 오류"));
         };
-        combined_lengths.extend_from_slice(literal_prefix);
-        combined_lengths.extend_from_slice(distance_prefix);
         let mut code_length_tokens = Vec::new();
         code_length_tokens
-            .try_reserve_exact(combined_lengths.len())
+            .try_reserve_exact(literal_count.saturating_add(distance_count))
             .map_err(|source| {
                 zip_with_source("deflate code length token 메모리 확보 실패", source)
             })?;
-        let mut length_index = 0_usize;
-        while length_index < combined_lengths.len() {
-            let Some(&value) = combined_lengths.get(length_index) else {
-                break;
-            };
+        let mut lengths = literal_prefix
+            .iter()
+            .chain(distance_prefix)
+            .copied()
+            .peekable();
+        while let Some(value) = lengths.next() {
             if value == 0 {
                 let mut run = 1_usize;
-                while combined_lengths.get(length_index.saturating_add(run)) == Some(&0) {
+                while lengths.next_if_eq(&0).is_some() {
                     run = run.saturating_add(1);
                 }
                 let mut remaining = run;
@@ -748,7 +742,6 @@ impl DynamicFrequencies {
                     },
                     remaining,
                 ));
-                length_index = length_index.saturating_add(run);
             } else {
                 code_length_tokens.push(CodeLengthToken {
                     extra: 0,
@@ -756,9 +749,7 @@ impl DynamicFrequencies {
                     symbol: value,
                 });
                 let mut run = 0_usize;
-                while combined_lengths.get(length_index.saturating_add(1).saturating_add(run))
-                    == Some(&value)
-                {
+                while lengths.next_if_eq(&value).is_some() {
                     run = run.saturating_add(1);
                 }
                 let mut remaining = run;
@@ -781,7 +772,6 @@ impl DynamicFrequencies {
                     },
                     remaining,
                 ));
-                length_index = length_index.saturating_add(1).saturating_add(run);
             }
         }
         let mut code_length_freq = [0_u32; CODE_LENGTH_SYMBOLS];
@@ -958,7 +948,7 @@ impl HuffmanLengthBuilder<'_> {
     fn leaf_lengths(&self) -> ZipResult<Vec<HuffmanLeafLength>> {
         let mut nodes = Vec::new();
         let mut leaves = Vec::new();
-        let mut active = Vec::new();
+        let mut active = BinaryHeap::new();
         let node_capacity = self
             .frequencies
             .len()
@@ -987,7 +977,7 @@ impl HuffmanLengthBuilder<'_> {
                 node_index,
                 symbol,
             });
-            active.push((u64::from(freq), node_index));
+            active.push(Reverse((u64::from(freq), node_index)));
         }
         if active.is_empty() {
             return Err(zip_static("deflate Huffman frequency가 비어 있습니다."));
@@ -1008,13 +998,10 @@ impl HuffmanLengthBuilder<'_> {
             return Ok(leaf_lengths);
         }
         while active.len() > 1 {
-            active.sort_unstable_by(|&(left_freq, left), &(right_freq, right)| {
-                right_freq.cmp(&left_freq).then_with(|| right.cmp(&left))
-            });
-            let (left_freq, left) = active
+            let Reverse((left_freq, left)) = active
                 .pop()
                 .ok_or_else(|| zip_static("deflate Huffman left node가 없습니다."))?;
-            let (right_freq, right) = active
+            let Reverse((right_freq, right)) = active
                 .pop()
                 .ok_or_else(|| zip_static("deflate Huffman right node가 없습니다."))?;
             let parent = nodes.len();
@@ -1030,7 +1017,7 @@ impl HuffmanLengthBuilder<'_> {
                 .get_mut(right)
                 .ok_or_else(|| zip_static("deflate Huffman right node 범위 오류"))?;
             *right_child_node = Some(parent);
-            active.push((freq, parent));
+            active.push(Reverse((freq, parent)));
         }
         let mut leaf_lengths = Vec::new();
         leaf_lengths
