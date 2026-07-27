@@ -52,9 +52,9 @@ impl LoadedSource {
             (0_usize, 0_usize, 0_usize, false),
             |(brand_count, diesel_count, gasoline_count, has_premium), record| {
                 (
-                    brand_count.saturating_add(usize::from(!record.brand.is_empty())),
-                    diesel_count.saturating_add(usize::from(record.fuels.diesel.is_some())),
-                    gasoline_count.saturating_add(usize::from(record.fuels.gasoline.is_some())),
+                    brand_count.strict_add(usize::from(!record.brand.is_empty())),
+                    diesel_count.strict_add(usize::from(record.fuels.diesel.is_some())),
+                    gasoline_count.strict_add(usize::from(record.fuels.gasoline.is_some())),
                     has_premium || record.fuels.premium.is_some(),
                 )
             },
@@ -265,40 +265,32 @@ impl UpdateRun<'_> {
         let shifted_days = kst
             .as_secs()
             .div_euclid(SECS_PER_DAY_U64)
-            .saturating_add(719_468);
+            .strict_add(719_468);
         let era = shifted_days.div_euclid(146_097);
         let day_of_era = shifted_days.rem_euclid(146_097);
         let year_of_era = day_of_era
-            .saturating_sub(day_of_era.div_euclid(1_460))
-            .saturating_add(day_of_era.div_euclid(36_524))
-            .saturating_sub(day_of_era.div_euclid(146_096))
+            .strict_sub(day_of_era.div_euclid(1_460))
+            .strict_add(day_of_era.div_euclid(36_524))
+            .strict_sub(day_of_era.div_euclid(146_096))
             .div_euclid(365);
-        let year_base = year_of_era.saturating_add(era.saturating_mul(400));
-        let day_of_year = day_of_era.saturating_sub(
+        let year_base = year_of_era.strict_add(era.strict_mul(400));
+        let day_of_year = day_of_era.strict_sub(
             365_u64
-                .saturating_mul(year_of_era)
-                .saturating_add(year_of_era.div_euclid(4))
-                .saturating_sub(year_of_era.div_euclid(100)),
+                .strict_mul(year_of_era)
+                .strict_add(year_of_era.div_euclid(4))
+                .strict_sub(year_of_era.div_euclid(100)),
         );
-        let march_month = 5_u64
-            .saturating_mul(day_of_year)
-            .saturating_add(2)
-            .div_euclid(153);
+        let march_month = 5_u64.strict_mul(day_of_year).strict_add(2).div_euclid(153);
         let day = day_of_year
-            .saturating_sub(
-                153_u64
-                    .saturating_mul(march_month)
-                    .saturating_add(2)
-                    .div_euclid(5),
-            )
-            .saturating_add(1);
+            .strict_sub(153_u64.strict_mul(march_month).strict_add(2).div_euclid(5))
+            .strict_add(1);
         let month = if march_month < 10 {
-            march_month.saturating_add(3)
+            march_month.strict_add(3)
         } else {
-            march_month.saturating_sub(9)
+            march_month.strict_sub(9)
         };
         let year = if month <= 2 {
-            year_base.saturating_add(1)
+            year_base.strict_add(1)
         } else {
             year_base
         };
@@ -312,15 +304,15 @@ impl UpdateRun<'_> {
         today: &str,
     ) -> Result<()> {
         let (worksheet, shared_string_table) = book.change_log_sheet_mut();
-        let mut updater = ChangeLogUpdater {
+        ChangeLogUpdater {
             added: &master_update.added,
             changes: &master_update.changes,
             deleted: &master_update.deleted,
             shared_string_table,
             today,
             worksheet,
-        };
-        updater.update()?;
+        }
+        .update()?;
         write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
         book.save(self.master_path, self.save_verification)?;
         self.print_update_summary(

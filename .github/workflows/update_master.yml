@@ -16,10 +16,8 @@ jobs:
           persist-credentials: false
       - name: Install latest stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
-      - name: Update Linux package index
-        run: sudo apt-get update
       - name: Install native dependencies
-        run: sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Run updater
         run: cargo +stable run --release --frozen -- --verify
       - name: Upload result artifact

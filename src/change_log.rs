@@ -153,16 +153,11 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         };
         Ok(old_data_rows)
     }
-    fn extend_entry_conditional_formats(
+    fn set_entry_conditional_formats(
         &mut self,
         old_data_rows: RangeInclusive<u32>,
-        entry_count: usize,
-    ) -> Result<u32> {
-        let last_change_row = add_row_offset(
-            CHANGELOG_DATA_START_ROW,
-            entry_count.saturating_sub(1),
-            "변경내역 마지막 행 계산",
-        )?;
+        last_change_row: u32,
+    ) -> Result<()> {
         let target_cols = [
             CHANGELOG_COL_DELTA_GAS,
             CHANGELOG_COL_DELTA_PREMIUM,
@@ -175,8 +170,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 last: last_change_row,
             },
             &target_cols,
-        )?;
-        Ok(last_change_row)
+        )
     }
     pub(super) fn update(&mut self) -> Result<()> {
         if !self
@@ -201,14 +195,11 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         let entry_count = self
             .changes
             .len()
-            .saturating_add(self.added.len())
-            .saturating_add(self.deleted.len());
+            .strict_add(self.added.len())
+            .strict_add(self.deleted.len());
         if entry_count == 0 {
-            let last_change_row =
-                self.extend_entry_conditional_formats(old_data_rows, entry_count)?;
-            return self
-                .worksheet
-                .truncate_rows_after(last_change_row.max(style_template_row));
+            self.set_entry_conditional_formats(old_data_rows, CHANGELOG_DATA_START_ROW)?;
+            return self.worksheet.truncate_rows_after(style_template_row);
         }
         let change_entries = self.changes.iter().map(|change| ChangeLogRowValues {
             address: &change.record.address,
@@ -236,8 +227,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         });
         let mut formula_buffer = String::new();
         let formula_capacity = ROW_DECIMAL_TEXT_MAX_LEN
-            .saturating_mul(4)
-            .saturating_add("IF(OR(E=\"\",F=\"\"),\"\",F-E)".len());
+            .strict_mul(4)
+            .strict_add("IF(OR(E=\"\",F=\"\"),\"\",F-E)".len());
         formula_buffer
             .try_reserve_exact(formula_capacity)
             .map_err(|source| err_with_source("변경내역 delta formula 메모리 확보 실패", source))?;
@@ -258,7 +249,12 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 &mut formula_buffer,
             )?;
         }
-        let last_change_row = self.extend_entry_conditional_formats(old_data_rows, entry_count)?;
+        let last_change_row = add_row_offset(
+            CHANGELOG_DATA_START_ROW,
+            entry_count.strict_sub(1),
+            "변경내역 마지막 행 계산",
+        )?;
+        self.set_entry_conditional_formats(old_data_rows, last_change_row)?;
         self.worksheet
             .truncate_rows_after(last_change_row.max(style_template_row))
     }

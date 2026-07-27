@@ -11,10 +11,7 @@ use super::{
         extract_first_tag_text, find_end_tag, find_start_tag, find_tag_end, is_valid_xml_char,
     },
 };
-use crate::{
-    diagnostic::{Result, append_fmt, err, err_with_source},
-    sheet_util::parse_i32_str,
-};
+use crate::diagnostic::{Result, append_fmt, err, err_with_source};
 use alloc::{borrow::Cow, collections::BTreeMap, rc::Rc};
 use core::{
     fmt::Display,
@@ -618,7 +615,7 @@ impl Workbook {
             sheet.validate_fixed_header(sheet_name, self.shared_strings.values())?;
             let (sheet_xml, sheet_reference_count) = sheet.to_xml()?;
             shared_string_reference_count =
-                shared_string_reference_count.saturating_add(sheet_reference_count);
+                shared_string_reference_count.strict_add(sheet_reference_count);
             self.container.put_text(sheet_path, sheet_xml)?;
         }
         let shared_strings_xml = self.shared_strings.to_xml(shared_string_reference_count)?;
@@ -826,7 +823,7 @@ impl WorksheetParser<'_> {
                 if attr_count == MAX_XML_ATTRIBUTE_COUNT {
                     return Err(err("XML 속성 개수가 허용 한도를 초과했습니다."));
                 }
-                attr_count = attr_count.saturating_add(1);
+                attr_count = attr_count.strict_add(1);
                 if name.is_empty() {
                     return Err(err("XML 속성 파싱 실패: 빈 속성 이름"));
                 }
@@ -1359,7 +1356,9 @@ impl Worksheet {
                 } else {
                     MAX_SHARED_FORMULA_FOLLOWERS
                 };
-                let max_last_row = row.saturating_add(max_followers).min(MAX_A1_ROW);
+                let max_last_row = row
+                    .checked_add(max_followers)
+                    .map_or(MAX_A1_ROW, |last_row| last_row.min(MAX_A1_ROW));
                 let mut last_row = row;
                 while last_row < max_last_row {
                     let candidate_row = last_row
@@ -1465,7 +1464,7 @@ impl Worksheet {
             .ok_or_else(|| err("worksheet style 대상 row 길이 계산 실패"))?;
         if self.rows.len() < required_len {
             self.rows
-                .try_reserve(required_len.saturating_sub(self.rows.len()))
+                .try_reserve(required_len.strict_sub(self.rows.len()))
                 .map_err(|source| {
                     err_with_source("worksheet style 대상 row 메모리 확보 실패", source)
                 })?;
@@ -1613,7 +1612,73 @@ impl Worksheet {
         shared_strings: &[Rc<str>],
     ) -> Result<Option<i32>> {
         let text = self.try_get_display_at(col, row, shared_strings)?;
-        Ok(parse_i32_str(&text))
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let (negative, digits) = trimmed.strip_prefix('-').map_or_else(
+            || {
+                trimmed
+                    .strip_prefix('+')
+                    .map_or((false, trimmed), |unsigned| (false, unsigned))
+            },
+            |unsigned| (true, unsigned),
+        );
+        if digits.is_empty() {
+            return Ok(None);
+        }
+        let mut whole = 0_i64;
+        let mut round_away_from_zero = false;
+        let mut saw_digit = false;
+        let mut saw_fraction_digit = false;
+        let mut seen_decimal = false;
+        for byte in digits.bytes() {
+            match byte {
+                b',' if !seen_decimal => {}
+                b'.' if !seen_decimal => {
+                    seen_decimal = true;
+                }
+                b'0'..=b'9' => {
+                    saw_digit = true;
+                    let digit = i64::from(byte.strict_sub(b'0'));
+                    if seen_decimal {
+                        if !saw_fraction_digit {
+                            round_away_from_zero = digit >= 5_i64;
+                            saw_fraction_digit = true;
+                        }
+                    } else {
+                        let Some(next) = whole
+                            .checked_mul(10)
+                            .and_then(|scaled| scaled.checked_add(digit))
+                        else {
+                            return Ok(None);
+                        };
+                        whole = next;
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        if !saw_digit {
+            return Ok(None);
+        }
+        let magnitude = if round_away_from_zero {
+            let Some(rounded) = whole.checked_add(1) else {
+                return Ok(None);
+            };
+            rounded
+        } else {
+            whole
+        };
+        let signed = if negative {
+            let Some(negative_value) = magnitude.checked_neg() else {
+                return Ok(None);
+            };
+            negative_value
+        } else {
+            magnitude
+        };
+        Ok(i32::try_from(signed).ok())
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
         let row_index = usize::try_from(row)
@@ -1624,7 +1689,7 @@ impl Worksheet {
             .checked_add(1)
             .ok_or_else(|| err("worksheet cell row 길이 계산 실패"))?;
         if rows.len() < required_len {
-            rows.try_reserve(required_len.saturating_sub(rows.len()))
+            rows.try_reserve(required_len.strict_sub(rows.len()))
                 .map_err(|source| err_with_source("worksheet cell row 메모리 확보 실패", source))?;
             rows.resize_with(required_len, Row::empty);
         }
@@ -1676,7 +1741,7 @@ impl Worksheet {
             let mut index = row.cells.partition_point(|cell| cell.col <= max_col);
             while let Some(cell) = row.cells.get(index) {
                 if cell_has_payload(cell)? {
-                    index = index.saturating_add(1);
+                    index = index.strict_add(1);
                 } else {
                     row.cells.remove(index);
                 }
@@ -1922,8 +1987,7 @@ impl Worksheet {
                 for cell in &row.cells {
                     let col = cell.col;
                     if cell.value_type == CellValueType::SharedString {
-                        shared_string_reference_count =
-                            shared_string_reference_count.saturating_add(1);
+                        shared_string_reference_count = shared_string_reference_count.strict_add(1);
                     }
                     let cell_ref_len =
                         with_unlocked_ref_parts(col, row_num, |col_text, row_number| {
@@ -2561,7 +2625,7 @@ fn checked_capacity(parts: &[usize]) -> Option<usize> {
 fn u32_decimal_text_len(value: u32) -> usize {
     value
         .checked_ilog10()
-        .map_or(1, |log| usize::from(log.to_le_bytes()[0]).saturating_add(1))
+        .map_or(1, |log| usize::from(log.to_le_bytes()[0]).strict_add(1))
 }
 fn push_decimal_text(out: &mut String, value: impl Display) {
     append_fmt(out, format_args!("{value}"));

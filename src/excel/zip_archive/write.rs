@@ -174,10 +174,13 @@ impl<'part> StreamingZipWriter<'part, '_> {
         self.header_buffer.extend_from_slice(part.name.as_bytes());
         if let Some((extra_len, header)) = local_extra {
             self.header_buffer.extend_from_slice(&header);
+            let padding_len = extra_len
+                .checked_sub(header.len())
+                .ok_or_else(|| err("ZIP local extra header가 선언 길이를 초과했습니다."))?;
             self.header_buffer.resize(
                 self.header_buffer
                     .len()
-                    .checked_add(extra_len.saturating_sub(header.len()))
+                    .checked_add(padding_len)
                     .ok_or_else(|| err("ZIP local extra 크기 계산 실패"))?,
                 0,
             );

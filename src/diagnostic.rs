@@ -12,7 +12,7 @@ pub(super) struct AppError {
     source: Option<BoxError>,
 }
 struct ControlEscapingWriter<'formatter, 'output>(&'formatter mut fmt::Formatter<'output>);
-struct TerminalSafeText<'text>(&'text str);
+struct TerminalSafeDisplay<'value, T: ?Sized>(&'value T);
 impl AppError {
     fn context(context: impl Into<Cow<'static, str>>, source: impl Into<BoxError>) -> Self {
         Self {
@@ -45,9 +45,12 @@ impl fmt::Write for ControlEscapingWriter<'_, '_> {
         write_control_escaped(self.0, s)
     }
 }
-impl Display for TerminalSafeText<'_> {
+impl<T> Display for TerminalSafeDisplay<'_, T>
+where
+    T: Display + ?Sized,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_control_escaped(f, self.0)
+        write!(&mut ControlEscapingWriter(f), "{}", self.0)
     }
 }
 impl fmt::Debug for AppError {
@@ -95,12 +98,24 @@ pub(super) fn append_fmt(target: &mut String, args: fmt::Arguments<'_>) {
         "String formatting must be infallible"
     );
 }
-pub(super) const fn terminal_safe(text: &str) -> impl Display + '_ {
-    TerminalSafeText(text)
+pub(super) const fn terminal_safe<T>(value: &T) -> impl Display + '_
+where
+    T: Display + ?Sized,
+{
+    TerminalSafeDisplay(value)
 }
 fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     for character in text.chars() {
-        if character.is_control() {
+        if character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        {
             for escaped in character.escape_debug() {
                 formatter.write_char(escaped)?;
             }

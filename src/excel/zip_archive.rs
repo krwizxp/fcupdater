@@ -582,7 +582,7 @@ pub(super) fn scan_open_archive(
             .try_reserve_exact(archive_len)
             .map_err(|source| err_with_source("xlsx 압축 파일 메모리 확보 실패", source))?;
     }
-    let read_limit = metadata.len().saturating_add(1);
+    let read_limit = metadata.len().strict_add(1);
     let mut limited = file.take(read_limit);
     let mut buffer = vec![0_u8; ZIP_FINGERPRINT_BUFFER_BYTES].into_boxed_slice();
     let mut crc = u32::MAX;
@@ -597,13 +597,11 @@ pub(super) fn scan_open_archive(
         if read_len == 0 {
             break;
         }
-        bytes_read = bytes_read
-            .checked_add(read_len)
-            .ok_or_else(|| err("xlsx 압축 파일 읽기 크기 계산 실패"))?;
+        bytes_read = bytes_read.strict_add(read_len);
         let (chunk, _) = buffer.split_at(read_len);
         crc = crc32_update(crc, chunk)?;
         if let Some(bytes) = retained.as_mut() {
-            if bytes.capacity().saturating_sub(bytes.len()) < read_len {
+            if bytes.capacity().strict_sub(bytes.len()) < read_len {
                 bytes.try_reserve(read_len).map_err(|source| {
                     err_with_source("xlsx 압축 파일 메모리 추가 확보 실패", source)
                 })?;

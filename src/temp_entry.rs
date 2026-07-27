@@ -50,7 +50,7 @@ pub(crate) fn cleanup_stale_temp_files(parent: &Path, prefix: &str) -> io::Resul
         let path = entry.path();
         match fs::remove_file(&path) {
             Ok(()) => {
-                removed = removed.saturating_add(1);
+                removed = removed.strict_add(1);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {

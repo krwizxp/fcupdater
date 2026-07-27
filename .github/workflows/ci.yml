@@ -33,12 +33,9 @@ jobs:
           persist-credentials: false
       - name: Install latest stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
-      - name: Update Linux package index
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update
       - name: Install Linux native dependencies
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Build Release Binary
         run: cargo +stable build --release --frozen --bin fcupdater
       - name: Prepare binary artifact with Rust

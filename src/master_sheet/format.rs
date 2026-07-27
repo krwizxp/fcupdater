@@ -1,7 +1,8 @@
 use super::{DECIMAL_SCALE, ScaledDecimal, ScaledSortKey};
-use crate::diagnostic::{Result, err};
+use crate::diagnostic::{Result, append_fmt, err};
 const UNIT_PRICE_MAX_FRAC_DIGITS: usize = 15;
-pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
+pub(super) fn format_scaled_value_into(text: &mut String, value: i128, scale: i128) {
+    text.clear();
     let sign = if value != 0 && (value < 0) != (scale < 0) {
         "-"
     } else {
@@ -10,24 +11,27 @@ pub(super) fn format_scaled_value(value: i128, scale: i128) -> String {
     let abs = value.unsigned_abs();
     let scale_abs = scale.unsigned_abs();
     if scale_abs == 0 {
-        return format!("{sign}{abs}");
+        append_fmt(text, format_args!("{sign}{abs}"));
+        return;
     }
     let whole = abs.div_euclid(scale_abs);
     let frac = abs.rem_euclid(scale_abs);
     if frac == 0 {
-        return format!("{sign}{whole}");
+        append_fmt(text, format_args!("{sign}{whole}"));
+        return;
     }
     let width = usize::from(scale_abs.ilog10().to_le_bytes()[0]);
-    let mut text = format!("{sign}{whole}.{frac:0width$}");
+    append_fmt(text, format_args!("{sign}{whole}.{frac:0width$}"));
     text.truncate(text.trim_end_matches('0').len());
-    text
 }
-pub(super) fn format_unit_price_text(
+pub(super) fn format_unit_price_text_into(
+    text: &mut String,
     total: ScaledSortKey,
     qty: ScaledDecimal,
-) -> Result<Option<String>> {
+) -> Result<bool> {
+    text.clear();
     if qty == ScaledDecimal::ZERO {
-        return Ok(None);
+        return Ok(false);
     }
     let denominator_raw = qty
         .as_i128()
@@ -43,19 +47,21 @@ pub(super) fn format_unit_price_text(
     let denominator = denominator_raw.unsigned_abs();
     let whole = abs.div_euclid(denominator);
     let mut remainder = abs.rem_euclid(denominator);
+    append_fmt(text, format_args!("{sign}{whole}"));
     if remainder == 0 {
-        return Ok(Some(format!("{sign}{whole}")));
+        return Ok(true);
     }
-    let mut text = format!("{sign}{whole}");
     let integer_end = text.len();
     text.push('.');
     for _ in 0..UNIT_PRICE_MAX_FRAC_DIGITS {
         if remainder == 0 {
             break;
         }
-        remainder = remainder.wrapping_mul(10);
+        remainder = remainder
+            .checked_mul(10)
+            .ok_or_else(|| err("단가 소수부 계산 중 overflow가 발생했습니다."))?;
         let digit = remainder.div_euclid(denominator).to_le_bytes()[0];
-        text.push(char::from(b'0'.wrapping_add(digit)));
+        text.push(char::from(b'0'.strict_add(digit)));
         remainder = remainder.rem_euclid(denominator);
     }
     text.truncate(text.trim_end_matches('0').len());
@@ -65,5 +71,5 @@ pub(super) fn format_unit_price_text(
             text.replace_range(..1, "");
         }
     }
-    Ok(Some(text))
+    Ok(true)
 }

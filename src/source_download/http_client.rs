@@ -72,7 +72,7 @@ impl CookieJar {
         }) {
             return Err("Cookie 값에 허용되지 않는 문자가 포함되어 있습니다.".into());
         }
-        let pair_len = name.len().saturating_add(1).saturating_add(value.len());
+        let pair_len = name.len().strict_add(1).strict_add(value.len());
         if pair_len > MAX_COOKIE_PAIR_BYTES {
             return Err(format!(
                 "Cookie 이름과 값이 허용 한도({MAX_COOKIE_PAIR_BYTES} bytes)를 초과했습니다."
@@ -80,13 +80,14 @@ impl CookieJar {
             .into());
         }
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
-            let additional = value.len().saturating_sub(cookie.value.len());
-            cookie
-                .value
-                .try_reserve_exact(additional)
-                .map_err(|source| {
-                    download_error_with_source("Cookie 값 메모리 확보 실패", source)
-                })?;
+            if value.len() > cookie.value.len() {
+                cookie
+                    .value
+                    .try_reserve_exact(value.len().strict_sub(cookie.value.len()))
+                    .map_err(|source| {
+                        download_error_with_source("Cookie 값 메모리 확보 실패", source)
+                    })?;
+            }
             cookie.value.clear();
             cookie.value.push_str(value);
             return Ok(());
@@ -212,7 +213,7 @@ impl SourceDownload {
             } else {
                 3
             };
-            sum.saturating_add(byte_len)
+            sum.strict_add(byte_len)
         })
     }
     fn post_form(
@@ -225,10 +226,10 @@ impl SourceDownload {
         let mut body = mem::take(&mut self.form_body_buffer);
         let result = (|| {
             let required_capacity = form.iter().fold(0_usize, |sum, &(name, value)| {
-                sum.saturating_add(usize::from(sum != 0))
-                    .saturating_add(Self::percent_encoded_len(name.as_bytes()))
-                    .saturating_add(Self::percent_encoded_len(value.as_bytes()))
-                    .saturating_add(1)
+                sum.strict_add(usize::from(sum != 0))
+                    .strict_add(Self::percent_encoded_len(name.as_bytes()))
+                    .strict_add(Self::percent_encoded_len(value.as_bytes()))
+                    .strict_add(1)
             });
             body.clear();
             body.try_reserve_exact(required_capacity)
@@ -370,11 +371,11 @@ impl SourceDownload {
         let cookie_text = if jar.cookies.is_empty() {
             None
         } else {
-            let separator_capacity = jar.cookies.len().saturating_sub(1).saturating_mul(2);
+            let separator_capacity = jar.cookies.len().strict_sub(1).strict_mul(2);
             let capacity = jar.cookies.iter().fold(separator_capacity, |sum, cookie| {
-                sum.saturating_add(cookie.name.len())
-                    .saturating_add(1)
-                    .saturating_add(cookie.value.len())
+                sum.strict_add(cookie.name.len())
+                    .strict_add(1)
+                    .strict_add(cookie.value.len())
             });
             cookie_header
                 .try_reserve_exact(capacity)
@@ -455,8 +456,8 @@ impl SourceDownload {
         let Some((value, _)) = value_tail.split_once('\'') else {
             return Err(format!("NetFunnel result 파싱 실패: {text}").into());
         };
-        let value_start = text.len().saturating_sub(value_tail.len());
-        let value_end = value_start.saturating_add(value.len());
+        let value_start = text.len().strict_sub(value_tail.len());
+        let value_end = value_start.strict_add(value.len());
         text.truncate(value_end);
         text.replace_range(..value_start, "");
         Ok(text)
@@ -464,9 +465,9 @@ impl SourceDownload {
 }
 const fn hex_digit(nibble: u8) -> u8 {
     if nibble < 10 {
-        b'0'.wrapping_add(nibble)
+        b'0'.strict_add(nibble)
     } else {
-        b'A'.wrapping_add(nibble.saturating_sub(10))
+        b'A'.strict_add(nibble.strict_sub(10))
     }
 }
 const fn is_url_form_literal(byte: u8) -> bool {
@@ -480,8 +481,8 @@ fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     if value.is_empty() {
         return Err(format!("NetFunnel key 비어 있음: {result}").into());
     }
-    let value_start = result.len().saturating_sub(value_tail.len());
-    let value_end = value_start.saturating_add(value.len());
+    let value_start = result.len().strict_sub(value_tail.len());
+    let value_end = value_start.strict_add(value.len());
     result.truncate(value_end);
     result.replace_range(..value_start, "");
     Ok(result)

@@ -100,7 +100,7 @@ impl ResponseHeaders {
             }
             parsed = parsed
                 .checked_mul(10)
-                .and_then(|scaled| scaled.checked_add(usize::from(byte.wrapping_sub(b'0'))))
+                .and_then(|scaled| scaled.checked_add(usize::from(byte.strict_sub(b'0'))))
                 .ok_or("HTTP Content-Length 해석 실패")?;
         }
         if parsed > limit {

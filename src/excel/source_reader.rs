@@ -1,8 +1,5 @@
 use super::copy_text;
-use crate::{
-    diagnostic::{AppError, Result, err, err_with_source},
-    sheet_util::parse_i32_str,
-};
+use crate::diagnostic::{AppError, Result, err, err_with_source};
 use core::{fmt::Display, range::Range};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
@@ -119,9 +116,13 @@ struct SstChunkReader<'chunks, 'chunk> {
     offset_in_chunk: usize,
 }
 impl CfbDataParser<'_> {
-    fn build_fat_table(&self, fat_sector_ids: &[u32]) -> Result<Vec<u32>> {
+    fn build_fat_table(
+        &self,
+        fat_sector_ids: impl Iterator<Item = u32>,
+        fat_sector_count: usize,
+    ) -> Result<Vec<u32>> {
         let entries_per_sector = CFB_SECTOR_SIZE.div_euclid(4);
-        let total_entries = fat_sector_ids.len().strict_mul(entries_per_sector);
+        let total_entries = fat_sector_count.strict_mul(entries_per_sector);
         let mut fat: Vec<u32> = Vec::new();
         fat.try_reserve_exact(total_entries).map_err(|source| {
             err_with_source(
@@ -130,29 +131,18 @@ impl CfbDataParser<'_> {
             )
         })?;
         for sid in fat_sector_ids {
-            let sector_idx = sector_id_to_index(*sid, || {
-                prefixed_display_message("CFB sector id 변환 실패: ", *sid)
+            let sector_idx = sector_id_to_index(sid, || {
+                prefixed_display_message("CFB sector id 변환 실패: ", sid)
             })?;
-            let sector = get_sector_slice_at_index(self.0, sector_idx, *sid)?;
+            let sector = get_sector_slice_at_index(self.0, sector_idx, sid)?;
             let (chunks, &[]) = sector.as_chunks::<4>() else {
                 return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
             };
-            fat.extend(
-                chunks
-                    .iter()
-                    .take(entries_per_sector)
-                    .map(|chunk| u32::from_le_bytes(*chunk)),
-            );
+            fat.extend(chunks.iter().map(|chunk| u32::from_le_bytes(*chunk)));
         }
         Ok(fat)
     }
-    fn collect_difat_entries(&self) -> Result<Vec<u32>> {
-        let mut difat_entries: Vec<u32> = Vec::new();
-        reserve_vec_entries_exact(
-            &mut difat_entries,
-            109,
-            "CFB DIFAT entry 목록 메모리 확보 실패",
-        )?;
+    fn header_difat_entries(&self) -> Result<&[[u8; 4]]> {
         let header_difat = self
             .0
             .get(0x4C..512)
@@ -160,13 +150,7 @@ impl CfbDataParser<'_> {
         let (header_difat_chunks, &[]) = header_difat.as_chunks::<4>() else {
             return Err(err("CFB DIFAT 헤더 길이가 4바이트 단위가 아닙니다."));
         };
-        difat_entries.extend(
-            header_difat_chunks
-                .iter()
-                .map(|chunk| u32::from_le_bytes(*chunk))
-                .filter(|&sid| is_regular_sector_id(sid)),
-        );
-        Ok(difat_entries)
+        Ok(header_difat_chunks)
     }
     fn parse_cfb_header(&self) -> Result<CfbHeader> {
         let Some(data) = self.0.first_chunk::<512>() else {
@@ -361,20 +345,24 @@ impl SourceReader {
                 "CFB FAT sector 개수가 비정상적으로 큽니다: {declared_fat_sectors} (최대 {max_sector_count})"
             )));
         }
-        let difat_entries = parser.collect_difat_entries()?;
-        if declared_fat_sectors == 0 || difat_entries.is_empty() {
+        let difat_chunks = parser.header_difat_entries()?;
+        let difat_entries = || {
+            difat_chunks
+                .iter()
+                .map(|chunk| u32::from_le_bytes(*chunk))
+                .filter(|&sid| is_regular_sector_id(sid))
+        };
+        let difat_entry_count = difat_entries().count();
+        if declared_fat_sectors == 0 || difat_entry_count == 0 {
             return Err(err("CFB FAT 정보를 찾지 못했습니다."));
         }
-        if difat_entries.len() != declared_fat_sectors {
-            let difat_entry_count = difat_entries.len();
+        if difat_entry_count != declared_fat_sectors {
             return Err(err(format!(
                 "CFB FAT 엔트리 개수가 선언과 다릅니다: 선언 {declared_fat_sectors}, 실제 {difat_entry_count}"
             )));
         }
-        let fat_sector_ids = difat_entries.as_slice();
-        for (index, sector_id) in fat_sector_ids.iter().enumerate() {
-            if fat_sector_ids
-                .iter()
+        for (index, sector_id) in difat_entries().enumerate() {
+            if difat_entries()
                 .take(index)
                 .any(|previous| previous == sector_id)
             {
@@ -384,7 +372,7 @@ impl SourceReader {
                 )));
             }
         }
-        let fat = parser.build_fat_table(fat_sector_ids)?;
+        let fat = parser.build_fat_table(difat_entries(), difat_entry_count)?;
         parser.read_workbook_stream(header, &fat)
     }
     pub(crate) fn visit_xls_source(
@@ -590,7 +578,9 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         first_chunk_end: usize,
     ) -> Result<(Vec<&'workbook [u8]>, usize)> {
         let mut chunks: Vec<&[u8]> = Vec::new();
-        reserve_vec_entries_exact(&mut chunks, 8, "xls SST chunk 목록 메모리 확보 실패")?;
+        chunks.try_reserve_exact(8).map_err(|source| {
+            err_with_source("xls SST chunk 목록 메모리 확보 실패: 8 entries", source)
+        })?;
         chunks.push(first_chunk);
         let mut records = BiffRecordReader {
             context: "SST Continue",
@@ -829,9 +819,6 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             if !found_header {
                 return Err(err("Opinet 소스 헤더 행을 찾지 못했습니다."));
             }
-            if visitor_error.is_some() {
-                return Ok(());
-            }
             let address = row_text_trimmed(row, COL_ADDRESS);
             if address.is_empty() {
                 if row.iter().flatten().any(|text| !text.trim().is_empty()) {
@@ -856,18 +843,20 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 .into());
             }
             found_record = true;
-            if let Err(source) = visitor(SourceRecordRef {
-                address,
-                brand: row_text_trimmed(row, COL_BRAND),
-                fuels: FuelValues {
-                    diesel,
-                    gasoline,
-                    premium,
-                },
-                name,
-                region: row_text_trimmed(row, COL_REGION),
-                self_yn,
-            }) {
+            if visitor_error.is_none()
+                && let Err(source) = visitor(SourceRecordRef {
+                    address,
+                    brand: row_text_trimmed(row, COL_BRAND),
+                    fuels: FuelValues {
+                        diesel,
+                        gasoline,
+                        premium,
+                    },
+                    name,
+                    region: row_text_trimmed(row, COL_REGION),
+                    self_yn,
+                })
+            {
                 visitor_error = Some(source);
             }
             Ok(())
@@ -944,19 +933,14 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                             "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
                         ))
                     })?;
-                    if row >= SOURCE_HEADER_ROW && col < SOURCE_COLUMN_COUNT {
-                        let cell = current_row.get_mut(col).ok_or_else(|| {
-                            err(prefixed_display_message(
-                                "Opinet 고정 소스 열 범위 오류: ",
-                                col.strict_add(1),
-                            ))
-                        })?;
-                        if cell.replace(value).is_some() {
-                            return Err(err(format!(
-                                "Opinet 고정 소스 셀이 중복 선언되었습니다: row={row}, col={}",
-                                col.strict_add(1)
-                            )));
-                        }
+                    if row >= SOURCE_HEADER_ROW
+                        && let Some(cell) = current_row.get_mut(col)
+                        && cell.replace(value).is_some()
+                    {
+                        return Err(err(format!(
+                            "Opinet 고정 소스 셀이 중복 선언되었습니다: row={row}, col={}",
+                            col.strict_add(1)
+                        )));
                     }
                 }
                 0x0203 | 0x027E | 0x00BD | 0x0204 => {
@@ -1022,15 +1006,6 @@ fn validate_sst_option(flags: u8, allowed_mask: u8, context: &str) -> Result<()>
     }
     Ok(())
 }
-fn reserve_vec_entries_exact<T>(
-    values: &mut Vec<T>,
-    additional: usize,
-    context: &str,
-) -> Result<()> {
-    values
-        .try_reserve_exact(additional)
-        .map_err(|source| err_with_source(format!("{context}: {additional} entries"), source))
-}
 fn row_fuel_price(
     row: &SourceRow<'_>,
     idx: usize,
@@ -1049,45 +1024,68 @@ fn row_fuel_price(
             "Opinet 소스 {row_num}행 {label} 가격은 음수일 수 없습니다: {text}"
         )));
     }
-    let unsigned = text.strip_prefix('+').unwrap_or(text);
-    let (whole, fraction) = unsigned
-        .split_once('.')
-        .map_or((unsigned, None), |(whole, fraction)| {
-            (whole, Some(fraction))
-        });
-    let valid_fraction = fraction.is_none_or(|digits| {
-        !digits.is_empty()
-            && !digits.contains('.')
-            && digits.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    let valid_whole = if whole.contains(',') {
-        let mut groups = whole.split(',');
-        groups.next().is_some_and(|first| {
-            (1..=3).contains(&first.len()) && first.bytes().all(|byte| byte.is_ascii_digit())
-        }) && groups
-            .all(|group| group.len() == 3 && group.bytes().all(|byte| byte.is_ascii_digit()))
-    } else {
-        !whole.is_empty() && whole.bytes().all(|byte| byte.is_ascii_digit())
-    };
-    if !valid_whole || !valid_fraction {
-        return Err(err(format!(
-            "Opinet 소스 {row_num}행 {label} 가격 형식이 올바르지 않습니다: {text}"
-        )));
-    }
-    let value = parse_i32_str(text).ok_or_else(|| {
+    let invalid_price = || {
         err(format!(
             "Opinet 소스 {row_num}행 {label} 가격 형식이 올바르지 않습니다: {text}"
         ))
-    })?;
-    if value == 0_i32 {
+    };
+    let mut value = 0_i64;
+    let mut group_len = 0_usize;
+    let mut whole_digits = 0_usize;
+    let mut fraction_digits = 0_usize;
+    let mut comma_seen = false;
+    let mut decimal_seen = false;
+    let mut round_up = false;
+    for byte in text.strip_prefix('+').unwrap_or(text).bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                let digit = i64::from(byte.strict_sub(b'0'));
+                if decimal_seen {
+                    if fraction_digits == 0 {
+                        round_up = digit >= 5;
+                    }
+                    fraction_digits = fraction_digits.strict_add(1);
+                } else {
+                    value = value
+                        .checked_mul(10)
+                        .and_then(|scaled| scaled.checked_add(digit))
+                        .ok_or_else(&invalid_price)?;
+                    group_len = group_len.strict_add(1);
+                    whole_digits = whole_digits.strict_add(1);
+                }
+            }
+            b',' if !decimal_seen => {
+                if group_len == 0 || comma_seen && group_len != 3 || !comma_seen && group_len > 3 {
+                    return Err(invalid_price());
+                }
+                comma_seen = true;
+                group_len = 0;
+            }
+            b'.' if !decimal_seen => {
+                if whole_digits == 0 || comma_seen && group_len != 3 {
+                    return Err(invalid_price());
+                }
+                decimal_seen = true;
+            }
+            _ => return Err(invalid_price()),
+        }
+    }
+    if whole_digits == 0 || comma_seen && group_len != 3 || decimal_seen && fraction_digits == 0 {
+        return Err(invalid_price());
+    }
+    if round_up {
+        value = value.checked_add(1).ok_or_else(&invalid_price)?;
+    }
+    let parsed_value = i32::try_from(value).map_err(|_conversion_error| invalid_price())?;
+    if parsed_value == 0_i32 {
         return Ok(None);
     }
-    if !(MIN_FUEL_PRICE..=MAX_FUEL_PRICE).contains(&value) {
+    if !(MIN_FUEL_PRICE..=MAX_FUEL_PRICE).contains(&parsed_value) {
         return Err(err(format!(
             "Opinet 소스 {row_num}행 {label} 가격이 허용 범위({MIN_FUEL_PRICE}~{MAX_FUEL_PRICE})를 벗어났습니다: {text}"
         )));
     }
-    Ok(Some(value))
+    Ok(Some(parsed_value))
 }
 fn row_text_trimmed<'strings>(row: &SourceRow<'strings>, idx: usize) -> &'strings str {
     row.get(idx).copied().flatten().map_or("", str::trim)
@@ -1102,8 +1100,13 @@ fn sector_id_to_index(sector_id: u32, message: impl FnOnce() -> String) -> Resul
     usize::try_from(sector_id).map_err(|source| err_with_source(message(), source))
 }
 fn get_sector_slice_at_index(data: &[u8], sector_idx: usize, sector_id: u32) -> Result<&[u8]> {
-    data.get(CFB_SECTOR_SIZE..)
-        .and_then(|sectors| sectors.chunks_exact(CFB_SECTOR_SIZE).nth(sector_idx))
+    let start_offset = sector_idx
+        .checked_add(1)
+        .and_then(|index| index.checked_mul(CFB_SECTOR_SIZE));
+    let sector_range =
+        start_offset.and_then(|offset| offset.checked_add(CFB_SECTOR_SIZE).map(|end| offset..end));
+    sector_range
+        .and_then(|bounds| data.get(bounds))
         .ok_or_else(|| {
             err(format!(
                 "CFB sector 범위를 벗어났습니다: sector={sector_id}, size={CFB_SECTOR_SIZE}"
@@ -1177,9 +1180,7 @@ fn read_stream_from_fat_chain(
         let sector = get_sector_slice_at_index(data, sid_usize, sid)?;
         if let Some(remain) = remaining.as_mut() {
             let take = (*remain).min(sector.len());
-            let prefix = sector
-                .get(..take)
-                .ok_or_else(|| err("sector 슬라이스 범위 오류"))?;
+            let (prefix, _) = sector.split_at(take);
             out.extend_from_slice(prefix);
             *remain = remain.strict_sub(take);
         } else {

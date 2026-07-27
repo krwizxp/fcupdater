@@ -5,7 +5,9 @@ use super::{
     xml::{XmlAttrScanner, XmlScanner},
     zip_archive::scan_open_archive,
 };
-use crate::diagnostic::{AppError, Result, err, err_with_source, path_context_message};
+use crate::diagnostic::{
+    AppError, Result, err, err_with_source, path_context_message, terminal_safe,
+};
 use crate::temp_entry::{cleanup_stale_temp_files, reserve_unique_temp_entry};
 use crate::validate_regular_file;
 use alloc::borrow::Cow;
@@ -1501,10 +1503,12 @@ fn direct_xml_children<'xml>(
 }
 fn write_path_warning(context: &str, path: &Path, source: &io::Error) {
     let mut error_output = stderr().lock();
+    let path_display = path.display();
     match writeln!(
         &mut error_output,
-        "경고: {context}: {} ({source})",
-        path.display(),
+        "경고: {context}: {} ({})",
+        terminal_safe(&path_display),
+        terminal_safe(source),
     ) {
         Ok(()) | Err(_) => {}
     }

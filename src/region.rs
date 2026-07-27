@@ -204,7 +204,7 @@ pub(super) const fn increment_target_region_count(
         TargetRegion::Asan => asan,
         TargetRegion::Cheonan => cheonan,
     };
-    *region_count = region_count.saturating_add(1);
+    *region_count = region_count.strict_add(1);
 }
 fn target_region_from_normalized(text: &str) -> Option<TargetRegion> {
     if text.strip_prefix("대전").is_some_and(|tail| {
