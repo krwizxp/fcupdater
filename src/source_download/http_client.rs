@@ -190,21 +190,6 @@ impl SourceDownload {
         }
         Ok(body)
     }
-    fn get_text(&mut self, path: &str, referer: Option<&str>) -> DownloadResult<String> {
-        let headers = Self::request_headers(
-            &self.cookie_jars,
-            &mut self.cookie_header_buffer,
-            HttpHost::Opinet,
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            None,
-            referer,
-            false,
-        )?;
-        let raw_response = self.platform.get(OPINET_HOST, path, headers)?;
-        let body = self.finish_response(HttpHost::Opinet, raw_response)?;
-        String::from_utf8(body)
-            .map_err(|source| download_error_with_source("HTTP 응답 UTF-8 변환 실패", source))
-    }
     fn post_form(
         &mut self,
         path: &str,
@@ -271,7 +256,20 @@ impl SourceDownload {
     }
     pub(crate) fn refresh_source(mut self) -> DownloadResult<Vec<u8>> {
         let result = (|| -> DownloadResult<Vec<u8>> {
-            let opdownload_page = self.get_text(OPDOWNLOAD_PATH, None)?;
+            let headers = Self::request_headers(
+                &self.cookie_jars,
+                &mut self.cookie_header_buffer,
+                HttpHost::Opinet,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                None,
+                None,
+                false,
+            )?;
+            let opdownload_response = self.platform.get(OPINET_HOST, OPDOWNLOAD_PATH, headers)?;
+            let body = self.finish_response(HttpHost::Opinet, opdownload_response)?;
+            let opdownload_page = String::from_utf8(body).map_err(|source| {
+                download_error_with_source("HTTP 응답 UTF-8 변환 실패", source)
+            })?;
             let opinet_key = {
                 const KEY_ASSIGNMENT_MARKER: &str = "opinet_key.value";
                 let Some((_, after_marker)) = opdownload_page.split_once(KEY_ASSIGNMENT_MARKER)

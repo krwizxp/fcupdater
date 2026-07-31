@@ -16,6 +16,8 @@ use crate::temp_entry::{
 };
 use alloc::borrow::Cow;
 use core::{array, convert::identity, mem, str};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
     fs,
     io::{self, Seek as _, SeekFrom, Write as _, stderr},
@@ -23,12 +25,6 @@ use std::{
     process,
     time::{SystemTime, UNIX_EPOCH},
 };
-cfg_select! {
-    any(target_os = "linux", target_os = "macos") => {
-        use std::os::unix::fs::OpenOptionsExt as _;
-    }
-    _ => {}
-}
 mod atomic_replace;
 const MAX_XLSX_TEXT_PART_BYTES: usize = 64 * 1024 * 1024;
 const CONTENT_TYPES_NAMESPACE: &str =
@@ -263,7 +259,6 @@ const BLANK_EXCEL_THUMBNAIL_DWORDS: [u32; 32] = [
     0,
     20,
 ];
-#[derive(Debug)]
 pub(crate) struct XlsxContainer {
     drawing_rid: Option<String>,
     parts: Vec<PackagePart>,
@@ -561,26 +556,21 @@ impl TempArchivePromotion<'_> {
                 source,
             )
         })?;
-        cfg_select! {
-            any(target_os = "linux", target_os = "macos") => {
-                let parent = self
-                    .target_xlsx
-                    .parent()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                fs::File::open(parent)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|source| {
-                        err_with_source(
-                            path_context_message(
-                                "xlsx 저장 완료 후 폴더 내구성 동기화 실패",
-                                parent,
-                            ),
-                            source,
-                        )
-                    })?;
-            }
-            _ => {}
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let parent = self
+                .target_xlsx
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|source| {
+                    err_with_source(
+                        path_context_message("xlsx 저장 완료 후 폴더 내구성 동기화 실패", parent),
+                        source,
+                    )
+                })?;
         }
         Ok(())
     }

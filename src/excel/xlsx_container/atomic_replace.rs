@@ -52,26 +52,20 @@ cfg_select! {
     }
     _ => {}
 }
-cfg_select! {
-    target_os = "windows" => {
-        const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
-    }
-    target_os = "linux" => {
-        const AT_FDCWD: c_int = -100;
-        const RENAME_EXCHANGE: c_uint = 2;
-    }
-    target_os = "macos" => {
-        const RENAME_SWAP: c_uint = 2;
-    }
-    _ => {}
-}
+#[cfg(target_os = "windows")]
+const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+#[cfg(target_os = "linux")]
+const AT_FDCWD: c_int = -100;
+#[cfg(target_os = "linux")]
+const RENAME_EXCHANGE: c_uint = 2;
+#[cfg(target_os = "macos")]
+const RENAME_SWAP: c_uint = 2;
 #[derive(Debug)]
 pub(super) struct ReplaceFailure {
     replace: io::Error,
     #[cfg(target_os = "windows")]
     restore: Option<io::Error>,
 }
-#[derive(Debug)]
 pub(super) enum ReplaceFilesError {
     Failed(ReplaceFailure),
     #[cfg(target_os = "windows")]

@@ -42,7 +42,6 @@ enum XlsxPartRole {
     OptionalInput,
     Required,
 }
-#[derive(Debug)]
 struct CanonicalStyleMap {
     entries: Vec<Option<u32>>,
 }
@@ -60,12 +59,11 @@ pub(super) enum SaveVerification {
     Skip,
     Verify,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct ArchiveFingerprint {
     crc32: u32,
     len: usize,
 }
-#[derive(Debug)]
 struct PackagePart {
     bytes: Vec<u8>,
     name: &'static str,

@@ -42,7 +42,7 @@ const SOURCE_COLUMN_COUNT: usize = COL_DIESEL + 1;
 const WORKBOOK_STREAM_NAME: [char; 8] = ['W', 'o', 'r', 'k', 'b', 'o', 'o', 'k'];
 const MIN_FUEL_PRICE: i32 = 100;
 const MAX_FUEL_PRICE: i32 = 100_000;
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub(crate) struct FuelValues<T> {
     pub diesel: T,
     pub gasoline: T,
@@ -57,7 +57,6 @@ impl<T> FuelValues<T> {
         }
     }
 }
-#[derive(Debug)]
 pub(crate) struct SourceRecord {
     pub address: String,
     pub brand: String,
@@ -86,7 +85,7 @@ impl SourceRecordRef<'_> {
         })
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct CfbHeader {
     first_dir_sector: u32,
     num_fat_sectors: u32,

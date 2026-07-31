@@ -7,7 +7,7 @@ use std::{
 };
 cfg_select! {
     target_os = "windows" => {
-        use core::{ffi::c_void, mem::size_of};
+        use core::ffi::c_void;
         use std::os::windows::{
             fs::{MetadataExt as _, OpenOptionsExt as _},
             io::AsRawHandle as _,
@@ -20,15 +20,10 @@ cfg_select! {
     }
     _ => {}
 }
-cfg_select! {
-    target_os = "linux" => {
-        const OPEN_NOFOLLOW: i32 = 0x0002_0000;
-    }
-    target_os = "macos" => {
-        const OPEN_NOFOLLOW: i32 = 0x0000_0100;
-    }
-    _ => {}
-}
+#[cfg(target_os = "linux")]
+const OPEN_NOFOLLOW: i32 = 0x0002_0000;
+#[cfg(target_os = "macos")]
+const OPEN_NOFOLLOW: i32 = 0x0000_0100;
 #[cfg(target_os = "windows")]
 const _: () = assert!(
     size_of::<ByHandleFileInformation>() == 52,
@@ -60,7 +55,7 @@ unsafe extern "system" {
         information: *mut ByHandleFileInformation,
     ) -> i32;
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct FileIdentity {
     index: u64,
     volume: u64,

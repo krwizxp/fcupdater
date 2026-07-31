@@ -112,7 +112,6 @@ const MASTER_FORMULA_LAYOUT: FormulaLayout = FormulaLayout {
     optional_zero_col: Some(11),
     required_cols: &[1, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, MASTER_LAST_COL],
 };
-#[derive(Debug)]
 pub(crate) struct Workbook {
     calc_chain_xml: Option<String>,
     change_log_sheet: Worksheet,
@@ -122,29 +121,24 @@ pub(crate) struct Workbook {
     shared_strings: SharedStringTable,
     xml_text: String,
 }
-#[derive(Debug)]
 pub(crate) struct SharedStringTable {
     entries: Vec<String>,
     index: HashMap<Rc<str>, usize>,
     values: Vec<Rc<str>>,
 }
-#[derive(Debug)]
 pub(crate) struct Worksheet {
     prefix: String,
     rows: Vec<Row>,
     suffix: String,
 }
-#[derive(Debug)]
 struct XmlTagLocation {
     self_closing: bool,
     span: Range<usize>,
 }
-#[derive(Debug)]
 pub(crate) struct Row {
     attrs_xml: String,
     cells: Vec<Cell>,
 }
-#[derive(Debug)]
 struct Cell {
     col: u32,
     inner_xml: Option<String>,
@@ -187,12 +181,12 @@ struct FormulaLayout {
     optional_zero_col: Option<u32>,
     required_cols: &'static [u32],
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ExcelSheetKind {
     ChangeLog,
     Master,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum CellValueType {
     General,
     Number,
@@ -209,7 +203,6 @@ impl CellValueType {
         }
     }
 }
-#[derive(Debug)]
 struct XmlAttr<'text> {
     name: Cow<'text, str>,
     value: Cow<'text, str>,
@@ -223,7 +216,7 @@ enum XmlEscapeContext {
     Attribute,
     Text,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct CellReference {
     pub col: u32,
     pub col_locked: bool,

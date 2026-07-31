@@ -51,13 +51,11 @@ type RowRange = RangeInclusive<u32>;
 pub(super) struct MasterSheetUpdater<'source> {
     pub source_index: &'source HashMap<String, SourceRecord>,
 }
-#[derive(Debug)]
 pub(super) struct ChangeRow<'source> {
     pub old_fuels: FuelValues<Option<i32>>,
     pub reason: String,
     pub record: &'source SourceRecord,
 }
-#[derive(Debug)]
 pub(super) struct StoreRow {
     pub address: String,
     pub fuels: FuelValues<Option<i32>>,
@@ -73,9 +71,9 @@ pub(super) struct MasterSheetUpdateResult<'source> {
     pub existing_region_counts: [usize; TARGET_REGION_COUNT],
     pub matched_existing_region_counts: [usize; TARGET_REGION_COUNT],
 }
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct ScaledDecimal(i64);
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct ScaledSortKey(i128);
 impl ScaledDecimal {
     const ZERO: Self = Self(0);
