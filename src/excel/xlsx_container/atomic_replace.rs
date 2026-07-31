@@ -65,15 +65,10 @@ cfg_select! {
     }
     _ => {}
 }
-#[derive(Clone, Copy)]
-pub(super) enum DisplacedFile {
-    #[cfg(target_os = "windows")]
-    Backup,
-    Replacement,
-}
 #[derive(Debug)]
 pub(super) struct ReplaceFailure {
     replace: io::Error,
+    #[cfg(target_os = "windows")]
     restore: Option<io::Error>,
 }
 #[derive(Debug)]
@@ -88,21 +83,22 @@ impl ReplaceFailure {
     const fn new(replace: io::Error) -> Self {
         Self {
             replace,
+            #[cfg(target_os = "windows")]
             restore: None,
         }
     }
 }
 impl fmt::Display for ReplaceFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(target_os = "windows")]
         if let Some(restore) = self.restore.as_ref() {
-            write!(
+            return write!(
                 f,
                 "{}; 원본 대상 파일 자동 복원도 실패했습니다: {restore}",
                 self.replace,
-            )
-        } else {
-            fmt::Display::fmt(&self.replace, f)
+            );
         }
+        fmt::Display::fmt(&self.replace, f)
     }
 }
 impl Error for ReplaceFailure {
@@ -135,6 +131,19 @@ cfg_select! {
                     ));
                 }
             };
+            let capacity = extended_prefix
+                .len()
+                .checked_add(absolute.as_os_str().len())
+                .and_then(|len| len.checked_add(1))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows file path length overflow",
+                    )
+                })?;
+            let mut wide = Vec::new();
+            wide.try_reserve_exact(capacity).map_err(io::Error::other)?;
+            wide.extend(extended_prefix.encode_utf16());
             let mut path_wide = absolute.as_os_str().encode_wide();
             for _ in 0_usize..skipped_units {
                 let Some(unit) = path_wide.next() else {
@@ -150,14 +159,14 @@ cfg_select! {
                     ));
                 }
             }
-            let mut wide = Vec::new();
-            wide.extend(extended_prefix.encode_utf16());
-            wide.extend(path_wide);
-            if wide.contains(&0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Windows file path contains a NUL character",
-                ));
+            for unit in path_wide {
+                if unit == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows file path contains a NUL character",
+                    ));
+                }
+                wide.push(unit);
             }
             wide.push(0);
             Ok(wide)
@@ -167,7 +176,7 @@ cfg_select! {
             replacement: &Path,
             backup: &Path,
             rollback: bool,
-        ) -> Result<DisplacedFile, ReplaceFilesError> {
+        ) -> Result<(), ReplaceFilesError> {
             let (incoming, backup_output) = if rollback {
                 (backup, replacement)
             } else {
@@ -195,11 +204,7 @@ cfg_select! {
                 )
             };
             if status != 0_i32 {
-                return Ok(if rollback {
-                    DisplacedFile::Replacement
-                } else {
-                    DisplacedFile::Backup
-                });
+                return Ok(());
             }
             let replace = io::Error::last_os_error();
             if replace.raw_os_error() != Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
@@ -219,9 +224,7 @@ cfg_select! {
         pub(super) fn replace_files(
             target: &Path,
             replacement: &Path,
-            _backup: &Path,
-            _rollback: bool,
-        ) -> Result<DisplacedFile, ReplaceFilesError> {
+        ) -> Result<(), ReplaceFilesError> {
             let target_c = path_to_c_string(target)
                 .map_err(ReplaceFailure::new)
                 .map_err(ReplaceFilesError::Failed)?;
@@ -249,7 +252,7 @@ cfg_select! {
                 unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP) }
             };
             if status == 0_i32 {
-                Ok(DisplacedFile::Replacement)
+                Ok(())
             } else {
                 Err(ReplaceFilesError::Failed(ReplaceFailure::new(
                     io::Error::last_os_error(),

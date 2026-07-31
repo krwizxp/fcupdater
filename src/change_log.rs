@@ -53,6 +53,7 @@ impl ChangeLogRowValues<'_> {
         shared_strings: &mut SharedStringTable,
         row: u32,
         formula_buffer: &mut String,
+        cache_buffer: &mut String,
     ) -> Result<()> {
         for (col, value) in [
             (CHANGELOG_COL_REGION, self.region),
@@ -86,19 +87,23 @@ impl ChangeLogRowValues<'_> {
                     "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
                 ),
             );
-            let cached = old_value
+            let cached_value = old_value
                 .zip(new_value)
                 .map(|(old, new)| {
                     new.checked_sub(old)
                         .ok_or_else(|| err("변경내역 delta cache 계산 실패"))
                 })
-                .transpose()?
-                .map(|value| value.to_string());
+                .transpose()?;
+            cache_buffer.clear();
+            if let Some(value) = cached_value {
+                append_fmt(cache_buffer, format_args!("{value}"));
+            }
             worksheet.set_formula_at_with_cache(
                 target_col,
                 row,
                 formula_buffer,
-                cached.as_deref(),
+                cached_value.map(|_| cache_buffer.as_str()),
+                false,
             )?;
         }
         Ok(())
@@ -232,6 +237,10 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         formula_buffer
             .try_reserve_exact(formula_capacity)
             .map_err(|source| err_with_source("변경내역 delta formula 메모리 확보 실패", source))?;
+        let mut cache_buffer = String::new();
+        cache_buffer
+            .try_reserve_exact(ROW_DECIMAL_TEXT_MAX_LEN)
+            .map_err(|source| err_with_source("변경내역 delta cache 메모리 확보 실패", source))?;
         let worksheet = &mut *self.worksheet;
         for (index, values) in change_entries
             .chain(added_entries)
@@ -247,6 +256,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 self.shared_string_table,
                 row,
                 &mut formula_buffer,
+                &mut cache_buffer,
             )?;
         }
         let last_change_row = add_row_offset(

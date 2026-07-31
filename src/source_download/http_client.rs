@@ -4,8 +4,9 @@ use super::{
     NETFUNNEL_ENTRY_ACTION_ID, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
     OIL_PRICE_DOWNLOAD_TAR_URL, OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH,
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
-    download_error_with_source, push_decimal_fragment,
+    download_error_with_source,
 };
+use crate::diagnostic::append_fmt;
 use core::{mem, time::Duration};
 use std::{
     thread::sleep,
@@ -149,14 +150,13 @@ impl SourceDownload {
                     return take_netfunnel_key(result);
                 }
                 201 | 202 => {
-                    current_ttl = result
-                        .split_once("ttl=")
-                        .map(|(_, ttl_tail)| {
-                            let ttl_text = split_head_or_all(ttl_tail, '&');
-                            parse_netfunnel_u32(ttl_text, "NetFunnel ttl 파싱 실패")
-                        })
-                        .transpose()?;
-                    let wait_secs = current_ttl.unwrap_or(1).clamp(1, 30);
+                    let Some((_, ttl_tail)) = result.split_once("ttl=") else {
+                        return Err(format!("NetFunnel 대기 응답에 ttl 없음: {result}").into());
+                    };
+                    let ttl_text = split_head_or_all(ttl_tail, '&');
+                    let ttl = parse_netfunnel_u32(ttl_text, "NetFunnel ttl 파싱 실패")?;
+                    let wait_secs = ttl.clamp(1, 30);
+                    current_ttl = Some(ttl);
                     current_key = Some(take_netfunnel_key(result)?);
                     sleep(Duration::from_secs(u64::from(wait_secs)));
                 }
@@ -170,26 +170,25 @@ impl SourceDownload {
         &mut self,
         host: HttpHost,
         response: HttpResponse,
-    ) -> DownloadResult<HttpResponse> {
-        for (cookie_name, cookie_value) in response
-            .headers
-            .set_cookies
-            .iter()
-            .filter_map(|value| split_head_or_all(value, ';').split_once('='))
-        {
+    ) -> DownloadResult<Vec<u8>> {
+        let HttpResponse {
+            body,
+            headers,
+            status,
+        } = response;
+        for value in &headers.set_cookies {
+            let pair = split_head_or_all(value, ';');
+            let (cookie_name, cookie_value) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("HTTP Set-Cookie 형식이 올바르지 않습니다: {value}"))?;
             self.add_cookie_for_host(host, cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
         }
-        if !(200..300).contains(&response.status) {
-            let body_preview = String::from_utf8_lossy(
-                response
-                    .body
-                    .get(..HTTP_ERROR_PREVIEW_BYTES)
-                    .unwrap_or(&response.body),
-            );
-            let status = response.status;
+        if !(200..300).contains(&status) {
+            let body_preview =
+                String::from_utf8_lossy(body.get(..HTTP_ERROR_PREVIEW_BYTES).unwrap_or(&body));
             return Err(format!("HTTP {status}: {body_preview}").into());
         }
-        Ok(response)
+        Ok(body)
     }
     fn get_text(&mut self, path: &str, referer: Option<&str>) -> DownloadResult<String> {
         let headers = Self::request_headers(
@@ -202,19 +201,9 @@ impl SourceDownload {
             false,
         )?;
         let raw_response = self.platform.get(OPINET_HOST, path, headers)?;
-        let response = self.finish_response(HttpHost::Opinet, raw_response)?;
-        String::from_utf8(response.body)
+        let body = self.finish_response(HttpHost::Opinet, raw_response)?;
+        String::from_utf8(body)
             .map_err(|source| download_error_with_source("HTTP 응답 UTF-8 변환 실패", source))
-    }
-    fn percent_encoded_len(bytes: &[u8]) -> usize {
-        bytes.iter().fold(0_usize, |sum, byte| {
-            let byte_len = if is_url_form_literal(*byte) || *byte == b' ' {
-                1
-            } else {
-                3
-            };
-            sum.strict_add(byte_len)
-        })
     }
     fn post_form(
         &mut self,
@@ -222,13 +211,12 @@ impl SourceDownload {
         form: &[(&str, &str)],
         referer: Option<&str>,
         profile: PostHeaderProfile,
-    ) -> DownloadResult<HttpResponse> {
+    ) -> DownloadResult<Vec<u8>> {
         let mut body = mem::take(&mut self.form_body_buffer);
         let result = (|| {
             let required_capacity = form.iter().fold(0_usize, |sum, &(name, value)| {
                 sum.strict_add(usize::from(sum != 0))
-                    .strict_add(Self::percent_encoded_len(name.as_bytes()))
-                    .strict_add(Self::percent_encoded_len(value.as_bytes()))
+                    .strict_add(name.len().strict_add(value.len()).strict_mul(3))
                     .strict_add(1)
             });
             body.clear();
@@ -264,7 +252,12 @@ impl SourceDownload {
     fn push_percent_encoded(out: &mut String, bytes: &[u8]) {
         for byte in bytes {
             match *byte {
-                literal if is_url_form_literal(literal) => out.push(char::from(literal)),
+                literal
+                    if literal.is_ascii_alphanumeric()
+                        || matches!(literal, b'-' | b'_' | b'.' | b'~') =>
+                {
+                    out.push(char::from(literal));
+                }
                 b' ' => out.push('+'),
                 other => {
                     let high = other >> 4_u8;
@@ -276,7 +269,7 @@ impl SourceDownload {
             }
         }
     }
-    pub(crate) fn refresh_source(&mut self) -> DownloadResult<Vec<u8>> {
+    pub(crate) fn refresh_source(mut self) -> DownloadResult<Vec<u8>> {
         let result = (|| -> DownloadResult<Vec<u8>> {
             let opdownload_page = self.get_text(OPDOWNLOAD_PATH, None)?;
             let opinet_key = {
@@ -323,22 +316,20 @@ impl SourceDownload {
                 PostHeaderProfile::Ajax,
             )?;
             let download_key = self.fetch_netfunnel_ticket(NETFUNNEL_DOWNLOAD_ACTION_ID)?;
-            let response = self
-                .post_form(
-                    OPDOWNLOAD_EXCEL_PATH,
-                    &[
-                        ("LPG_CD", GAS_STATION_LPG_CODE),
-                        ("DATE_DIV_CD", ""),
-                        ("PAGE_DIV", CURRENT_PRICE_PAGE_DIV),
-                        ("SIDO_NM", DEFAULT_REGION_LABEL),
-                        ("SIGUN_NM", DEFAULT_REGION_LABEL),
-                        ("API_GBN", GAS_STATION_API_GBN),
-                        ("netfunnel_key", download_key.as_str()),
-                    ],
-                    Some(OPDOWNLOAD_URL),
-                    PostHeaderProfile::Standard,
-                )?
-                .body;
+            let response = self.post_form(
+                OPDOWNLOAD_EXCEL_PATH,
+                &[
+                    ("LPG_CD", GAS_STATION_LPG_CODE),
+                    ("DATE_DIV_CD", ""),
+                    ("PAGE_DIV", CURRENT_PRICE_PAGE_DIV),
+                    ("SIDO_NM", DEFAULT_REGION_LABEL),
+                    ("SIGUN_NM", DEFAULT_REGION_LABEL),
+                    ("API_GBN", GAS_STATION_API_GBN),
+                    ("netfunnel_key", download_key.as_str()),
+                ],
+                Some(OPDOWNLOAD_URL),
+                PostHeaderProfile::Standard,
+            )?;
             if !response.starts_with(&OLE2_SIGNATURE) {
                 let preview_len = response.len().min(HTTP_ERROR_PREVIEW_BYTES);
                 let (preview_bytes, _) = response.split_at(preview_len);
@@ -425,14 +416,14 @@ impl SourceDownload {
             path.push_str("%3B");
             if let Some(ttl_secs) = ttl {
                 path.push_str("&ttl=");
-                push_decimal_fragment(&mut path, u128::from(ttl_secs));
+                append_fmt(&mut path, format_args!("{ttl_secs}"));
             }
             path.push_str("&sid=");
             path.push_str(NETFUNNEL_SERVICE_ID);
             path.push_str("&aid=");
             path.push_str(action_id);
             path.push_str("&js=yes&");
-            push_decimal_fragment(&mut path, timestamp);
+            append_fmt(&mut path, format_args!("{timestamp}"));
             let headers = Self::request_headers(
                 &self.cookie_jars,
                 &mut self.cookie_header_buffer,
@@ -447,7 +438,7 @@ impl SourceDownload {
         };
         self.netfunnel_path_buffer = path;
         let response = response_result?;
-        let mut text = String::from_utf8(response.body).map_err(|source| {
+        let mut text = String::from_utf8(response).map_err(|source| {
             download_error_with_source("NetFunnel 응답 UTF-8 변환 실패", source)
         })?;
         let Some((_, value_tail)) = text.split_once("result='") else {
@@ -469,9 +460,6 @@ const fn hex_digit(nibble: u8) -> u8 {
     } else {
         b'A'.strict_add(nibble.strict_sub(10))
     }
-}
-const fn is_url_form_literal(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
 }
 fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     let Some((_, value_tail)) = result.split_once("key=") else {

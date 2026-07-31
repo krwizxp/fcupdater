@@ -35,7 +35,6 @@ fn main() -> io::Result<()> {
     if args.next().is_some() {
         return Err(invalid_input("unexpected package artifact argument"));
     }
-    let artifact_dir = Path::new("artifacts");
     if entry_name.is_empty()
         || entry_name.len() > 100
         || entry_name.contains('/')
@@ -45,12 +44,13 @@ fn main() -> io::Result<()> {
             "artifact entry name must be a 1-100 byte file name",
         ));
     }
-    fs::create_dir_all(artifact_dir)?;
     let source = PathBuf::from("target").join("release").join(format!(
         "{}{}",
         env!("CARGO_PKG_NAME"),
         env::consts::EXE_SUFFIX
     ));
+    let artifact_dir = Path::new("artifacts");
+    fs::create_dir_all(artifact_dir)?;
     let destination = artifact_dir.join(format!(
         "{entry_name}.{}",
         if cfg!(windows) { "exe" } else { "tar" }
@@ -102,9 +102,8 @@ fn main() -> io::Result<()> {
     }
     let remainder = source_len.rem_euclid(TAR_BLOCK_LEN_U64);
     if remainder != 0 {
-        let remainder_usize = usize::try_from(remainder).map_err(|conversion_error| {
-            io::Error::new(io::ErrorKind::InvalidInput, conversion_error)
-        })?;
+        let [low, high, _, _, _, _, _, _] = remainder.to_le_bytes();
+        let remainder_usize = usize::from(u16::from_le_bytes([low, high]));
         let padding = TAR_BLOCK_LEN.abs_diff(remainder_usize);
         let (padding_bytes, _) = ZERO_BLOCK.split_at(padding);
         output.write_all(padding_bytes)?;

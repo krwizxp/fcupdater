@@ -2,36 +2,13 @@ use crate::diagnostic::{Result, err, err_with_source};
 use alloc::borrow::Cow;
 use core::{iter, range::Range};
 pub(super) struct XmlTag<'xml> {
-    end: usize,
-    is_start: bool,
-    local_name: &'xml str,
-    name: &'xml str,
-    raw: &'xml str,
-    self_closing: bool,
-    start: usize,
-}
-impl<'xml> XmlTag<'xml> {
-    pub(super) const fn end(&self) -> usize {
-        self.end
-    }
-    pub(super) const fn is_start(&self) -> bool {
-        self.is_start
-    }
-    pub(super) const fn local_name(&self) -> &'xml str {
-        self.local_name
-    }
-    pub(super) const fn name(&self) -> &'xml str {
-        self.name
-    }
-    pub(super) const fn raw(&self) -> &'xml str {
-        self.raw
-    }
-    pub(super) const fn self_closing(&self) -> bool {
-        self.self_closing
-    }
-    pub(super) const fn start(&self) -> usize {
-        self.start
-    }
+    pub end: usize,
+    pub is_start: bool,
+    pub local_name: &'xml str,
+    pub name: &'xml str,
+    pub raw: &'xml str,
+    pub self_closing: bool,
+    pub start: usize,
 }
 pub(super) struct XmlScanner<'xml> {
     cursor: usize,
@@ -305,6 +282,23 @@ fn find_delimited_markup_end(
         .checked_add(terminator.len())?
         .checked_sub(1)
 }
+fn element_body_and_close_start<'xml>(
+    xml: &'xml str,
+    tag_name: &str,
+    open_end: usize,
+) -> Result<(&'xml str, usize)> {
+    let body_start = checked_offset_add(open_end, 1)
+        .ok_or_else(|| err(format!("XML <{tag_name}> 본문 시작 계산에 실패했습니다.")))?;
+    let body_end = find_end_tag(xml, tag_name, body_start)
+        .ok_or_else(|| err(format!("XML </{tag_name}> 종료 태그를 찾지 못했습니다.")))?;
+    let body = xml
+        .get(Range {
+            start: body_start,
+            end: body_end,
+        })
+        .ok_or_else(|| err(format!("XML <{tag_name}> 본문 범위가 손상되었습니다.")))?;
+    Ok((body, body_end))
+}
 pub(super) fn extract_first_tag_text<'xml>(
     xml: &'xml str,
     tag_name: &str,
@@ -316,18 +310,7 @@ pub(super) fn extract_first_tag_text<'xml>(
     if tag.self_closing {
         return Ok(Some(""));
     }
-    let open_end = tag.end;
-    let body_start = checked_offset_add(open_end, 1)
-        .ok_or_else(|| err(format!("XML <{tag_name}> 본문 시작 계산에 실패했습니다.")))?;
-    let body_end = find_end_tag(xml, tag_name, body_start)
-        .ok_or_else(|| err(format!("XML </{tag_name}> 종료 태그를 찾지 못했습니다.")))?;
-    let body_span = Range {
-        start: body_start,
-        end: body_end,
-    };
-    xml.get(body_span)
-        .ok_or_else(|| err(format!("XML <{tag_name}> 본문 범위가 손상되었습니다.")))
-        .map(Some)
+    element_body_and_close_start(xml, tag_name, tag.end).map(|(body, _)| Some(body))
 }
 pub(super) fn extract_all_tag_text<'xml>(
     xml: &'xml str,
@@ -342,18 +325,7 @@ pub(super) fn extract_all_tag_text<'xml>(
         if tag.self_closing {
             continue;
         }
-        let open_end = tag.end;
-        let body_start = checked_offset_add(open_end, 1)
-            .ok_or_else(|| err(format!("XML <{tag_name}> 본문 시작 계산에 실패했습니다.")))?;
-        let body_end = find_end_tag(xml, tag_name, body_start)
-            .ok_or_else(|| err(format!("XML </{tag_name}> 종료 태그를 찾지 못했습니다.")))?;
-        let body_span = Range {
-            start: body_start,
-            end: body_end,
-        };
-        let body = xml
-            .get(body_span)
-            .ok_or_else(|| err(format!("XML <{tag_name}> 본문 범위가 손상되었습니다.")))?;
+        let (body, body_end) = element_body_and_close_start(xml, tag_name, tag.end)?;
         let decoded = decode_xml_entities(body)?;
         if !decoded.is_empty() {
             if let Some(out_text) = out.as_mut() {
@@ -400,6 +372,7 @@ pub(super) fn extract_all_tag_text<'xml>(
 pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
     let mut out: Option<String> = None;
     let mut i = 0_usize;
+    let mut copy_start = 0_usize;
     while i < text.len() {
         let rest = text
             .get(i..)
@@ -439,19 +412,19 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                         return Err(err(format!("지원하지 않는 XML entity입니다: &{entity};")));
                     };
                     let value = if let Some(hex) = body.strip_prefix(['x', 'X']) {
-                        if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                            return Err(err("XML numeric hex entity가 16진수 형식이 아닙니다."));
-                        }
-                        u32::from_str_radix(hex, 16).map_err(|source| {
-                            err_with_source("XML numeric hex entity 해석 실패", source)
-                        })?
+                        parse_numeric_entity(
+                            hex,
+                            16,
+                            "XML numeric hex entity가 16진수 형식이 아닙니다.",
+                            "XML numeric hex entity 해석 실패",
+                        )?
                     } else {
-                        if body.is_empty() || !body.bytes().all(|byte| byte.is_ascii_digit()) {
-                            return Err(err("XML numeric entity가 10진수 형식이 아닙니다."));
-                        }
-                        body.parse::<u32>().map_err(|source| {
-                            err_with_source("XML numeric entity 해석 실패", source)
-                        })?
+                        parse_numeric_entity(
+                            body,
+                            10,
+                            "XML numeric entity가 10진수 형식이 아닙니다.",
+                            "XML numeric entity 해석 실패",
+                        )?
                     };
                     char::from_u32(value)
                 }
@@ -473,26 +446,41 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                 out_text.try_reserve_exact(text.len()).map_err(|source| {
                     err_with_source("XML entity decode 메모리 확보 실패", source)
                 })?;
-                let prefix = text
-                    .get(..i)
-                    .ok_or_else(|| err("XML entity decode prefix 범위가 손상되었습니다."))?;
-                out_text.push_str(prefix);
                 out.insert(out_text)
             };
+            out_text.push_str(
+                text.get(copy_start..i)
+                    .ok_or_else(|| err("XML entity decode prefix 범위가 손상되었습니다."))?,
+            );
             out_text.push(decoded_char);
             let consumed = checked_offset_add(entity.len(), 2)
                 .ok_or_else(|| err("XML entity 소비 길이 계산에 실패했습니다."))?;
             i = checked_offset_add(i, consumed)
                 .ok_or_else(|| err("XML entity 다음 cursor 계산에 실패했습니다."))?;
+            copy_start = i;
             continue;
-        }
-        if let Some(out_text) = out.as_mut() {
-            out_text.push(ch);
         }
         i = checked_offset_add(i, ch.len_utf8())
             .ok_or_else(|| err("XML entity decode cursor 계산에 실패했습니다."))?;
     }
+    if let Some(out_text) = out.as_mut() {
+        out_text.push_str(
+            text.get(copy_start..)
+                .ok_or_else(|| err("XML entity decode 나머지 범위가 손상되었습니다."))?,
+        );
+    }
     Ok(out.map_or(Cow::Borrowed(text), Cow::Owned))
+}
+fn parse_numeric_entity(
+    value: &str,
+    radix: u32,
+    format_error: &'static str,
+    parse_context: &'static str,
+) -> Result<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| char::from(byte).is_digit(radix)) {
+        return Err(err(format_error));
+    }
+    u32::from_str_radix(value, radix).map_err(|source| err_with_source(parse_context, source))
 }
 pub(super) fn is_valid_xml_char(ch: char) -> bool {
     matches!(

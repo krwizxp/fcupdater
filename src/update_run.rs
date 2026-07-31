@@ -1,6 +1,6 @@
 use crate::{
     change_log::ChangeLogUpdater,
-    diagnostic::{Result, err, err_with_source, terminal_safe},
+    diagnostic::{Result, err, err_with_source, path_context_message, terminal_safe},
     excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::{ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, StoreRow},
@@ -9,6 +9,7 @@ use crate::{
         normalize_address_key_into, target_region,
     },
     source_download::SourceDownload,
+    temp_entry::open_regular,
     write_line,
 };
 use core::{mem, time::Duration};
@@ -21,6 +22,7 @@ use std::{
 const HALF_COUNT_DIVISOR: usize = 2;
 const KST_OFFSET: Duration = Duration::from_hours(9);
 const SECS_PER_DAY_U64: u64 = 86_400;
+const SOURCE_INDEX_GROWTH: usize = 256;
 struct LoadedSource {
     index: HashMap<String, SourceRecord>,
     region_counts: [usize; TARGET_REGION_COUNT],
@@ -83,6 +85,7 @@ impl UpdateRun<'_> {
             index: HashMap::new(),
             region_counts: [0; TARGET_REGION_COUNT],
         };
+        let mut address_key_scratch = String::new();
         let mut target_region_scratch = String::new();
         let source_index_result = SourceReader { data: source_data }
             .visit_xls_source(|borrowed_record| {
@@ -92,14 +95,16 @@ impl UpdateRun<'_> {
                     &mut target_region_scratch,
                     TargetRegionPolicy::StrictSource,
                 )? {
-                    normalize_address_key_into(
-                        borrowed_record.address,
-                        &mut target_region_scratch,
-                    )?;
-                    let key = mem::take(&mut target_region_scratch);
-                    loaded_source.index.try_reserve(1).map_err(|source| {
-                        err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
-                    })?;
+                    normalize_address_key_into(borrowed_record.address, &mut address_key_scratch)?;
+                    let key = mem::take(&mut address_key_scratch);
+                    if loaded_source.index.len() == loaded_source.index.capacity() {
+                        loaded_source
+                            .index
+                            .try_reserve(SOURCE_INDEX_GROWTH)
+                            .map_err(|source| {
+                                err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
+                            })?;
+                    }
                     match loaded_source.index.entry(key) {
                         Entry::Vacant(entry) => {
                             entry.insert(borrowed_record.into_owned_with_region(region.label())?);
@@ -126,13 +131,20 @@ impl UpdateRun<'_> {
         loaded_source: &'source LoadedSource,
     ) -> Result<(StdWorkbook, MasterSheetUpdateResult<'source>)> {
         write_line(self.out, format_args!("마스터 파일 처리 중..."))?;
-        let container = XlsxContainer::open(self.master_path)?;
+        let master_file = open_regular(self.master_path, false).map_err(|source| {
+            err_with_source(
+                path_context_message("마스터 xlsx 파일 열기 실패", self.master_path),
+                source,
+            )
+        })?;
+        let container = XlsxContainer::from_validated_file(master_file, self.master_path)?;
         let mut book = StdWorkbook::from_container(container)?;
         let master_update = MasterSheetUpdater {
             source_index: &loaded_source.index,
         }
         .update(&mut book)?;
         write_line(self.out, format_args!("대상 지역별 건수 확인:"))?;
+        let mut region_validation_error = None;
         for (((region, existing_count), matched_existing_count), source_count) in TARGET_REGIONS
             .iter()
             .zip(master_update.existing_region_counts.iter())
@@ -146,22 +158,17 @@ impl UpdateRun<'_> {
                     "  {label}: 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
                 ),
             )?;
-        }
-        for (((region, existing_count), matched_existing_count), source_count) in TARGET_REGIONS
-            .iter()
-            .zip(master_update.existing_region_counts.iter())
-            .zip(master_update.matched_existing_region_counts.iter())
-            .zip(loaded_source.region_counts.iter())
-        {
-            let label = region.label();
-            if *existing_count == 0 {
-                continue;
-            }
-            if *matched_existing_count < existing_count.div_ceil(HALF_COUNT_DIVISOR) {
-                return Err(err(format!(
+            if region_validation_error.is_none()
+                && *existing_count != 0
+                && *matched_existing_count < existing_count.div_ceil(HALF_COUNT_DIVISOR)
+            {
+                region_validation_error = Some(format!(
                     "대상 지역의 기존 주소 일치 건수가 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
-                )));
+                ));
             }
+        }
+        if let Some(message) = region_validation_error {
+            return Err(err(message));
         }
         if master_update.existing_count == 0 {
             return Err(err("현행화 대상 레코드를 찾지 못했습니다."));

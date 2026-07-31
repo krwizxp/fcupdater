@@ -5,7 +5,7 @@ use excel::SaveVerification;
 use std::{
     env,
     ffi::OsStr,
-    fs::{File, Metadata, TryLockError},
+    fs::{File, TryLockError},
     io::{self, Write, stdout},
     path::Path,
 };
@@ -14,9 +14,10 @@ cfg_select! {
         use std::os::windows::fs::OpenOptionsExt as _;
     }
     any(target_os = "linux", target_os = "macos") => {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     }
 }
+use temp_entry::{configure_no_follow, validate_regular_file};
 use update_run::UpdateRun;
 mod change_log;
 mod diagnostic;
@@ -51,16 +52,6 @@ const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
 const RUN_LOCK_PATH: &str = ".fcupdater.lock";
 #[cfg(target_os = "windows")]
 const RUN_LOCK_SHARE_MODE: u32 = 0x0000_0003;
-fn validate_regular_file(file: &File) -> io::Result<Metadata> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "경로는 일반 파일이어야 합니다.",
-        ));
-    }
-    Ok(metadata)
-}
 fn main() -> Result<()> {
     let mut out = stdout();
     let mut raw_args = env::args_os().skip(1);
@@ -104,6 +95,7 @@ fn main() -> Result<()> {
         .write(true)
         .create(true)
         .truncate(false);
+    configure_no_follow(&mut lock_options);
     cfg_select! {
         target_os = "windows" => {
             lock_options.share_mode(RUN_LOCK_SHARE_MODE);
@@ -115,8 +107,23 @@ fn main() -> Result<()> {
     let run_lock = lock_options
         .open(Path::new(RUN_LOCK_PATH))
         .map_err(|source| err_with_source("실행 잠금 파일 열기 실패", source))?;
-    validate_regular_file(&run_lock)
-        .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
+    cfg_select! {
+        target_os = "windows" => {
+            validate_regular_file(&run_lock)
+                .map(|_| ())
+                .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
+        }
+        any(target_os = "linux", target_os = "macos") => {
+            let (lock_metadata, _) = validate_regular_file(&run_lock)
+                .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
+            if lock_metadata.mode() & 0o022 != 0 {
+                return Err(err(
+                    "실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.",
+                ));
+            }
+        }
+        _ => {}
+    }
     match run_lock.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Err(err("다른 fcupdater 실행이 진행 중입니다.")),

@@ -32,6 +32,11 @@ pub(super) enum TargetRegionPolicy {
     StrictSource,
 }
 impl TargetRegion {
+    pub(super) fn from_label(label: &str) -> Option<Self> {
+        TARGET_REGIONS
+            .into_iter()
+            .find(|region| region.label() == label)
+    }
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Daejeon => "대전",
@@ -43,57 +48,46 @@ impl TargetRegion {
             Self::Cheonan => "천안",
         }
     }
-}
-const fn ignored_address_key_char(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
+    pub(super) const fn value<T>(self, values: &[T; TARGET_REGION_COUNT]) -> T
+    where
+        T: Copy,
+    {
+        let &[daejeon, sejong, cheongju, gongju, boryeong, asan, cheonan] = values;
+        match self {
+            Self::Daejeon => daejeon,
+            Self::Sejong => sejong,
+            Self::Cheongju => cheongju,
+            Self::Gongju => gongju,
+            Self::Boryeong => boryeong,
+            Self::Asan => asan,
+            Self::Cheonan => cheonan,
+        }
+    }
+    pub(super) const fn value_mut<T>(self, values: &mut [T; TARGET_REGION_COUNT]) -> &mut T {
+        let [daejeon, sejong, cheongju, gongju, boryeong, asan, cheonan] = values.each_mut();
+        match self {
+            Self::Daejeon => daejeon,
+            Self::Sejong => sejong,
+            Self::Cheongju => cheongju,
+            Self::Gongju => gongju,
+            Self::Boryeong => boryeong,
+            Self::Asan => asan,
+            Self::Cheonan => cheonan,
+        }
+    }
 }
 pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
-    let mut rest = addr.trim();
-    let capacity = rest.len();
+    let trimmed = addr.trim();
     out.clear();
-    out.try_reserve_exact(capacity)
+    out.try_reserve_exact(trimmed.len())
         .map_err(|source| err_with_source("주소 key 정규화 메모리 확보 실패", source))?;
-    while !rest.is_empty() {
-        let mut replaced = false;
-        if matches!(rest.chars().next(), Some('충' | '대' | '세')) {
-            'replacement: for (from, to) in ADDRESS_KEY_REPLACEMENTS {
-                let mut prefix_tail = rest;
-                for expected in from.chars() {
-                    loop {
-                        let Some(ch) = prefix_tail.chars().next() else {
-                            continue 'replacement;
-                        };
-                        let Some(tail) = prefix_tail.get(ch.len_utf8()..) else {
-                            continue 'replacement;
-                        };
-                        prefix_tail = tail;
-                        if ignored_address_key_char(ch) {
-                            continue;
-                        }
-                        if ch != expected {
-                            continue 'replacement;
-                        }
-                        break;
-                    }
-                }
-                out.push_str(to);
-                rest = prefix_tail;
-                replaced = true;
-                break;
-            }
+    out.extend(trimmed.chars().filter(|ch| {
+        !ch.is_whitespace() && !matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
+    }));
+    for (from, to) in ADDRESS_KEY_REPLACEMENTS {
+        while let Some(start) = out.find(from) {
+            out.replace_range(start..start.strict_add(from.len()), to);
         }
-        if replaced {
-            continue;
-        }
-        let mut chars = rest.chars();
-        let Some(ch) = chars.next() else {
-            break;
-        };
-        rest = chars.as_str();
-        if ignored_address_key_char(ch) {
-            continue;
-        }
-        out.push(ch);
     }
     Ok(())
 }
@@ -186,25 +180,8 @@ pub(super) const fn increment_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],
     region: TargetRegion,
 ) {
-    let &mut [
-        ref mut daejeon,
-        ref mut sejong,
-        ref mut cheongju,
-        ref mut gongju,
-        ref mut boryeong,
-        ref mut asan,
-        ref mut cheonan,
-    ] = counts;
-    let region_count = match region {
-        TargetRegion::Daejeon => daejeon,
-        TargetRegion::Sejong => sejong,
-        TargetRegion::Cheongju => cheongju,
-        TargetRegion::Gongju => gongju,
-        TargetRegion::Boryeong => boryeong,
-        TargetRegion::Asan => asan,
-        TargetRegion::Cheonan => cheonan,
-    };
-    *region_count = region_count.strict_add(1);
+    let count = region.value_mut(counts);
+    *count = count.strict_add(1);
 }
 fn target_region_from_normalized(text: &str) -> Option<TargetRegion> {
     if text.strip_prefix("대전").is_some_and(|tail| {

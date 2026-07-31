@@ -49,7 +49,7 @@ unsafe extern "system" {
         context: usize,
     ) -> i32;
     pub(super) fn WinHttpSetOption(
-        h_internet: *const c_void,
+        h_internet: HInternet,
         option: u32,
         buffer: *const c_void,
         buffer_length: u32,

@@ -1,6 +1,4 @@
-use crate::diagnostic::{
-    Result as DownloadResult, append_fmt, err_with_source as download_error_with_source,
-};
+use crate::diagnostic::{Result as DownloadResult, err_with_source as download_error_with_source};
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         use self::libcurl::Client as PlatformHttpClient;
@@ -18,7 +16,9 @@ mod http_client;
 const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
 const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const RESPONSE_HEADER_CONTENT_LENGTH: &[u8] = b"Content-Length";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const RESPONSE_HEADER_SET_COOKIE: &[u8] = b"Set-Cookie";
 const OLE2_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const _: () = assert!(
@@ -49,12 +49,11 @@ pub(super) struct SourceDownload {
     netfunnel_path_buffer: String,
     platform: PlatformHttpClient,
 }
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ResponseHeaders {
     content_length: Option<usize>,
     set_cookies: Vec<String>,
 }
-#[derive(Debug)]
 struct HttpResponse {
     body: Vec<u8>,
     headers: ResponseHeaders,
@@ -85,7 +84,8 @@ impl RequestHeaders<'_> {
     }
 }
 impl ResponseHeaders {
-    fn parse_content_length(&mut self, raw_value: &str, limit: usize) -> DownloadResult<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn parse_content_length(&mut self, raw_value: &str) -> DownloadResult<()> {
         let value = raw_value.trim_ascii();
         if value.is_empty() {
             return Err("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.".into());
@@ -95,7 +95,7 @@ impl ResponseHeaders {
             if !byte.is_ascii_digit() {
                 return Err("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.".into());
             }
-            if parsed > limit {
+            if parsed > HTTP_MAX_BODY_BYTES {
                 continue;
             }
             parsed = parsed
@@ -103,19 +103,7 @@ impl ResponseHeaders {
                 .and_then(|scaled| scaled.checked_add(usize::from(byte.strict_sub(b'0'))))
                 .ok_or("HTTP Content-Length 해석 실패")?;
         }
-        if parsed > limit {
-            return Err(
-                format!("HTTP Content-Length가 허용 한도({limit} bytes)를 초과했습니다.").into(),
-            );
-        }
-        if self
-            .content_length
-            .is_some_and(|previous| previous != parsed)
-        {
-            return Err("HTTP Content-Length 헤더 값이 서로 다릅니다.".into());
-        }
-        self.content_length = Some(parsed);
-        Ok(())
+        self.set_content_length(parsed)
     }
     fn push_set_cookie(&mut self, value: &str) -> DownloadResult<()> {
         self.set_cookies.try_reserve(1).map_err(|source| {
@@ -129,30 +117,35 @@ impl ResponseHeaders {
         self.set_cookies.push(owned);
         Ok(())
     }
-}
-fn push_decimal_fragment(out: &mut String, value: u128) {
-    append_fmt(out, format_args!("{value}"));
-}
-cfg_select! {
-    windows => {
-        fn checked_http_buffer_len(
-            label: &str,
-            current_len: usize,
-            additional_len: usize,
-            limit: usize,
-        ) -> DownloadResult<usize> {
-            let next_len = current_len
-                .checked_add(additional_len)
-                .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
-            if next_len > limit {
-                Err(format!(
-                    "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
-                )
-                .into())
-            } else {
-                Ok(next_len)
-            }
+    fn set_content_length(&mut self, parsed: usize) -> DownloadResult<()> {
+        if parsed > HTTP_MAX_BODY_BYTES {
+            return Err(format!(
+                "HTTP Content-Length가 허용 한도({HTTP_MAX_BODY_BYTES} bytes)를 초과했습니다."
+            )
+            .into());
         }
+        if self
+            .content_length
+            .is_some_and(|previous| previous != parsed)
+        {
+            return Err("HTTP Content-Length 헤더 값이 서로 다릅니다.".into());
+        }
+        self.content_length = Some(parsed);
+        Ok(())
     }
-    _ => {}
+}
+fn checked_http_buffer_len(
+    label: &str,
+    current_len: usize,
+    additional_len: usize,
+    limit: usize,
+) -> DownloadResult<usize> {
+    let next_len = current_len
+        .checked_add(additional_len)
+        .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
+    if next_len > limit {
+        Err(format!("HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다.").into())
+    } else {
+        Ok(next_len)
+    }
 }

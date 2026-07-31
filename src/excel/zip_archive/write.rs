@@ -3,7 +3,7 @@ use super::{
     CENTRAL_DIRECTORY_HEADER_LEN, CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_LEN,
     END_OF_CENTRAL_DIRECTORY_SIGNATURE, EXCEL_ENTRY_FLAGS, LOCAL_FILE_HEADER_LEN,
     LOCAL_FILE_HEADER_SIGNATURE, METHOD_DEFLATE, VERSION_MADE_BY, VERSION_NEEDED,
-    ZIP_MAX_ARCHIVE_BYTES, ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, crc32, deflate, excel_local_extra,
+    ZIP_MAX_ARCHIVE_BYTES, ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, deflate,
 };
 use crate::diagnostic::{Result, err, err_with_source, path_context_message};
 use core::mem;
@@ -27,27 +27,10 @@ struct StreamingZipWriter<'part, 'path> {
     bytes_written: usize,
     deflate_workspace: deflate::DeflateWorkspace,
     entries: Vec<WriteEntry<'part>>,
-    file: BufWriter<File>,
+    file: BufWriter<&'path mut File>,
     header_buffer: Vec<u8>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     permissions: Permissions,
-    source_bytes: &'part [u8],
-}
-impl ZipArchiveBuilder<'_, '_> {
-    pub(in crate::excel) fn create(self) -> Result<()> {
-        StreamingZipWriter {
-            archive_path: self.archive_path,
-            bytes_written: 0,
-            deflate_workspace: deflate::DeflateWorkspace::default(),
-            entries: Vec::new(),
-            file: BufWriter::with_capacity(ZIP_OUTPUT_BUFFER_CAPACITY, self.file),
-            header_buffer: Vec::new(),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            permissions: self.permissions,
-            source_bytes: self.source_bytes,
-        }
-        .write(self.parts)
-    }
 }
 impl<'part> StreamingZipWriter<'part, '_> {
     fn append_central_directory(&mut self) -> Result<()> {
@@ -113,7 +96,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
         write_u16(&mut self.header_buffer, 0);
         self.write_header_buffer("xlsx 압축 중앙 디렉터리 쓰기 실패")
     }
-    fn append_changed(&mut self, part: &'part PackagePart) -> Result<WriteEntry<'part>> {
+    fn append_file(&mut self, part: &'part PackagePart) -> Result<WriteEntry<'part>> {
         let uncompressed_size = part.bytes.len();
         if uncompressed_size > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES {
             return Err(err(format!(
@@ -138,10 +121,18 @@ impl<'part> StreamingZipWriter<'part, '_> {
             .map_err(|source| err_with_source("ZIP entry 압축 크기 변환 실패", source))?;
         let uncompressed_size_u32 = u32::try_from(uncompressed_size)
             .map_err(|source| err_with_source("ZIP entry 원본 크기 변환 실패", source))?;
-        let crc32 = crc32(&part.bytes)?;
+        let crc32 = plan.crc32();
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
-        let local_extra = excel_local_extra(part.name);
+        let local_extra = match part.name {
+            "[Content_Types].xml" | "_rels/.rels" => {
+                Some((520, [0x20, 0xa2, 0x04, 0x02, 0x28, 0xa0, 0x00, 0x02]))
+            }
+            "xl/_rels/workbook.xml.rels" | "docProps/core.xml" | "docProps/app.xml" => {
+                Some((264, [0x20, 0xa2, 0x04, 0x01, 0x28, 0xa0, 0x00, 0x01]))
+            }
+            _ => None,
+        };
         let local_extra_len = local_extra.map_or(0, |(len, _)| len);
         let local_header_len = LOCAL_FILE_HEADER_LEN
             .checked_add(part.name.len())
@@ -203,36 +194,6 @@ impl<'part> StreamingZipWriter<'part, '_> {
             uncompressed_size: uncompressed_size_u32,
         })
     }
-    fn append_file(&mut self, part: &'part PackagePart) -> Result<()> {
-        let entry = if part.changed {
-            self.append_changed(part)?
-        } else {
-            let entry = WriteEntry {
-                compressed_size: part.compressed_size,
-                crc32: part.crc32,
-                local_header_offset: u32::try_from(self.bytes_written)
-                    .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?,
-                part,
-                uncompressed_size: part.uncompressed_size,
-            };
-            let local_record = self
-                .source_bytes
-                .get(part.local_record)
-                .ok_or_else(|| err("ZIP 원본 local record 범위 오류"))?;
-            let next =
-                self.ensure_output_limit(local_record.len(), "ZIP local record 출력 크기 계산")?;
-            IoWrite::write_all(&mut self.file, local_record).map_err(|source_err| {
-                err_with_source(
-                    path_context_message("xlsx 압축 원본 record 쓰기 실패", self.archive_path),
-                    source_err,
-                )
-            })?;
-            self.bytes_written = next;
-            entry
-        };
-        self.entries.push(entry);
-        Ok(())
-    }
     fn ensure_output_limit(&self, len: usize, context: &str) -> Result<usize> {
         let next = self
             .bytes_written
@@ -257,7 +218,8 @@ impl<'part> StreamingZipWriter<'part, '_> {
             .try_reserve_exact(parts.len())
             .map_err(|source| err_with_source("ZIP entry 목록 메모리 확보 실패", source))?;
         for part in parts {
-            self.append_file(part)?;
+            let entry = self.append_file(part)?;
+            self.entries.push(entry);
         }
         self.append_central_directory()?;
         IoWrite::flush(&mut self.file).map_err(|source_err| {
@@ -291,6 +253,21 @@ impl<'part> StreamingZipWriter<'part, '_> {
         })?;
         self.bytes_written = next_bytes_written;
         Ok(())
+    }
+}
+impl ZipArchiveBuilder<'_, '_> {
+    pub(in crate::excel) fn create(self) -> Result<()> {
+        StreamingZipWriter {
+            archive_path: self.archive_path,
+            bytes_written: 0,
+            deflate_workspace: deflate::DeflateWorkspace::default(),
+            entries: Vec::new(),
+            file: BufWriter::with_capacity(ZIP_OUTPUT_BUFFER_CAPACITY, self.file),
+            header_buffer: Vec::new(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            permissions: self.permissions,
+        }
+        .write(self.parts)
     }
 }
 fn write_u16(out: &mut Vec<u8>, value: u16) {

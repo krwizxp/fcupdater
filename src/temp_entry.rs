@@ -1,88 +1,166 @@
-use core::time::Duration;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::Permissions;
 use std::{
-    fs, io,
+    fs::{File, Metadata, OpenOptions},
+    io,
     path::Path,
-    process,
-    time::{SystemTime, UNIX_EPOCH},
 };
-const STALE_TEMP_ENTRY_AGE: Duration = Duration::from_hours(24);
-const TEMP_ENTRY_RESERVATION_ATTEMPTS: u32 = 1024;
-pub(crate) fn cleanup_stale_temp_files(parent: &Path, prefix: &str) -> io::Result<usize> {
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?
-        .as_nanos();
-    let mut removed = 0_usize;
-    for entry_result in fs::read_dir(parent)? {
-        let entry = entry_result?;
-        let file_name_os = entry.file_name();
-        let Some(file_name) = file_name_os.to_str() else {
-            continue;
+cfg_select! {
+    target_os = "windows" => {
+        use core::{ffi::c_void, mem::size_of};
+        use std::os::windows::{
+            fs::{MetadataExt as _, OpenOptionsExt as _},
+            io::AsRawHandle as _,
         };
-        let Some(suffix) = file_name.strip_prefix(prefix) else {
-            continue;
-        };
-        let mut fragments = suffix.split('_');
-        let (Some(pid), Some(created_at), Some(sequence), None) = (
-            fragments.next(),
-            fragments.next(),
-            fragments.next(),
-            fragments.next(),
-        ) else {
-            continue;
-        };
-        if pid.parse::<u32>().is_err() || sequence.parse::<u32>().is_err() {
-            continue;
-        }
-        let Ok(created_at_nanos) = created_at.parse::<u128>() else {
-            continue;
-        };
-        let Some(age_nanos) = now_nanos.checked_sub(created_at_nanos) else {
-            continue;
-        };
-        if age_nanos < STALE_TEMP_ENTRY_AGE.as_nanos() {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                removed = removed.strict_add(1);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("{}: {error}", path.display()),
-                ));
-            }
-        }
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     }
-    Ok(removed)
+    any(target_os = "linux", target_os = "macos") => {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    }
+    _ => {}
 }
-pub(crate) fn reserve_unique_temp_entry<T>(
-    parent: &Path,
-    prefix: &str,
-    mut create_entry: impl FnMut(&Path) -> io::Result<T>,
-) -> io::Result<T> {
-    let pid = process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?
-        .as_nanos();
-    for sequence in 0..TEMP_ENTRY_RESERVATION_ATTEMPTS {
-        let path = parent.join(format!("{prefix}{pid}_{nanos}_{sequence}"));
-        match create_entry(&path) {
-            Ok(entry) => return Ok(entry),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+cfg_select! {
+    target_os = "linux" => {
+        const OPEN_NOFOLLOW: i32 = 0x0002_0000;
+    }
+    target_os = "macos" => {
+        const OPEN_NOFOLLOW: i32 = 0x0000_0100;
+    }
+    _ => {}
+}
+#[cfg(target_os = "windows")]
+const _: () = assert!(
+    size_of::<ByHandleFileInformation>() == 52,
+    "Windows BY_HANDLE_FILE_INFORMATION size mismatch"
+);
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Default)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time_low: u32,
+    creation_time_high: u32,
+    last_access_time_low: u32,
+    last_access_time_high: u32,
+    last_write_time_low: u32,
+    last_write_time_high: u32,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_file_information_by_handle(
+        file: *mut c_void,
+        information: *mut ByHandleFileInformation,
+    ) -> i32;
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    index: u64,
+    volume: u64,
+}
+pub(crate) struct ValidatedFile {
+    pub file: File,
+    pub identity: FileIdentity,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub permissions: Permissions,
+}
+pub(crate) fn configure_no_follow(options: &mut OpenOptions) {
+    cfg_select! {
+        target_os = "windows" => {
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        any(target_os = "linux", target_os = "macos") => {
+            options.custom_flags(OPEN_NOFOLLOW);
+        }
+        _ => {
+            compile_error!("Secure file opening supports only Windows, Linux, and macOS.");
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "임시 항목 이름 충돌이 반복되었습니다. 잠시 후 다시 시도하세요.",
-    ))
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn configure_replaceable_file(options: &mut OpenOptions) {
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+    options.share_mode(FILE_SHARE_READ_WRITE_DELETE);
+}
+pub(crate) fn open_regular(path: &Path, writable: bool) -> io::Result<ValidatedFile> {
+    let mut options = File::options();
+    options.read(true);
+    if writable {
+        options.write(true);
+        #[cfg(target_os = "windows")]
+        configure_replaceable_file(&mut options);
+    }
+    configure_no_follow(&mut options);
+    let file = options.open(path)?;
+    validate_open_file(file)
+}
+pub(crate) fn validate_open_file(file: File) -> io::Result<ValidatedFile> {
+    let validation = validate_regular_file(&file)?;
+    Ok(ValidatedFile {
+        file,
+        identity: validation.1,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        permissions: validation.0.permissions(),
+    })
+}
+pub(crate) fn validate_regular_file(file: &File) -> io::Result<(Metadata, FileIdentity)> {
+    let metadata = file.metadata()?;
+    #[cfg(target_os = "windows")]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "리파스 포인트는 허용되지 않습니다.",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "경로는 일반 파일이어야 합니다.",
+        ));
+    }
+    let (link_count, identity) = cfg_select! {
+        target_os = "windows" => {{
+            let mut information = ByHandleFileInformation::default();
+            // SAFETY: information is a writable BY_HANDLE_FILE_INFORMATION buffer and file is open.
+            let status = unsafe {
+                get_file_information_by_handle(
+                    file.as_raw_handle(),
+                    &raw mut information,
+                )
+            };
+            if status == 0_i32 {
+                return Err(io::Error::last_os_error());
+            }
+            let index = u64::from(information.file_index_high)
+                .strict_shl(32)
+                | u64::from(information.file_index_low);
+            (u64::from(information.number_of_links), FileIdentity {
+                index,
+                volume: u64::from(information.volume_serial_number),
+            })
+        }}
+        any(target_os = "linux", target_os = "macos") => {
+            (metadata.nlink(), FileIdentity {
+                index: metadata.ino(),
+                volume: metadata.dev(),
+            })
+        }
+        _ => {
+            compile_error!("File identity supports only Windows, Linux, and macOS.")
+        }
+    };
+    if link_count != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "파일의 하드 링크 수는 1이어야 합니다.",
+        ));
+    }
+    Ok((metadata, identity))
 }

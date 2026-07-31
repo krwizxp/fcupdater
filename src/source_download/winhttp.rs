@@ -1,7 +1,6 @@
 use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
-    RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE, ResponseHeaders,
-    checked_http_buffer_len, download_error_with_source,
+    ResponseHeaders, checked_http_buffer_len, download_error_with_source,
 };
 use alloc::{string::String, vec::Vec};
 use core::{
@@ -20,6 +19,7 @@ use std::{
 mod sys;
 const DWORD_BYTE_SIZE: u32 = 4;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_WINHTTP_HEADER_NOT_FOUND: u32 = 12_150;
 const HTTP_MAX_HEADER_BYTES_DWORD: u32 = 256 * 1024;
 const INTERNET_DEFAULT_HTTPS_PORT: u16 = 443;
 const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: u32 = 4;
@@ -58,10 +58,11 @@ const WINHTTP_ENABLE_SSL_REVOCATION: u32 = 0x0000_0001;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_WINHTTP_INVALID_OPTION: u32 = 12_009;
 const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
-const WINHTTP_QUERY_RAW_HEADERS_CRLF: u32 = 22;
+const WINHTTP_QUERY_CONTENT_LENGTH: u32 = 5;
+const WINHTTP_QUERY_SET_COOKIE: u32 = 43;
 const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
 const WINHTTP_CONNECT_TIMEOUT_MS: i32 = 30_000;
-const WINHTTP_CONNECT_CACHE_LIMIT: usize = 4;
+const WINHTTP_CONNECT_CACHE_LIMIT: usize = 2;
 const WINHTTP_RECEIVE_TIMEOUT_MS: i32 = 60_000;
 const WINHTTP_RESOLVE_TIMEOUT_MS: i32 = 30_000;
 const WINHTTP_SEND_TIMEOUT_MS: i32 = 60_000;
@@ -71,14 +72,15 @@ const HEADER_SEPARATOR_WIDE: [u16; 2] = [0x3A, 0x20];
 const HEADER_TERMINATOR_WIDE: [u16; 2] = [0x0D, 0x0A];
 const METHOD_GET_WIDE: [u16; 4] = [0x47, 0x45, 0x54, 0];
 const METHOD_POST_WIDE: [u16; 5] = [0x50, 0x4F, 0x53, 0x54, 0];
-type HInternet = *mut c_void;
+enum WinHttpHandle {}
+type HInternet = *mut WinHttpHandle;
 #[derive(Default)]
 pub(super) struct Client {
     header_buffer: Vec<u16>,
     read_buffer: Vec<u8>,
     session_cache: Option<SessionCache>,
 }
-struct Handle(NonNull<c_void>);
+struct Handle(NonNull<WinHttpHandle>);
 struct CachedConnect {
     handle: Handle,
     host: String,
@@ -110,13 +112,12 @@ impl Client {
         body: &[u8],
         header_buffer: &mut Vec<u16>,
     ) -> DownloadResult<(Handle, u32, Instant)> {
-        let host_wide = wide(host)?;
         let path_wide = wide(path)?;
         let header_capacity = headers
             .iter()
             .try_fold(0_usize, |acc, (name, value)| {
-                acc.checked_add(name.encode_utf16().count())?
-                    .checked_add(value.encode_utf16().count())?
+                acc.checked_add(name.len())?
+                    .checked_add(value.len())?
                     .checked_add(4)
             })
             .and_then(|capacity| capacity.checked_add(1))
@@ -140,12 +141,12 @@ impl Client {
         })?;
         header_buffer.push(0);
         let started = Instant::now();
-        let connect = self.cached_connect_ptr(host, &host_wide)?;
+        let connect = self.cached_connect(host)?;
         (|| {
             // SAFETY: method and path are NUL-terminated and connect is valid.
             let raw_request = unsafe {
                 sys::WinHttpOpenRequest(
-                    connect,
+                    connect.as_ptr(),
                     method.as_ptr(),
                     path_wide.as_ptr(),
                     null(),
@@ -215,11 +216,7 @@ impl Client {
         })()
         .inspect_err(|_| self.session_cache = None)
     }
-    fn cached_connect_ptr(
-        &mut self,
-        host: &str,
-        host_wide: &[u16],
-    ) -> DownloadResult<HInternet> {
+    fn cached_connect(&mut self, host: &str) -> DownloadResult<NonNull<WinHttpHandle>> {
         let cache = if let Some(ref mut cache) = self.session_cache {
             cache
         } else {
@@ -284,8 +281,9 @@ impl Client {
             .filter_map(Option::as_ref)
             .find(|entry| entry.host == host)
         {
-            return Ok(entry.handle.as_ptr());
+            return Ok(entry.handle.0);
         }
+        let host_wide = wide(host)?;
         // SAFETY: host_wide is NUL-terminated and cache.session is a valid session handle.
         let raw_connect = unsafe {
             sys::WinHttpConnect(
@@ -303,7 +301,7 @@ impl Client {
                 download_error_with_source("WinHTTP connect host key 메모리 확보 실패", source)
         })?;
         host_key.push_str(host);
-        let connect = handle.as_ptr();
+        let connect = handle.0;
         let entry = CachedConnect {
             handle,
             host: host_key,
@@ -312,7 +310,7 @@ impl Client {
             *slot = Some(entry);
         } else {
             cache.connects.rotate_left(1);
-            let [_, _, _, slot] = cache.connects.each_mut();
+            let [_, slot] = cache.connects.each_mut();
             *slot = Some(entry);
         }
         Ok(connect)
@@ -332,98 +330,116 @@ impl Client {
         header_buffer: &mut Vec<u16>,
     ) -> DownloadResult<HttpResponse> {
         (|| {
-            let mut bytes = 0_u32;
-            let mut index = 0_u32;
-            // SAFETY: request is valid; this first call probes the required buffer size.
-            let probe_ok = unsafe {
-                sys::WinHttpQueryHeaders(
-                    request.as_ptr(),
-                    WINHTTP_QUERY_RAW_HEADERS_CRLF,
-                    null(),
-                    null_mut(),
-                    &raw mut bytes,
-                    &raw mut index,
-                )
-            };
             let mut headers = ResponseHeaders::default();
-            if probe_ok == 0_i32 {
-                let last_error = Self::last_error_code();
-                if last_error != ERROR_INSUFFICIENT_BUFFER {
+            let mut content_length_index = 0_u32;
+            loop {
+                let previous_index = content_length_index;
+                let mut value = 0_u32;
+                let mut bytes = DWORD_BYTE_SIZE;
+                // SAFETY: request is valid and value is a DWORD output buffer.
+                let queried = unsafe {
+                    sys::WinHttpQueryHeaders(
+                        request.as_ptr(),
+                        WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                        null(),
+                        (&raw mut value).cast::<c_void>(),
+                        &raw mut bytes,
+                        &raw mut content_length_index,
+                    )
+                };
+                if queried == 0_i32 {
+                    let code = Self::last_error_code();
+                    if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
+                        break;
+                    }
+                    return Err(Self::windows_error_message(
+                        "WinHttpQueryHeaders Content-Length",
+                        code,
+                    )
+                    .into());
+                }
+                if content_length_index <= previous_index {
                     return Err(
-                        Self::windows_error_message("WinHttpQueryHeaders", last_error).into(),
+                        "WinHTTP Content-Length header index가 진행되지 않았습니다.".into(),
                     );
                 }
-                let header_bytes = usize::try_from(bytes).map_err(|source| {
-                    download_error_with_source("응답 헤더 길이 변환 실패", source)
-                })?;
-                checked_http_buffer_len("헤더", 0, header_bytes, HTTP_MAX_HEADER_BYTES)?;
-                if !header_bytes.is_multiple_of(2) {
+                headers.set_content_length(usize::try_from(value).map_err(|source| {
+                    download_error_with_source("Content-Length 변환 실패", source)
+                })?)?;
+            }
+            let mut cookie_index = 0_u32;
+            let mut header_bytes_seen = 0_usize;
+            loop {
+                let current_index = cookie_index;
+                let mut bytes = 0_u32;
+                // SAFETY: request is valid; this call probes the indexed header value size.
+                let probe = unsafe {
+                    sys::WinHttpQueryHeaders(
+                        request.as_ptr(),
+                        WINHTTP_QUERY_SET_COOKIE,
+                        null(),
+                        null_mut(),
+                        &raw mut bytes,
+                        &raw mut cookie_index,
+                    )
+                };
+                if probe != 0_i32 {
                     return Err(
-                        "응답 헤더 UTF-16 버퍼 길이가 2바이트 단위가 아닙니다.".into(),
+                        "WinHTTP Set-Cookie 크기 조회가 예기치 않게 성공했습니다.".into(),
                     );
+                }
+                let code = Self::last_error_code();
+                if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
+                    break;
+                }
+                if code != ERROR_INSUFFICIENT_BUFFER {
+                    return Err(Self::windows_error_message(
+                        "WinHttpQueryHeaders Set-Cookie 크기",
+                        code,
+                    )
+                    .into());
+                }
+                let header_bytes = usize::try_from(bytes).map_err(|source| {
+                    download_error_with_source("Set-Cookie 길이 변환 실패", source)
+                })?;
+                header_bytes_seen = checked_http_buffer_len(
+                    "헤더",
+                    header_bytes_seen,
+                    header_bytes,
+                    HTTP_MAX_HEADER_BYTES,
+                )?;
+                if !header_bytes.is_multiple_of(2) {
+                    return Err("Set-Cookie UTF-16 길이가 2바이트 단위가 아닙니다.".into());
                 }
                 let units = header_bytes.div_euclid(2);
                 header_buffer.clear();
                 if header_buffer.capacity() < units {
                     header_buffer.try_reserve_exact(units).map_err(|source| {
-                        download_error_with_source("응답 헤더 버퍼 메모리 확보 실패", source)
+                        download_error_with_source("Set-Cookie 메모리 확보 실패", source)
                     })?;
                 }
                 header_buffer.resize(units, 0_u16);
-                index = 0;
-                // SAFETY: buffer has the size requested by WinHTTP and request is valid.
-                let fetch_ok = unsafe {
+                cookie_index = current_index;
+                // SAFETY: buffer has the probed size and request is valid.
+                let fetched = unsafe {
                     sys::WinHttpQueryHeaders(
                         request.as_ptr(),
-                        WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                        WINHTTP_QUERY_SET_COOKIE,
                         null(),
                         header_buffer.as_mut_ptr().cast::<c_void>(),
                         &raw mut bytes,
-                        &raw mut index,
+                        &raw mut cookie_index,
                     )
                 };
-                Self::check_winhttp(fetch_ok, "WinHttpQueryHeaders")?;
-                while header_buffer.pop_if(|value| *value == 0).is_some() {}
-                for raw_line in header_buffer
-                    .split(|unit| *unit == u16::from(b'\n'))
-                    .skip(1)
-                {
-                    let trimmed_line = trim_ascii_utf16(
-                        raw_line
-                            .strip_suffix(&[u16::from(b'\r')])
-                            .unwrap_or(raw_line),
-                    );
-                    let Some(colon) = trimmed_line
-                        .iter()
-                        .position(|unit| *unit == u16::from(b':'))
-                    else {
-                        continue;
-                    };
-                    let (raw_name, tail) = trimmed_line.split_at(colon);
-                    let Some((_, raw_value)) = tail.split_first() else {
-                        continue;
-                    };
-                    let name = trim_ascii_utf16(raw_name);
-                    let value = trim_ascii_utf16(raw_value);
-                    let is_content_length =
-                        header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_CONTENT_LENGTH);
-                    if !(is_content_length
-                        || header_name_eq_ignore_ascii_case(name, RESPONSE_HEADER_SET_COOKIE))
-                    {
-                        continue;
-                    }
-                    let header_value = String::from_utf16(value).map_err(|source| {
-                        download_error_with_source(
-                            "응답 header 값 UTF-16 변환 실패",
-                            source,
-                        )
-                    })?;
-                    if is_content_length {
-                        headers.parse_content_length(&header_value, HTTP_MAX_BODY_BYTES)?;
-                    } else {
-                        headers.push_set_cookie(&header_value)?;
-                    }
+                Self::check_winhttp(fetched, "WinHttpQueryHeaders Set-Cookie")?;
+                if cookie_index <= current_index {
+                    return Err("WinHTTP Set-Cookie header index가 진행되지 않았습니다.".into());
                 }
+                while header_buffer.pop_if(|unit| *unit == 0).is_some() {}
+                let value = String::from_utf16(header_buffer).map_err(|source| {
+                    download_error_with_source("Set-Cookie UTF-16 변환 실패", source)
+                })?;
+                headers.push_set_cookie(value.trim_ascii())?;
             }
             let body = self.read_body(request, headers.content_length, started)?;
             if let Some(expected_len) = headers.content_length
@@ -596,28 +612,6 @@ impl Client {
     fn windows_error_message(context: &str, code: u32) -> String {
         format!("{context} 실패: Windows error {code}")
     }
-}
-const fn trim_ascii_utf16(mut value: &[u16]) -> &[u16] {
-    while let Some((first, rest)) = value.split_first()
-        && is_ascii_whitespace_utf16(*first)
-    {
-        value = rest;
-    }
-    while let Some((last, rest)) = value.split_last()
-        && is_ascii_whitespace_utf16(*last)
-    {
-        value = rest;
-    }
-    value
-}
-const fn is_ascii_whitespace_utf16(value: u16) -> bool {
-    matches!(value, 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
-}
-fn header_name_eq_ignore_ascii_case(name: &[u16], expected: &[u8]) -> bool {
-    name.len() == expected.len()
-        && name.iter().zip(expected).all(|(&unit, &byte)| {
-            u8::try_from(unit).is_ok_and(|unit_byte| unit_byte.eq_ignore_ascii_case(&byte))
-        })
 }
 fn wide(value: &str) -> DownloadResult<Vec<u16>> {
     let capacity = value

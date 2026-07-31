@@ -39,7 +39,7 @@ jobs:
       - name: Build Release Binary
         run: cargo +stable build --release --frozen --bin fcupdater
       - name: Prepare binary artifact with Rust
-        run: cargo +stable run --release --frozen --example package_artifact -- "${{ matrix.binary_name }}"
+        run: cargo +stable run --frozen --example package_artifact -- "${{ matrix.binary_name }}"
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

@@ -39,6 +39,7 @@ const COL_PREMIUM: usize = 6;
 const COL_GASOLINE: usize = 7;
 const COL_DIESEL: usize = 8;
 const SOURCE_COLUMN_COUNT: usize = COL_DIESEL + 1;
+const WORKBOOK_STREAM_NAME: [char; 8] = ['W', 'o', 'r', 'k', 'b', 'o', 'o', 'k'];
 const MIN_FUEL_PRICE: i32 = 100;
 const MAX_FUEL_PRICE: i32 = 100_000;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -90,11 +91,6 @@ struct CfbHeader {
     first_dir_sector: u32,
     num_fat_sectors: u32,
 }
-#[derive(Debug)]
-struct BiffBoundSheet {
-    offset: usize,
-    sheet_type: u8,
-}
 struct BiffRecordReader<'workbook> {
     context: &'static str,
     pos: usize,
@@ -116,13 +112,9 @@ struct SstChunkReader<'chunks, 'chunk> {
     offset_in_chunk: usize,
 }
 impl CfbDataParser<'_> {
-    fn build_fat_table(
-        &self,
-        fat_sector_ids: impl Iterator<Item = u32>,
-        fat_sector_count: usize,
-    ) -> Result<Vec<u32>> {
+    fn build_fat_table(&self, fat_sector_ids: &[u32]) -> Result<Vec<u32>> {
         let entries_per_sector = CFB_SECTOR_SIZE.div_euclid(4);
-        let total_entries = fat_sector_count.strict_mul(entries_per_sector);
+        let total_entries = fat_sector_ids.len().strict_mul(entries_per_sector);
         let mut fat: Vec<u32> = Vec::new();
         fat.try_reserve_exact(total_entries).map_err(|source| {
             err_with_source(
@@ -130,7 +122,7 @@ impl CfbDataParser<'_> {
                 source,
             )
         })?;
-        for sid in fat_sector_ids {
+        for &sid in fat_sector_ids {
             let sector_idx = sector_id_to_index(sid, || {
                 prefixed_display_message("CFB sector id 변환 실패: ", sid)
             })?;
@@ -235,7 +227,6 @@ impl CfbDataParser<'_> {
         let (chunks, &[]) = dir_stream.as_chunks::<128>() else {
             return Err(err("CFB 디렉터리 stream 길이가 128바이트 단위가 아닙니다."));
         };
-        let mut decoded_name = String::new();
         let mut workbook_entry = None;
         for entry in chunks {
             let name_len = usize::from(read_u16_le(entry, 0x40)?);
@@ -285,27 +276,17 @@ impl CfbDataParser<'_> {
             let (name_units, &[]) = bytes.as_chunks::<2>() else {
                 return Err(err("UTF-16 문자열 길이가 홀수입니다."));
             };
-            decoded_name.clear();
-            decoded_name
-                .try_reserve_exact(name_units.len().strict_mul(3))
-                .map_err(|source| {
-                    err_with_source(
-                        format!(
-                            "UTF-16 문자열 메모리 확보 실패: {} code units",
-                            name_units.len()
-                        ),
-                        source,
-                    )
-                })?;
-            for item in
+            let mut workbook_name = name_units.len() == WORKBOOK_STREAM_NAME.len();
+            for (index, item) in
                 char::decode_utf16(name_units.iter().map(|chunk| u16::from_le_bytes(*chunk)))
+                    .enumerate()
             {
-                decoded_name.push(
-                    item.map_err(|source| err_with_source("CFB UTF-16 문자열 해석 실패", source))?,
-                );
+                let decoded =
+                    item.map_err(|source| err_with_source("CFB UTF-16 문자열 해석 실패", source))?;
+                workbook_name &= WORKBOOK_STREAM_NAME.get(index) == Some(&decoded);
             }
             if object_type == CFB_OBJECT_STREAM
-                && decoded_name == "Workbook"
+                && workbook_name
                 && workbook_entry
                     .replace((start_sector, stream_size))
                     .is_some()
@@ -346,33 +327,38 @@ impl SourceReader {
             )));
         }
         let difat_chunks = parser.header_difat_entries()?;
-        let difat_entries = || {
-            difat_chunks
-                .iter()
-                .map(|chunk| u32::from_le_bytes(*chunk))
-                .filter(|&sid| is_regular_sector_id(sid))
-        };
-        let difat_entry_count = difat_entries().count();
-        if declared_fat_sectors == 0 || difat_entry_count == 0 {
-            return Err(err("CFB FAT 정보를 찾지 못했습니다."));
-        }
-        if difat_entry_count != declared_fat_sectors {
+        if declared_fat_sectors > difat_chunks.len() {
             return Err(err(format!(
-                "CFB FAT 엔트리 개수가 선언과 다릅니다: 선언 {declared_fat_sectors}, 실제 {difat_entry_count}"
+                "CFB FAT 엔트리 개수가 header DIFAT 용량을 초과했습니다: {declared_fat_sectors}"
             )));
         }
-        for (index, sector_id) in difat_entries().enumerate() {
-            if difat_entries()
-                .take(index)
-                .any(|previous| previous == sector_id)
-            {
+        let mut difat_entries = Vec::new();
+        difat_entries
+            .try_reserve_exact(declared_fat_sectors)
+            .map_err(|source| err_with_source("CFB DIFAT 목록 메모리 확보 실패", source))?;
+        for chunk in difat_chunks {
+            let sector_id = u32::from_le_bytes(*chunk);
+            if !is_regular_sector_id(sector_id) {
+                continue;
+            }
+            if difat_entries.contains(&sector_id) {
                 return Err(err(prefixed_display_message(
                     "CFB FAT sector가 중복 선언되었습니다: ",
                     sector_id,
                 )));
             }
+            difat_entries.push(sector_id);
         }
-        let fat = parser.build_fat_table(difat_entries(), difat_entry_count)?;
+        if declared_fat_sectors == 0 || difat_entries.is_empty() {
+            return Err(err("CFB FAT 정보를 찾지 못했습니다."));
+        }
+        if difat_entries.len() != declared_fat_sectors {
+            return Err(err(format!(
+                "CFB FAT 엔트리 개수가 선언과 다릅니다: 선언 {declared_fat_sectors}, 실제 {}",
+                difat_entries.len()
+            )));
+        }
+        let fat = parser.build_fat_table(&difat_entries)?;
         parser.read_workbook_stream(header, &fat)
     }
     pub(crate) fn visit_xls_source(
@@ -381,15 +367,9 @@ impl SourceReader {
     ) -> Result<Result<()>> {
         let workbook = self.open()?;
         let biff = BiffWorkbookReader(&workbook);
-        let (boundsheet, shared_strings) = biff.parse_globals()?;
-        if boundsheet.sheet_type != 0 {
-            return Err(err(prefixed_display_message(
-                "Opinet 고정 소스에서 예상하지 않은 sheet type: ",
-                boundsheet.sheet_type,
-            )));
-        }
+        let (sheet_offset, shared_strings) = biff.parse_globals()?;
         biff.visit_worksheet(
-            boundsheet.offset,
+            sheet_offset,
             shared_strings.declared_total,
             &shared_strings.values,
             &mut visitor,
@@ -526,18 +506,12 @@ impl SstChunkReader<'_, '_> {
     fn skip_bytes(&mut self, len: usize) -> Result<()> {
         let mut remaining = len;
         while remaining > 0 {
-            while let Some(chunk) = self.chunks.get(self.chunk_index) {
-                if self.offset_in_chunk < chunk.len() {
-                    break;
-                }
-                self.chunk_index = self.chunk_index.strict_add(1);
-                self.offset_in_chunk = 0;
-            }
-            let Some(chunk) = self.chunks.get(self.chunk_index).copied() else {
-                return Err(err(format!(
-                    "SST data가 예상보다 짧습니다. (요청 {len} bytes)"
-                )));
-            };
+            self.ensure_available()?;
+            let chunk = self
+                .chunks
+                .get(self.chunk_index)
+                .copied()
+                .ok_or_else(|| err("SST chunk 접근 범위 오류"))?;
             let remain = chunk.len().strict_sub(self.offset_in_chunk);
             let take = remain.min(remaining);
             self.offset_in_chunk = self.offset_in_chunk.strict_add(take);
@@ -595,19 +569,17 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             if record_id != BIFF_RECORD_CONTINUE {
                 return Ok((chunks, record_start));
             }
-            if chunks.len() == chunks.capacity() {
-                chunks.try_reserve(1).map_err(|source| {
-                    err_with_source(
-                        "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
-                        source,
-                    )
-                })?;
-            }
+            chunks.try_reserve(1).map_err(|source| {
+                err_with_source(
+                    "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
+                    source,
+                )
+            })?;
             chunks.push(chunk);
         }
     }
-    fn parse_globals(&self) -> Result<(BiffBoundSheet, BiffSharedStrings)> {
-        let mut boundsheet: Option<BiffBoundSheet> = None;
+    fn parse_globals(&self) -> Result<(usize, BiffSharedStrings)> {
+        let mut sheet_offset = None;
         let mut code_page_seen = false;
         let mut records = BiffRecordReader {
             context: "BIFF globals",
@@ -636,10 +608,13 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     let sheet_type = *data
                         .get(5)
                         .ok_or_else(|| err("xls BoundSheet record가 예상보다 짧습니다."))?;
-                    if boundsheet
-                        .replace(BiffBoundSheet { offset, sheet_type })
-                        .is_some()
-                    {
+                    if sheet_type != 0 {
+                        return Err(err(prefixed_display_message(
+                            "Opinet 고정 소스에서 예상하지 않은 sheet type: ",
+                            sheet_type,
+                        )));
+                    }
+                    if sheet_offset.replace(offset).is_some() {
                         return Err(err("Opinet 고정 소스와 다른 worksheet 개수입니다."));
                     }
                 }
@@ -673,7 +648,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 break;
             }
         }
-        let Some(parsed_boundsheet) = boundsheet else {
+        let Some(parsed_sheet_offset) = sheet_offset else {
             return Err(err("xls에서 BoundSheet를 찾지 못했습니다."));
         };
         if !code_page_seen {
@@ -687,7 +662,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         if parsed_shared_strings.values.is_empty() {
             return Err(err("Opinet 고정 소스의 SST가 비어 있습니다."));
         }
-        Ok((parsed_boundsheet, parsed_shared_strings))
+        Ok((parsed_sheet_offset, parsed_shared_strings))
     }
     fn read_sst(
         &self,

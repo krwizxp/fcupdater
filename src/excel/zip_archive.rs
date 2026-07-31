@@ -1,9 +1,9 @@
-use super::{ArchiveFingerprint, PackagePart, XlsxPackageKind, ZipPackageReader};
+use super::{ArchiveFingerprint, PackagePart, XLSX_PARTS, XlsxPartRole, ZipPackageReader};
 use crate::diagnostic::{
     AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
     err_with_source as zip_with_source, path_context_message,
 };
-use core::{range::Range, str};
+use core::str;
 use std::{fs::File, io::Read as _, path::Path};
 mod deflate;
 mod write;
@@ -19,17 +19,18 @@ const CRC32_TABLE: [u32; 256] = {
         let mut bit = 0_u8;
         while bit < 8_u8 {
             value = value.wrapping_shr(1) ^ (0xedb8_8320_u32 & 0_u32.wrapping_sub(value & 1_u32));
-            bit = bit.wrapping_add(1);
+            bit = bit.strict_add(1);
         }
         *slot = value;
         remaining = tail;
-        seed = seed.wrapping_add(1);
+        seed = seed.strict_add(1);
     }
     table
 };
 const DEFLATE_MAX_BITS: usize = 15;
 const DEFLATE_MAX_BITS_U8: u8 = 15;
 const DATA_DESCRIPTOR_LEN: usize = 16;
+const DATA_DESCRIPTOR_LEN_WITHOUT_SIGNATURE: usize = 12;
 const DATA_DESCRIPTOR_SIGNATURE: u32 = 0x0807_4b50;
 const DISTANCE_SYMBOLS: usize = 30;
 const END_OF_CENTRAL_DIRECTORY_LEN: usize = 22;
@@ -45,6 +46,8 @@ const MAX_MATCH: usize = 258;
 const MIN_MATCH: usize = 3;
 const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
 const METHOD_DEFLATE: u16 = 8;
+const METHOD_STORED: u16 = 0;
+const SUPPORTED_FLAGS: u16 = 0x080e;
 const VERSION_MADE_BY: u16 = 45;
 const VERSION_NEEDED: u16 = 20;
 const ZIP_COMMENT_MAX_LEN: usize = 0xffff;
@@ -109,12 +112,12 @@ struct ZipEntry<'zip> {
     modified_time: u16,
     name: &'zip str,
     uncompressed_size: u32,
+    version_needed: u16,
 }
 struct ZipCentralDirectory<'bytes> {
     bytes: &'bytes [u8],
     cursor: usize,
     end: usize,
-    package_kind: XlsxPackageKind,
     remaining_entries: usize,
 }
 impl ZipEntry<'_> {
@@ -122,10 +125,16 @@ impl ZipEntry<'_> {
         &self,
         bytes: &[u8],
         expected_len: usize,
-        package_kind: XlsxPackageKind,
-    ) -> Result<(Vec<u8>, Range<usize>)> {
+        expected_local_offset: usize,
+    ) -> Result<(Vec<u8>, usize)> {
         let local_offset = usize::try_from(self.local_header_offset)
             .map_err(|source| err_with_source("ZIP local header offset 변환 실패", source))?;
+        if local_offset != expected_local_offset {
+            return Err(err(format!(
+                "ZIP local record가 연속된 고정 순서가 아닙니다: {}",
+                self.name
+            )));
+        }
         let (local_header, _) = split_header_at::<LOCAL_FILE_HEADER_LEN>(
             bytes,
             local_offset,
@@ -140,13 +149,13 @@ impl ZipEntry<'_> {
         if read_u32(local_header, 0)? != LOCAL_FILE_HEADER_SIGNATURE {
             return Err(zip_entry_message(ZIP_BAD_LOCAL_HEADER_MESSAGE, self.name).into());
         }
-        if read_u16(local_header, 4)? != VERSION_NEEDED {
+        if read_u16(local_header, 4)? != self.version_needed {
             return Err(local_mismatch(
-                "ZIP local header version이 지원 표현과 다릅니다",
+                "ZIP local header version이 중앙 디렉터리와 다릅니다",
             ));
         }
         let local_flags = read_u16(local_header, 6)?;
-        if local_flags != self.flags || local_flags != package_kind.entry_flags() {
+        if local_flags != self.flags {
             return Err(local_mismatch(
                 "ZIP local header flags가 중앙 디렉터리와 다릅니다",
             ));
@@ -163,27 +172,27 @@ impl ZipEntry<'_> {
                 "ZIP local header 수정 시각이 중앙 디렉터리와 다릅니다",
             ));
         }
-        match package_kind {
-            XlsxPackageKind::Excel => {
-                if read_u32(local_header, 14)? != self.crc32
-                    || read_u32(local_header, 18)? != self.compressed_size
-                    || read_u32(local_header, 22)? != self.uncompressed_size
-                {
-                    return Err(local_mismatch(
-                        "ZIP local CRC 또는 크기가 중앙 디렉터리와 다릅니다",
-                    ));
-                }
-            }
-            XlsxPackageKind::LibreOffice => {
-                if read_u32(local_header, 14)? != 0
-                    || read_u32(local_header, 18)? != 0
-                    || read_u32(local_header, 22)? != 0
-                {
-                    return Err(local_mismatch(
-                        "LibreOffice ZIP data descriptor local 필드가 0이 아닙니다",
-                    ));
-                }
-            }
+        let local_crc = read_u32(local_header, 14)?;
+        let local_compressed_size = read_u32(local_header, 18)?;
+        let local_uncompressed_size = read_u32(local_header, 22)?;
+        if self.flags & 0x0008 == 0
+            && (local_crc != self.crc32
+                || local_compressed_size != self.compressed_size
+                || local_uncompressed_size != self.uncompressed_size)
+        {
+            return Err(local_mismatch(
+                "ZIP local CRC 또는 크기가 중앙 디렉터리와 다릅니다",
+            ));
+        }
+        if self.flags & 0x0008 != 0
+            && ((local_crc != 0 && local_crc != self.crc32)
+                || (local_compressed_size != 0 && local_compressed_size != self.compressed_size)
+                || (local_uncompressed_size != 0
+                    && local_uncompressed_size != self.uncompressed_size))
+        {
+            return Err(local_mismatch(
+                "ZIP data descriptor local CRC 또는 크기가 올바르지 않습니다",
+            ));
         }
         let name_len = usize::from(read_u16(local_header, 26)?);
         let extra_len = usize::from(read_u16(local_header, 28)?);
@@ -207,25 +216,7 @@ impl ZipEntry<'_> {
         let local_extra = bytes
             .get(extra_start..data_start)
             .ok_or_else(|| zip_static("ZIP local extra 범위 오류"))?;
-        let extra_is_valid = match package_kind {
-            XlsxPackageKind::Excel => excel_local_extra(self.name).map_or_else(
-                || local_extra.is_empty(),
-                |(len, header)| {
-                    local_extra.len() == len
-                        && local_extra.get(..header.len()) == Some(header.as_slice())
-                        && local_extra
-                            .get(header.len()..)
-                            .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
-                },
-            ),
-            XlsxPackageKind::LibreOffice => local_extra.is_empty(),
-        };
-        if !extra_is_valid {
-            return Err(err(zip_entry_message(
-                "ZIP local extra가 고정 package 표현과 다릅니다",
-                self.name,
-            )));
-        }
+        validate_zip_extra(local_extra, self.name)?;
         let compressed_len = usize::try_from(self.compressed_size)
             .map_err(|source| err_with_source("ZIP 압축 크기 변환 실패", source))?;
         let data_end = data_start
@@ -234,56 +225,65 @@ impl ZipEntry<'_> {
         let Some(compressed) = bytes.get(data_start..data_end) else {
             return Err(zip_entry_message(ZIP_DATA_RANGE_MESSAGE, self.name).into());
         };
-        if self.method != METHOD_DEFLATE {
-            return Err(err(format!(
-                "지원하지 않는 ZIP 압축 방식({}): {}",
-                self.method, self.name
-            )));
-        }
-        let local_end = match package_kind {
-            XlsxPackageKind::Excel => data_end,
-            XlsxPackageKind::LibreOffice => {
-                let (descriptor, _) = split_header_at::<DATA_DESCRIPTOR_LEN>(
-                    bytes,
-                    data_end,
-                    "ZIP data descriptor 범위 오류",
-                )?;
-                if read_u32(descriptor, 0)? != DATA_DESCRIPTOR_SIGNATURE
-                    || read_u32(descriptor, 4)? != self.crc32
-                    || read_u32(descriptor, 8)? != self.compressed_size
-                    || read_u32(descriptor, 12)? != self.uncompressed_size
-                {
-                    return Err(local_mismatch(
-                        "ZIP data descriptor가 중앙 디렉터리와 다릅니다",
-                    ));
-                }
-                data_end
-                    .checked_add(DATA_DESCRIPTOR_LEN)
-                    .ok_or_else(|| zip_static("ZIP local record 끝 계산 실패"))?
+        let local_end = if self.flags & 0x0008 == 0 {
+            data_end
+        } else {
+            let descriptor_tail = bytes
+                .get(data_end..)
+                .ok_or_else(|| zip_static("ZIP data descriptor 범위 오류"))?;
+            let first = read_u32(descriptor_tail, 0)?;
+            let (crc_offset, descriptor_len) = if first == DATA_DESCRIPTOR_SIGNATURE {
+                (4, DATA_DESCRIPTOR_LEN)
+            } else {
+                (0, DATA_DESCRIPTOR_LEN_WITHOUT_SIGNATURE)
+            };
+            let descriptor = descriptor_tail
+                .get(..descriptor_len)
+                .ok_or_else(|| zip_static("ZIP data descriptor 범위 오류"))?;
+            if read_u32(descriptor, crc_offset)? != self.crc32
+                || read_u32(descriptor, crc_offset.strict_add(4))? != self.compressed_size
+                || read_u32(descriptor, crc_offset.strict_add(8))? != self.uncompressed_size
+            {
+                return Err(err(zip_entry_message(
+                    "ZIP data descriptor가 중앙 디렉터리와 다릅니다",
+                    self.name,
+                )));
             }
+            data_end
+                .checked_add(descriptor_len)
+                .ok_or_else(|| zip_static("ZIP local record 끝 계산 실패"))?
         };
-        let output = deflate::DeflateInflater {
-            bytes: compressed,
-            expected_len,
-        }
-        .inflate()?;
+        let (output, output_crc32) = if self.method == METHOD_DEFLATE {
+            (deflate::DeflateInflater {
+                bytes: compressed,
+                expected_len,
+            })
+            .inflate()?
+        } else {
+            if compressed_len != expected_len {
+                return Err(local_mismatch(
+                    "ZIP stored entry의 압축/해제 크기가 다릅니다",
+                ));
+            }
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(expected_len)
+                .map_err(|source| err_with_source("ZIP stored entry 메모리 확보 실패", source))?;
+            output.extend_from_slice(compressed);
+            let crc = !crc32_update(u32::MAX, &output)?;
+            (output, crc)
+        };
         if output.len() != expected_len {
             return Err(zip_entry_message(ZIP_BAD_SIZE_MESSAGE, self.name).into());
         }
-        if crc32(&output)? != self.crc32 {
+        if output_crc32 != self.crc32 {
             return Err(zip_entry_message(ZIP_BAD_CRC_MESSAGE, self.name).into());
         }
-        Ok((
-            output,
-            Range {
-                start: local_offset,
-                end: local_end,
-            },
-        ))
+        Ok((output, local_end))
     }
 }
-impl ZipCentralDirectory<'_> {
-    fn next_entry(&mut self) -> Result<Option<ZipEntry<'_>>> {
+impl<'bytes> ZipCentralDirectory<'bytes> {
+    fn next_entry(&mut self) -> Result<Option<ZipEntry<'bytes>>> {
         if self.remaining_entries == 0 {
             if self.cursor != self.end {
                 return Err(zip_static(ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE));
@@ -298,40 +298,36 @@ impl ZipCentralDirectory<'_> {
         if read_u32(header, 0)? != CENTRAL_DIRECTORY_SIGNATURE {
             return Err(zip_static(ZIP_BAD_CENTRAL_SIGNATURE_MESSAGE));
         }
-        if read_u16(header, 4)? != self.package_kind.version_made_by()
-            || read_u16(header, 6)? != VERSION_NEEDED
-        {
-            return Err(zip_static("ZIP entry version이 지원 표현과 다릅니다."));
-        }
+        let version_needed = read_u16(header, 6)?;
         let flags = read_u16(header, 8)?;
-        if flags != self.package_kind.entry_flags() {
-            return Err(zip_static("ZIP entry flags가 지원 표현과 다릅니다."));
+        let method = read_u16(header, 10)?;
+        if method != METHOD_DEFLATE && method != METHOD_STORED {
+            return Err(zip_static("ZIP entry 압축 방식을 지원하지 않습니다."));
         }
-        if read_u16(header, 10)? != METHOD_DEFLATE {
-            return Err(zip_static("ZIP entry 압축 방식이 지원 표현과 다릅니다."));
+        let minimum_version = if method == METHOD_DEFLATE { 20 } else { 10 };
+        if version_needed < minimum_version || version_needed > VERSION_NEEDED {
+            return Err(zip_static("ZIP entry version이 지원 범위를 벗어났습니다."));
         }
-        if self.package_kind == XlsxPackageKind::Excel
-            && (read_u16(header, 12)? != 0 || read_u16(header, 14)? != 0x0021)
-        {
+        if flags & !SUPPORTED_FLAGS != 0 {
             return Err(zip_static(
-                "ZIP entry 수정 시각이 Excel 고정 표현과 다릅니다.",
+                "ZIP entry flags에 지원하지 않는 기능이 있습니다.",
+            ));
+        }
+        if method == METHOD_STORED && flags & 0x0006 != 0 {
+            return Err(zip_static(
+                "ZIP stored entry에 DEFLATE 압축 옵션 flag가 있습니다.",
             ));
         }
         let name_len = usize::from(read_u16(header, 28)?);
         let extra_len = usize::from(read_u16(header, 30)?);
         let comment_len = usize::from(read_u16(header, 32)?);
-        if extra_len != 0 || comment_len != 0 {
-            return Err(zip_static(
-                "ZIP 중앙 디렉터리 extra/comment는 지원하지 않습니다.",
-            ));
-        }
-        if read_u16(header, 34)? != 0 || read_u16(header, 36)? != 0 || read_u32(header, 38)? != 0 {
-            return Err(zip_static(
-                "ZIP 중앙 디렉터리 disk/attribute 표현이 지원 형식과 다릅니다.",
-            ));
+        if read_u16(header, 34)? != 0 {
+            return Err(zip_static("분할 ZIP entry는 지원하지 않습니다."));
         }
         let entry_len = CENTRAL_DIRECTORY_HEADER_LEN
             .checked_add(name_len)
+            .and_then(|len| len.checked_add(extra_len))
+            .and_then(|len| len.checked_add(comment_len))
             .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 entry 길이 계산 실패"))?;
         let next_cursor = self
             .cursor
@@ -340,41 +336,37 @@ impl ZipCentralDirectory<'_> {
         if next_cursor > self.end {
             return Err(zip_static(ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE));
         }
-        let payload = tail
-            .get(..name_len)
-            .ok_or_else(|| zip_static(ZIP_CENTRAL_HEADER_RANGE))?;
-        let Some(name_bytes) = payload.get(..name_len) else {
+        let Some(name_bytes) = tail.get(..name_len) else {
             return Err(zip_static("ZIP entry 이름이 파일 범위를 벗어났습니다."));
         };
         let name = str::from_utf8(name_bytes)
             .map_err(|source| err_with_source("ZIP entry 이름이 UTF-8이 아닙니다", source))?;
+        let extra_start = name_len;
+        let extra_end = extra_start
+            .checked_add(extra_len)
+            .ok_or_else(|| zip_static("ZIP 중앙 extra 범위 계산 실패"))?;
+        let central_extra = tail
+            .get(extra_start..extra_end)
+            .ok_or_else(|| zip_static("ZIP 중앙 extra 범위 오류"))?;
+        validate_zip_extra(central_extra, name)?;
         self.cursor = next_cursor;
-        self.remaining_entries = self
-            .remaining_entries
-            .checked_sub(1)
-            .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 entry 개수 계산 실패"))?;
+        self.remaining_entries = self.remaining_entries.strict_sub(1);
         Ok(Some(ZipEntry {
             compressed_size: read_u32(header, 20)?,
             crc32: read_u32(header, 16)?,
             flags,
             local_header_offset: read_u32(header, 42)?,
-            method: read_u16(header, 10)?,
+            method,
             modified_date: read_u16(header, 14)?,
             modified_time: read_u16(header, 12)?,
             name,
             uncompressed_size: read_u32(header, 24)?,
+            version_needed,
         }))
     }
 }
 impl ZipPackageReader<'_> {
-    pub(super) fn read(
-        &self,
-    ) -> Result<(
-        ArchiveFingerprint,
-        Vec<u8>,
-        XlsxPackageKind,
-        Vec<PackagePart>,
-    )> {
+    pub(super) fn read(self) -> Result<(ArchiveFingerprint, Vec<PackagePart>)> {
         let mut archive_bytes = Vec::new();
         let fingerprint = scan_open_archive(
             &self.archive_file,
@@ -384,17 +376,10 @@ impl ZipPackageReader<'_> {
         if archive_bytes.len() < END_OF_CENTRAL_DIRECTORY_LEN {
             return Err(zip_static("ZIP 파일이 너무 짧습니다."));
         }
-        let search_window = END_OF_CENTRAL_DIRECTORY_LEN
-            .checked_add(ZIP_COMMENT_MAX_LEN)
-            .ok_or_else(|| zip_static("ZIP EOCD 최대 검색 범위 계산 실패"))?;
+        let search_window = END_OF_CENTRAL_DIRECTORY_LEN.strict_add(ZIP_COMMENT_MAX_LEN);
         let min_offset = archive_bytes.len().saturating_sub(search_window);
-        let max_offset = archive_bytes
-            .len()
-            .checked_sub(END_OF_CENTRAL_DIRECTORY_LEN)
-            .ok_or_else(|| zip_static("ZIP EOCD 최대 offset 계산 실패"))?;
-        let search_end = max_offset
-            .checked_add(4_usize)
-            .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 계산 실패"))?;
+        let max_offset = archive_bytes.len().strict_sub(END_OF_CENTRAL_DIRECTORY_LEN);
+        let search_end = max_offset.strict_add(4_usize);
         let search_bytes = archive_bytes
             .get(min_offset..search_end)
             .ok_or_else(|| zip_static("ZIP EOCD 검색 범위 오류"))?;
@@ -410,9 +395,7 @@ impl ZipPackageReader<'_> {
             else {
                 return Err(zip_static("ZIP EOCD를 찾지 못했습니다."));
             };
-            let offset = min_offset
-                .checked_add(relative_offset)
-                .ok_or_else(|| zip_static("ZIP EOCD offset 계산 실패"))?;
+            let offset = min_offset.strict_add(relative_offset);
             let (eocd, _) = split_header_at::<END_OF_CENTRAL_DIRECTORY_LEN>(
                 archive_bytes.as_slice(),
                 offset,
@@ -436,18 +419,10 @@ impl ZipPackageReader<'_> {
             return Err(zip_static("분할 ZIP archive는 지원하지 않습니다."));
         }
         let entry_count = usize::from(entries_total);
-        let package_kind = match entry_count {
-            13 => XlsxPackageKind::Excel,
-            14 => XlsxPackageKind::LibreOffice,
-            _ => {
-                return Err(err(format!(
-                    "ZIP entry 수가 지원하는 Excel/LibreOffice 고정 스키마와 다릅니다: {entry_count} (13 또는 14 필요)"
-                )));
-            }
-        };
-        let part_names = package_kind.part_names();
-        if read_u16(eocd, 20)? != 0 {
-            return Err(zip_static("ZIP archive comment는 지원하지 않습니다."));
+        if entry_count > XLSX_PARTS.len() {
+            return Err(err(format!(
+                "ZIP entry 수가 지원 상한을 초과했습니다: {entry_count}"
+            )));
         }
         let central_dir_size = usize::try_from(read_u32(eocd, 12)?)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
@@ -465,24 +440,26 @@ impl ZipPackageReader<'_> {
             bytes: archive_bytes.as_slice(),
             cursor: central_dir_offset,
             end: central_dir_end,
-            package_kind,
             remaining_entries: entry_count,
         };
         let mut total_uncompressed = 0_usize;
-        let mut expected_local_offset = 0_usize;
-        let mut parts = Vec::new();
-        parts
-            .try_reserve_exact(part_names.len())
-            .map_err(|source| err_with_source("ZIP package part 목록 메모리 확보 실패", source))?;
-        for &expected_name in part_names {
+        let mut entries: Vec<(ZipEntry<'_>, &'static str, usize)> = Vec::new();
+        entries
+            .try_reserve_exact(entry_count)
+            .map_err(|source| err_with_source("ZIP entry 목록 메모리 확보 실패", source))?;
+        for _ in 0..entry_count {
             let entry = central_directory
                 .next_entry()?
                 .ok_or_else(|| zip_static("ZIP entry가 고정 스키마보다 적습니다."))?;
-            if entry.name != expected_name {
+            let Some(&(part_name, _)) = XLSX_PARTS.iter().find(|&&(name, _)| name == entry.name)
+            else {
                 return Err(err(format!(
-                    "ZIP entry 순서 또는 이름이 고정 스키마와 다릅니다: {} != {expected_name}",
+                    "ZIP entry 이름이 고정 스키마에 없습니다: {}",
                     entry.name
                 )));
+            };
+            if entries.iter().any(|item| item.1 == part_name) {
+                return Err(err(format!("ZIP entry 이름이 중복되었습니다: {part_name}")));
             }
             let expected_len = usize::try_from(entry.uncompressed_size)
                 .map_err(|source| err_with_source("ZIP 해제 크기 변환 실패", source))?;
@@ -501,58 +478,74 @@ impl ZipPackageReader<'_> {
                 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES,
                 entry.name,
             )?;
-            let (mut bytes, local_record) =
-                entry.data(archive_bytes.as_slice(), expected_len, package_kind)?;
-            if local_record.start != expected_local_offset {
-                return Err(err(format!(
-                    "ZIP local record가 연속된 고정 순서가 아닙니다: {expected_name}"
-                )));
-            }
-            expected_local_offset = local_record.end;
-            if package_kind == XlsxPackageKind::Excel
-                && !matches!(
-                    expected_name,
-                    "[Content_Types].xml"
-                        | "_rels/.rels"
-                        | "xl/_rels/workbook.xml.rels"
-                        | "xl/workbook.xml"
-                        | "xl/sharedStrings.xml"
-                        | "xl/calcChain.xml"
-                        | "xl/worksheets/sheet1.xml"
-                        | "xl/worksheets/sheet2.xml"
-                )
-            {
-                bytes = Vec::new();
-            }
-            parts.push(PackagePart {
-                bytes,
-                changed: false,
-                compressed_size: entry.compressed_size,
-                crc32: entry.crc32,
-                local_record,
-                name: expected_name,
-                uncompressed_size: entry.uncompressed_size,
-            });
+            entries.push((entry, part_name, expected_len));
         }
-        if central_directory.next_entry()?.is_some() || expected_local_offset != central_dir_offset
-        {
+        if central_directory.next_entry()?.is_some() {
+            return Err(zip_static(
+                "ZIP 중앙 디렉터리 entry 수가 일치하지 않습니다.",
+            ));
+        }
+        for (name, role) in XLSX_PARTS {
+            if role == XlsxPartRole::Required && !entries.iter().any(|item| item.1 == name) {
+                return Err(err(format!("ZIP 필수 entry가 없습니다: {name}")));
+            }
+        }
+        entries.sort_unstable_by_key(|item| item.0.local_header_offset);
+        let mut expected_local_offset = 0_usize;
+        let mut parts: Vec<PackagePart> = Vec::new();
+        parts
+            .try_reserve_exact(entry_count)
+            .map_err(|source| err_with_source("ZIP package part 목록 메모리 확보 실패", source))?;
+        for (entry, name, expected_len) in entries {
+            let (bytes, local_end) = entry.data(
+                archive_bytes.as_slice(),
+                expected_len,
+                expected_local_offset,
+            )?;
+            expected_local_offset = local_end;
+            parts.push(PackagePart { bytes, name });
+        }
+        if expected_local_offset != central_dir_offset {
             return Err(zip_static(
                 "ZIP local/central record 범위가 고정 package 표현과 다릅니다.",
             ));
         }
-        Ok((fingerprint, archive_bytes, package_kind, parts))
+        Ok((fingerprint, parts))
     }
 }
-pub(super) fn excel_local_extra(name: &str) -> Option<(usize, [u8; 8])> {
-    match name {
-        "[Content_Types].xml" | "_rels/.rels" => {
-            Some((520, [0x20, 0xa2, 0x04, 0x02, 0x28, 0xa0, 0x00, 0x02]))
+fn validate_zip_extra(extra: &[u8], entry_name: &str) -> Result<()> {
+    let mut cursor = 0_usize;
+    while cursor < extra.len() {
+        let header = extra
+            .get(cursor..)
+            .and_then(|bytes| bytes.split_first_chunk::<4>())
+            .map(|value| value.0)
+            .ok_or_else(|| {
+                err(zip_entry_message(
+                    "ZIP extra field header 범위가 손상되었습니다",
+                    entry_name,
+                ))
+            })?;
+        let field_id = u16::from_le_bytes([header[0], header[1]]);
+        let field_len = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if matches!(field_id, 0x0001 | 0x9901) {
+            return Err(err(zip_entry_message(
+                "ZIP64 또는 AES extra field는 지원하지 않습니다",
+                entry_name,
+            )));
         }
-        "xl/_rels/workbook.xml.rels" | "docProps/core.xml" | "docProps/app.xml" => {
-            Some((264, [0x20, 0xa2, 0x04, 0x01, 0x28, 0xa0, 0x00, 0x01]))
-        }
-        _ => None,
+        cursor = cursor
+            .checked_add(4)
+            .and_then(|start| start.checked_add(field_len))
+            .filter(|end| *end <= extra.len())
+            .ok_or_else(|| {
+                err(zip_entry_message(
+                    "ZIP extra field 범위가 손상되었습니다",
+                    entry_name,
+                ))
+            })?;
     }
+    Ok(())
 }
 pub(super) fn scan_open_archive(
     file: &File,
@@ -578,8 +571,9 @@ pub(super) fn scan_open_archive(
         )));
     }
     if let Some(bytes) = retained.as_mut() {
+        bytes.clear();
         bytes
-            .try_reserve_exact(archive_len)
+            .try_reserve_exact(archive_len.strict_add(1))
             .map_err(|source| err_with_source("xlsx 압축 파일 메모리 확보 실패", source))?;
     }
     let read_limit = metadata.len().strict_add(1);
@@ -601,11 +595,6 @@ pub(super) fn scan_open_archive(
         let (chunk, _) = buffer.split_at(read_len);
         crc = crc32_update(crc, chunk)?;
         if let Some(bytes) = retained.as_mut() {
-            if bytes.capacity().strict_sub(bytes.len()) < read_len {
-                bytes.try_reserve(read_len).map_err(|source| {
-                    err_with_source("xlsx 압축 파일 메모리 추가 확보 실패", source)
-                })?;
-            }
             bytes.extend_from_slice(chunk);
         }
     }
@@ -643,17 +632,17 @@ fn ensure_zip_size_limit(
 fn zip_entry_message(context: &str, entry_name: &str) -> String {
     format!("{context}: {entry_name}")
 }
-fn crc32(bytes: &[u8]) -> ZipResult<u32> {
-    crc32_update(u32::MAX, bytes).map(|crc| !crc)
-}
 fn crc32_update(initial: u32, bytes: &[u8]) -> ZipResult<u32> {
-    bytes.iter().try_fold(initial, |crc, &byte| {
-        let table_index = usize::from((crc ^ u32::from(byte)).to_le_bytes()[0]);
-        let Some(table_value) = CRC32_TABLE.get(table_index).copied() else {
-            return Err(zip_static("ZIP CRC32 table 범위가 손상되었습니다."));
-        };
-        Ok((crc >> 8_u8) ^ table_value)
-    })
+    bytes
+        .iter()
+        .try_fold(initial, |crc, &byte| crc32_update_byte(crc, byte))
+}
+fn crc32_update_byte(crc: u32, byte: u8) -> ZipResult<u32> {
+    let table_index = usize::from((crc ^ u32::from(byte)).to_le_bytes()[0]);
+    let Some(table_value) = CRC32_TABLE.get(table_index).copied() else {
+        return Err(zip_static("ZIP CRC32 table 범위가 손상되었습니다."));
+    };
+    Ok((crc >> 8_u8) ^ table_value)
 }
 fn split_header_at<'bytes, const LEN: usize>(
     bytes: &'bytes [u8],
