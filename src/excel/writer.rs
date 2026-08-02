@@ -367,10 +367,12 @@ impl SharedStringTable {
     }
 }
 impl Workbook {
-    fn build_calc_chain_xml(&mut self) -> Result<String> {
+    fn build_calc_chain_xml(
+        &mut self,
+        master_formula_count: usize,
+        change_log_formula_count: usize,
+    ) -> Result<String> {
         let source_xml = self.calc_chain_xml.take();
-        let change_log_formula_count = self.change_log_sheet.canonical_formula_count();
-        let master_formula_count = self.master_sheet.canonical_formula_count();
         let mut change_log_remaining = change_log_formula_count;
         let mut master_remaining = master_formula_count;
         let mut change_log_matches = source_xml.is_some();
@@ -765,24 +767,21 @@ impl Workbook {
             .canonicalize_excel_output(ExcelSheetKind::Master, &self.input_styles)?;
         self.change_log_sheet
             .canonicalize_excel_output(ExcelSheetKind::ChangeLog, &self.input_styles)?;
-        let calc_chain_xml = self.build_calc_chain_xml()?;
         self.master_sheet.canonical_share_formulas()?;
         self.change_log_sheet.canonical_share_formulas()?;
-        let mut shared_string_reference_count = 0_usize;
-        for (sheet_name, sheet_path, sheet) in [
-            (MASTER_SHEET_NAME, MASTER_SHEET_PATH, &self.master_sheet),
-            (
-                CHANGE_LOG_SHEET_NAME,
-                CHANGE_LOG_SHEET_PATH,
-                &self.change_log_sheet,
-            ),
-        ] {
-            sheet.validate_fixed_header(sheet_name, self.shared_strings.values())?;
-            let (sheet_xml, sheet_reference_count) = sheet.to_xml()?;
-            shared_string_reference_count =
-                shared_string_reference_count.strict_add(sheet_reference_count);
-            self.container.put_text(sheet_path, sheet_xml)?;
-        }
+        self.master_sheet
+            .validate_fixed_header(MASTER_SHEET_NAME, self.shared_strings.values())?;
+        let (master_xml, master_shared_count, master_formula_count) = self.master_sheet.to_xml()?;
+        self.container.put_text(MASTER_SHEET_PATH, master_xml)?;
+        self.change_log_sheet
+            .validate_fixed_header(CHANGE_LOG_SHEET_NAME, self.shared_strings.values())?;
+        let (change_log_xml, change_log_shared_count, change_log_formula_count) =
+            self.change_log_sheet.to_xml()?;
+        self.container
+            .put_text(CHANGE_LOG_SHEET_PATH, change_log_xml)?;
+        let calc_chain_xml =
+            self.build_calc_chain_xml(master_formula_count, change_log_formula_count)?;
+        let shared_string_reference_count = master_shared_count.strict_add(change_log_shared_count);
         let shared_strings_xml = self.shared_strings.to_xml(shared_string_reference_count)?;
         self.container.put_text("xl/workbook.xml", self.xml_text)?;
         self.container
@@ -2227,9 +2226,10 @@ impl Worksheet {
     pub(crate) fn take_rows(&mut self) -> Vec<Row> {
         mem::take(&mut self.rows)
     }
-    fn to_xml(&self) -> Result<(String, usize)> {
+    fn to_xml(&self) -> Result<(String, usize, usize)> {
         let cell_name = "c";
         let row_name = "row";
+        let mut formula_count = 0_usize;
         let mut shared_string_reference_count = 0_usize;
         let estimated_capacity = (|| {
             let cell_markup_len =
@@ -2264,6 +2264,8 @@ impl Worksheet {
                             checked_capacity(&[capacity, " t=\"\"".len(), value_type.len()])?;
                     }
                     if let Some(inner) = cell.inner_xml.as_ref() {
+                        formula_count = formula_count
+                            .strict_add(usize::from(find_start_tag(inner, "f", 0).is_some()));
                         capacity = capacity.checked_add(inner.len())?;
                     }
                 }
@@ -2318,7 +2320,7 @@ impl Worksheet {
             push_end_tag_name(&mut out, row_name);
         }
         out.push_str(&self.suffix);
-        Ok((out, shared_string_reference_count))
+        Ok((out, shared_string_reference_count, formula_count))
     }
     pub(crate) fn truncate_rows_after(&mut self, last_row_to_keep: u32) -> Result<()> {
         let keep_len = usize::try_from(last_row_to_keep)

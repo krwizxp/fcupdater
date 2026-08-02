@@ -828,7 +828,7 @@ impl<'source> MasterSheetUpdater<'source> {
         let self_yn_changed = !old_self_yn
             .chars()
             .filter(|ch| !ch.is_whitespace())
-            .eq(src.self_yn.chars().filter(|ch| !ch.is_whitespace()));
+            .eq(src.service.label().chars());
         let price_changed = row.fuels != src.fuels;
         let change =
             (region_changed || name_changed || brand_changed || self_yn_changed || price_changed)
@@ -1164,7 +1164,7 @@ impl<'source> MasterSheetUpdater<'source> {
             (COL_REGION, src.region),
             (COL_NAME, src.name.as_str()),
             (COL_BRAND, src.brand.as_str()),
-            (COL_SELF_YN, src.self_yn.as_str()),
+            (COL_SELF_YN, src.service.label()),
             (COL_ADDRESS, src.address.as_str()),
         ] {
             shared_strings.set_cell(ws, col, row, value)?;

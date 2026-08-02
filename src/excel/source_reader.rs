@@ -63,7 +63,7 @@ pub(crate) struct SourceRecord {
     pub fuels: FuelValues<Option<i32>>,
     pub name: String,
     pub region: &'static str,
-    pub self_yn: String,
+    pub service: StationService,
 }
 pub(crate) struct SourceRecordRef<'record> {
     pub address: &'record str,
@@ -71,7 +71,20 @@ pub(crate) struct SourceRecordRef<'record> {
     pub fuels: FuelValues<Option<i32>>,
     pub name: &'record str,
     pub region: &'record str,
-    pub self_yn: &'record str,
+    pub service: StationService,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum StationService {
+    General,
+    SelfService,
+}
+impl StationService {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::General => "일반",
+            Self::SelfService => "셀프",
+        }
+    }
 }
 impl SourceRecordRef<'_> {
     pub(crate) fn into_owned_with_region(self, region: &'static str) -> Result<SourceRecord> {
@@ -81,7 +94,7 @@ impl SourceRecordRef<'_> {
             fuels: self.fuels,
             name: copy_text(self.name, "소스 상호명")?,
             region,
-            self_yn: copy_text(self.self_yn, "소스 셀프 여부")?,
+            service: self.service,
         })
     }
 }
@@ -809,13 +822,16 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 return Err(format!("Opinet 소스 {row_num}행 상호명 값이 비어 있습니다.").into());
             }
             let premium = row_fuel_price(row, COL_PREMIUM, row_num, "고급휘발유")?;
-            let self_yn = row_text_trimmed(row, COL_SELF_YN);
-            if !matches!(self_yn, "셀프" | "일반") {
-                return Err(format!(
-                    "Opinet 소스 {row_num}행 셀프 여부 값이 올바르지 않습니다: {self_yn}"
-                )
-                .into());
-            }
+            let service = match row_text_trimmed(row, COL_SELF_YN) {
+                "셀프" => StationService::SelfService,
+                "일반" => StationService::General,
+                self_yn => {
+                    return Err(format!(
+                        "Opinet 소스 {row_num}행 셀프 여부 값이 올바르지 않습니다: {self_yn}"
+                    )
+                    .into());
+                }
+            };
             found_record = true;
             if visitor_error.is_none()
                 && let Err(source) = visitor(SourceRecordRef {
@@ -828,7 +844,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     },
                     name,
                     region: row_text_trimmed(row, COL_REGION),
-                    self_yn,
+                    service,
                 })
             {
                 visitor_error = Some(source);

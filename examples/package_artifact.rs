@@ -44,20 +44,25 @@ fn main() -> io::Result<()> {
             "artifact entry name must be a 1-100 byte file name",
         ));
     }
-    let source = PathBuf::from("target").join("release").join(format!(
-        "{}{}",
-        env!("CARGO_PKG_NAME"),
-        env::consts::EXE_SUFFIX
-    ));
+    let source = env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| PathBuf::from("target"), PathBuf::from)
+        .join("release")
+        .join(format!(
+            "{}{}",
+            env!("CARGO_PKG_NAME"),
+            env::consts::EXE_SUFFIX
+        ));
+    let mut input = File::open(&source)?;
+    let source_len = input.metadata()?.len();
     let artifact_dir = Path::new("artifacts");
     fs::create_dir_all(artifact_dir)?;
     let destination = artifact_dir.join(format!(
         "{entry_name}.{}",
         if cfg!(windows) { "exe" } else { "tar" }
     ));
-    let source_len = source.metadata()?.len();
     if cfg!(windows) {
-        let copied = fs::copy(source, destination)?;
+        let mut output = File::create(&destination)?;
+        let copied = io::copy(&mut input, &mut output)?;
         return if copied == source_len {
             Ok(())
         } else {
@@ -90,7 +95,6 @@ fn main() -> io::Result<()> {
     let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
     write_octal(&mut header[148..155], checksum)?;
     header[155] = b' ';
-    let mut input = File::open(&source)?;
     let mut output = BufWriter::new(File::create(destination)?);
     output.write_all(&header)?;
     let copied = io::copy(&mut input, &mut output)?;

@@ -1,6 +1,8 @@
 use crate::diagnostic::{Result, err, err_with_source};
 use alloc::borrow::Cow;
 use core::{iter, range::Range};
+const MAX_XML_ATTRIBUTE_COUNT: usize = 128;
+const MAX_XML_DEPTH: usize = 256;
 pub(super) struct XmlTag<'xml> {
     pub end: usize,
     pub is_start: bool,
@@ -119,17 +121,25 @@ impl<'tag> XmlAttrScanner<'tag> {
     }
     pub(super) fn next(&mut self) -> Result<Option<(&'tag str, Cow<'tag, str>)>> {
         let bytes = self.tag.as_bytes();
+        let separator_start = self.cursor;
         while bytes.get(self.cursor).is_some_and(u8::is_ascii_whitespace) {
             self.cursor = checked_offset_add(self.cursor, 1)
                 .ok_or_else(|| err("XML 속성 공백 cursor 계산에 실패했습니다."))?;
         }
         match bytes.get(self.cursor).copied() {
-            Some(b'/' | b'>') | None => return Ok(None),
+            Some(b'/' | b'?' | b'>') | None => return Ok(None),
+            Some(_) if self.cursor == separator_start => {
+                return Err(err("XML 속성 사이에 공백이 없습니다."));
+            }
             Some(_) => {}
         }
         let name_start = self.cursor;
         while bytes.get(self.cursor).is_some_and(|byte| {
-            !byte.is_ascii_whitespace() && *byte != b'=' && *byte != b'/' && *byte != b'>'
+            !byte.is_ascii_whitespace()
+                && *byte != b'='
+                && *byte != b'/'
+                && *byte != b'?'
+                && *byte != b'>'
         }) {
             self.cursor = checked_offset_add(self.cursor, 1)
                 .ok_or_else(|| err("XML 속성 이름 cursor 계산에 실패했습니다."))?;
@@ -177,8 +187,298 @@ impl<'tag> XmlAttrScanner<'tag> {
         Ok(Some((name, decode_xml_entities(value)?)))
     }
 }
+struct XmlDocumentValidator<'context, 'xml> {
+    context: &'context str,
+    xml: &'xml str,
+}
+impl XmlDocumentValidator<'_, '_> {
+    fn validate(&self) -> Result<()> {
+        let context = self.context;
+        let xml = self.xml;
+        let mut cursor = usize::from(xml.starts_with('\u{feff}')).strict_mul('\u{feff}'.len_utf8());
+        let declaration_start = cursor;
+        let mut stack = Vec::new();
+        stack.try_reserve_exact(16).map_err(|source| {
+            err_with_source(format!("{context} XML stack 메모리 확보 실패"), source)
+        })?;
+        let mut saw_declaration = false;
+        let mut saw_root = false;
+        let mut root_closed = false;
+        while cursor < xml.len() {
+            let tail = xml
+                .get(cursor..)
+                .ok_or_else(|| err(format!("{context} XML cursor 범위가 손상되었습니다.")))?;
+            let Some(relative_start) = tail.find('<') else {
+                validate_xml_text(tail, !stack.is_empty(), context)?;
+                break;
+            };
+            let markup_start = checked_offset_add(cursor, relative_start)
+                .ok_or_else(|| err(format!("{context} XML markup 위치 계산 실패")))?;
+            validate_xml_text(
+                tail.get(..relative_start)
+                    .ok_or_else(|| err(format!("{context} XML text 범위가 손상되었습니다.")))?,
+                !stack.is_empty(),
+                context,
+            )?;
+            let markup = xml
+                .get(markup_start..)
+                .ok_or_else(|| err(format!("{context} XML markup 범위가 손상되었습니다.")))?;
+            if markup.starts_with("<!--") {
+                let end = find_tag_end(xml, markup_start)
+                    .ok_or_else(|| err(format!("{context} XML comment가 닫히지 않았습니다.")))?;
+                let body = xml
+                    .get(markup_start.strict_add(4)..end.strict_sub(2))
+                    .ok_or_else(|| err(format!("{context} XML comment 범위가 손상되었습니다.")))?;
+                if body.contains("--") || body.ends_with('-') {
+                    return Err(err(format!(
+                        "{context} XML comment의 '-' 사용이 올바르지 않습니다."
+                    )));
+                }
+                validate_xml_chars(body, context)?;
+                cursor = end.strict_add(1);
+                continue;
+            }
+            if markup.starts_with("<![CDATA[") {
+                if stack.is_empty() {
+                    return Err(err(format!("{context} XML CDATA가 root 밖에 있습니다.")));
+                }
+                let end = find_tag_end(xml, markup_start)
+                    .ok_or_else(|| err(format!("{context} XML CDATA가 닫히지 않았습니다.")))?;
+                let body = xml
+                    .get(markup_start.strict_add(9)..end.strict_sub(2))
+                    .ok_or_else(|| err(format!("{context} XML CDATA 범위가 손상되었습니다.")))?;
+                validate_xml_chars(body, context)?;
+                cursor = end.strict_add(1);
+                continue;
+            }
+            if markup.starts_with("<?") {
+                let end = find_tag_end(xml, markup_start).ok_or_else(|| {
+                    err(format!(
+                        "{context} XML processing instruction이 닫히지 않았습니다."
+                    ))
+                })?;
+                let raw = xml.get(markup_start..=end).ok_or_else(|| {
+                    err(format!("{context} XML declaration 범위가 손상되었습니다."))
+                })?;
+                if saw_declaration || saw_root || markup_start != declaration_start {
+                    return Err(err(format!(
+                        "{context} XML declaration은 문서 시작에 한 번만 허용됩니다."
+                    )));
+                }
+                self.validate_declaration(raw)?;
+                saw_declaration = true;
+                cursor = end.strict_add(1);
+                continue;
+            }
+            if markup.starts_with("<!") {
+                return Err(err(format!(
+                    "{context} XML DTD·declaration은 지원하지 않습니다."
+                )));
+            }
+            let end = find_tag_end(xml, markup_start)
+                .ok_or_else(|| err(format!("{context} XML element가 닫히지 않았습니다.")))?;
+            let tag = XmlScanner::from(xml, markup_start)
+                .next_tag()
+                .filter(|tag| tag.start == markup_start && tag.end == end)
+                .ok_or_else(|| err(format!("{context} XML element 형식이 올바르지 않습니다.")))?;
+            if !is_valid_xml_name(tag.name) {
+                return Err(err(format!(
+                    "{context} XML element 이름이 올바르지 않습니다."
+                )));
+            }
+            if tag.is_start {
+                self.validate_attributes(tag.raw, tag.self_closing)?;
+                if stack.is_empty() {
+                    if saw_root || root_closed {
+                        return Err(err(format!("{context} XML root가 여러 개입니다.")));
+                    }
+                    saw_root = true;
+                }
+                if tag.self_closing {
+                    if stack.is_empty() {
+                        root_closed = true;
+                    }
+                } else {
+                    if stack.len() == MAX_XML_DEPTH {
+                        return Err(err(format!(
+                            "{context} XML 중첩 깊이가 최대 {MAX_XML_DEPTH}을 초과합니다."
+                        )));
+                    }
+                    stack.push(tag.name);
+                }
+            } else {
+                self.validate_close_tag(tag.raw, tag.name)?;
+                let opening = stack.pop().ok_or_else(|| {
+                    err(format!(
+                        "{context} XML 종료 태그에 대응하는 시작 태그가 없습니다."
+                    ))
+                })?;
+                if opening != tag.name {
+                    return Err(err(format!(
+                        "{context} XML 태그 쌍이 일치하지 않습니다: {opening} / {}",
+                        tag.name
+                    )));
+                }
+                if stack.is_empty() {
+                    root_closed = true;
+                }
+            }
+            cursor = end.strict_add(1);
+        }
+        if !saw_root {
+            return Err(err(format!("{context} XML root 태그가 없습니다.")));
+        }
+        if !stack.is_empty() || !root_closed {
+            return Err(err(format!(
+                "{context} XML에 닫히지 않은 element가 있습니다."
+            )));
+        }
+        Ok(())
+    }
+    fn validate_attributes(&self, tag: &str, self_closing: bool) -> Result<()> {
+        let context = self.context;
+        let mut scanner = XmlAttrScanner::new(tag)?;
+        let mut names = Vec::new();
+        names.try_reserve_exact(8).map_err(|source| {
+            err_with_source(format!("{context} XML 속성 메모리 확보 실패"), source)
+        })?;
+        while let Some((name, _)) = scanner.next()? {
+            if !is_valid_xml_name(name) {
+                return Err(err(format!("{context} XML 속성 이름이 올바르지 않습니다.")));
+            }
+            if names.contains(&name) {
+                return Err(err(format!("{context} XML 속성이 중복되었습니다: {name}")));
+            }
+            if names.len() == MAX_XML_ATTRIBUTE_COUNT {
+                return Err(err(format!(
+                    "{context} XML 속성 수가 최대 {MAX_XML_ATTRIBUTE_COUNT}을 초과합니다."
+                )));
+            }
+            names.push(name);
+        }
+        let expected_end = if self_closing { "/>" } else { ">" };
+        if scanner
+            .tag
+            .get(scanner.cursor..)
+            .is_none_or(|tail| tail.trim() != expected_end)
+        {
+            return Err(err(format!(
+                "{context} XML element 끝 형식이 올바르지 않습니다."
+            )));
+        }
+        Ok(())
+    }
+    fn validate_close_tag(&self, tag: &str, name: &str) -> Result<()> {
+        if tag
+            .strip_prefix("</")
+            .and_then(|tail| tail.strip_suffix('>'))
+            .and_then(|body| body.strip_prefix(name))
+            .is_none_or(|tail| !tail.trim().is_empty())
+        {
+            return Err(err(format!(
+                "{} XML 종료 태그 형식이 올바르지 않습니다.",
+                self.context
+            )));
+        }
+        Ok(())
+    }
+    fn validate_declaration(&self, declaration: &str) -> Result<()> {
+        let context = self.context;
+        if !declaration
+            .as_bytes()
+            .get(5)
+            .is_some_and(u8::is_ascii_whitespace)
+            || !declaration.ends_with("?>")
+        {
+            return Err(err(format!(
+                "{context} XML declaration 형식이 올바르지 않습니다."
+            )));
+        }
+        let mut scanner = XmlAttrScanner {
+            cursor: 5,
+            tag: declaration,
+        };
+        let mut version = false;
+        let mut encoding = false;
+        let mut standalone = false;
+        while let Some((name, value)) = scanner.next()? {
+            match name {
+                "version" if !version && !encoding && !standalone && value == "1.0" => {
+                    version = true;
+                }
+                "encoding"
+                    if version
+                        && !encoding
+                        && !standalone
+                        && value.eq_ignore_ascii_case("utf-8") =>
+                {
+                    encoding = true;
+                }
+                "standalone"
+                    if version && !standalone && matches!(value.as_ref(), "yes" | "no") =>
+                {
+                    standalone = true;
+                }
+                _ => {
+                    return Err(err(format!(
+                        "{context} XML declaration 속성이 올바르지 않습니다."
+                    )));
+                }
+            }
+        }
+        if !version
+            || scanner
+                .tag
+                .get(scanner.cursor..)
+                .is_none_or(|tail| tail.trim() != "?>")
+        {
+            return Err(err(format!(
+                "{context} XML declaration 형식이 올바르지 않습니다."
+            )));
+        }
+        Ok(())
+    }
+}
 const fn checked_offset_add(base: usize, add: usize) -> Option<usize> {
     base.checked_add(add)
+}
+pub(super) fn validate_xml_document(xml: &str, context: &str) -> Result<()> {
+    XmlDocumentValidator { context, xml }.validate()
+}
+fn validate_xml_text(text: &str, inside_root: bool, context: &str) -> Result<()> {
+    if !inside_root {
+        if text
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return Ok(());
+        }
+        return Err(err(format!("{context} XML root 밖에 text가 있습니다.")));
+    }
+    decode_xml_entities(text).map(|_| ()).map_err(|source| {
+        err_with_source(format!("{context} XML text가 올바르지 않습니다."), source)
+    })
+}
+fn validate_xml_chars(text: &str, context: &str) -> Result<()> {
+    if let Some(ch) = text.chars().find(|&ch| !is_valid_xml_char(ch)) {
+        return Err(err(format!(
+            "{context} XML에 허용되지 않는 문자가 있습니다: U+{:04X}",
+            u32::from(ch)
+        )));
+    }
+    Ok(())
+}
+fn is_valid_xml_name(name: &str) -> bool {
+    let mut part_count = 0_u8;
+    let valid = name.split(':').all(|part| {
+        part_count = part_count.strict_add(1);
+        let mut bytes = part.bytes();
+        bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    });
+    valid && matches!(part_count, 1 | 2)
 }
 pub(super) fn extract_attr<'tag>(
     tag: &'tag str,

@@ -2,7 +2,7 @@ use super::{
     ArchiveFingerprint, CALC_CHAIN_PATH, CHANGE_LOG_SHEET_NAME, CanonicalStyleMap,
     MASTER_SHEET_NAME, PackagePart, SPREADSHEETML_NAMESPACE, SaveVerification, XLSX_PARTS,
     XlsxPartRole, ZipArchiveBuilder, ZipPackageReader,
-    xml::{XmlAttrScanner, XmlScanner, find_end_tag, find_tag_end},
+    xml::{XmlAttrScanner, XmlScanner, find_end_tag, find_tag_end, validate_xml_document},
     zip_archive::scan_open_archive,
 };
 use crate::diagnostic::{
@@ -806,6 +806,16 @@ impl XlsxContainer {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             source_permissions,
         };
+        for part in &container.parts {
+            if part.name == "docProps/thumbnail.emf" {
+                continue;
+            }
+            validate_text_part_len(part.name, part.bytes.len())?;
+            let xml = str::from_utf8(&part.bytes).map_err(|source| {
+                err_with_source(format!("xlsx part UTF-8 해석 실패: {}", part.name), source)
+            })?;
+            validate_xml_document(xml, part.name)?;
+        }
         container.validate_content_types()?;
         validate_relationship_set(
             container.text("_rels/.rels")?,
@@ -1101,6 +1111,7 @@ impl XlsxContainer {
     }
     pub(super) fn put_text(&mut self, name: &str, content: String) -> Result<()> {
         validate_text_part_len(name, content.len())?;
+        validate_xml_document(&content, name)?;
         let part = self.part_mut(name)?;
         part.bytes = content.into_bytes();
         Ok(())
