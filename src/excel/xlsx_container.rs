@@ -2,7 +2,7 @@ use super::{
     ArchiveFingerprint, CALC_CHAIN_PATH, CHANGE_LOG_SHEET_NAME, CanonicalStyleMap,
     MASTER_SHEET_NAME, PackagePart, SPREADSHEETML_NAMESPACE, SaveVerification, XLSX_PARTS,
     XlsxPartRole, ZipArchiveBuilder, ZipPackageReader,
-    xml::{XmlAttrScanner, XmlScanner, find_end_tag, find_tag_end},
+    xml::{XmlAttrScanner, XmlScanner, decode_xml_entities, find_end_tag, find_tag_end},
     zip_archive::scan_open_archive,
 };
 use crate::diagnostic::{
@@ -908,6 +908,12 @@ impl XlsxContainer {
                         err(format!("core.xml의 {qualified} 본문이 올바르지 않습니다."))
                     })?
             };
+            decode_xml_entities(body).map_err(|source| {
+                err_with_source(
+                    format!("core.xml의 {qualified} 본문이 올바르지 않습니다."),
+                    source,
+                )
+            })?;
             *slot = Some(body);
         }
         for ((qualified, opening, closing), body_value) in
