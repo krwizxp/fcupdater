@@ -14,6 +14,34 @@ cfg_select! {
         };
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const _: () = assert!(
+            size_of::<ByHandleFileInformation>() == 52,
+            "Windows BY_HANDLE_FILE_INFORMATION size mismatch"
+        );
+        #[repr(C)]
+        #[derive(Default)]
+        struct ByHandleFileInformation {
+            file_attributes: u32,
+            creation_time_low: u32,
+            creation_time_high: u32,
+            last_access_time_low: u32,
+            last_access_time_high: u32,
+            last_write_time_low: u32,
+            last_write_time_high: u32,
+            volume_serial_number: u32,
+            file_size_high: u32,
+            file_size_low: u32,
+            number_of_links: u32,
+            file_index_high: u32,
+            file_index_low: u32,
+        }
+        unsafe extern "system" {
+            #[link_name = "GetFileInformationByHandle"]
+            fn get_file_information_by_handle(
+                file: *mut c_void,
+                information: *mut ByHandleFileInformation,
+            ) -> i32;
+        }
     }
     any(target_os = "linux", target_os = "macos") => {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -24,37 +52,6 @@ cfg_select! {
 const OPEN_NOFOLLOW: i32 = 0x0002_0000;
 #[cfg(target_os = "macos")]
 const OPEN_NOFOLLOW: i32 = 0x0000_0100;
-#[cfg(target_os = "windows")]
-const _: () = assert!(
-    size_of::<ByHandleFileInformation>() == 52,
-    "Windows BY_HANDLE_FILE_INFORMATION size mismatch"
-);
-#[cfg(target_os = "windows")]
-#[repr(C)]
-#[derive(Default)]
-struct ByHandleFileInformation {
-    file_attributes: u32,
-    creation_time_low: u32,
-    creation_time_high: u32,
-    last_access_time_low: u32,
-    last_access_time_high: u32,
-    last_write_time_low: u32,
-    last_write_time_high: u32,
-    volume_serial_number: u32,
-    file_size_high: u32,
-    file_size_low: u32,
-    number_of_links: u32,
-    file_index_high: u32,
-    file_index_low: u32,
-}
-#[cfg(target_os = "windows")]
-unsafe extern "system" {
-    #[link_name = "GetFileInformationByHandle"]
-    fn get_file_information_by_handle(
-        file: *mut c_void,
-        information: *mut ByHandleFileInformation,
-    ) -> i32;
-}
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct FileIdentity {
     index: u64,

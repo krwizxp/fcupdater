@@ -1,7 +1,6 @@
 use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
-    RESPONSE_HEADER_CONTENT_LENGTH, RESPONSE_HEADER_SET_COOKIE, ResponseHeaders,
-    checked_http_buffer_len, download_error_with_source,
+    ResponseHeaders, checked_http_buffer_len, download_error_with_source,
 };
 use crate::diagnostic::AppError as DownloadError;
 use alloc::{borrow::Cow, string::String, vec::Vec};
@@ -55,6 +54,8 @@ const CURL_SSLVERSION_MAX_DEFAULT: c_long = 1 << 16;
 const CURL_SSLVERSION_TLSV1_2: c_long = 6;
 const HTTPS_SCHEME_PREFIX: &str = "https://";
 const HTTPS_PROTOCOL: &CStr = c"https";
+const RESPONSE_HEADER_CONTENT_LENGTH: &[u8] = b"Content-Length";
+const RESPONSE_HEADER_SET_COOKIE: &[u8] = b"Set-Cookie";
 static CURL_INIT: LazyLock<CurlCode> = LazyLock::new(|| {
     // SAFETY: LazyLock runs this initializer once before any easy handles are used.
     unsafe { sys::curl_global_init(CURL_GLOBAL_DEFAULT) }
@@ -559,7 +560,7 @@ fn nul_terminated_buffer<'buffer>(
     out.clear();
     if out.capacity() < capacity {
         out.try_reserve_exact(capacity).map_err(|source| {
-            download_error_with_source(format!("{label} 메모리 확보 실패"), source)
+            download_error_with_source("libcurl 문자열 메모리 확보 실패", source)
         })?;
     }
     for part in parts {

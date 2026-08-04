@@ -1,11 +1,13 @@
-use super::super::{PackagePart, ZipArchiveBuilder};
+use super::super::{MAX_XLSX_PART_BYTES, PackagePart, ZipArchiveBuilder};
 use super::{
     CENTRAL_DIRECTORY_HEADER_LEN, CENTRAL_DIRECTORY_SIGNATURE, END_OF_CENTRAL_DIRECTORY_LEN,
     END_OF_CENTRAL_DIRECTORY_SIGNATURE, EXCEL_ENTRY_FLAGS, LOCAL_FILE_HEADER_LEN,
     LOCAL_FILE_HEADER_SIGNATURE, METHOD_DEFLATE, VERSION_MADE_BY, VERSION_NEEDED,
-    ZIP_MAX_ARCHIVE_BYTES, ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES, deflate,
+    ZIP_MAX_ARCHIVE_BYTES, deflate,
 };
-use crate::diagnostic::{Result, err, err_with_source, path_context_message};
+use crate::diagnostic::{
+    Result, err, err_with_source, path_context_message, try_vec_with_capacity,
+};
 use core::mem;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::Permissions;
@@ -98,9 +100,9 @@ impl<'part> StreamingZipWriter<'part, '_> {
     }
     fn append_file(&mut self, part: &'part PackagePart) -> Result<WriteEntry<'part>> {
         let uncompressed_size = part.bytes.len();
-        if uncompressed_size > ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES {
+        if uncompressed_size > MAX_XLSX_PART_BYTES {
             return Err(err(format!(
-                "xlsx part 크기가 허용 한도({ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} bytes)를 초과했습니다: {} -> {}",
+                "xlsx part 크기가 허용 한도({MAX_XLSX_PART_BYTES} bytes)를 초과했습니다: {} -> {}",
                 self.archive_path.display(),
                 part.name
             )));
@@ -214,9 +216,6 @@ impl<'part> StreamingZipWriter<'part, '_> {
             .map_err(|source| err_with_source(context, source))
     }
     fn write(mut self, parts: &'part [PackagePart]) -> Result<()> {
-        self.entries
-            .try_reserve_exact(parts.len())
-            .map_err(|source| err_with_source("ZIP entry 목록 메모리 확보 실패", source))?;
         for part in parts {
             let entry = self.append_file(part)?;
             self.entries.push(entry);
@@ -257,11 +256,12 @@ impl<'part> StreamingZipWriter<'part, '_> {
 }
 impl ZipArchiveBuilder<'_, '_> {
     pub(in crate::excel) fn create(self) -> Result<()> {
+        let entries = try_vec_with_capacity(self.parts.len(), "ZIP entry 목록 메모리 확보 실패")?;
         StreamingZipWriter {
             archive_path: self.archive_path,
             bytes_written: 0,
             deflate_workspace: deflate::DeflateWorkspace::default(),
-            entries: Vec::new(),
+            entries,
             file: BufWriter::with_capacity(ZIP_OUTPUT_BUFFER_CAPACITY, self.file),
             header_buffer: Vec::new(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]

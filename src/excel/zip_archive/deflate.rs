@@ -4,59 +4,72 @@ use super::{
     HASH_SIZE, LENGTH_BASES, LENGTH_EXTRA_BITS, LITERAL_LENGTH_SYMBOLS, MAX_CHAIN, MAX_MATCH,
     MIN_MATCH, ZipResult, crc32_update, crc32_update_byte, read_u16, zip_static, zip_with_source,
 };
+use crate::diagnostic::try_vec_with_capacity;
 use alloc::collections::BinaryHeap;
 use core::{array::from_fn, cmp::Reverse, iter::repeat_n, mem, range::Range};
 use std::io::Write as IoWrite;
-#[cfg(target_arch = "x86_64")]
-macro_rules! matching_prefix_16 {
-    ($left:expr, $right:expr) => {{
-        use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
-        // SAFETY: The caller keeps the complete 16-byte candidate range inside the input slice.
-        let left_vector = unsafe { _mm_loadu_si128($left.cast()) };
-        // SAFETY: The caller keeps the complete 16-byte current range inside the input slice.
-        let right_vector = unsafe { _mm_loadu_si128($right.cast()) };
-        // SAFETY: SSE2 is part of the x86-64 baseline, and both operands are complete vectors.
-        let equal = unsafe { _mm_cmpeq_epi8(left_vector, right_vector) };
-        // SAFETY: SSE2 is part of the x86-64 baseline, and equal is a complete vector.
-        let mismatch_mask = !unsafe { _mm_movemask_epi8(equal) } & 0xffff_i32;
-        let [prefix, ..] = mismatch_mask.trailing_zeros().to_le_bytes();
-        usize::from(prefix).min(SIMD_MATCH_BYTES)
-    }};
-}
-#[cfg(target_arch = "aarch64")]
-macro_rules! matching_prefix_16 {
-    ($left:expr, $right:expr) => {{
-        use core::arch::aarch64::{vceqq_u8, vld1q_u8, vminvq_u8, vst1q_u8};
-        // SAFETY: The caller keeps the complete unaligned 16-byte candidate range inside the input slice.
-        let left_vector = unsafe { vld1q_u8($left) };
-        // SAFETY: The caller keeps the complete unaligned 16-byte current range inside the input slice.
-        let right_vector = unsafe { vld1q_u8($right) };
-        // SAFETY: Advanced SIMD is part of the AArch64 baseline, and both operands are complete vectors.
-        let equal = unsafe { vceqq_u8(left_vector, right_vector) };
-        // SAFETY: Advanced SIMD is part of the AArch64 baseline, and equal is a complete vector.
-        if unsafe { vminvq_u8(equal) } == u8::MAX {
-            SIMD_MATCH_BYTES
-        } else {
-            let mut lanes = [0_u8; SIMD_MATCH_BYTES];
-            // SAFETY: lanes owns exactly 16 writable bytes required by the NEON store.
-            unsafe { vst1q_u8(lanes.as_mut_ptr(), equal); }
-            lanes
-                .iter()
-                .position(|lane| *lane == 0)
-                .unwrap_or(SIMD_MATCH_BYTES)
+cfg_select! {
+    target_arch = "x86_64" => {
+        macro_rules! matching_prefix_16 {
+            ($left:expr, $right:expr) => {{
+                use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+                // SAFETY: The caller keeps the complete 16-byte candidate range inside the input slice.
+                let left_vector = unsafe { _mm_loadu_si128($left.cast()) };
+                // SAFETY: The caller keeps the complete 16-byte current range inside the input slice.
+                let right_vector = unsafe { _mm_loadu_si128($right.cast()) };
+                // SAFETY: SSE2 is part of the x86-64 baseline, and both operands are complete vectors.
+                let equal = unsafe { _mm_cmpeq_epi8(left_vector, right_vector) };
+                // SAFETY: SSE2 is part of the x86-64 baseline, and equal is a complete vector.
+                let mismatch_mask = !unsafe { _mm_movemask_epi8(equal) } & 0xffff_i32;
+                let [prefix, ..] = mismatch_mask.trailing_zeros().to_le_bytes();
+                usize::from(prefix).min(SIMD_MATCH_BYTES)
+            }};
         }
-    }};
+    }
+    target_arch = "aarch64" => {
+        macro_rules! matching_prefix_16 {
+            ($left:expr, $right:expr) => {{
+                use core::arch::aarch64::{vceqq_u8, vld1q_u8, vminvq_u8, vst1q_u8};
+                // SAFETY: The caller keeps the complete unaligned 16-byte candidate range inside the input slice.
+                let left_vector = unsafe { vld1q_u8($left) };
+                // SAFETY: The caller keeps the complete unaligned 16-byte current range inside the input slice.
+                let right_vector = unsafe { vld1q_u8($right) };
+                // SAFETY: Advanced SIMD is part of the AArch64 baseline, and both operands are complete vectors.
+                let equal = unsafe { vceqq_u8(left_vector, right_vector) };
+                // SAFETY: Advanced SIMD is part of the AArch64 baseline, and equal is a complete vector.
+                if unsafe { vminvq_u8(equal) } == u8::MAX {
+                    SIMD_MATCH_BYTES
+                } else {
+                    let mut lanes = [0_u8; SIMD_MATCH_BYTES];
+                    // SAFETY: lanes owns exactly 16 writable bytes required by the NEON store.
+                    unsafe { vst1q_u8(lanes.as_mut_ptr(), equal); }
+                    lanes
+                        .iter()
+                        .position(|lane| *lane == 0)
+                        .unwrap_or(SIMD_MATCH_BYTES)
+                }
+            }};
+        }
+    }
+    _ => {
+        compile_error!("DEFLATE SIMD matching supports only x86-64 and AArch64.");
+    }
 }
 const TOO_FAR_MATCH_DISTANCE: usize = 4096;
 const CALC_CHAIN_BLOCK_BYTES: usize = 96 * 1024;
+const DECODE_MAX_SYMBOLS: usize = FIXED_LITERAL_SYMBOLS;
+const DECODE_ROOT_BITS: u8 = 9;
+const DECODE_ROOT_SIZE: usize = 1 << DECODE_ROOT_BITS;
 const DEFLATE_SEARCH_WORK_LIMIT: usize = 512 * 1024 * 1024;
 const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
 const DEFLATE_TOKEN_RESERVE_CHUNK: usize = 64 * 1024;
 const DEFLATE_WINDOW_LEN: usize = 0x8000;
 const EXCEL_FLUSH_BLOCK_COUNT: u8 = 2;
+const FINAL_BLOCK_BOUNDARY_COUNT: usize = 1;
 const SHARED_STRINGS_BLOCK_BYTES: usize = 76 * 1024;
 const SIMD_MATCH_BYTES: usize = 16;
 const WORKSHEET_BLOCK_BYTES: usize = 144 * 1024;
+const WORKSHEET_TRAILING_BOUNDARY_COUNT: usize = 2;
 const XML_NICE_MATCH_LEN: usize = 128;
 struct BitReader<'bytes> {
     bit_buffer: u32,
@@ -79,17 +92,18 @@ struct BitWriter<'writer> {
     len: usize,
     writer: &'writer mut dyn IoWrite,
 }
-struct Huffman {
-    code_ranges: [(usize, usize); DEFLATE_MAX_BITS + 1],
-    codes: Vec<HuffmanCode>,
+struct DecodeHuffman {
+    counts: [u16; DEFLATE_MAX_BITS + 1],
+    first_codes: [u16; DEFLATE_MAX_BITS + 1],
+    first_symbols: [u16; DEFLATE_MAX_BITS + 1],
+    root: [DecodeEntry; DECODE_ROOT_SIZE],
+    symbols: [u16; DECODE_MAX_SYMBOLS],
 }
+#[derive(Clone, Copy)]
+struct DecodeEntry(u16);
 struct WriteHuffman {
     codes: Vec<u16>,
     lengths: Vec<u8>,
-}
-struct HuffmanCode {
-    code: u16,
-    symbol: u16,
 }
 #[derive(Clone, Copy)]
 enum DeflateToken {
@@ -162,8 +176,8 @@ struct DynamicFrequencies {
     literal: [u32; LITERAL_LENGTH_SYMBOLS],
 }
 struct DynamicTrees {
-    distance: Option<Huffman>,
-    literal: Huffman,
+    distance: Option<DecodeHuffman>,
+    literal: DecodeHuffman,
 }
 #[derive(Clone, Copy)]
 struct DeflateSymbol {
@@ -175,26 +189,37 @@ struct HuffmanLengthBuilder<'frequencies> {
     frequencies: &'frequencies [u32],
     max_bits: u8,
 }
+impl DecodeEntry {
+    const EMPTY: Self = Self(0);
+    const fn bit_len(self) -> u8 {
+        self.0.to_le_bytes()[1] >> 1
+    }
+    const fn is_direct(self) -> bool {
+        self.0 != 0
+    }
+    const fn symbol(self) -> u16 {
+        self.0 & 0x01ff
+    }
+}
 impl BitReader<'_> {
     const fn align_to_byte(&mut self) {
         self.bit_buffer = 0;
         self.bit_count = 0;
     }
-    fn read_bits(&mut self, count: u8) -> ZipResult<u16> {
-        while self.bit_count < count {
-            let Some(&byte) = self.bytes.get(self.cursor) else {
-                return Err(zip_static("deflate bitstream이 예기치 않게 끝났습니다."));
-            };
-            self.bit_buffer |= u32::from(byte) << u32::from(self.bit_count);
-            self.cursor = self.cursor.strict_add(1);
-            self.bit_count = self.bit_count.strict_add(8);
+    fn consume_bits(&mut self, count: u8) -> ZipResult<()> {
+        if count > self.bit_count {
+            return Err(zip_static("deflate bit buffer 소비 범위 오류"));
         }
-        let mask = 1_u32.strict_shl(u32::from(count)).strict_sub(1);
-        let value = self.bit_buffer & mask;
         self.bit_buffer >>= u32::from(count);
         self.bit_count = self.bit_count.strict_sub(count);
-        let [low, high, _, _] = value.to_le_bytes();
-        Ok(u16::from_le_bytes([low, high]))
+        Ok(())
+    }
+    fn read_bits(&mut self, count: u8) -> ZipResult<u16> {
+        let value = self
+            .try_peek_bits(count)
+            .ok_or_else(|| zip_static("deflate bitstream이 예기치 않게 끝났습니다."))?;
+        self.consume_bits(count)?;
+        Ok(value)
     }
     fn read_stored_bytes(&mut self, len: usize) -> ZipResult<&[u8]> {
         self.align_to_byte();
@@ -207,6 +232,18 @@ impl BitReader<'_> {
         };
         self.cursor = end;
         Ok(bytes)
+    }
+    fn try_peek_bits(&mut self, count: u8) -> Option<u16> {
+        while self.bit_count < count {
+            let &byte = self.bytes.get(self.cursor)?;
+            self.bit_buffer |= u32::from(byte) << u32::from(self.bit_count);
+            self.cursor = self.cursor.strict_add(1);
+            self.bit_count = self.bit_count.strict_add(8);
+        }
+        let mask = 1_u32.strict_shl(u32::from(count)).strict_sub(1);
+        let value = self.bit_buffer & mask;
+        let [low, high, _, _] = value.to_le_bytes();
+        Some(u16::from_le_bytes([low, high]))
     }
 }
 impl BitCounter {
@@ -290,87 +327,122 @@ impl BitWriter<'_> {
         Ok(())
     }
 }
-impl Huffman {
+impl DecodeHuffman {
     fn decode(&self, reader: &mut BitReader<'_>) -> ZipResult<u16> {
-        let mut code = 0_u16;
-        for bit_len in 1_u8..=DEFLATE_MAX_BITS_U8 {
-            let bit = reader.read_bits(1)?;
-            let shift = u32::from(bit_len.strict_sub(1));
-            code |= bit << shift;
-            let Some(&(start, end)) = self.code_ranges.get(usize::from(bit_len)) else {
-                return Err(zip_static("deflate Huffman code 범위 오류"));
-            };
-            let Some(candidates) = self.codes.get(start..end) else {
-                return Err(zip_static("deflate Huffman code table 범위 오류"));
-            };
-            for candidate in candidates {
-                if candidate.code == code {
-                    return Ok(candidate.symbol);
-                }
+        if let Some(prefix) = reader.try_peek_bits(DECODE_ROOT_BITS) {
+            let entry = self
+                .root
+                .get(usize::from(prefix))
+                .copied()
+                .ok_or_else(|| zip_static("deflate root decode table 범위 오류"))?;
+            if entry.is_direct() {
+                reader.consume_bits(entry.bit_len())?;
+                return Ok(entry.symbol());
             }
+        }
+        let mut code = 0_u16;
+        for ((&count, &first_code), &first_symbol) in self
+            .counts
+            .iter()
+            .zip(self.first_codes.iter())
+            .zip(self.first_symbols.iter())
+            .skip(1)
+        {
+            code = code.strict_shl(1) | reader.read_bits(1)?;
+            let Some(offset) = code.checked_sub(first_code) else {
+                continue;
+            };
+            if offset >= count {
+                continue;
+            }
+            let symbol_index = usize::from(first_symbol.strict_add(offset));
+            return self
+                .symbols
+                .get(symbol_index)
+                .copied()
+                .ok_or_else(|| zip_static("deflate canonical symbol 범위 오류"));
         }
         Err(zip_static("deflate Huffman code를 해석하지 못했습니다."))
     }
     fn from_lengths(lengths: &[u8]) -> ZipResult<Option<Self>> {
-        let Some(mut next_code) = canonical_next_codes(lengths)? else {
+        if lengths.len() > DECODE_MAX_SYMBOLS {
+            return Err(zip_static("deflate decode symbol 수가 너무 많습니다."));
+        }
+        let mut counts = [0_u16; DEFLATE_MAX_BITS + 1];
+        let Some(mut next_codes) = canonical_next_codes(lengths, &mut counts)? else {
             return Ok(None);
         };
-        let mut codes = Vec::new();
-        codes
-            .try_reserve_exact(lengths.len())
-            .map_err(|source| zip_with_source("deflate Huffman code 메모리 확보 실패", source))?;
-        let mut code_ranges = [(0_usize, 0_usize); DEFLATE_MAX_BITS + 1];
-        for len in 1_u8..=DEFLATE_MAX_BITS_U8 {
-            let start = codes.len();
-            for (symbol, &symbol_len) in lengths.iter().enumerate() {
-                if symbol_len != len {
+        let first_codes = next_codes;
+        let mut first_symbols = [0_u16; DEFLATE_MAX_BITS + 1];
+        let mut symbol_count = 0_u16;
+        for (first_symbol, count) in first_symbols.iter_mut().zip(counts).skip(1) {
+            *first_symbol = symbol_count;
+            symbol_count = symbol_count.strict_add(count);
+        }
+        let mut root = [DecodeEntry::EMPTY; DECODE_ROOT_SIZE];
+        let mut symbols = [0_u16; DECODE_MAX_SYMBOLS];
+        let mut symbol_slots = symbols.iter_mut();
+        for (bit_len, next_code) in (1_u8..=DEFLATE_MAX_BITS_U8).zip(next_codes.iter_mut().skip(1))
+        {
+            for (symbol_u16, &symbol_len) in (0_u16..).zip(lengths) {
+                if symbol_len != bit_len {
                     continue;
                 }
-                let Some(next_slot) = next_code.get_mut(usize::from(len)) else {
-                    return Err(zip_static("deflate Huffman next code 범위 오류"));
-                };
-                let assigned = *next_slot;
-                let code_limit = 1_u16
-                    .checked_shl(u32::from(len))
-                    .ok_or_else(|| zip_static("deflate Huffman code 범위 계산 실패"))?;
+                let assigned = *next_code;
+                let code_limit = 1_u16.strict_shl(u32::from(bit_len));
                 if assigned >= code_limit {
                     return Err(zip_static("deflate Huffman code가 과포화되었습니다."));
                 }
-                *next_slot = next_slot.strict_add(1);
-                let symbol_u16 = u16::try_from(symbol)
-                    .map_err(|source| zip_with_source("deflate symbol 변환 실패", source))?;
-                codes.push(HuffmanCode {
-                    code: reverse_low_bits(assigned, len),
-                    symbol: symbol_u16,
-                });
+                *next_code = next_code.strict_add(1);
+                let symbol_slot = symbol_slots
+                    .next()
+                    .ok_or_else(|| zip_static("deflate decode symbol table 범위 오류"))?;
+                *symbol_slot = symbol_u16;
+                if bit_len > DECODE_ROOT_BITS {
+                    continue;
+                }
+                let suffix_bits = DECODE_ROOT_BITS.strict_sub(bit_len);
+                let repetitions = 1_usize.strict_shl(u32::from(suffix_bits));
+                let base = usize::from(reverse_low_bits(assigned, bit_len));
+                let entry = DecodeEntry(
+                    symbol_u16 | u16::from(bit_len).strict_shl(u32::from(DECODE_ROOT_BITS)),
+                );
+                for suffix in 0..repetitions {
+                    let index = base | suffix.strict_shl(u32::from(bit_len));
+                    let root_slot = root
+                        .get_mut(index)
+                        .ok_or_else(|| zip_static("deflate root decode table 생성 범위 오류"))?;
+                    if root_slot.is_direct() {
+                        return Err(zip_static("deflate root decode code가 충돌합니다."));
+                    }
+                    *root_slot = entry;
+                }
             }
-            let Some(range) = code_ranges.get_mut(usize::from(len)) else {
-                return Err(zip_static("deflate Huffman code range 범위 오류"));
-            };
-            *range = (start, codes.len());
         }
-        Ok(Some(Self { code_ranges, codes }))
+        Ok(Some(Self {
+            counts,
+            first_codes,
+            first_symbols,
+            root,
+            symbols,
+        }))
     }
 }
 impl WriteHuffman {
     fn from_lengths(lengths: Vec<u8>) -> ZipResult<Self> {
-        let Some(mut next_code) = canonical_next_codes(&lengths)? else {
+        let mut length_counts = [0_u16; DEFLATE_MAX_BITS + 1];
+        let Some(mut next_code) = canonical_next_codes(&lengths, &mut length_counts)? else {
             return Err(zip_static("deflate 출력 Huffman code가 비어 있습니다."));
         };
-        let mut codes = Vec::new();
-        codes.try_reserve_exact(lengths.len()).map_err(|source| {
-            zip_with_source("deflate 출력 Huffman code 메모리 확보 실패", source)
-        })?;
+        let mut codes =
+            try_vec_with_capacity(lengths.len(), "deflate 출력 Huffman code 메모리 확보 실패")?;
         codes.resize(lengths.len(), 0_u16);
-        for (symbol, &len) in lengths.iter().enumerate() {
+        for (code_slot, &len) in codes.iter_mut().zip(&lengths) {
             if len == 0 {
                 continue;
             }
             let Some(next_slot) = next_code.get_mut(usize::from(len)) else {
                 return Err(zip_static("deflate 출력 Huffman code 범위 오류"));
-            };
-            let Some(code_slot) = codes.get_mut(symbol) else {
-                return Err(zip_static("deflate 출력 Huffman symbol 범위 오류"));
             };
             *code_slot = reverse_low_bits(*next_slot, len);
             *next_slot = next_slot.strict_add(1);
@@ -462,15 +534,12 @@ impl InflateState<'_> {
             let [length, _] = self.reader.read_bits(3)?.to_le_bytes();
             *slot = length;
         }
-        let code_tree = Huffman::from_lengths(&code_lengths)?
+        let code_tree = DecodeHuffman::from_lengths(&code_lengths)?
             .ok_or_else(|| zip_static("deflate code length tree가 비어 있습니다."))?;
         let total = literal_count
             .checked_add(distance_count)
             .ok_or_else(|| zip_static("deflate code length 총합 계산 실패"))?;
-        let mut lengths = Vec::new();
-        lengths
-            .try_reserve_exact(total)
-            .map_err(|source| zip_with_source("deflate code length 메모리 확보 실패", source))?;
+        let mut lengths = try_vec_with_capacity(total, "deflate code length 메모리 확보 실패")?;
         while lengths.len() < total {
             let symbol = code_tree.decode(&mut self.reader)?;
             match symbol {
@@ -504,15 +573,15 @@ impl InflateState<'_> {
         else {
             return Err(zip_static("deflate literal/distance length 범위 오류"));
         };
-        let literal = Huffman::from_lengths(literal_lengths)?
+        let literal = DecodeHuffman::from_lengths(literal_lengths)?
             .ok_or_else(|| zip_static("deflate literal Huffman tree가 비어 있습니다."))?;
-        let distance = Huffman::from_lengths(distance_lengths)?;
+        let distance = DecodeHuffman::from_lengths(distance_lengths)?;
         Ok(DynamicTrees { distance, literal })
     }
     fn inflate_compressed_block(
         &mut self,
-        literal_tree: &Huffman,
-        distance_tree: Option<&Huffman>,
+        literal_tree: &DecodeHuffman,
+        distance_tree: Option<&DecodeHuffman>,
     ) -> ZipResult<()> {
         loop {
             let symbol = literal_tree.decode(&mut self.reader)?;
@@ -560,10 +629,7 @@ impl InflateState<'_> {
 }
 impl DeflateInflater<'_> {
     pub(super) fn inflate(self) -> ZipResult<(Vec<u8>, u32)> {
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(self.expected_len)
-            .map_err(|source| zip_with_source("deflate 출력 메모리 확보 실패", source))?;
+        let output = try_vec_with_capacity(self.expected_len, "deflate 출력 메모리 확보 실패")?;
         let mut state = InflateState {
             crc32: u32::MAX,
             expected_len: self.expected_len,
@@ -593,9 +659,9 @@ impl DeflateInflater<'_> {
                                 _ => 0,
                             });
                         let distance_lengths = [5_u8; FIXED_DISTANCE_SYMBOLS];
-                        let literal = Huffman::from_lengths(&literal_lengths)?
+                        let literal = DecodeHuffman::from_lengths(&literal_lengths)?
                             .ok_or_else(|| zip_static("fixed literal Huffman tree 생성 실패"))?;
-                        let distance = Huffman::from_lengths(&distance_lengths)?
+                        let distance = DecodeHuffman::from_lengths(&distance_lengths)?
                             .ok_or_else(|| zip_static("fixed distance Huffman tree 생성 실패"))?;
                         let trees = DynamicTrees {
                             distance: Some(distance),
@@ -698,12 +764,10 @@ impl DynamicFrequencies {
         let Some(distance_prefix) = distance_lengths.get(..distance_count) else {
             return Err(zip_static("deflate distance length 범위 오류"));
         };
-        let mut code_length_tokens = Vec::new();
-        code_length_tokens
-            .try_reserve_exact(literal_count.strict_add(distance_count))
-            .map_err(|source| {
-                zip_with_source("deflate code length token 메모리 확보 실패", source)
-            })?;
+        let mut code_length_tokens = try_vec_with_capacity(
+            literal_count.strict_add(distance_count),
+            "deflate code length token 메모리 확보 실패",
+        )?;
         let mut lengths = literal_prefix
             .iter()
             .chain(distance_prefix)
@@ -880,10 +944,10 @@ impl DynamicDeflatePlan {
 }
 impl HuffmanLengthBuilder<'_> {
     fn build(&self) -> ZipResult<Vec<u8>> {
-        let mut lengths = Vec::new();
-        lengths
-            .try_reserve_exact(self.frequencies.len())
-            .map_err(|source| zip_with_source("deflate Huffman length 메모리 확보 실패", source))?;
+        let mut lengths = try_vec_with_capacity(
+            self.frequencies.len(),
+            "deflate Huffman length 메모리 확보 실패",
+        )?;
         lengths.resize(self.frequencies.len(), 0_u8);
         let mut leaf_lengths = self.leaf_lengths()?;
         if leaf_lengths.len() == 1 {
@@ -944,21 +1008,19 @@ impl HuffmanLengthBuilder<'_> {
         Ok(lengths)
     }
     fn leaf_lengths(&self) -> ZipResult<Vec<HuffmanLeafLength>> {
-        let mut nodes = Vec::new();
-        let mut leaves = Vec::new();
-        let mut active = BinaryHeap::new();
         let node_capacity = self
             .frequencies
             .len()
             .checked_mul(2)
             .and_then(|len| len.checked_sub(1))
             .ok_or_else(|| zip_static("deflate Huffman node 용량 계산 실패"))?;
-        nodes
-            .try_reserve_exact(node_capacity)
-            .map_err(|source| zip_with_source("deflate Huffman node 메모리 확보 실패", source))?;
-        leaves
-            .try_reserve_exact(self.frequencies.len())
-            .map_err(|source| zip_with_source("deflate Huffman leaf 메모리 확보 실패", source))?;
+        let mut nodes =
+            try_vec_with_capacity(node_capacity, "deflate Huffman node 메모리 확보 실패")?;
+        let mut leaves = try_vec_with_capacity(
+            self.frequencies.len(),
+            "deflate Huffman leaf 메모리 확보 실패",
+        )?;
+        let mut active = BinaryHeap::new();
         active
             .try_reserve_exact(self.frequencies.len())
             .map_err(|source| {
@@ -1037,10 +1099,10 @@ impl HuffmanLengthBuilder<'_> {
         longest_len: usize,
     ) -> ZipResult<Vec<usize>> {
         let max_bit_count = usize::from(self.max_bits);
-        let mut length_counts = Vec::new();
-        length_counts
-            .try_reserve_exact(longest_len.strict_add(1))
-            .map_err(|source| zip_with_source("deflate length count 메모리 확보 실패", source))?;
+        let mut length_counts = try_vec_with_capacity(
+            longest_len.strict_add(1),
+            "deflate length count 메모리 확보 실패",
+        )?;
         length_counts.resize(longest_len.strict_add(1), 0_usize);
         for leaf in leaf_lengths {
             let count = length_counts
@@ -1245,10 +1307,10 @@ impl DeflateWriter<'_, '_> {
         })
     }
     pub(super) fn plan(&mut self, part_name: &str) -> ZipResult<Option<DeflatePlan>> {
-        let mut boundaries = Vec::new();
-        boundaries
-            .try_reserve(16)
-            .map_err(|source| zip_with_source("deflate block 경계 메모리 확보 실패", source))?;
+        let mut boundaries = try_vec_with_capacity(
+            FINAL_BLOCK_BOUNDARY_COUNT,
+            "deflate block 경계 메모리 확보 실패",
+        )?;
         if matches!(
             part_name,
             "xl/worksheets/sheet1.xml" | "xl/worksheets/sheet2.xml"
@@ -1284,6 +1346,7 @@ impl DeflateWriter<'_, '_> {
                 open_start,
                 close_end,
                 WORKSHEET_BLOCK_BYTES,
+                WORKSHEET_TRAILING_BOUNDARY_COUNT,
             )?;
             boundaries.push(DeflateOutputBoundary {
                 empty_stored_after: EXCEL_FLUSH_BLOCK_COUNT,
@@ -1296,7 +1359,13 @@ impl DeflateWriter<'_, '_> {
                 _ => None,
             };
             if let Some(chunk_bytes) = part_chunk_bytes {
-                push_chunk_boundaries(&mut boundaries, 0, self.bytes.len(), chunk_bytes)?;
+                push_chunk_boundaries(
+                    &mut boundaries,
+                    0,
+                    self.bytes.len(),
+                    chunk_bytes,
+                    FINAL_BLOCK_BOUNDARY_COUNT,
+                )?;
             }
         }
         boundaries.push(DeflateOutputBoundary {
@@ -1306,10 +1375,8 @@ impl DeflateWriter<'_, '_> {
         let Some((tokens, crc32)) = self.tokens(&boundaries)? else {
             return Ok(None);
         };
-        let mut blocks = Vec::<DeflateBlockPlan>::new();
-        blocks
-            .try_reserve_exact(boundaries.len())
-            .map_err(|source| zip_with_source("deflate block plan 메모리 확보 실패", source))?;
+        let mut blocks: Vec<DeflateBlockPlan> =
+            try_vec_with_capacity(boundaries.len(), "deflate block plan 메모리 확보 실패")?;
         let mut output_len = 0_usize;
         let mut token_end = 0_usize;
         let mut token_start = 0_usize;
@@ -1525,8 +1592,10 @@ impl DeflateWriter<'_, '_> {
         Ok(Some((tokens, !crc32)))
     }
 }
-fn canonical_next_codes(lengths: &[u8]) -> ZipResult<Option<[u16; DEFLATE_MAX_BITS + 1]>> {
-    let mut length_counts = [0_u16; DEFLATE_MAX_BITS + 1];
+fn canonical_next_codes(
+    lengths: &[u8],
+    length_counts: &mut [u16; DEFLATE_MAX_BITS + 1],
+) -> ZipResult<Option<[u16; DEFLATE_MAX_BITS + 1]>> {
     for &length in lengths {
         if length == 0 {
             continue;
@@ -1541,18 +1610,11 @@ fn canonical_next_codes(lengths: &[u8]) -> ZipResult<Option<[u16; DEFLATE_MAX_BI
     }
     let mut next_codes = [0_u16; DEFLATE_MAX_BITS + 1];
     let mut code = 0_u16;
-    for bits in 1..=DEFLATE_MAX_BITS {
-        let previous = bits.strict_sub(1);
-        let Some(&previous_count) = length_counts.get(previous) else {
-            return Err(zip_static("deflate Huffman count 범위 오류"));
-        };
+    for (next_code, &previous_count) in next_codes.iter_mut().skip(1).zip(length_counts.iter()) {
         code = code
             .checked_add(previous_count)
             .and_then(|sum| sum.checked_mul(2))
             .ok_or_else(|| zip_static("deflate Huffman canonical code가 범위를 초과했습니다."))?;
-        let Some(next_code) = next_codes.get_mut(bits) else {
-            return Err(zip_static("deflate Huffman next code 범위 오류"));
-        };
         *next_code = code;
     }
     Ok(Some(next_codes))
@@ -1619,7 +1681,18 @@ fn push_chunk_boundaries(
     start: usize,
     end: usize,
     chunk_bytes: usize,
+    trailing_boundaries: usize,
 ) -> ZipResult<()> {
+    let span = end
+        .checked_sub(start)
+        .ok_or_else(|| zip_static("deflate chunk 범위 순서가 올바르지 않습니다."))?;
+    let additional_capacity = span
+        .saturating_sub(1)
+        .div_euclid(chunk_bytes)
+        .strict_add(trailing_boundaries);
+    boundaries
+        .try_reserve_exact(additional_capacity)
+        .map_err(|source| zip_with_source("deflate block 경계 메모리 확보 실패", source))?;
     let mut next = start
         .checked_add(chunk_bytes)
         .ok_or_else(|| zip_static("deflate chunk 경계 계산 실패"))?;

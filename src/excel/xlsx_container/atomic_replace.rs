@@ -18,6 +18,7 @@ cfg_select! {
 }
 cfg_select! {
     target_os = "windows" => {
+        const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn ReplaceFileW(
@@ -31,6 +32,8 @@ cfg_select! {
         }
     }
     target_os = "linux" => {
+        const AT_FDCWD: c_int = -100;
+        const RENAME_EXCHANGE: c_uint = 2;
         unsafe extern "C" {
             fn renameat2(
                 old_dir_fd: c_int,
@@ -42,6 +45,7 @@ cfg_select! {
         }
     }
     target_os = "macos" => {
+        const RENAME_SWAP: c_uint = 2;
         unsafe extern "C" {
             fn renamex_np(
                 old_path: *const c_char,
@@ -52,14 +56,6 @@ cfg_select! {
     }
     _ => {}
 }
-#[cfg(target_os = "windows")]
-const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
-#[cfg(target_os = "linux")]
-const AT_FDCWD: c_int = -100;
-#[cfg(target_os = "linux")]
-const RENAME_EXCHANGE: c_uint = 2;
-#[cfg(target_os = "macos")]
-const RENAME_SWAP: c_uint = 2;
 #[derive(Debug)]
 pub(super) struct ReplaceFailure {
     replace: io::Error,
@@ -167,15 +163,10 @@ cfg_select! {
         }
         pub(super) fn replace_files(
             target: &Path,
-            replacement: &Path,
-            backup: &Path,
-            rollback: bool,
+            incoming: &Path,
+            backup_output: &Path,
+            restore_on_move_failure: &Path,
         ) -> Result<(), ReplaceFilesError> {
-            let (incoming, backup_output) = if rollback {
-                (backup, replacement)
-            } else {
-                (replacement, backup)
-            };
             let target_wide = path_to_wide(target)
                 .map_err(ReplaceFailure::new)
                 .map_err(ReplaceFilesError::Failed)?;
@@ -204,8 +195,7 @@ cfg_select! {
             if replace.raw_os_error() != Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
                 return Err(ReplaceFilesError::Failed(ReplaceFailure::new(replace)));
             }
-            let restore_from = if rollback { incoming } else { backup_output };
-            match fs::rename(restore_from, target) {
+            match fs::rename(restore_on_move_failure, target) {
                 Ok(()) => Err(ReplaceFilesError::Restored(ReplaceFailure::new(replace))),
                 Err(restore) => Err(ReplaceFilesError::RecoveryRequired(ReplaceFailure {
                     replace,
@@ -215,7 +205,7 @@ cfg_select! {
         }
     }
     any(target_os = "linux", target_os = "macos") => {
-        pub(super) fn replace_files(
+        pub(super) fn exchange_files(
             target: &Path,
             replacement: &Path,
         ) -> Result<(), ReplaceFilesError> {
@@ -225,25 +215,25 @@ cfg_select! {
             let replacement_c = path_to_c_string(replacement)
                 .map_err(ReplaceFailure::new)
                 .map_err(ReplaceFilesError::Failed)?;
-            #[cfg(target_os = "linux")]
-            let status = {
-                // SAFETY: both paths are valid NUL-terminated byte strings and AT_FDCWD selects
-                // the current process path resolution context.
-                unsafe {
-                    renameat2(
-                        AT_FDCWD,
-                        target_c.as_ptr(),
-                        AT_FDCWD,
-                        replacement_c.as_ptr(),
-                        RENAME_EXCHANGE,
-                    )
+            let status = cfg_select! {
+                target_os = "linux" => {
+                    // SAFETY: both paths are valid NUL-terminated byte strings and AT_FDCWD selects
+                    // the current process path resolution context.
+                    unsafe {
+                        renameat2(
+                            AT_FDCWD,
+                            target_c.as_ptr(),
+                            AT_FDCWD,
+                            replacement_c.as_ptr(),
+                            RENAME_EXCHANGE,
+                        )
+                    }
                 }
-            };
-            #[cfg(target_os = "macos")]
-            let status = {
-                // SAFETY: both paths are valid NUL-terminated byte strings and RENAME_SWAP
-                // requests an atomic exchange of two existing paths.
-                unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP) }
+                target_os = "macos" => {
+                    // SAFETY: both paths are valid NUL-terminated byte strings and RENAME_SWAP
+                    // requests an atomic exchange of two existing paths.
+                    unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP) }
+                }
             };
             if status == 0_i32 {
                 Ok(())

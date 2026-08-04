@@ -1,5 +1,5 @@
 pub(super) use self::source_reader::{FuelValues, SourceReader, SourceRecord};
-use crate::diagnostic::{Result, err_with_source};
+use crate::diagnostic::{Result, try_string_with_capacity};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::Permissions;
 use std::{fs::File, path::Path};
@@ -15,6 +15,7 @@ pub(super) const CHANGE_LOG_SHEET_PATH: &str = "xl/worksheets/sheet2.xml";
 pub(super) const MASTER_SHEET_NAME: &str = "유류비";
 pub(super) const MASTER_SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
 pub(super) const CALC_CHAIN_PATH: &str = "xl/calcChain.xml";
+pub(super) const MAX_XLSX_PART_BYTES: usize = 64 * 1024 * 1024;
 const XLSX_PARTS: [(&str, XlsxPartRole); 16] = [
     ("[Content_Types].xml", XlsxPartRole::Required),
     ("_rels/.rels", XlsxPartRole::Required),
@@ -79,10 +80,8 @@ struct ZipPackageReader<'path> {
     archive_file: File,
     archive_path: &'path Path,
 }
-fn copy_text(text: &str, context: &str) -> Result<String> {
-    let mut out = String::new();
-    out.try_reserve_exact(text.len())
-        .map_err(|source| err_with_source(format!("{context} 메모리 확보 실패"), source))?;
+fn copy_text(text: &str) -> Result<String> {
+    let mut out = try_string_with_capacity(text.len(), "텍스트 복사 메모리 확보 실패")?;
     out.push_str(text);
     Ok(out)
 }

@@ -4,7 +4,7 @@ use super::{
     NETFUNNEL_ENTRY_ACTION_ID, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
     OIL_PRICE_DOWNLOAD_TAR_URL, OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH,
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
-    download_error_with_source,
+    download_error_with_source, try_string_with_capacity,
 };
 use crate::diagnostic::append_fmt;
 use core::{mem, time::Duration};
@@ -103,17 +103,9 @@ impl CookieJar {
             .try_reserve(1)
             .map_err(|source| download_error_with_source("Cookie 목록 메모리 확보 실패", source))?;
         let mut cookie = Cookie {
-            name: String::new(),
-            value: String::new(),
+            name: try_string_with_capacity(name.len(), "Cookie 이름 메모리 확보 실패")?,
+            value: try_string_with_capacity(value.len(), "Cookie 값 메모리 확보 실패")?,
         };
-        cookie
-            .name
-            .try_reserve_exact(name.len())
-            .map_err(|source| download_error_with_source("Cookie 이름 메모리 확보 실패", source))?;
-        cookie
-            .value
-            .try_reserve_exact(value.len())
-            .map_err(|source| download_error_with_source("Cookie 값 메모리 확보 실패", source))?;
         cookie.name.push_str(name);
         cookie.value.push_str(value);
         self.cookies.push(cookie);

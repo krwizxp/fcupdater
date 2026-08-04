@@ -89,6 +89,20 @@ pub(super) fn err_with_source(
 ) -> AppError {
     AppError::context(context, source)
 }
+pub(super) fn try_string_with_capacity(capacity: usize, context: &'static str) -> Result<String> {
+    let mut value = String::new();
+    value
+        .try_reserve_exact(capacity)
+        .map_err(|source| err_with_source(context, source))?;
+    Ok(value)
+}
+pub(super) fn try_vec_with_capacity<T>(capacity: usize, context: &'static str) -> Result<Vec<T>> {
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(capacity)
+        .map_err(|source| err_with_source(context, source))?;
+    Ok(value)
+}
 pub(super) fn path_context_message(label: &str, path: &Path) -> String {
     format!("{label}: {}", path.display())
 }

@@ -1,6 +1,6 @@
 use super::CellReference;
-use crate::diagnostic::{Result, err, err_with_source};
-use core::{fmt::Write as _, str};
+use crate::diagnostic::{Result, append_fmt, err, err_with_source};
+use core::str;
 const COL_NAME_BUF_LEN: usize = 8;
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
 pub(super) const MAX_A1_COL: u32 = 0x4000;
@@ -16,18 +16,10 @@ fn col_name_text(mut col: u32, buffer: &mut [u8; COL_NAME_BUF_LEN]) -> Result<&s
     }
     let mut index = buffer.len();
     while col > 0 {
-        let base = col
-            .checked_sub(1)
-            .ok_or_else(|| err("Excel column 변환 중 underflow가 발생했습니다."))?;
-        let rem = u8::try_from(base.rem_euclid(26))
-            .map_err(|source| err_with_source("Excel column 나머지 변환 실패", source))?;
-        let letter = b'A'
-            .checked_add(rem)
-            .ok_or_else(|| err("Excel column 문자 계산 실패"))?;
-        let next_index = index
-            .checked_sub(1)
-            .ok_or_else(|| err("Excel column buffer index 계산 실패"))?;
-        index = next_index;
+        let base = col.strict_sub(1);
+        let [rem, ..] = base.rem_euclid(26).to_le_bytes();
+        let letter = b'A'.strict_add(rem);
+        index = index.strict_sub(1);
         let slot = buffer
             .get_mut(index)
             .ok_or_else(|| err("Excel column buffer 범위가 손상되었습니다."))?;
@@ -125,8 +117,8 @@ fn push_ref_with_locks(output: &mut String, reference: CellReference) -> Result<
     if reference.row_locked {
         output.push('$');
     }
-    write!(output, "{}", reference.row)
-        .map_err(|source| err_with_source("Excel cell reference 출력 실패", source))
+    append_fmt(output, format_args!("{}", reference.row));
+    Ok(())
 }
 pub(super) fn with_unlocked_ref_parts<R>(
     col: u32,

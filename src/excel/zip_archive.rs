@@ -1,7 +1,10 @@
-use super::{ArchiveFingerprint, PackagePart, XLSX_PARTS, XlsxPartRole, ZipPackageReader};
+use super::{
+    ArchiveFingerprint, MAX_XLSX_PART_BYTES, PackagePart, XLSX_PARTS, XlsxPartRole,
+    ZipPackageReader,
+};
 use crate::diagnostic::{
     AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
-    err_with_source as zip_with_source, path_context_message,
+    err_with_source as zip_with_source, path_context_message, try_vec_with_capacity,
 };
 use core::str;
 use std::{fs::File, io::Read as _, path::Path};
@@ -62,7 +65,6 @@ const ZIP_DATA_RANGE_MESSAGE: &str = "ZIP entry 데이터가 파일 범위를 �
 const ZIP_EOCD_HEADER_RANGE: &str = "ZIP EOCD header 범위 오류";
 const ZIP_FINGERPRINT_BUFFER_BYTES: usize = 64 * 1024;
 const ZIP_MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
-const ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 const LENGTH_BASES: [usize; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
@@ -99,7 +101,7 @@ const _: () = assert!(
     "deflate match bounds must be ordered"
 );
 const _: () = assert!(
-    ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES >= ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
+    ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES >= MAX_XLSX_PART_BYTES,
     "ZIP total limit must cover at least one entry"
 );
 struct ZipEntry<'zip> {
@@ -265,10 +267,8 @@ impl ZipEntry<'_> {
                     "ZIP stored entry의 압축/해제 크기가 다릅니다",
                 ));
             }
-            let mut output = Vec::new();
-            output
-                .try_reserve_exact(expected_len)
-                .map_err(|source| err_with_source("ZIP stored entry 메모리 확보 실패", source))?;
+            let mut output =
+                try_vec_with_capacity(expected_len, "ZIP stored entry 메모리 확보 실패")?;
             output.extend_from_slice(compressed);
             let crc = !crc32_update(u32::MAX, &output)?;
             (output, crc)
@@ -443,10 +443,8 @@ impl ZipPackageReader<'_> {
             remaining_entries: entry_count,
         };
         let mut total_uncompressed = 0_usize;
-        let mut entries: Vec<(ZipEntry<'_>, &'static str, usize)> = Vec::new();
-        entries
-            .try_reserve_exact(entry_count)
-            .map_err(|source| err_with_source("ZIP entry 목록 메모리 확보 실패", source))?;
+        let mut entries: Vec<(ZipEntry<'_>, &'static str, usize)> =
+            try_vec_with_capacity(entry_count, "ZIP entry 목록 메모리 확보 실패")?;
         for _ in 0..entry_count {
             let entry = central_directory
                 .next_entry()?
@@ -463,12 +461,7 @@ impl ZipPackageReader<'_> {
             }
             let expected_len = usize::try_from(entry.uncompressed_size)
                 .map_err(|source| err_with_source("ZIP 해제 크기 변환 실패", source))?;
-            ensure_zip_size_limit(
-                "entry 해제",
-                expected_len,
-                ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
-                entry.name,
-            )?;
+            ensure_zip_size_limit("entry 해제", expected_len, MAX_XLSX_PART_BYTES, entry.name)?;
             total_uncompressed = total_uncompressed
                 .checked_add(expected_len)
                 .ok_or_else(|| zip_static("ZIP 전체 해제 크기 계산 실패"))?;
@@ -492,10 +485,8 @@ impl ZipPackageReader<'_> {
         }
         entries.sort_unstable_by_key(|item| item.0.local_header_offset);
         let mut expected_local_offset = 0_usize;
-        let mut parts: Vec<PackagePart> = Vec::new();
-        parts
-            .try_reserve_exact(entry_count)
-            .map_err(|source| err_with_source("ZIP package part 목록 메모리 확보 실패", source))?;
+        let mut parts: Vec<PackagePart> =
+            try_vec_with_capacity(entry_count, "ZIP package part 목록 메모리 확보 실패")?;
         for (entry, name, expected_len) in entries {
             let (bytes, local_end) = entry.data(
                 archive_bytes.as_slice(),

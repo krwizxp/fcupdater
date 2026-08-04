@@ -1,5 +1,5 @@
 use crate::{
-    diagnostic::{Result, append_fmt, err, err_with_source},
+    diagnostic::{Result, append_fmt, err, try_string_with_capacity},
     excel::{
         FuelValues, SourceRecord,
         writer::{SharedStringTable, Worksheet},
@@ -132,7 +132,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         {
             if self
                 .worksheet
-                .row_has_any_data(row, &cols, self.shared_string_table.values())?
+                .row_has_any_data(row, &cols, self.shared_string_table)?
             {
                 last_row = Some(row);
                 break;
@@ -188,15 +188,12 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         self.shared_string_table
             .set_cell(self.worksheet, 1, 2, &date_text)?;
         let old_data_rows = self.clear_existing_rows()?;
-        self.write_entries(CHANGELOG_STYLE_TEMPLATE_ROW, old_data_rows)?;
+        self.write_entries(old_data_rows)?;
         self.worksheet.update_dimension()?;
         Ok(())
     }
-    fn write_entries(
-        &mut self,
-        style_template_row: u32,
-        old_data_rows: RangeInclusive<u32>,
-    ) -> Result<()> {
+    fn write_entries(&mut self, old_data_rows: RangeInclusive<u32>) -> Result<()> {
+        let style_template_row = CHANGELOG_STYLE_TEMPLATE_ROW;
         let entry_count = self
             .changes
             .len()
@@ -230,17 +227,15 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             reason: "폐업",
             region: &item.region,
         });
-        let mut formula_buffer = String::new();
         let formula_capacity = ROW_DECIMAL_TEXT_MAX_LEN
             .strict_mul(4)
             .strict_add("IF(OR(E=\"\",F=\"\"),\"\",F-E)".len());
-        formula_buffer
-            .try_reserve_exact(formula_capacity)
-            .map_err(|source| err_with_source("변경내역 delta formula 메모리 확보 실패", source))?;
-        let mut cache_buffer = String::new();
-        cache_buffer
-            .try_reserve_exact(ROW_DECIMAL_TEXT_MAX_LEN)
-            .map_err(|source| err_with_source("변경내역 delta cache 메모리 확보 실패", source))?;
+        let mut formula_buffer =
+            try_string_with_capacity(formula_capacity, "변경내역 delta formula 메모리 확보 실패")?;
+        let mut cache_buffer = try_string_with_capacity(
+            ROW_DECIMAL_TEXT_MAX_LEN,
+            "변경내역 delta cache 메모리 확보 실패",
+        )?;
         let worksheet = &mut *self.worksheet;
         for (index, values) in change_entries
             .chain(added_entries)

@@ -1,5 +1,5 @@
 use super::copy_text;
-use crate::diagnostic::{AppError, Result, err, err_with_source};
+use crate::diagnostic::{AppError, Result, err, err_with_source, try_vec_with_capacity};
 use core::{fmt::Display, range::Range};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
@@ -89,10 +89,10 @@ impl StationService {
 impl SourceRecordRef<'_> {
     pub(crate) fn into_owned_with_region(self, region: &'static str) -> Result<SourceRecord> {
         Ok(SourceRecord {
-            address: copy_text(self.address, "소스 주소")?,
-            brand: copy_text(self.brand, "소스 브랜드")?,
+            address: copy_text(self.address)?,
+            brand: copy_text(self.brand)?,
             fuels: self.fuels,
-            name: copy_text(self.name, "소스 상호명")?,
+            name: copy_text(self.name)?,
             region,
             service: self.service,
         })
@@ -113,32 +113,23 @@ struct BiffSharedStrings {
     values: Vec<String>,
 }
 struct BiffWorkbookReader<'workbook>(&'workbook [u8]);
-struct CfbDataParser<'data>(&'data [u8]);
-pub(crate) struct SourceReader {
-    pub data: Vec<u8>,
-}
+pub(crate) struct SourceReader(Vec<u8>);
 type SourceRow<'strings> = [Option<&'strings str>; SOURCE_COLUMN_COUNT];
 struct SstChunkReader<'chunks, 'chunk> {
     chunk_index: usize,
     chunks: &'chunks [&'chunk [u8]],
     offset_in_chunk: usize,
 }
-impl CfbDataParser<'_> {
+impl SourceReader {
     fn build_fat_table(&self, fat_sector_ids: &[u32]) -> Result<Vec<u32>> {
         let entries_per_sector = CFB_SECTOR_SIZE.div_euclid(4);
         let total_entries = fat_sector_ids.len().strict_mul(entries_per_sector);
-        let mut fat: Vec<u32> = Vec::new();
-        fat.try_reserve_exact(total_entries).map_err(|source| {
-            err_with_source(
-                format!("CFB FAT 메모리 확보 실패: {total_entries} entries"),
-                source,
-            )
-        })?;
+        let mut fat = try_vec_with_capacity(total_entries, "CFB FAT 메모리 확보 실패")?;
         for &sid in fat_sector_ids {
             let sector_idx = sector_id_to_index(sid, || {
                 prefixed_display_message("CFB sector id 변환 실패: ", sid)
             })?;
-            let sector = get_sector_slice_at_index(self.0, sector_idx, sid)?;
+            let sector = get_sector_slice_at_index(&self.0, sector_idx, sid)?;
             let (chunks, &[]) = sector.as_chunks::<4>() else {
                 return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
             };
@@ -234,8 +225,13 @@ impl CfbDataParser<'_> {
         })
     }
     fn read_workbook_stream(&self, header: CfbHeader, fat: &[u32]) -> Result<Vec<u8>> {
-        let dir_stream =
-            read_stream_from_fat_chain(self.0, fat, header.first_dir_sector, None, "CFB 디렉터리")?;
+        let dir_stream = read_stream_from_fat_chain(
+            &self.0,
+            fat,
+            header.first_dir_sector,
+            None,
+            "CFB 디렉터리",
+        )?;
         let (chunks, &[]) = dir_stream.as_chunks::<128>() else {
             return Err(err("CFB 디렉터리 stream 길이가 128바이트 단위가 아닙니다."));
         };
@@ -315,12 +311,10 @@ impl CfbDataParser<'_> {
                 "Opinet 고정 소스에서 예상하지 않은 mini stream입니다: Workbook",
             ));
         }
-        read_stream_from_fat_chain(self.0, fat, start_sector, Some(stream_size), "Workbook")
+        read_stream_from_fat_chain(&self.0, fat, start_sector, Some(stream_size), "Workbook")
     }
-}
-impl SourceReader {
-    fn open(self) -> Result<Vec<u8>> {
-        let parser = CfbDataParser(&self.data);
+    fn read_xls_workbook(self) -> Result<Vec<u8>> {
+        let parser = self;
         let header = parser.parse_cfb_header()?;
         let max_sector_count = parser
             .0
@@ -344,10 +338,8 @@ impl SourceReader {
                 "CFB FAT 엔트리 개수가 header DIFAT 용량을 초과했습니다: {declared_fat_sectors}"
             )));
         }
-        let mut difat_entries = Vec::new();
-        difat_entries
-            .try_reserve_exact(declared_fat_sectors)
-            .map_err(|source| err_with_source("CFB DIFAT 목록 메모리 확보 실패", source))?;
+        let mut difat_entries =
+            try_vec_with_capacity(declared_fat_sectors, "CFB DIFAT 목록 메모리 확보 실패")?;
         for chunk in difat_chunks {
             let sector_id = u32::from_le_bytes(*chunk);
             if !is_regular_sector_id(sector_id) {
@@ -373,11 +365,11 @@ impl SourceReader {
         let fat = parser.build_fat_table(&difat_entries)?;
         parser.read_workbook_stream(header, &fat)
     }
-    pub(crate) fn visit_xls_source(
+    pub(crate) fn visit_rows(
         self,
         mut visitor: impl FnMut(SourceRecordRef<'_>) -> Result<()>,
     ) -> Result<Result<()>> {
-        let workbook = self.open()?;
+        let workbook = self.read_xls_workbook()?;
         let biff = BiffWorkbookReader(&workbook);
         let (sheet_offset, shared_strings) = biff.parse_globals()?;
         biff.visit_worksheet(
@@ -386,6 +378,11 @@ impl SourceReader {
             &shared_strings.values,
             &mut visitor,
         )
+    }
+}
+impl From<Vec<u8>> for SourceReader {
+    fn from(data: Vec<u8>) -> Self {
+        Self(data)
     }
 }
 impl SstChunkReader<'_, '_> {
@@ -482,12 +479,7 @@ impl SstChunkReader<'_, '_> {
             let required_capacity = out.len().strict_add(additional_capacity);
             if out.capacity() < required_capacity {
                 out.try_reserve_exact(additional_capacity)
-                    .map_err(|source| {
-                        err_with_source(
-                            format!("SST 문자열 메모리 확보 실패: {required_capacity} bytes"),
-                            source,
-                        )
-                    })?;
+                    .map_err(|source| err_with_source("SST 문자열 메모리 확보 실패", source))?;
             }
             if high_byte {
                 let (chunks, &[]) = bytes.as_chunks::<2>() else {
@@ -563,10 +555,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         first_chunk: &'workbook [u8],
         first_chunk_end: usize,
     ) -> Result<(Vec<&'workbook [u8]>, usize)> {
-        let mut chunks: Vec<&[u8]> = Vec::new();
-        chunks.try_reserve_exact(8).map_err(|source| {
-            err_with_source("xls SST chunk 목록 메모리 확보 실패: 8 entries", source)
-        })?;
+        let mut chunks =
+            try_vec_with_capacity(8, "xls SST chunk 목록 메모리 확보 실패: 8 entries")?;
         chunks.push(first_chunk);
         let mut records = BiffRecordReader {
             context: "SST Continue",
@@ -717,13 +707,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 max_unique_count,
             )));
         }
-        let mut out: Vec<String> = Vec::new();
-        out.try_reserve_exact(unique_count).map_err(|source| {
-            err_with_source(
-                format!("SST 문자열 테이블 메모리 확보 실패: {unique_count} entries"),
-                source,
-            )
-        })?;
+        let mut out = try_vec_with_capacity(unique_count, "SST 문자열 테이블 메모리 확보 실패")?;
         for _ in 0..unique_count {
             let char_count = usize::from(reader.read_u16()?);
             let flags = reader.read_u8()?;
@@ -1131,9 +1115,10 @@ fn read_stream_from_fat_chain(
                 .map_err(|source| err_with_source("FAT stream 길이 변환 실패", source))
         })
         .transpose()?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(remaining.unwrap_or(CFB_SECTOR_SIZE))
-        .map_err(|source| err_with_source("FAT stream 메모리 확보 실패", source))?;
+    let mut out = try_vec_with_capacity(
+        remaining.unwrap_or(CFB_SECTOR_SIZE),
+        "FAT stream 메모리 확보 실패",
+    )?;
     let mut sid = start_sector;
     let mut traversed = 0_usize;
     while sid != CFB_END_OF_CHAIN {

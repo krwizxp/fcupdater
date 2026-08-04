@@ -1,4 +1,7 @@
-use crate::diagnostic::{Result as DownloadResult, err_with_source as download_error_with_source};
+use crate::diagnostic::{
+    Result as DownloadResult, err_with_source as download_error_with_source,
+    try_string_with_capacity,
+};
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
         use self::libcurl::Client as PlatformHttpClient;
@@ -16,10 +19,6 @@ mod http_client;
 const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
 const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const RESPONSE_HEADER_CONTENT_LENGTH: &[u8] = b"Content-Length";
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const RESPONSE_HEADER_SET_COOKIE: &[u8] = b"Set-Cookie";
 const OLE2_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const _: () = assert!(
     OLE2_SIGNATURE.len() <= HTTP_ERROR_PREVIEW_BYTES,
@@ -109,10 +108,8 @@ impl ResponseHeaders {
         self.set_cookies.try_reserve(1).map_err(|source| {
             download_error_with_source("HTTP Set-Cookie 목록 메모리 확보 실패", source)
         })?;
-        let mut owned = String::new();
-        owned.try_reserve_exact(value.len()).map_err(|source| {
-            download_error_with_source("HTTP Set-Cookie 값 메모리 확보 실패", source)
-        })?;
+        let mut owned =
+            try_string_with_capacity(value.len(), "HTTP Set-Cookie 값 메모리 확보 실패")?;
         owned.push_str(value);
         self.set_cookies.push(owned);
         Ok(())

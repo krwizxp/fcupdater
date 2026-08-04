@@ -1,4 +1,4 @@
-use crate::diagnostic::{Result, err, err_with_source};
+use crate::diagnostic::{Result, err, err_with_source, try_string_with_capacity};
 use alloc::borrow::Cow;
 use core::{iter, range::Range};
 pub(super) struct XmlTag<'xml> {
@@ -9,6 +9,12 @@ pub(super) struct XmlTag<'xml> {
     pub raw: &'xml str,
     pub self_closing: bool,
     pub start: usize,
+}
+pub(super) struct XmlElement<'xml> {
+    pub body: &'xml str,
+    pub body_span: Range<usize>,
+    pub opening: XmlTag<'xml>,
+    pub span: Range<usize>,
 }
 pub(super) struct XmlScanner<'xml> {
     cursor: usize,
@@ -24,6 +30,69 @@ impl XmlScanner<'_> {
     }
 }
 impl<'xml> XmlScanner<'xml> {
+    fn find_tag_end(&self, tag_start: usize) -> Option<usize> {
+        let tail = self.xml.get(tag_start..)?;
+        if tail.starts_with("<!--") {
+            return find_delimited_markup_end(self.xml, tag_start, 4, "-->");
+        }
+        if tail.starts_with("<![CDATA[") {
+            return find_delimited_markup_end(self.xml, tag_start, 9, "]]>");
+        }
+        if tail.starts_with("<?") {
+            return find_delimited_markup_end(self.xml, tag_start, 2, "?>");
+        }
+        if !tail.starts_with('<') {
+            return None;
+        }
+        let is_declaration = tail.starts_with("<!");
+        let bytes = self.xml.as_bytes();
+        let mut cursor = if is_declaration {
+            tag_start.checked_add(2)?
+        } else {
+            tag_start
+        };
+        let mut in_comment = false;
+        let mut quote = None;
+        let mut subset_depth = 0_usize;
+        while let Some(&byte) = bytes.get(cursor) {
+            if in_comment {
+                if bytes
+                    .get(cursor..)
+                    .is_some_and(|remaining| remaining.starts_with(b"-->"))
+                {
+                    in_comment = false;
+                    cursor = cursor.checked_add(3)?;
+                } else {
+                    cursor = checked_offset_add(cursor, 1)?;
+                }
+                continue;
+            }
+            if is_declaration
+                && quote.is_none()
+                && bytes
+                    .get(cursor..)
+                    .is_some_and(|remaining| remaining.starts_with(b"<!--"))
+            {
+                in_comment = true;
+                cursor = cursor.checked_add(4)?;
+                continue;
+            }
+            match quote {
+                Some(active_quote) if byte == active_quote => quote = None,
+                None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+                None if is_declaration && byte == b'[' => {
+                    subset_depth = subset_depth.checked_add(1)?;
+                }
+                None if is_declaration && byte == b']' && subset_depth != 0 => {
+                    subset_depth = subset_depth.checked_sub(1)?;
+                }
+                None if byte == b'>' && subset_depth == 0 => return Some(cursor),
+                Some(_) | None => {}
+            }
+            cursor = checked_offset_add(cursor, 1)?;
+        }
+        None
+    }
     fn find_tag_matching<F>(&mut self, predicate: F) -> Option<XmlTag<'xml>>
     where
         F: FnMut(&XmlTag<'xml>) -> bool,
@@ -36,6 +105,51 @@ impl<'xml> XmlScanner<'xml> {
     pub(super) const fn new(xml: &'xml str) -> Self {
         Self { cursor: 0, xml }
     }
+    pub(super) fn next_element_named(
+        &mut self,
+        tag_name: &str,
+    ) -> Result<Option<XmlElement<'xml>>> {
+        let Some(opening) = self.next_start_named(tag_name) else {
+            return Ok(None);
+        };
+        let body_start = checked_offset_add(opening.end, 1)
+            .ok_or_else(|| err(format!("XML <{tag_name}> 본문 시작 계산에 실패했습니다.")))?;
+        let (body_end, end) = if opening.self_closing {
+            (body_start, body_start)
+        } else {
+            let wanted = local_tag_name(tag_name);
+            let closing = XmlScanner::from(self.xml, body_start)
+                .find_tag_matching(|tag| tag.local_name == wanted)
+                .ok_or_else(|| err(format!("XML </{tag_name}> 종료 태그를 찾지 못했습니다.")))?;
+            if closing.is_start {
+                return Err(err(format!(
+                    "XML <{tag_name}> 요소는 같은 이름으로 중첩될 수 없습니다."
+                )));
+            }
+            let end = checked_offset_add(closing.end, 1)
+                .ok_or_else(|| err(format!("XML </{tag_name}> 끝 계산에 실패했습니다.")))?;
+            (closing.start, end)
+        };
+        let body_span = Range {
+            start: body_start,
+            end: body_end,
+        };
+        let body = self
+            .xml
+            .get(body_span)
+            .ok_or_else(|| err(format!("XML <{tag_name}> 본문 범위가 손상되었습니다.")))?;
+        let span = Range {
+            start: opening.start,
+            end,
+        };
+        self.skip_to(end);
+        Ok(Some(XmlElement {
+            body,
+            body_span,
+            opening,
+            span,
+        }))
+    }
     pub(super) fn next_start_named(&mut self, tag_name: &str) -> Option<XmlTag<'xml>> {
         let wanted = local_tag_name(tag_name);
         self.find_tag_matching(|tag| tag.is_start && tag.local_name == wanted)
@@ -43,7 +157,7 @@ impl<'xml> XmlScanner<'xml> {
     pub(super) fn next_tag(&mut self) -> Option<XmlTag<'xml>> {
         while let Some(rel) = self.xml.get(self.cursor..)?.find('<') {
             let start = checked_offset_add(self.cursor, rel)?;
-            let end = find_tag_end(self.xml, start)?;
+            let end = self.find_tag_end(start)?;
             self.cursor = checked_offset_add(end, 1)?;
             let inner_start = checked_offset_add(start, 1)?;
             let mut name_start = inner_start;
@@ -208,75 +322,6 @@ pub(super) fn find_start_tag(xml: &str, tag_name: &str, from: usize) -> Option<u
         .next_start_named(tag_name)
         .map(|tag| tag.start)
 }
-pub(super) fn find_end_tag(xml: &str, tag_name: &str, from: usize) -> Option<usize> {
-    let wanted = local_tag_name(tag_name);
-    XmlScanner::from(xml, from)
-        .find_tag_matching(|tag| !tag.is_start && tag.local_name == wanted)
-        .map(|tag| tag.start)
-}
-pub(super) fn find_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
-    let tail = xml.get(tag_start..)?;
-    if tail.starts_with("<!--") {
-        return find_delimited_markup_end(xml, tag_start, 4, "-->");
-    }
-    if tail.starts_with("<![CDATA[") {
-        return find_delimited_markup_end(xml, tag_start, 9, "]]>");
-    }
-    if tail.starts_with("<?") {
-        return find_delimited_markup_end(xml, tag_start, 2, "?>");
-    }
-    if !tail.starts_with('<') {
-        return None;
-    }
-    let is_declaration = tail.starts_with("<!");
-    let bytes = xml.as_bytes();
-    let mut cursor = if is_declaration {
-        tag_start.checked_add(2)?
-    } else {
-        tag_start
-    };
-    let mut in_comment = false;
-    let mut quote = None;
-    let mut subset_depth = 0_usize;
-    while let Some(&byte) = bytes.get(cursor) {
-        if in_comment {
-            if bytes
-                .get(cursor..)
-                .is_some_and(|remaining| remaining.starts_with(b"-->"))
-            {
-                in_comment = false;
-                cursor = cursor.checked_add(3)?;
-            } else {
-                cursor = checked_offset_add(cursor, 1)?;
-            }
-            continue;
-        }
-        if is_declaration
-            && quote.is_none()
-            && bytes
-                .get(cursor..)
-                .is_some_and(|remaining| remaining.starts_with(b"<!--"))
-        {
-            in_comment = true;
-            cursor = cursor.checked_add(4)?;
-            continue;
-        }
-        match quote {
-            Some(active_quote) if byte == active_quote => quote = None,
-            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
-            None if is_declaration && byte == b'[' => {
-                subset_depth = subset_depth.checked_add(1)?;
-            }
-            None if is_declaration && byte == b']' && subset_depth != 0 => {
-                subset_depth = subset_depth.checked_sub(1)?;
-            }
-            None if byte == b'>' && subset_depth == 0 => return Some(cursor),
-            Some(_) | None => {}
-        }
-        cursor = checked_offset_add(cursor, 1)?;
-    }
-    None
-}
 fn find_delimited_markup_end(
     xml: &str,
     tag_start: usize,
@@ -297,35 +342,15 @@ fn find_delimited_markup_end(
         .checked_add(terminator.len())?
         .checked_sub(1)
 }
-fn element_body_and_close_start<'xml>(
-    xml: &'xml str,
-    tag_name: &str,
-    open_end: usize,
-) -> Result<(&'xml str, usize)> {
-    let body_start = checked_offset_add(open_end, 1)
-        .ok_or_else(|| err(format!("XML <{tag_name}> 본문 시작 계산에 실패했습니다.")))?;
-    let body_end = find_end_tag(xml, tag_name, body_start)
-        .ok_or_else(|| err(format!("XML </{tag_name}> 종료 태그를 찾지 못했습니다.")))?;
-    let body = xml
-        .get(Range {
-            start: body_start,
-            end: body_end,
-        })
-        .ok_or_else(|| err(format!("XML <{tag_name}> 본문 범위가 손상되었습니다.")))?;
-    Ok((body, body_end))
-}
 pub(super) fn extract_first_tag_text<'xml>(
     xml: &'xml str,
     tag_name: &str,
 ) -> Result<Option<&'xml str>> {
     let mut scanner = XmlScanner::new(xml);
-    let Some(tag) = scanner.next_start_named(tag_name) else {
+    let Some(element) = scanner.next_element_named(tag_name)? else {
         return Ok(None);
     };
-    if tag.self_closing {
-        return Ok(Some(""));
-    }
-    element_body_and_close_start(xml, tag_name, tag.end).map(|(body, _)| Some(body))
+    Ok(Some(element.body))
 }
 pub(super) fn extract_all_tag_text<'xml>(
     xml: &'xml str,
@@ -335,13 +360,12 @@ pub(super) fn extract_all_tag_text<'xml>(
     let mut first_text: Option<Cow<'xml, str>> = None;
     let mut out: Option<String> = None;
     let mut saw_text_tag = false;
-    while let Some(tag) = scanner.next_start_named(tag_name) {
+    while let Some(element) = scanner.next_element_named(tag_name)? {
         saw_text_tag = true;
-        if tag.self_closing {
+        if element.opening.self_closing {
             continue;
         }
-        let (body, body_end) = element_body_and_close_start(xml, tag_name, tag.end)?;
-        let decoded = decode_xml_entities(body)?;
+        let decoded = decode_xml_entities(element.body)?;
         if !decoded.is_empty() {
             if let Some(out_text) = out.as_mut() {
                 let next_len = out_text
@@ -353,7 +377,7 @@ pub(super) fn extract_all_tag_text<'xml>(
                         .checked_sub(out_text.len())
                         .ok_or_else(|| err(format!("XML <{tag_name}> text 용량 계산 실패")))?;
                     out_text.try_reserve_exact(additional).map_err(|source| {
-                        err_with_source(format!("XML <{tag_name}> text 메모리 확보 실패"), source)
+                        err_with_source("XML tag text 메모리 확보 실패", source)
                     })?;
                 }
                 out_text.push_str(decoded.as_ref());
@@ -362,10 +386,8 @@ pub(super) fn extract_all_tag_text<'xml>(
                     .len()
                     .checked_add(decoded.len())
                     .ok_or_else(|| err(format!("XML <{tag_name}> text 용량 계산 실패")))?;
-                let mut out_text = String::new();
-                out_text.try_reserve_exact(capacity).map_err(|source| {
-                    err_with_source(format!("XML <{tag_name}> text 메모리 확보 실패"), source)
-                })?;
+                let mut out_text =
+                    try_string_with_capacity(capacity, "XML tag text 메모리 확보 실패")?;
                 out_text.push_str(previous.as_ref());
                 out_text.push_str(decoded.as_ref());
                 out = Some(out_text);
@@ -373,11 +395,6 @@ pub(super) fn extract_all_tag_text<'xml>(
                 first_text = Some(decoded);
             }
         }
-        let close_end = find_tag_end(xml, body_end)
-            .ok_or_else(|| err(format!("XML </{tag_name}> 태그가 손상되었습니다.")))?;
-        let next_cursor = checked_offset_add(close_end, 1)
-            .ok_or_else(|| err(format!("XML 다음 <{tag_name}> cursor 계산에 실패했습니다.")))?;
-        scanner.skip_to(next_cursor);
     }
     Ok(out
         .map(Cow::Owned)
@@ -457,10 +474,8 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
             let out_text = if let Some(out_text) = out.as_mut() {
                 out_text
             } else {
-                let mut out_text = String::new();
-                out_text.try_reserve_exact(text.len()).map_err(|source| {
-                    err_with_source("XML entity decode 메모리 확보 실패", source)
-                })?;
+                let out_text =
+                    try_string_with_capacity(text.len(), "XML entity decode 메모리 확보 실패")?;
                 out.insert(out_text)
             };
             out_text.push_str(
