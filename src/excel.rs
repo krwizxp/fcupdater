@@ -27,7 +27,7 @@ const XLSX_PARTS: [(&str, XlsxPartRole); 16] = [
     ("xl/styles.xml", XlsxPartRole::Required),
     ("xl/sharedStrings.xml", XlsxPartRole::Required),
     ("docProps/thumbnail.emf", XlsxPartRole::OptionalInput),
-    (CALC_CHAIN_PATH, XlsxPartRole::OptionalInput),
+    (CALC_CHAIN_PATH, XlsxPartRole::InputOnly),
     ("docProps/core.xml", XlsxPartRole::Required),
     ("docProps/app.xml", XlsxPartRole::Required),
     ("docProps/custom.xml", XlsxPartRole::InputOnly),

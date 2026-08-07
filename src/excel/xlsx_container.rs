@@ -53,7 +53,7 @@ const EXCEL_CONTENT_TYPE_DEFAULTS: [(&str, &str); 3] = [
     ),
     ("xml", "application/xml"),
 ];
-const EXCEL_CONTENT_TYPE_OVERRIDES: [(&str, &str); 9] = [
+const EXCEL_CONTENT_TYPE_OVERRIDES: [(&str, &str); 8] = [
     (WORKBOOK_PART_NAME, WORKBOOK_CONTENT_TYPE),
     (
         "/xl/worksheets/sheet1.xml",
@@ -74,10 +74,6 @@ const EXCEL_CONTENT_TYPE_OVERRIDES: [(&str, &str); 9] = [
     (
         "/xl/sharedStrings.xml",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
-    ),
-    (
-        "/xl/calcChain.xml",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml",
     ),
     (
         "/docProps/core.xml",
@@ -129,7 +125,7 @@ const INPUT_ROOT_RELATIONSHIPS: [(&str, &str, Option<&str>); 5] = [
         Some("docProps/custom.xml"),
     ),
 ];
-const EXCEL_WORKBOOK_RELATIONSHIPS: [(&str, &str, &str); 6] = [
+const EXCEL_WORKBOOK_RELATIONSHIPS: [(&str, &str, &str); 5] = [
     (
         "rId3",
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
@@ -137,11 +133,6 @@ const EXCEL_WORKBOOK_RELATIONSHIPS: [(&str, &str, &str); 6] = [
     ),
     ("rId2", WORKSHEET_REL_TYPE, "worksheets/sheet2.xml"),
     ("rId1", WORKSHEET_REL_TYPE, "worksheets/sheet1.xml"),
-    (
-        "rId6",
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain",
-        "calcChain.xml",
-    ),
     (
         "rId5",
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
@@ -182,7 +173,11 @@ const ADDITIONAL_INPUT_CONTENT_TYPE_DEFAULTS: [(&str, &str); 3] = [
     ("jpeg", "image/jpeg"),
     ("png", "image/png"),
 ];
-const ADDITIONAL_INPUT_CONTENT_TYPE_OVERRIDES: [(&str, &str); 2] = [
+const ADDITIONAL_INPUT_CONTENT_TYPE_OVERRIDES: [(&str, &str); 3] = [
+    (
+        "/xl/calcChain.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml",
+    ),
     (
         "/docProps/custom.xml",
         "application/vnd.openxmlformats-officedocument.custom-properties+xml",
@@ -630,10 +625,7 @@ impl TempArchivePromotion<'_> {
     }
 }
 impl XlsxContainer {
-    pub(super) fn ensure_fixed_sheet_catalog(
-        &mut self,
-        workbook_xml: &mut String,
-    ) -> Result<Option<String>> {
+    pub(super) fn ensure_fixed_sheet_catalog(&mut self, workbook_xml: &mut String) -> Result<()> {
         replace_single_self_closing_tag(
             workbook_xml,
             "loext:extCalcPr",
@@ -683,7 +675,7 @@ impl XlsxContainer {
                 return Err(err(message));
             }
         }
-        let calc_chain_xml = self.take_workbook_dependencies(workbook_xml)?;
+        self.take_workbook_dependencies(workbook_xml)?;
         replace_single_self_closing_tag(
             workbook_xml,
             "fileVersion",
@@ -784,7 +776,7 @@ impl XlsxContainer {
             master_sheet_span,
             "<sheet name=\"유류비\" sheetId=\"1\" r:id=\"rId1\"/>",
         );
-        Ok(calc_chain_xml)
+        Ok(())
     }
     pub(crate) fn from_validated_file(
         source_file: ValidatedFile,
@@ -823,8 +815,11 @@ impl XlsxContainer {
         self.parts.iter().any(|part| part.name == name)
     }
     pub(super) fn package_prepare_excel_output(&mut self) -> Result<CanonicalStyleMap> {
-        let source_xfs = cell_xf_entries(self.text("xl/styles.xml")?)?;
+        let source_styles = self.text("xl/styles.xml")?;
+        let source_xfs = cell_xf_entries(source_styles)?;
+        let source_fonts = font_entries(source_styles)?;
         let excel_xfs = cell_xf_entries(EXCEL_STYLES_XML)?;
+        let excel_fonts = font_entries(EXCEL_STYLES_XML)?;
         let libreoffice_xfs = cell_xf_entries(LIBREOFFICE_CELL_XFS_XML)?;
         if libreoffice_xfs.len() != LIBREOFFICE_STYLE_MAP.len() {
             return Err(err(
@@ -834,12 +829,16 @@ impl XlsxContainer {
         let mut entries =
             try_vec_with_capacity(source_xfs.len(), "입력 style mapping 메모리 확보 실패")?;
         for source_xf in source_xfs {
-            let canonical = match find_equivalent_xf(source_xf, &excel_xfs)? {
+            let canonical = match find_equivalent_xf(
+                source_xf,
+                &excel_xfs,
+                Some((&source_fonts, &excel_fonts)),
+            )? {
                 Some(index) => Some(
                     u32::try_from(index)
                         .map_err(|error| err_with_source("Excel style index 변환 실패", error))?,
                 ),
-                None => find_equivalent_xf(source_xf, &libreoffice_xfs)?
+                None => find_equivalent_xf(source_xf, &libreoffice_xfs, None)?
                     .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
                     .copied(),
             };
@@ -994,7 +993,6 @@ impl XlsxContainer {
                     }
                     bytes
                 }
-                CALC_CHAIN_PATH => Vec::new(),
                 _ => {
                     let part = source_parts
                         .iter_mut()
@@ -1212,7 +1210,7 @@ impl XlsxContainer {
         String::from_utf8(bytes)
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
     }
-    fn take_workbook_dependencies(&mut self, workbook_xml: &str) -> Result<Option<String>> {
+    fn take_workbook_dependencies(&mut self, workbook_xml: &str) -> Result<()> {
         let workbook_relationships = self.take_text("xl/_rels/workbook.xml.rels")?;
         let relationship_ids = validate_relationship_set(
             &workbook_relationships,
@@ -1220,7 +1218,7 @@ impl XlsxContainer {
             &INPUT_WORKBOOK_RELATIONSHIPS,
             self,
         )?;
-        let calc_chain_xml = if self.has_part(CALC_CHAIN_PATH) {
+        if self.has_part(CALC_CHAIN_PATH) {
             let xml = self.take_text(CALC_CHAIN_PATH)?;
             let child_count = visit_direct_xml_children(
                 &xml,
@@ -1237,10 +1235,7 @@ impl XlsxContainer {
             if child_count == 0 {
                 return Err(err("calcChain.xml에 formula cell이 없습니다."));
             }
-            Some(xml)
-        } else {
-            None
-        };
+        }
         let [master_rid, change_log_rid, _, _, _, _] = relationship_ids;
         let sheet_ids = [
             master_rid
@@ -1278,7 +1273,7 @@ impl XlsxContainer {
         if workbook_scanner.next_start_named("sheet").is_some() {
             return Err(err("workbook sheet 수가 고정 스키마의 2개보다 많습니다."));
         }
-        Ok(calc_chain_xml)
+        Ok(())
     }
     pub(super) fn take_worksheet_text(&mut self, name: &str, sheet_name: &str) -> Result<String> {
         let drawing_rid = if name == super::MASTER_SHEET_PATH {
@@ -1429,26 +1424,46 @@ impl XlsxContainer {
     }
 }
 fn cell_xf_entries(styles_xml: &str) -> Result<Vec<&str>> {
+    style_entries(styles_xml, "cellXfs", "xf")
+}
+fn font_entries(styles_xml: &str) -> Result<Vec<&str>> {
+    style_entries(styles_xml, "fonts", "font")
+}
+fn style_entries<'text>(
+    styles_xml: &'text str,
+    group_name: &str,
+    entry_name: &str,
+) -> Result<Vec<&'text str>> {
     let mut scanner = XmlScanner::new(styles_xml);
     let element = scanner
-        .next_element_named("cellXfs")?
-        .filter(|element| element.opening.name == "cellXfs" && !element.opening.self_closing)
-        .ok_or_else(|| err("styles.xml의 cellXfs 시작 태그가 올바르지 않습니다."))?;
-    let opening = element.opening;
-    let declared_count = required_xml_attr(opening.raw, "count", "styles.xml cellXfs")?
+        .next_element_named(group_name)?
+        .filter(|element| element.opening.name == group_name && !element.opening.self_closing)
+        .ok_or_else(|| {
+            err(format!(
+                "styles.xml의 {group_name} 시작 태그가 올바르지 않습니다."
+            ))
+        })?;
+    let declared_count = required_xml_attr(element.opening.raw, "count", group_name)?
         .parse::<usize>()
-        .map_err(|source| err_with_source("styles.xml cellXfs count 해석 실패", source))?;
+        .map_err(|source| {
+            err_with_source(format!("styles.xml {group_name} count 해석 실패"), source)
+        })?;
     let body_start = element.body_span.start;
     let closing_start = element.body_span.end;
-    if styles_xml.get(closing_start..element.span.end) != Some("</cellXfs>") {
-        return Err(err(
-            "styles.xml의 cellXfs 종료 태그는 unprefixed여야 합니다.",
-        ));
+    if styles_xml
+        .get(closing_start..element.span.end)
+        .and_then(|tag| tag.strip_prefix("</"))
+        .and_then(|tag| tag.strip_suffix('>'))
+        != Some(group_name)
+    {
+        return Err(err(format!(
+            "styles.xml의 {group_name} 종료 태그는 unprefixed여야 합니다."
+        )));
     }
     scanner.skip_to(body_start);
     let mut entries =
-        try_vec_with_capacity(declared_count, "styles.xml cellXfs 목록 메모리 확보 실패")?;
-    let mut stack = try_vec_with_capacity(3, "styles.xml cellXfs stack 메모리 확보 실패")?;
+        try_vec_with_capacity(declared_count, "styles.xml 항목 목록 메모리 확보 실패")?;
+    let mut stack = try_vec_with_capacity(3, "styles.xml 항목 stack 메모리 확보 실패")?;
     let mut entry_start = None;
     let mut consumed = body_start;
     while let Some(tag) = scanner.next_tag() {
@@ -1459,13 +1474,15 @@ fn cell_xf_entries(styles_xml: &str) -> Result<Vec<&str>> {
             .get(consumed..tag.start)
             .is_some_and(|between| between.trim().is_empty())
         {
-            return Err(err("styles.xml cellXfs에 알 수 없는 text가 있습니다."));
+            return Err(err(format!(
+                "styles.xml {group_name}에 알 수 없는 text가 있습니다."
+            )));
         }
         if tag.is_start {
             if stack.is_empty() {
-                if tag.name != "xf" {
+                if tag.name != entry_name {
                     return Err(err(format!(
-                        "styles.xml cellXfs에 알 수 없는 {} 요소가 있습니다.",
+                        "styles.xml {group_name}에 알 수 없는 {} 요소가 있습니다.",
                         tag.name
                     )));
                 }
@@ -1474,25 +1491,27 @@ fn cell_xf_entries(styles_xml: &str) -> Result<Vec<&str>> {
             consumed = tag
                 .end
                 .checked_add(1)
-                .ok_or_else(|| err("styles.xml cellXfs 요소 끝 계산 실패"))?;
+                .ok_or_else(|| err("styles.xml 항목 끝 계산 실패"))?;
             if !tag.self_closing {
                 stack.push(tag.name);
                 continue;
             }
         } else {
-            let open = stack
-                .pop()
-                .ok_or_else(|| err("styles.xml cellXfs 종료 태그가 중복되었습니다."))?;
+            let open = stack.pop().ok_or_else(|| {
+                err(format!(
+                    "styles.xml {group_name} 종료 태그가 중복되었습니다."
+                ))
+            })?;
             if open != tag.name {
                 return Err(err(format!(
-                    "styles.xml cellXfs 태그 쌍이 일치하지 않습니다: {open} / {}",
+                    "styles.xml {group_name} 태그 쌍이 일치하지 않습니다: {open} / {}",
                     tag.name
                 )));
             }
             consumed = tag
                 .end
                 .checked_add(1)
-                .ok_or_else(|| err("styles.xml cellXfs 종료 범위 계산 실패"))?;
+                .ok_or_else(|| err("styles.xml 항목 종료 범위 계산 실패"))?;
         }
         if !stack.is_empty() {
             continue;
@@ -1502,10 +1521,10 @@ fn cell_xf_entries(styles_xml: &str) -> Result<Vec<&str>> {
                 .get(
                     entry_start
                         .take()
-                        .ok_or_else(|| err("cellXf 시작 위치가 없습니다."))?
+                        .ok_or_else(|| err("styles.xml 항목 시작 위치가 없습니다."))?
                         ..consumed,
                 )
-                .ok_or_else(|| err("cellXf 범위가 손상되었습니다."))?,
+                .ok_or_else(|| err("styles.xml 항목 범위가 손상되었습니다."))?,
         );
     }
     if !stack.is_empty()
@@ -1514,21 +1533,29 @@ fn cell_xf_entries(styles_xml: &str) -> Result<Vec<&str>> {
             .get(consumed..closing_start)
             .is_some_and(|trailing| trailing.trim().is_empty())
     {
-        return Err(err("styles.xml cellXfs 요소 구조가 올바르지 않습니다."));
+        return Err(err(format!(
+            "styles.xml {group_name} 요소 구조가 올바르지 않습니다."
+        )));
     }
     scanner.skip_to(element.span.end);
-    if scanner.next_start_named("cellXfs").is_some() {
-        return Err(err("styles.xml에 cellXfs 태그가 여러 개 있습니다."));
+    if scanner.next_start_named(group_name).is_some() {
+        return Err(err(format!(
+            "styles.xml에 {group_name} 태그가 여러 개 있습니다."
+        )));
     }
     if entries.len() != declared_count {
         return Err(err(format!(
-            "styles.xml cellXfs count가 실제 xf 수와 다릅니다: declared={declared_count}, actual={}",
+            "styles.xml {group_name} count가 실제 {entry_name} 수와 다릅니다: declared={declared_count}, actual={}",
             entries.len()
         )));
     }
     Ok(entries)
 }
-fn find_equivalent_xf(source: &str, catalog: &[&str]) -> Result<Option<usize>> {
+fn find_equivalent_xf(
+    source: &str,
+    catalog: &[&str],
+    fonts: Option<(&[&str], &[&str])>,
+) -> Result<Option<usize>> {
     const BOOLEAN_ATTRS: [&str; 13] = [
         "applyAlignment",
         "applyBorder",
@@ -1584,7 +1611,26 @@ fn find_equivalent_xf(source: &str, catalog: &[&str]) -> Result<Option<usize>> {
                     equivalent = false;
                     break;
                 };
-                let values_match = if BOOLEAN_ATTRS.contains(&name) {
+                let values_match = if name == "fontId" {
+                    fonts.map_or_else(
+                        || source_value == candidate_value,
+                        |(source_fonts, candidate_fonts)| {
+                            source_value
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|font_index| source_fonts.get(font_index))
+                                .zip(
+                                    candidate_value
+                                        .parse::<usize>()
+                                        .ok()
+                                        .and_then(|font_index| candidate_fonts.get(font_index)),
+                                )
+                                .is_some_and(|(source_font, candidate_font)| {
+                                    source_font == candidate_font
+                                })
+                        },
+                    )
+                } else if BOOLEAN_ATTRS.contains(&name) {
                     let source_bool = match source_value.as_ref() {
                         "0" | "false" => Some(false),
                         "1" | "true" => Some(true),
