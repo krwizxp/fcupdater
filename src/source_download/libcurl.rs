@@ -344,12 +344,6 @@ impl Client {
                 handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
                 handle.perform()
             };
-            let perform_result = if perform_code == CURLE_OK {
-                handle.ensure_https_scheme()?;
-                Ok(handle.response_code()?)
-            } else {
-                Err(perform_code)
-            };
             if let Some(callback_error) = body_buffer
                 .error
                 .take()
@@ -358,23 +352,21 @@ impl Client {
                 self.easy_handle = None;
                 return Err(callback_error);
             }
-            let raw_status = match perform_result {
-                Ok(response_code) => response_code,
-                Err(failed_code) => {
-                    let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
-                    let perform_error =
-                        if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
-                            && !message_cstr.to_bytes().is_empty()
-                        {
-                            let message = message_cstr.to_string_lossy();
-                            format!("curl_easy_perform 실패: {message} ({failed_code})")
-                        } else {
-                            curl_error("curl_easy_perform", failed_code)
-                        };
-                    self.easy_handle = None;
-                    return Err(perform_error.into());
-                }
-            };
+            if perform_code != CURLE_OK {
+                let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
+                let perform_error = if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
+                    && !message_cstr.to_bytes().is_empty()
+                {
+                    let message = message_cstr.to_string_lossy();
+                    format!("curl_easy_perform 실패: {message} ({perform_code})")
+                } else {
+                    curl_error("curl_easy_perform", perform_code)
+                };
+                self.easy_handle = None;
+                return Err(perform_error.into());
+            }
+            handle.ensure_https_scheme()?;
+            let raw_status = handle.response_code()?;
             u32::try_from(raw_status)
                 .map_err(|source| download_error_with_source("HTTP 상태 코드 변환 실패", source))
         })();
@@ -382,24 +374,7 @@ impl Client {
         self.url_buffer = url_buffer;
         result
     }
-    pub(super) fn get(
-        &mut self,
-        host: &str,
-        path: &str,
-        request_headers: RequestHeaders<'_>,
-    ) -> DownloadResult<HttpResponse> {
-        self.request(None, host, path, request_headers)
-    }
-    pub(super) fn post(
-        &mut self,
-        host: &str,
-        path: &str,
-        request_headers: RequestHeaders<'_>,
-        body: &[u8],
-    ) -> DownloadResult<HttpResponse> {
-        self.request(Some(body), host, path, request_headers)
-    }
-    fn request(
+    pub(super) fn request(
         &mut self,
         request_body: Option<&[u8]>,
         host: &str,

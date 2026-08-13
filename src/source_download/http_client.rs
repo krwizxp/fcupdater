@@ -24,13 +24,9 @@ enum HttpHost {
     Netfunnel,
     Opinet,
 }
-struct Cookie {
-    name: String,
-    value: String,
-}
 #[derive(Default)]
 pub(super) struct CookieJar {
-    cookies: Vec<Cookie>,
+    cookies: Vec<String>,
 }
 impl CookieJar {
     fn add_cookie(&mut self, name: &str, value: &str) -> DownloadResult<()> {
@@ -80,17 +76,22 @@ impl CookieJar {
             )
             .into());
         }
-        if let Some(cookie) = self.cookies.iter_mut().find(|cookie| cookie.name == name) {
-            if value.len() > cookie.value.len() {
+        if let Some(cookie) = self.cookies.iter_mut().find(|cookie| {
+            cookie
+                .strip_prefix(name)
+                .is_some_and(|tail| tail.starts_with('='))
+        }) {
+            let value_start = name.len().strict_add(1);
+            let old_value_len = cookie.len().strict_sub(value_start);
+            if value.len() > old_value_len {
                 cookie
-                    .value
-                    .try_reserve_exact(value.len().strict_sub(cookie.value.len()))
+                    .try_reserve_exact(value.len().strict_sub(old_value_len))
                     .map_err(|source| {
                         download_error_with_source("Cookie 값 메모리 확보 실패", source)
                     })?;
             }
-            cookie.value.clear();
-            cookie.value.push_str(value);
+            cookie.truncate(value_start);
+            cookie.push_str(value);
             return Ok(());
         }
         if self.cookies.len() >= MAX_COOKIES_PER_HOST {
@@ -102,13 +103,11 @@ impl CookieJar {
         self.cookies
             .try_reserve(1)
             .map_err(|source| download_error_with_source("Cookie 목록 메모리 확보 실패", source))?;
-        let mut cookie = Cookie {
-            name: try_string_with_capacity(name.len(), "Cookie 이름 메모리 확보 실패")?,
-            value: try_string_with_capacity(value.len(), "Cookie 값 메모리 확보 실패")?,
-        };
-        cookie.name.push_str(name);
-        cookie.value.push_str(value);
-        self.cookies.push(cookie);
+        let mut pair = try_string_with_capacity(pair_len, "Cookie 메모리 확보 실패")?;
+        pair.push_str(name);
+        pair.push('=');
+        pair.push_str(value);
+        self.cookies.push(pair);
         Ok(())
     }
 }
@@ -169,8 +168,7 @@ impl SourceDownload {
             status,
         } = response;
         for value in &headers.set_cookies {
-            let pair = split_head_or_all(value, ';');
-            let (cookie_name, cookie_value) = pair
+            let (cookie_name, cookie_value) = split_head_or_all(value, ';')
                 .split_once('=')
                 .ok_or_else(|| format!("HTTP Set-Cookie 형식이 올바르지 않습니다: {value}"))?;
             self.add_cookie_for_host(host, cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
@@ -218,9 +216,9 @@ impl SourceDownload {
                 referer,
                 matches!(profile, PostHeaderProfile::Ajax),
             )?;
-            let response = self
-                .platform
-                .post(OPINET_HOST, path, headers, body.as_bytes())?;
+            let response =
+                self.platform
+                    .request(Some(body.as_bytes()), OPINET_HOST, path, headers)?;
             self.finish_response(HttpHost::Opinet, response)
         })();
         self.form_body_buffer = body;
@@ -257,7 +255,9 @@ impl SourceDownload {
                 None,
                 false,
             )?;
-            let opdownload_response = self.platform.get(OPINET_HOST, OPDOWNLOAD_PATH, headers)?;
+            let opdownload_response =
+                self.platform
+                    .request(None, OPINET_HOST, OPDOWNLOAD_PATH, headers)?;
             let body = self.finish_response(HttpHost::Opinet, opdownload_response)?;
             let opdownload_page = String::from_utf8(body).map_err(|source| {
                 download_error_with_source("HTTP 응답 UTF-8 변환 실패", source)
@@ -354,9 +354,7 @@ impl SourceDownload {
         } else {
             let separator_capacity = jar.cookies.len().strict_sub(1).strict_mul(2);
             let capacity = jar.cookies.iter().fold(separator_capacity, |sum, cookie| {
-                sum.strict_add(cookie.name.len())
-                    .strict_add(1)
-                    .strict_add(cookie.value.len())
+                sum.strict_add(cookie.len())
             });
             cookie_header
                 .try_reserve_exact(capacity)
@@ -367,9 +365,7 @@ impl SourceDownload {
                 if index != 0 {
                     cookie_header.push_str("; ");
                 }
-                cookie_header.push_str(&cookie.name);
-                cookie_header.push('=');
-                cookie_header.push_str(&cookie.value);
+                cookie_header.push_str(cookie);
             }
             Some(cookie_header.as_str())
         };
@@ -423,7 +419,9 @@ impl SourceDownload {
                 None,
                 false,
             )?;
-            let response = self.platform.get(NETFUNNEL_HOST, &path, headers)?;
+            let response = self
+                .platform
+                .request(None, NETFUNNEL_HOST, &path, headers)?;
             self.finish_response(HttpHost::Netfunnel, response)
         };
         self.netfunnel_path_buffer = path;

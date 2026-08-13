@@ -1,6 +1,5 @@
 use super::{
-    ArchiveFingerprint, MAX_XLSX_PART_BYTES, PackagePart, XLSX_PARTS, XlsxPartRole,
-    ZipPackageReader,
+    ArchiveFingerprint, MAX_XLSX_PART_BYTES, PackagePart, PartRole, XLSX_PARTS, ZipPackageReader,
 };
 use crate::diagnostic::{
     AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
@@ -449,7 +448,8 @@ impl ZipPackageReader<'_> {
             let entry = central_directory
                 .next_entry()?
                 .ok_or_else(|| zip_static("ZIP entry가 고정 스키마보다 적습니다."))?;
-            let Some(&(part_name, _)) = XLSX_PARTS.iter().find(|&&(name, _)| name == entry.name)
+            let Some(&(part_name, _, _)) =
+                XLSX_PARTS.iter().find(|&&(name, _, _)| name == entry.name)
             else {
                 return Err(err(format!(
                     "ZIP entry 이름이 고정 스키마에 없습니다: {}",
@@ -478,8 +478,8 @@ impl ZipPackageReader<'_> {
                 "ZIP 중앙 디렉터리 entry 수가 일치하지 않습니다.",
             ));
         }
-        for (name, role) in XLSX_PARTS {
-            if role == XlsxPartRole::Required && !entries.iter().any(|item| item.1 == name) {
+        for (name, role, _) in XLSX_PARTS {
+            if role == PartRole::Required && !entries.iter().any(|item| item.1 == name) {
                 return Err(err(format!("ZIP 필수 entry가 없습니다: {name}")));
             }
         }
@@ -567,8 +567,7 @@ pub(super) fn scan_open_archive(
             .try_reserve_exact(archive_len.strict_add(1))
             .map_err(|source| err_with_source("xlsx 압축 파일 메모리 확보 실패", source))?;
     }
-    let read_limit = metadata.len().strict_add(1);
-    let mut limited = file.take(read_limit);
+    let mut limited = file.take(metadata.len().strict_add(1));
     let mut buffer = vec![0_u8; ZIP_FINGERPRINT_BUFFER_BYTES].into_boxed_slice();
     let mut crc = u32::MAX;
     let mut bytes_read = 0_usize;

@@ -458,14 +458,6 @@ impl Client {
         })()
         .inspect_err(|_| self.session_cache = None)
     }
-    pub(super) fn get(
-        &mut self,
-        host: &str,
-        path: &str,
-        headers: RequestHeaders<'_>,
-    ) -> DownloadResult<HttpResponse> {
-        self.request(host, path, headers, &METHOD_GET_WIDE, &[])
-    }
     fn last_error_code() -> u32 {
         // SAFETY: GetLastError has no preconditions.
         unsafe { sys::GetLastError() }
@@ -478,15 +470,6 @@ impl Client {
         Ok(NonNull::new(handle)
             .map(Handle)
             .ok_or_else(|| Self::last_error_message(context))?)
-    }
-    pub(super) fn post(
-        &mut self,
-        host: &str,
-        path: &str,
-        headers: RequestHeaders<'_>,
-        body: &[u8],
-    ) -> DownloadResult<HttpResponse> {
-        self.request(host, path, headers, &METHOD_POST_WIDE, body)
     }
     fn read_body(
         &mut self,
@@ -549,14 +532,17 @@ impl Client {
         }
         Ok(body)
     }
-    fn request(
+    pub(super) fn request(
         &mut self,
+        request_body: Option<&[u8]>,
         host: &str,
         path: &str,
         headers: RequestHeaders<'_>,
-        method: &[u16],
-        body: &[u8],
     ) -> DownloadResult<HttpResponse> {
+        let (body, method): (&[u8], &[u16]) = request_body.map_or_else(
+            || (&[][..], METHOD_GET_WIDE.as_slice()),
+            |body| (body, METHOD_POST_WIDE.as_slice()),
+        );
         let (request, status, started) = self.begin_request(host, path, &headers, method, body)?;
         self.complete_request(&request, status, started)
     }

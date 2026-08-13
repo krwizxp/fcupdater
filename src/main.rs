@@ -53,15 +53,14 @@ const RUN_LOCK_PATH: &str = ".fcupdater.lock";
 #[cfg(target_os = "windows")]
 const RUN_LOCK_SHARE_MODE: u32 = 0x0000_0003;
 fn main() -> Result<()> {
-    let mut out = stdout();
+    let mut out = stdout().lock();
     let mut raw_args = env::args_os().skip(1);
     let save_verification = match raw_args.next() {
         None => SaveVerification::Skip,
         Some(token) => {
             let is_help = token == OsStr::new("-h") || token == OsStr::new("--help");
-            let is_verify = token == OsStr::new("--verify");
             let is_version = token == OsStr::new("--version");
-            if !(is_help || is_verify || is_version) {
+            if !(is_help || token == OsStr::new("--verify") || is_version) {
                 return Err(err(format!(
                     "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
                     token.to_string_lossy()

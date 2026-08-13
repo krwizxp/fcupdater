@@ -7,8 +7,6 @@ use crate::{
     master_sheet::{ChangeRow, StoreRow},
     sheet_util::add_row_offset,
 };
-use core::range::RangeInclusive;
-const CHANGELOG_HEADER_ROW: u32 = 3;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
 const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
 const CHANGELOG_COL_REGION: u32 = 1;
@@ -89,11 +87,7 @@ impl ChangeLogRowValues<'_> {
             );
             let cached_value = old_value
                 .zip(new_value)
-                .map(|(old, new)| {
-                    new.checked_sub(old)
-                        .ok_or_else(|| err("변경내역 delta cache 계산 실패"))
-                })
-                .transpose()?;
+                .map(|(old, new)| new.strict_sub(old));
             cache_buffer.clear();
             if let Some(value) = cached_value {
                 append_fmt(cache_buffer, format_args!("{value}"));
@@ -110,74 +104,7 @@ impl ChangeLogRowValues<'_> {
     }
 }
 impl ChangeLogUpdater<'_, '_, '_, '_> {
-    fn clear_existing_rows(&mut self) -> Result<RangeInclusive<u32>> {
-        let cols = [
-            CHANGELOG_COL_REGION,
-            CHANGELOG_COL_NAME,
-            CHANGELOG_COL_ADDRESS,
-            CHANGELOG_COL_REASON,
-            CHANGELOG_COL_OLD_GAS,
-            CHANGELOG_COL_NEW_GAS,
-            CHANGELOG_COL_OLD_PREMIUM,
-            CHANGELOG_COL_NEW_PREMIUM,
-            CHANGELOG_COL_OLD_DIESEL,
-            CHANGELOG_COL_NEW_DIESEL,
-        ];
-        let mut last_row = None;
-        for row in self
-            .worksheet
-            .row_numbers_from(CHANGELOG_DATA_START_ROW)?
-            .into_iter()
-            .rev()
-        {
-            if self
-                .worksheet
-                .row_has_any_data(row, &cols, self.shared_string_table)?
-            {
-                last_row = Some(row);
-                break;
-            }
-        }
-        let old_data_rows = if let Some(last_data_row) = last_row {
-            self.worksheet.clear_cells_in_rows_through_col(
-                RangeInclusive {
-                    start: CHANGELOG_DATA_START_ROW,
-                    last: last_data_row,
-                },
-                CHANGELOG_COL_DELTA_DIESEL,
-            );
-            RangeInclusive {
-                start: CHANGELOG_DATA_START_ROW,
-                last: last_data_row,
-            }
-        } else {
-            RangeInclusive {
-                start: CHANGELOG_DATA_START_ROW,
-                last: CHANGELOG_HEADER_ROW,
-            }
-        };
-        Ok(old_data_rows)
-    }
-    fn set_entry_conditional_formats(
-        &mut self,
-        old_data_rows: RangeInclusive<u32>,
-        last_change_row: u32,
-    ) -> Result<()> {
-        let target_cols = [
-            CHANGELOG_COL_DELTA_GAS,
-            CHANGELOG_COL_DELTA_PREMIUM,
-            CHANGELOG_COL_DELTA_DIESEL,
-        ];
-        self.worksheet.extend_conditional_formats(
-            old_data_rows,
-            RangeInclusive {
-                start: CHANGELOG_DATA_START_ROW,
-                last: last_change_row,
-            },
-            &target_cols,
-        )
-    }
-    pub(super) fn update(&mut self) -> Result<()> {
+    pub(super) fn update(&mut self) -> Result<u32> {
         if !self
             .worksheet
             .has_any_row_format(CHANGELOG_STYLE_TEMPLATE_ROW, CHANGELOG_COL_DELTA_DIESEL)
@@ -187,12 +114,18 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         let date_text = format!("현행화 일자: {}", self.today);
         self.shared_string_table
             .set_cell(self.worksheet, 1, 2, &date_text)?;
-        let old_data_rows = self.clear_existing_rows()?;
-        self.write_entries(old_data_rows)?;
-        self.worksheet.update_dimension()?;
-        Ok(())
-    }
-    fn write_entries(&mut self, old_data_rows: RangeInclusive<u32>) -> Result<()> {
+        if let Some(last_data_row) = self
+            .worksheet
+            .row_numbers_from(CHANGELOG_DATA_START_ROW)?
+            .into_iter()
+            .last()
+        {
+            self.worksheet.clear_cells_in_rows_through_col(
+                CHANGELOG_DATA_START_ROW,
+                last_data_row,
+                CHANGELOG_COL_DELTA_DIESEL,
+            );
+        }
         let style_template_row = CHANGELOG_STYLE_TEMPLATE_ROW;
         let entry_count = self
             .changes
@@ -200,8 +133,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             .strict_add(self.added.len())
             .strict_add(self.deleted.len());
         if entry_count == 0 {
-            self.set_entry_conditional_formats(old_data_rows, CHANGELOG_DATA_START_ROW)?;
-            return self.worksheet.truncate_rows_after(style_template_row);
+            self.worksheet.truncate_rows_after(style_template_row)?;
+            return Ok(CHANGELOG_DATA_START_ROW);
         }
         let change_entries = self.changes.iter().map(|change| ChangeLogRowValues {
             address: &change.record.address,
@@ -259,8 +192,8 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             entry_count.strict_sub(1),
             "변경내역 마지막 행 계산",
         )?;
-        self.set_entry_conditional_formats(old_data_rows, last_change_row)?;
         self.worksheet
-            .truncate_rows_after(last_change_row.max(style_template_row))
+            .truncate_rows_after(last_change_row.max(style_template_row))?;
+        Ok(last_change_row)
     }
 }

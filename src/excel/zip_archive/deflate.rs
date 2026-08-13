@@ -12,52 +12,30 @@ use core::{
     range::Range,
 };
 use std::io::Write as IoWrite;
-cfg_select! {
-    target_arch = "x86_64" => {
-        macro_rules! matching_prefix_16 {
-            ($left:expr, $right:expr) => {{
-                use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
-                // SAFETY: The caller keeps the complete 16-byte candidate range inside the input slice.
-                let left_vector = unsafe { _mm_loadu_si128($left.cast()) };
-                // SAFETY: The caller keeps the complete 16-byte current range inside the input slice.
-                let right_vector = unsafe { _mm_loadu_si128($right.cast()) };
-                // SAFETY: SSE2 is part of the x86-64 baseline, and both operands are complete vectors.
-                let equal = unsafe { _mm_cmpeq_epi8(left_vector, right_vector) };
-                // SAFETY: SSE2 is part of the x86-64 baseline, and equal is a complete vector.
-                let mismatch_mask = !unsafe { _mm_movemask_epi8(equal) } & 0xffff_i32;
-                let [prefix, ..] = mismatch_mask.trailing_zeros().to_le_bytes();
-                usize::from(prefix).min(SIMD_MATCH_BYTES)
-            }};
+macro_rules! matching_prefix_16 {
+    ($left:expr, $right:expr) => {{
+        // SAFETY: The caller keeps both complete 16-byte ranges inside the input slice.
+        let first = unsafe { $left.cast::<u64>().read_unaligned() }
+            // SAFETY: The caller keeps both complete 16-byte ranges inside the input slice.
+            ^ unsafe { $right.cast::<u64>().read_unaligned() };
+        if first == 0 {
+            // SAFETY: The caller keeps both complete 16-byte ranges inside the input slice.
+            let second = unsafe { $left.add(8).cast::<u64>().read_unaligned() }
+                // SAFETY: The caller keeps both complete 16-byte ranges inside the input slice.
+                ^ unsafe { $right.add(8).cast::<u64>().read_unaligned() };
+            let [prefix, ..] = second
+                .trailing_zeros()
+                .div_euclid(u8::BITS)
+                .to_le_bytes();
+            8_usize.strict_add(usize::from(prefix))
+        } else {
+            let [prefix, ..] = first
+                .trailing_zeros()
+                .div_euclid(u8::BITS)
+                .to_le_bytes();
+            usize::from(prefix)
         }
-    }
-    target_arch = "aarch64" => {
-        macro_rules! matching_prefix_16 {
-            ($left:expr, $right:expr) => {{
-                use core::arch::aarch64::{vceqq_u8, vld1q_u8, vminvq_u8, vst1q_u8};
-                // SAFETY: The caller keeps the complete unaligned 16-byte candidate range inside the input slice.
-                let left_vector = unsafe { vld1q_u8($left) };
-                // SAFETY: The caller keeps the complete unaligned 16-byte current range inside the input slice.
-                let right_vector = unsafe { vld1q_u8($right) };
-                // SAFETY: Advanced SIMD is part of the AArch64 baseline, and both operands are complete vectors.
-                let equal = unsafe { vceqq_u8(left_vector, right_vector) };
-                // SAFETY: Advanced SIMD is part of the AArch64 baseline, and equal is a complete vector.
-                if unsafe { vminvq_u8(equal) } == u8::MAX {
-                    SIMD_MATCH_BYTES
-                } else {
-                    let mut lanes = [0_u8; SIMD_MATCH_BYTES];
-                    // SAFETY: lanes owns exactly 16 writable bytes required by the NEON store.
-                    unsafe { vst1q_u8(lanes.as_mut_ptr(), equal); }
-                    lanes
-                        .iter()
-                        .position(|lane| *lane == 0)
-                        .unwrap_or(SIMD_MATCH_BYTES)
-                }
-            }};
-        }
-    }
-    _ => {
-        compile_error!("DEFLATE SIMD matching supports only x86-64 and AArch64.");
-    }
+    }};
 }
 const DECODE_MAX_SYMBOLS: usize = FIXED_LITERAL_SYMBOLS;
 const DECODE_ROOT_BITS: u8 = 9;
@@ -70,7 +48,7 @@ const DEFLATE_MAX_DISTANCE: usize = DEFLATE_WINDOW_LEN - MAX_MATCH - MIN_MATCH -
 const EXCEL_FLUSH_BLOCK_COUNT: u8 = 2;
 const FINAL_BLOCK_BOUNDARY_COUNT: usize = 1;
 const EXCEL_TOKEN_BLOCK_LIMIT: usize = 8191;
-const SIMD_MATCH_BYTES: usize = 16;
+const MATCH_CHUNK_BYTES: usize = 16;
 const XML_MAX_INSERT_MATCH_LEN: usize = 4;
 const XML_NICE_MATCH_LEN: usize = 128;
 struct BitReader<'bytes> {
@@ -297,13 +275,6 @@ impl BitSink for BitWriter<'_> {
     }
 }
 impl BitWriter<'_> {
-    fn finish_stream(mut self) -> ZipResult<usize> {
-        if self.bit_count > 0 {
-            self.write_byte(self.bit_buffer.to_le_bytes()[0])?;
-        }
-        self.flush_buffer()?;
-        Ok(self.len)
-    }
     fn flush_buffer(&mut self) -> ZipResult<()> {
         if self.buffered_len == 0 {
             return Ok(());
@@ -1227,7 +1198,11 @@ impl DeflatePlan {
             writer,
         };
         self.write(&mut bit_writer)?;
-        bit_writer.finish_stream()
+        if bit_writer.bit_count > 0 {
+            bit_writer.write_byte(bit_writer.bit_buffer.to_le_bytes()[0])?;
+        }
+        bit_writer.flush_buffer()?;
+        Ok(bit_writer.len)
     }
 }
 impl Default for DeflateWorkBudget {
@@ -1516,20 +1491,20 @@ impl DeflateWriter<'_, '_> {
                     }
                     let mut len = 0_usize;
                     let mut mismatch_found = false;
-                    while max_len.strict_sub(len) >= SIMD_MATCH_BYTES
-                        && work_budget.remaining >= SIMD_MATCH_BYTES
+                    while max_len.strict_sub(len) >= MATCH_CHUNK_BYTES
+                        && work_budget.remaining >= MATCH_CHUNK_BYTES
                     {
                         let left = bytes.as_ptr().wrapping_add(candidate.strict_add(len));
                         let right = bytes.as_ptr().wrapping_add(position.strict_add(len));
                         let prefix = matching_prefix_16!(left, right);
-                        let compared = if prefix < SIMD_MATCH_BYTES {
+                        let compared = if prefix < MATCH_CHUNK_BYTES {
                             prefix.strict_add(1)
                         } else {
-                            SIMD_MATCH_BYTES
+                            MATCH_CHUNK_BYTES
                         };
                         work_budget.remaining = work_budget.remaining.strict_sub(compared);
                         len = len.strict_add(prefix);
-                        if prefix < SIMD_MATCH_BYTES {
+                        if prefix < MATCH_CHUNK_BYTES {
                             mismatch_found = true;
                             break;
                         }

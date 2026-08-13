@@ -8,6 +8,14 @@ pub(super) mod writer;
 pub(super) mod xlsx_container;
 mod xml;
 mod zip_archive;
+macro_rules! xlsx_part {
+    ($name:expr, $role:ident) => {
+        ($name, PartRole::$role, None)
+    };
+    ($name:expr, $role:ident, $content_type:expr) => {
+        ($name, PartRole::$role, Some($content_type))
+    };
+}
 pub(super) const SPREADSHEETML_NAMESPACE: &str =
     "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 pub(super) const CHANGE_LOG_SHEET_NAME: &str = "변경내역";
@@ -15,46 +23,49 @@ pub(super) const CHANGE_LOG_SHEET_PATH: &str = "xl/worksheets/sheet2.xml";
 pub(super) const MASTER_SHEET_NAME: &str = "유류비";
 pub(super) const MASTER_SHEET_PATH: &str = "xl/worksheets/sheet1.xml";
 pub(super) const CALC_CHAIN_PATH: &str = "xl/calcChain.xml";
+pub(super) const FILTER_DATABASE_REF_PREFIX: &str = "유류비!$A$14:$W$";
 pub(super) const MAX_XLSX_PART_BYTES: usize = 64 * 1024 * 1024;
-const XLSX_PARTS: [(&str, XlsxPartRole); 16] = [
-    ("[Content_Types].xml", XlsxPartRole::Required),
-    ("_rels/.rels", XlsxPartRole::Required),
-    ("xl/workbook.xml", XlsxPartRole::Required),
-    ("xl/_rels/workbook.xml.rels", XlsxPartRole::Required),
-    ("xl/worksheets/sheet1.xml", XlsxPartRole::Required),
-    ("xl/worksheets/sheet2.xml", XlsxPartRole::Required),
-    ("xl/theme/theme1.xml", XlsxPartRole::Required),
-    ("xl/styles.xml", XlsxPartRole::Required),
-    ("xl/sharedStrings.xml", XlsxPartRole::Required),
-    ("docProps/thumbnail.emf", XlsxPartRole::OptionalInput),
-    (CALC_CHAIN_PATH, XlsxPartRole::InputOnly),
-    ("docProps/core.xml", XlsxPartRole::Required),
-    ("docProps/app.xml", XlsxPartRole::Required),
-    ("docProps/custom.xml", XlsxPartRole::InputOnly),
-    (
-        "xl/worksheets/_rels/sheet1.xml.rels",
-        XlsxPartRole::InputOnly,
-    ),
-    ("xl/drawings/drawing1.xml", XlsxPartRole::InputOnly),
+const CT_WORKBOOK: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+const CT_WORKSHEET: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+const CT_THEME: &str = "application/vnd.openxmlformats-officedocument.theme+xml";
+const CT_STYLES: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml";
+const CT_SHARED_STRINGS: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml";
+const CT_CORE_PROPERTIES: &str = "application/vnd.openxmlformats-package.core-properties+xml";
+const CT_APP_PROPERTIES: &str =
+    "application/vnd.openxmlformats-officedocument.extended-properties+xml";
+const CT_CALC_CHAIN: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml";
+const CT_CUSTOM_PROPERTIES: &str =
+    "application/vnd.openxmlformats-officedocument.custom-properties+xml";
+const CT_DRAWING: &str = "application/vnd.openxmlformats-officedocument.drawing+xml";
+const XLSX_PARTS: [(&str, PartRole, Option<&str>); 16] = [
+    xlsx_part!("[Content_Types].xml", Required),
+    xlsx_part!("_rels/.rels", Required),
+    xlsx_part!("xl/workbook.xml", Required, CT_WORKBOOK),
+    xlsx_part!("xl/_rels/workbook.xml.rels", Required),
+    xlsx_part!("xl/worksheets/sheet1.xml", Required, CT_WORKSHEET),
+    xlsx_part!("xl/worksheets/sheet2.xml", Required, CT_WORKSHEET),
+    xlsx_part!("xl/theme/theme1.xml", Required, CT_THEME),
+    xlsx_part!("xl/styles.xml", Required, CT_STYLES),
+    xlsx_part!("xl/sharedStrings.xml", Required, CT_SHARED_STRINGS),
+    xlsx_part!("docProps/thumbnail.emf", OptionalInput),
+    xlsx_part!(CALC_CHAIN_PATH, InputOnly, CT_CALC_CHAIN),
+    xlsx_part!("docProps/core.xml", Required, CT_CORE_PROPERTIES),
+    xlsx_part!("docProps/app.xml", Required, CT_APP_PROPERTIES),
+    xlsx_part!("docProps/custom.xml", InputOnly, CT_CUSTOM_PROPERTIES),
+    xlsx_part!("xl/worksheets/_rels/sheet1.xml.rels", InputOnly),
+    xlsx_part!("xl/drawings/drawing1.xml", InputOnly, CT_DRAWING),
 ];
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum XlsxPartRole {
+enum PartRole {
     InputOnly,
     OptionalInput,
     Required,
 }
-struct CanonicalStyleMap {
-    entries: Vec<Option<u32>>,
-}
-impl CanonicalStyleMap {
-    fn get(&self, style: u32) -> Option<u32> {
-        usize::try_from(style)
-            .ok()
-            .and_then(|index| self.entries.get(index))
-            .copied()
-            .flatten()
-    }
-}
+type CanonicalStyleMap = Vec<Option<u32>>;
 #[derive(Clone, Copy)]
 pub(super) enum SaveVerification {
     Skip,

@@ -1,5 +1,5 @@
 use super::copy_text;
-use crate::diagnostic::{AppError, Result, err, err_with_source, try_vec_with_capacity};
+use crate::diagnostic::{Result, err, err_with_source, try_vec_with_capacity};
 use core::{fmt::Display, range::Range};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
@@ -154,32 +154,18 @@ impl SourceReader {
         if !data.starts_with(&CFB_SIGNATURE) {
             return Err(err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."));
         }
-        let major_version = read_u16_le(data, 0x1A)?;
-        let byte_order = read_u16_le(data, 0x1C)?;
-        let sector_shift = read_u16_le(data, 0x1E)?;
-        let mini_sector_shift = read_u16_le(data, 0x20)?;
-        if major_version != 3 {
-            return Err(err(prefixed_display_message(
-                "Opinet 고정 소스에서 예상하지 않은 CFB major version: ",
-                major_version,
-            )));
-        }
-        if byte_order != CFB_BYTE_ORDER_LITTLE_ENDIAN {
-            return Err(err(format!(
-                "Opinet 고정 소스에서 예상하지 않은 CFB byte order: {byte_order:#06x}"
-            )));
-        }
-        if sector_shift != 9 {
-            return Err(err(prefixed_display_message(
-                "Opinet 고정 소스에서 예상하지 않은 CFB sector shift: ",
-                sector_shift,
-            )));
-        }
-        if mini_sector_shift != 6 {
-            return Err(err(prefixed_display_message(
-                "지원하지 않는 CFB mini sector shift: ",
-                mini_sector_shift,
-            )));
+        for (offset, expected, label) in [
+            (0x1A, 3, "major version"),
+            (0x1C, CFB_BYTE_ORDER_LITTLE_ENDIAN, "byte order"),
+            (0x1E, 9, "sector shift"),
+            (0x20, 6, "mini sector shift"),
+        ] {
+            let actual = read_u16_le(data, offset)?;
+            if actual != expected {
+                return Err(err(format!(
+                    "Opinet 고정 소스에서 예상하지 않은 CFB {label}: {actual:#06x}"
+                )));
+            }
         }
         if !self.0.len().is_multiple_of(CFB_SECTOR_SIZE) {
             return Err(err(format!(
@@ -187,37 +173,19 @@ impl SourceReader {
                 self.0.len()
             )));
         }
-        let num_difat_sectors = read_u32_le(data, 0x48)?;
-        if num_difat_sectors != 0 {
-            return Err(err(prefixed_display_message(
-                "Opinet 고정 소스에서 예상하지 않은 CFB DIFAT sector 개수: ",
-                num_difat_sectors,
-            )));
-        }
-        let first_difat_sector = read_u32_le(data, 0x44)?;
-        if first_difat_sector != CFB_END_OF_CHAIN {
-            return Err(err(format!(
-                "CFB DIFAT sector가 없지만 시작 sector가 end-of-chain이 아닙니다: {first_difat_sector:#x}"
-            )));
-        }
-        let num_mini_fat_sectors = read_u32_le(data, 0x40)?;
-        if num_mini_fat_sectors != 0 {
-            return Err(err(prefixed_display_message(
-                "Opinet 고정 소스에서 예상하지 않은 CFB mini FAT sector 개수: ",
-                num_mini_fat_sectors,
-            )));
-        }
-        let first_mini_fat_sector = read_u32_le(data, 0x3C)?;
-        if first_mini_fat_sector != CFB_END_OF_CHAIN {
-            return Err(err(format!(
-                "CFB mini FAT sector가 없지만 시작 sector가 end-of-chain이 아닙니다: {first_mini_fat_sector:#x}"
-            )));
-        }
-        let mini_stream_cutoff_size = read_u32_le(data, 0x38)?;
-        if mini_stream_cutoff_size != CFB_MINI_STREAM_CUTOFF_SIZE {
-            return Err(err(format!(
-                "Opinet 고정 소스에서 예상하지 않은 CFB mini stream cutoff: {mini_stream_cutoff_size}"
-            )));
+        for (offset, expected, label) in [
+            (0x48, 0, "DIFAT sector 개수"),
+            (0x44, CFB_END_OF_CHAIN, "DIFAT 시작 sector"),
+            (0x40, 0, "mini FAT sector 개수"),
+            (0x3C, CFB_END_OF_CHAIN, "mini FAT 시작 sector"),
+            (0x38, CFB_MINI_STREAM_CUTOFF_SIZE, "mini stream cutoff"),
+        ] {
+            let actual = read_u32_le(data, offset)?;
+            if actual != expected {
+                return Err(err(format!(
+                    "Opinet 고정 소스에서 예상하지 않은 CFB {label}: {actual:#010x}"
+                )));
+            }
         }
         Ok(CfbHeader {
             first_dir_sector: read_u32_le(data, 0x30)?,
@@ -272,8 +240,7 @@ impl SourceReader {
                 )));
             }
             let text_len = name_len.strict_sub(2);
-            let terminator = read_u16_le(entry, text_len)?;
-            if terminator != 0 {
+            if read_u16_le(entry, text_len)? != 0 {
                 return Err(err(format!(
                     "CFB directory entry 이름이 NUL로 끝나지 않습니다: object_type={object_type}"
                 )));
@@ -368,7 +335,7 @@ impl SourceReader {
     pub(crate) fn visit_rows(
         self,
         mut visitor: impl FnMut(SourceRecordRef<'_>) -> Result<()>,
-    ) -> Result<Result<()>> {
+    ) -> Result<()> {
         let workbook = self.read_xls_workbook()?;
         let biff = BiffWorkbookReader(&workbook);
         let (sheet_offset, shared_strings) = biff.parse_globals()?;
@@ -713,9 +680,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             let flags = reader.read_u8()?;
             validate_sst_option(flags, BIFF_SST_STRING_FLAGS_MASK, "SST 문자열 option")?;
             let high_byte = (flags & 0x01) != 0;
-            let rich = (flags & 0x08) != 0;
             let ext = (flags & 0x04) != 0;
-            let rich_run_count = if rich {
+            let rich_run_count = if flags & 0x08 != 0 {
                 usize::from(reader.read_u16()?)
             } else {
                 0_usize
@@ -729,8 +695,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             };
             let value = reader.read_xl_unicode_chars(char_count, high_byte)?;
             if rich_run_count > 0 {
-                let rich_bytes = rich_run_count.strict_mul(4);
-                reader.skip_bytes(rich_bytes)?;
+                reader.skip_bytes(rich_run_count.strict_mul(4))?;
             }
             if ext_len > 0 {
                 reader.skip_bytes(ext_len)?;
@@ -751,7 +716,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         declared_total: usize,
         shared_strings: &'strings [String],
         visitor: &mut impl FnMut(SourceRecordRef<'strings>) -> Result<()>,
-    ) -> Result<Result<()>> {
+    ) -> Result<()> {
         if sheet_offset >= self.0.len() {
             return Err(err(prefixed_display_message(
                 "worksheet offset이 workbook stream 범위를 벗어났습니다: ",
@@ -760,7 +725,6 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         }
         let mut found_header = false;
         let mut found_record = false;
-        let mut visitor_error: Option<AppError> = None;
         let mut flush_row = |row_num: usize, row: &SourceRow<'strings>| -> Result<()> {
             if row_num < SOURCE_HEADER_ROW {
                 return Ok(());
@@ -817,23 +781,18 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 }
             };
             found_record = true;
-            if visitor_error.is_none()
-                && let Err(source) = visitor(SourceRecordRef {
-                    address,
-                    brand: row_text_trimmed(row, COL_BRAND),
-                    fuels: FuelValues {
-                        diesel,
-                        gasoline,
-                        premium,
-                    },
-                    name,
-                    region: row_text_trimmed(row, COL_REGION),
-                    service,
-                })
-            {
-                visitor_error = Some(source);
-            }
-            Ok(())
+            visitor(SourceRecordRef {
+                address,
+                brand: row_text_trimmed(row, COL_BRAND),
+                fuels: FuelValues {
+                    diesel,
+                    gasoline,
+                    premium,
+                },
+                name,
+                region: row_text_trimmed(row, COL_REGION),
+                service,
+            })
         };
         let mut current_row = SourceRow::default();
         let mut current_row_num = None;
@@ -937,13 +896,10 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         if !found_header {
             return Err(err("Opinet 소스 헤더 행을 찾지 못했습니다."));
         }
-        if let Some(source) = visitor_error {
-            return Ok(Err(source));
-        }
         if !found_record {
             return Err(err("xls 시트에서 유효한 소스 데이터를 찾지 못했습니다."));
         }
-        Ok(Ok(()))
+        Ok(())
     }
 }
 fn validate_biff_bof(

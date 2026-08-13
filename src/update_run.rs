@@ -87,42 +87,39 @@ impl UpdateRun<'_> {
         };
         let mut address_key_scratch = String::new();
         let mut target_region_scratch = String::new();
-        let source_index_result = SourceReader::from(source_data)
-            .visit_rows(|borrowed_record| {
-                if let Some(region) = target_region(
-                    borrowed_record.region,
-                    borrowed_record.address,
-                    &mut target_region_scratch,
-                    TargetRegionPolicy::StrictSource,
-                )? {
-                    normalize_address_key_into(borrowed_record.address, &mut address_key_scratch)?;
-                    let key = mem::take(&mut address_key_scratch);
-                    if loaded_source.index.len() == loaded_source.index.capacity() {
-                        loaded_source
-                            .index
-                            .try_reserve(SOURCE_INDEX_GROWTH)
-                            .map_err(|source| {
-                                err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
-                            })?;
+        SourceReader::from(source_data).visit_rows(|borrowed_record| {
+            if let Some(region) = target_region(
+                borrowed_record.region,
+                borrowed_record.address,
+                &mut target_region_scratch,
+                TargetRegionPolicy::StrictSource,
+            )? {
+                normalize_address_key_into(borrowed_record.address, &mut address_key_scratch)?;
+                let key = mem::take(&mut address_key_scratch);
+                if loaded_source.index.len() == loaded_source.index.capacity() {
+                    loaded_source
+                        .index
+                        .try_reserve(SOURCE_INDEX_GROWTH)
+                        .map_err(|source| {
+                            err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
+                        })?;
+                }
+                match loaded_source.index.entry(key) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(borrowed_record.into_owned_with_region(region.label())?);
+                        increment_target_region_count(&mut loaded_source.region_counts, region);
                     }
-                    match loaded_source.index.entry(key) {
-                        Entry::Vacant(entry) => {
-                            entry.insert(borrowed_record.into_owned_with_region(region.label())?);
-                            increment_target_region_count(&mut loaded_source.region_counts, region);
-                        }
-                        Entry::Occupied(entry) => {
-                            let existing = entry.get();
-                            return Err(err(format!(
-                                "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
-                                existing.address, existing.name, borrowed_record.name
-                            )));
-                        }
+                    Entry::Occupied(entry) => {
+                        let existing = entry.get();
+                        return Err(err(format!(
+                            "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
+                            existing.address, existing.name, borrowed_record.name
+                        )));
                     }
                 }
-                Ok(())
-            })
-            .map_err(|source_err| err_with_source("Opinet 소스 xls 읽기 실패", source_err))?;
-        source_index_result?;
+            }
+            Ok(())
+        })?;
         loaded_source.finish_validation()?;
         Ok(loaded_source)
     }
@@ -261,7 +258,7 @@ impl UpdateRun<'_> {
     }
     pub(super) fn run(&mut self) -> Result<()> {
         let loaded_source = self.load_source()?;
-        let (book, master_update) = self.open_updated_workbook(&loaded_source)?;
+        let (mut book, master_update) = self.open_updated_workbook(&loaded_source)?;
         let since_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|source| err_with_source("현재 시간 조회 실패", source))?;
@@ -301,26 +298,23 @@ impl UpdateRun<'_> {
             year_base
         };
         let today = format!("{year:04}-{month:02}-{day:02}");
-        self.save_workbook_with_change_log(&master_update, book, &today)
-    }
-    fn save_workbook_with_change_log(
-        &mut self,
-        master_update: &MasterSheetUpdateResult<'_>,
-        mut book: StdWorkbook,
-        today: &str,
-    ) -> Result<()> {
         let (worksheet, shared_string_table) = book.change_log_sheet_mut();
-        ChangeLogUpdater {
+        let change_log_last_row = ChangeLogUpdater {
             added: &master_update.added,
             changes: &master_update.changes,
             deleted: &master_update.deleted,
             shared_string_table,
-            today,
+            today: &today,
             worksheet,
         }
         .update()?;
         write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
-        book.save(self.master_path, self.save_verification)?;
+        book.save(
+            self.master_path,
+            self.save_verification,
+            master_update.last_data_row,
+            change_log_last_row,
+        )?;
         self.print_update_summary(
             &master_update.changes,
             &master_update.added,
@@ -331,7 +325,6 @@ impl UpdateRun<'_> {
                 "마스터 파일은 저장됐지만 실행 요약 출력에 실패했습니다.",
                 source,
             )
-        })?;
-        Ok(())
+        })
     }
 }

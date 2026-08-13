@@ -37,9 +37,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Build Release Binary
-        run: cargo +stable build --release --frozen --bin fcupdater
+        run: cargo +stable build --release --frozen --bin fcupdater --example package_artifact
       - name: Prepare binary artifact with Rust
-        run: cargo +stable run --frozen --example package_artifact -- "${{ matrix.binary_name }}"
+        run: ${{ runner.os == 'Windows' && 'target/release/examples/package_artifact.exe' || 'target/release/examples/package_artifact' }} "${{ matrix.binary_name }}"
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
