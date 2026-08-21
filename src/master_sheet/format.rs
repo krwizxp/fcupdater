@@ -1,42 +1,29 @@
-use super::{DECIMAL_SCALE, ScaledDecimal, ScaledSortKey};
-use crate::diagnostic::{Result, append_fmt, err};
-use crate::excel::writer::format_excel_ratio_into;
+use core::fmt::NumBuffer;
 pub(super) fn format_scaled_value_into(text: &mut String, value: i128, scale: i128) {
     text.clear();
-    let sign = if value != 0 && (value < 0) != (scale < 0) {
-        "-"
-    } else {
-        ""
-    };
+    let negative = value != 0 && (value < 0) != (scale < 0);
     let abs = value.unsigned_abs();
     let scale_abs = scale.unsigned_abs();
+    if negative {
+        text.push('-');
+    }
+    let mut buffer = NumBuffer::new();
     if scale_abs == 0 {
-        append_fmt(text, format_args!("{sign}{abs}"));
+        text.push_str(abs.format_into(&mut buffer));
         return;
     }
     let whole = abs.div_euclid(scale_abs);
+    text.push_str(whole.format_into(&mut buffer));
     let frac = abs.rem_euclid(scale_abs);
     if frac == 0 {
-        append_fmt(text, format_args!("{sign}{whole}"));
         return;
     }
+    text.push('.');
     let width = usize::from(scale_abs.ilog10().to_le_bytes()[0]);
-    append_fmt(text, format_args!("{sign}{whole}.{frac:0width$}"));
-    text.truncate(text.trim_end_matches('0').len());
-}
-pub(super) fn format_unit_price_text_into(
-    text: &mut String,
-    total: ScaledSortKey,
-    qty: ScaledDecimal,
-) -> Result<bool> {
-    text.clear();
-    if qty == ScaledDecimal::ZERO {
-        return Ok(false);
+    let frac_text = frac.format_into(&mut buffer);
+    for _ in frac_text.len()..width {
+        text.push('0');
     }
-    let denominator_raw = qty
-        .as_i128()
-        .checked_mul(DECIMAL_SCALE.as_i128())
-        .ok_or_else(|| err("단가 분모 계산 중 overflow가 발생했습니다."))?;
-    format_excel_ratio_into(text, total.as_i128(), denominator_raw)?;
-    Ok(true)
+    text.push_str(frac_text);
+    text.truncate(text.trim_end_matches('0').len());
 }

@@ -233,19 +233,15 @@ impl ReservedTempArchive {
                 source,
             )
         })?;
-        if file.identity != self.identity {
-            return Err(err(format!(
+        (file.identity == self.identity).ok_or_else(|| {
+            err(format!(
                 "xlsx 임시 파일 identity가 실행 중 변경되었습니다: {}",
                 self.path.display()
-            )));
-        }
-        Ok(())
+            ))
+        })
     }
     fn verify_saved_archive(&mut self) -> Result<()> {
-        let mut saved_handle = self
-            .file
-            .take()
-            .ok_or_else(|| err("저장 검증용 xlsx handle이 닫혀 있습니다."))?;
+        let mut saved_handle = self.file.take().unwrap_or_else(|| process::abort());
         let saved_archive = self.path();
         saved_handle.seek(SeekFrom::Start(0)).map_err(|source| {
             err_with_source(
@@ -288,10 +284,7 @@ impl ReservedTempArchive {
         parts: &[PackagePart],
         #[cfg(any(target_os = "linux", target_os = "macos"))] permissions: fs::Permissions,
     ) -> Result<()> {
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| err("xlsx 임시 저장 파일 handle이 닫혀 있습니다."))?;
+        let file = self.file.as_mut().unwrap_or_else(|| process::abort());
         ZipArchiveBuilder {
             archive_path: self.path.as_path(),
             file,
@@ -481,7 +474,7 @@ impl TempArchivePromotion<'_> {
             let parent = self
                 .target_xlsx
                 .parent()
-                .filter(|path| !path.as_os_str().is_empty())
+                .filter(|path| !path.is_empty())
                 .unwrap_or_else(|| Path::new("."));
             fs::File::open(parent)
                 .and_then(|file| file.sync_all())
@@ -541,13 +534,12 @@ impl TempArchivePromotion<'_> {
                     source,
                 )
             })?;
-        if fingerprint != self.expected_fingerprint {
-            return Err(err(format!(
+        (fingerprint == self.expected_fingerprint).ok_or_else(|| {
+            err(format!(
                 "원본 xlsx가 실행 중 변경되어 저장을 중단했습니다: {}",
                 self.target_xlsx.display()
-            )));
-        }
-        Ok(())
+            ))
+        })
     }
 }
 impl XlsxContainer {
@@ -655,8 +647,8 @@ impl XlsxContainer {
                 "custom.xml",
             )?;
         }
-        container.part_mut("[Content_Types].xml")?.bytes = Vec::new();
-        container.part_mut("_rels/.rels")?.bytes = Vec::new();
+        container.part_mut("[Content_Types].xml").bytes = Vec::new();
+        container.part_mut("_rels/.rels").bytes = Vec::new();
         Ok(container)
     }
     fn has_part(&self, name: &str) -> bool {
@@ -664,17 +656,17 @@ impl XlsxContainer {
     }
     pub(super) fn package_prepare_excel_output(&mut self) -> Result<CanonicalStyleMap> {
         let source_styles = self.text("xl/styles.xml")?;
-        let source_xfs = cell_xf_entries(source_styles)?;
-        let source_fonts = font_entries(source_styles)?;
-        let excel_xfs = cell_xf_entries(EXCEL_STYLES_XML)?;
-        let excel_fonts = font_entries(EXCEL_STYLES_XML)?;
-        let libreoffice_xfs = cell_xf_entries(LIBREOFFICE_CELL_XFS_XML)?;
+        let source_xfs = style_entries(source_styles, "cellXfs", "xf")?;
+        let source_fonts = style_entries(source_styles, "fonts", "font")?;
+        let excel_xfs = style_entries(EXCEL_STYLES_XML, "cellXfs", "xf")?;
+        let excel_fonts = style_entries(EXCEL_STYLES_XML, "fonts", "font")?;
+        let libreoffice_xfs = style_entries(LIBREOFFICE_CELL_XFS_XML, "cellXfs", "xf")?;
         if libreoffice_xfs.len() != LIBREOFFICE_STYLE_MAP.len() {
             return Err(err(
                 "내장 LibreOffice style mapping 수가 올바르지 않습니다.",
             ));
         }
-        let mut entries =
+        let mut input_styles =
             try_vec_with_capacity(source_xfs.len(), "입력 style mapping 메모리 확보 실패")?;
         for source_xf in source_xfs {
             let canonical = match find_equivalent_xf(
@@ -690,14 +682,13 @@ impl XlsxContainer {
                     .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
                     .copied(),
             };
-            entries.push(canonical);
+            input_styles.push(canonical);
         }
-        let input_styles = entries;
         let mut source_parts = mem::take(&mut self.parts);
         let source_core = source_parts
             .iter_mut()
             .find(|part| part.name == "docProps/core.xml")
-            .ok_or_else(|| err("Excel core.xml 원본 part를 찾지 못했습니다."))?;
+            .unwrap_or_else(|| process::abort());
         let source_core_xml = str::from_utf8(&source_core.bytes)
             .map_err(|source| err_with_source("core.xml UTF-8 해석 실패", source))?;
         let mut core_xml = try_string_with_capacity(
@@ -764,7 +755,7 @@ impl XlsxContainer {
         let source_app = source_parts
             .iter_mut()
             .find(|part| part.name == "docProps/app.xml")
-            .ok_or_else(|| err("Excel app.xml 원본 part를 찾지 못했습니다."))?;
+            .unwrap_or_else(|| process::abort());
         let source_app_xml = str::from_utf8(&source_app.bytes)
             .map_err(|source_error| err_with_source("app.xml UTF-8 해석 실패", source_error))?;
         let (_, total_time_tail) = source_app_xml
@@ -805,8 +796,7 @@ impl XlsxContainer {
                 "docProps/thumbnail.emf" => {
                     let thumbnail_len = BLANK_EXCEL_THUMBNAIL_DWORDS
                         .len()
-                        .checked_mul(size_of::<u32>())
-                        .ok_or_else(|| err("Excel thumbnail 크기 계산 실패"))?;
+                        .strict_mul(size_of::<u32>());
                     let mut bytes =
                         try_vec_with_capacity(thumbnail_len, "Excel thumbnail 메모리 확보 실패")?;
                     for value in BLANK_EXCEL_THUMBNAIL_DWORDS {
@@ -818,11 +808,7 @@ impl XlsxContainer {
                     let index = source_parts
                         .iter()
                         .position(|part| part.name == name)
-                        .ok_or_else(|| {
-                            err(format!(
-                                "입력에서 Excel 공통 part를 찾지 못했습니다: {name}"
-                            ))
-                        })?;
+                        .unwrap_or_else(|| process::abort());
                     source_parts.swap_remove(index).bytes
                 }
             };
@@ -831,27 +817,25 @@ impl XlsxContainer {
         self.parts = output_parts;
         Ok(input_styles)
     }
-    fn part(&self, name: &str) -> Result<&PackagePart> {
+    fn part(&self, name: &str) -> &PackagePart {
         self.parts
             .iter()
             .find(|part| part.name == name)
-            .ok_or_else(|| err(format!("xlsx part를 찾지 못했습니다: {name}")))
+            .unwrap_or_else(|| process::abort())
     }
-    fn part_mut(&mut self, name: &str) -> Result<&mut PackagePart> {
+    fn part_mut(&mut self, name: &str) -> &mut PackagePart {
         self.parts
             .iter_mut()
             .find(|part| part.name == name)
-            .ok_or_else(|| err(format!("xlsx part를 찾지 못했습니다: {name}")))
+            .unwrap_or_else(|| process::abort())
     }
-    pub(super) fn put_text(&mut self, name: &str, content: String) -> Result<()> {
-        let part = self.part_mut(name)?;
-        part.bytes = content.into_bytes();
-        Ok(())
+    pub(super) fn put_text(&mut self, name: &str, content: String) {
+        self.part_mut(name).bytes = content.into_bytes();
     }
     pub(super) fn save(self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
         let parent = target_xlsx
             .parent()
-            .filter(|path| !path.as_os_str().is_empty())
+            .filter(|path| !path.is_empty())
             .unwrap_or_else(|| Path::new("."));
         let target_file_name = crate::MASTER_PATH;
         let temp_archive_prefix = format!(".{target_file_name}.tmp_");
@@ -955,7 +939,7 @@ impl XlsxContainer {
         Ok(xml)
     }
     pub(super) fn take_text(&mut self, name: &str) -> Result<String> {
-        let bytes = mem::take(&mut self.part_mut(name)?.bytes);
+        let bytes = mem::take(&mut self.part_mut(name).bytes);
         String::from_utf8(bytes)
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
     }
@@ -1105,7 +1089,7 @@ impl XlsxContainer {
         Ok(xml)
     }
     fn text(&self, name: &str) -> Result<&str> {
-        let part = self.part(name)?;
+        let part = self.part(name);
         str::from_utf8(&part.bytes)
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
     }
@@ -1194,12 +1178,6 @@ impl XlsxContainer {
         }
         Ok(())
     }
-}
-fn cell_xf_entries(styles_xml: &str) -> Result<Vec<&str>> {
-    style_entries(styles_xml, "cellXfs", "xf")
-}
-fn font_entries(styles_xml: &str) -> Result<Vec<&str>> {
-    style_entries(styles_xml, "fonts", "font")
 }
 fn style_entries<'text>(
     styles_xml: &'text str,
@@ -1400,15 +1378,11 @@ fn validate_exact_attrs<const N: usize>(
     context: &str,
 ) -> Result<()> {
     let values = parse_attrs(tag, expected.map(|(name, _)| name), context)?;
-    if values
+    values
         .iter()
         .zip(expected)
         .all(|(value, expected_attr)| value.as_deref() == Some(expected_attr.1))
-    {
-        Ok(())
-    } else {
-        Err(err(format!("{context} 속성이 고정 스키마와 다릅니다.")))
-    }
+        .ok_or_else(|| err(format!("{context} 속성이 고정 스키마와 다릅니다.")))
 }
 fn validate_relationship_set<'xml, const N: usize>(
     xml: &'xml str,
@@ -1606,11 +1580,7 @@ fn validate_empty_xml_root<const N: usize>(
             .next_direct_element_until(root.name, context)?
             .is_none()
     };
-    if empty {
-        Ok(())
-    } else {
-        Err(err(format!("{context}의 XML root가 비어 있지 않습니다.")))
-    }
+    empty.ok_or_else(|| err(format!("{context}의 XML root가 비어 있지 않습니다.")))
 }
 fn required_xml_attr<'tag>(
     tag: &'tag str,

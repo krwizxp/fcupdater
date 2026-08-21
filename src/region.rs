@@ -1,4 +1,5 @@
 use crate::diagnostic::{Result, err, err_with_source};
+use std::process;
 pub(super) const TARGET_REGION_COUNT: usize = 7;
 const DAEJEON_DISTRICT_KEYS: [&str; 5] = ["대덕구", "동구", "서구", "유성구", "중구"];
 pub(super) const TARGET_REGIONS: [TargetRegion; TARGET_REGION_COUNT] = [
@@ -37,6 +38,17 @@ impl TargetRegion {
             .into_iter()
             .find(|region| region.label() == label)
     }
+    const fn index(self) -> usize {
+        match self {
+            Self::Daejeon => 0,
+            Self::Sejong => 1,
+            Self::Cheongju => 2,
+            Self::Gongju => 3,
+            Self::Boryeong => 4,
+            Self::Asan => 5,
+            Self::Cheonan => 6,
+        }
+    }
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Daejeon => "대전",
@@ -48,32 +60,16 @@ impl TargetRegion {
             Self::Cheonan => "천안",
         }
     }
-    pub(super) const fn value<T>(self, values: &[T; TARGET_REGION_COUNT]) -> T
+    pub(super) fn value<T>(self, values: &[T; TARGET_REGION_COUNT]) -> T
     where
         T: Copy,
     {
-        let &[daejeon, sejong, cheongju, gongju, boryeong, asan, cheonan] = values;
-        match self {
-            Self::Daejeon => daejeon,
-            Self::Sejong => sejong,
-            Self::Cheongju => cheongju,
-            Self::Gongju => gongju,
-            Self::Boryeong => boryeong,
-            Self::Asan => asan,
-            Self::Cheonan => cheonan,
-        }
+        *values.get(self.index()).unwrap_or_else(|| process::abort())
     }
-    pub(super) const fn value_mut<T>(self, values: &mut [T; TARGET_REGION_COUNT]) -> &mut T {
-        let [daejeon, sejong, cheongju, gongju, boryeong, asan, cheonan] = values.each_mut();
-        match self {
-            Self::Daejeon => daejeon,
-            Self::Sejong => sejong,
-            Self::Cheongju => cheongju,
-            Self::Gongju => gongju,
-            Self::Boryeong => boryeong,
-            Self::Asan => asan,
-            Self::Cheonan => cheonan,
-        }
+    pub(super) fn value_mut<T>(self, values: &mut [T; TARGET_REGION_COUNT]) -> &mut T {
+        values
+            .get_mut(self.index())
+            .unwrap_or_else(|| process::abort())
     }
 }
 pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
@@ -176,7 +172,7 @@ fn daejeon_region(district: &str) -> Option<TargetRegion> {
         .contains(&district)
         .then_some(TargetRegion::Daejeon)
 }
-pub(super) const fn increment_target_region_count(
+pub(super) fn increment_target_region_count(
     counts: &mut [usize; TARGET_REGION_COUNT],
     region: TargetRegion,
 ) {

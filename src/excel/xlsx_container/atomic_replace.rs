@@ -235,13 +235,11 @@ cfg_select! {
                     unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP) }
                 }
             };
-            if status == 0_i32 {
-                Ok(())
-            } else {
-                Err(ReplaceFilesError::Failed(ReplaceFailure::new(
+            (status == 0_i32).ok_or_else(|| {
+                ReplaceFilesError::Failed(ReplaceFailure::new(
                     io::Error::last_os_error(),
-                )))
-            }
+                ))
+            })
         }
     }
     _ => {

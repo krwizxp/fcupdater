@@ -115,18 +115,12 @@ impl ResponseHeaders {
         Ok(())
     }
     fn set_content_length(&mut self, parsed: usize) -> DownloadResult<()> {
-        if parsed > HTTP_MAX_BODY_BYTES {
-            return Err(format!(
-                "HTTP Content-Length가 허용 한도({HTTP_MAX_BODY_BYTES} bytes)를 초과했습니다."
-            )
-            .into());
-        }
-        if self
-            .content_length
-            .is_some_and(|previous| previous != parsed)
-        {
-            return Err("HTTP Content-Length 헤더 값이 서로 다릅니다.".into());
-        }
+        (parsed <= HTTP_MAX_BODY_BYTES).ok_or_else(|| {
+            format!("HTTP Content-Length가 허용 한도({HTTP_MAX_BODY_BYTES} bytes)를 초과했습니다.")
+        })?;
+        self.content_length
+            .is_none_or(|previous| previous == parsed)
+            .ok_or("HTTP Content-Length 헤더 값이 서로 다릅니다.")?;
         self.content_length = Some(parsed);
         Ok(())
     }
@@ -140,9 +134,7 @@ fn checked_http_buffer_len(
     let next_len = current_len
         .checked_add(additional_len)
         .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
-    if next_len > limit {
-        Err(format!("HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다.").into())
-    } else {
-        Ok(next_len)
-    }
+    (next_len <= limit).then_some(next_len).ok_or_else(|| {
+        format!("HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다.").into()
+    })
 }

@@ -1,6 +1,7 @@
 use super::CellReference;
-use crate::diagnostic::{Result, err, err_with_source};
+use crate::diagnostic::{Result, err};
 use core::str;
+use std::process;
 const COL_NAME_BUF_LEN: usize = 8;
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
 pub(super) const MAX_A1_COL: u32 = 0x4000;
@@ -73,16 +74,11 @@ pub(super) fn with_unlocked_ref_parts<R>(
         index = index.strict_sub(1);
         *col_buffer
             .get_mut(index)
-            .ok_or_else(|| err("Excel column buffer 범위가 손상되었습니다."))? =
-            b'A'.strict_add(rem);
+            .unwrap_or_else(|| process::abort()) = b'A'.strict_add(rem);
         col = base.div_euclid(26);
     }
-    let col_name = str::from_utf8(
-        col_buffer
-            .get(index..)
-            .ok_or_else(|| err("Excel column 결과 범위가 손상되었습니다."))?,
-    )
-    .map_err(|source| err_with_source("Excel column UTF-8 변환 실패", source))?;
+    let col_name = str::from_utf8(col_buffer.get(index..).unwrap_or_else(|| process::abort()))
+        .unwrap_or_else(|_| process::abort());
     if !(1..=MAX_A1_ROW).contains(&row) {
         return Err(err(format!("Excel row 범위를 벗어났습니다: {row}")));
     }

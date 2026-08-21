@@ -7,10 +7,9 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{
     ffi::{CStr, c_char, c_long, c_uint, c_void},
     marker::{PhantomData, PhantomPinned},
-    mem::{self, offset_of},
+    mem,
     ptr::{NonNull, null_mut},
-    slice,
-    str,
+    slice, str,
 };
 use std::sync::LazyLock;
 mod sys;
@@ -18,11 +17,7 @@ macro_rules! curl_setopt {
     ($handle:expr, $option:expr, $value:expr) => {{
         // SAFETY: call sites pair each option with a wrapper using its documented libcurl ABI type.
         let code = unsafe { sys::curl_easy_setopt($handle.as_ptr(), $option, $value) };
-        if code == CURLE_OK {
-            Ok(())
-        } else {
-            Err(curl_error("curl_easy_setopt", code).into())
-        }
+        (code == CURLE_OK).ok_or_else(|| curl_error("curl_easy_setopt", code).into())
     }};
 }
 const CURLE_OK: CurlCode = 0;
@@ -30,8 +25,6 @@ const CURL_ERROR_SIZE: usize = 256;
 const CURL_GLOBAL_DEFAULT: c_long = 3;
 const CURLINFO_RESPONSE_CODE: CurlInfo = 0x20_0002;
 const CURLINFO_SCHEME: CurlInfo = 0x10_0031;
-const CURL_MIN_PROTOCOLS_STR_VERSION: c_uint = 0x07_55_00;
-const CURLVERSION_NOW: CurlVersion = 11;
 const CURLOPT_CONNECTTIMEOUT_MS: CurlOption = 156;
 const CURLOPT_ERRORBUFFER: CurlOption = 10_010;
 const CURLOPT_FOLLOWLOCATION: CurlOption = 52;
@@ -60,34 +53,6 @@ static CURL_INIT: LazyLock<CurlCode> = LazyLock::new(|| {
     // SAFETY: LazyLock runs this initializer once before any easy handles are used.
     unsafe { sys::curl_global_init(CURL_GLOBAL_DEFAULT) }
 });
-static CURL_PROTOCOLS_STR_UNSUPPORTED_VERSION: LazyLock<Option<Cow<'static, str>>> =
-    LazyLock::new(|| {
-        // SAFETY: callers force this after curl_global_init has completed, and libcurl returns a
-        // process-wide immutable version info pointer.
-        NonNull::new(unsafe { sys::curl_version_info(CURLVERSION_NOW) }).map_or(
-            Some(Cow::Borrowed("unknown")),
-            |version_info| {
-                // SAFETY: version_info is non-null and points to libcurl's version info.
-                let version_info_ref = unsafe { version_info.as_ref() };
-                if version_info_ref.version_num >= CURL_MIN_PROTOCOLS_STR_VERSION {
-                    None
-                } else {
-                    let version_ptr = version_info_ref.version;
-                    let version = if version_ptr.is_null() {
-                        Cow::Borrowed("unknown")
-                    } else {
-                        // SAFETY: libcurl documents version as an ASCII NUL-terminated string.
-                        Cow::Owned(
-                            unsafe { CStr::from_ptr(version_ptr) }
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
-                    };
-                    Some(version)
-                }
-            },
-        )
-    });
 #[repr(C)]
 struct Curl {
     _data: (),
@@ -97,21 +62,6 @@ type CurlCode = c_uint;
 type CurlInfo = c_uint;
 type CurlOffT = i64;
 type CurlOption = c_uint;
-type CurlVersion = c_uint;
-#[repr(C)]
-struct CurlVersionInfoData {
-    age: CurlVersion,
-    version: *const c_char,
-    version_num: c_uint,
-}
-const _: () = assert!(
-    size_of::<CurlVersionInfoData>() == size_of::<[*const c_char; 3]>()
-        && align_of::<CurlVersionInfoData>() == align_of::<*const c_char>()
-        && offset_of!(CurlVersionInfoData, age) == 0
-        && offset_of!(CurlVersionInfoData, version) == size_of::<*const c_char>()
-        && offset_of!(CurlVersionInfoData, version_num) == size_of::<[*const c_char; 2]>(),
-    "libcurl version info prefix ABI mismatch"
-);
 #[derive(Default)]
 pub(super) struct Client {
     easy_handle: Option<EasyHandle>,
@@ -171,23 +121,20 @@ impl EasyHandle {
         // SAFETY: scheme is a valid output pointer for CURLINFO_SCHEME.
         let status_code =
             unsafe { sys::curl_easy_getinfo(self.as_ptr(), CURLINFO_SCHEME, &raw mut scheme) };
-        if status_code != CURLE_OK {
-            return Err(curl_error("curl_easy_getinfo scheme", status_code).into());
-        }
+        (status_code == CURLE_OK)
+            .ok_or_else(|| curl_error("curl_easy_getinfo scheme", status_code))?;
         let Some(scheme_ptr) = NonNull::new(scheme) else {
             return Err("curl 최종 scheme이 비어 있습니다.".into());
         };
         // SAFETY: libcurl returns a NUL-terminated scheme string owned by the easy handle.
         let scheme_bytes = unsafe { CStr::from_ptr(scheme_ptr.as_ptr()) }.to_bytes();
-        if scheme_bytes.eq_ignore_ascii_case(b"https") {
-            Ok(())
-        } else {
-            Err(format!(
+        scheme_bytes.eq_ignore_ascii_case(b"https").ok_or_else(|| {
+            format!(
                 "curl 최종 scheme이 HTTPS가 아닙니다: {}",
                 String::from_utf8_lossy(scheme_bytes)
             )
-            .into())
-        }
+            .into()
+        })
     }
     fn perform(&self) -> CurlCode {
         // SAFETY: self.0 is a configured easy handle and callback data live until this call returns.
@@ -205,11 +152,9 @@ impl EasyHandle {
         let status_code = unsafe {
             sys::curl_easy_getinfo(self.as_ptr(), CURLINFO_RESPONSE_CODE, &raw mut raw_status)
         };
-        if status_code == CURLE_OK {
-            Ok(raw_status)
-        } else {
-            Err(curl_error("curl_easy_getinfo response_code", status_code).into())
-        }
+        (status_code == CURLE_OK)
+            .ok_or_else(|| curl_error("curl_easy_getinfo response_code", status_code))?;
+        Ok(raw_status)
     }
     fn setopt_callback(
         &self,
@@ -273,22 +218,18 @@ impl Client {
             }
             let url = nul_terminated_buffer(
                 &mut url_buffer,
-                &[HTTPS_SCHEME_PREFIX.as_bytes(), host.as_bytes(), path.as_bytes()],
+                &[
+                    HTTPS_SCHEME_PREFIX.as_bytes(),
+                    host.as_bytes(),
+                    path.as_bytes(),
+                ],
                 "URL",
             )?;
             let init_code = *CURL_INIT;
-            if init_code != CURLE_OK {
-                return Err(curl_error("curl_global_init", init_code).into());
-            }
+            (init_code == CURLE_OK).ok_or_else(|| curl_error("curl_global_init", init_code))?;
             let handle = match &mut self.easy_handle {
                 &mut Some(ref mut handle) => handle,
                 empty @ &mut None => {
-                    if let Some(version) = CURL_PROTOCOLS_STR_UNSUPPORTED_VERSION.as_ref() {
-                        return Err(format!(
-                            "libcurl {version}은 HTTPS protocol 제한 최신 API를 지원하지 않습니다. libcurl 7.85.0 이상이 필요합니다."
-                        )
-                        .into());
-                    }
                     // SAFETY: curl_easy_init has no preconditions after global init.
                     let raw_handle_ptr = unsafe { sys::curl_easy_init() };
                     let Some(raw_handle) = NonNull::new(raw_handle_ptr) else {
@@ -316,9 +257,8 @@ impl Client {
                 handle.setopt_long(option, value)?;
             }
             handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
-            let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES).map_err(|source| {
-                download_error_with_source("HTTP 본문 한도 변환 실패", source)
-            })?;
+            let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES)
+                .map_err(|source| download_error_with_source("HTTP 본문 한도 변환 실패", source))?;
             handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;
             if let Some(body_bytes) = request_body {
                 handle.setopt_long(CURLOPT_POST, 1)?;
@@ -327,10 +267,7 @@ impl Client {
                 })?;
                 handle.setopt_long(CURLOPT_POSTFIELDSIZE, body_len)?;
                 if !body_bytes.is_empty() {
-                    handle.setopt_ptr(
-                        CURLOPT_POSTFIELDS,
-                        body_bytes.as_ptr().cast::<c_char>(),
-                    )?;
+                    handle.setopt_ptr(CURLOPT_POSTFIELDS, body_bytes.as_ptr().cast::<c_char>())?;
                 }
             } else {
                 handle.setopt_long(CURLOPT_HTTPGET, 1)?;
@@ -355,7 +292,7 @@ impl Client {
             if perform_code != CURLE_OK {
                 let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
                 let perform_error = if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
-                    && !message_cstr.to_bytes().is_empty()
+                    && !message_cstr.is_empty()
                 {
                     let message = message_cstr.to_string_lossy();
                     format!("curl_easy_perform 실패: {message} ({perform_code})")
@@ -530,8 +467,7 @@ fn nul_terminated_buffer<'buffer>(
 ) -> DownloadResult<&'buffer CStr> {
     let capacity = parts
         .iter()
-        .try_fold(1_usize, |capacity, part| capacity.checked_add(part.len()))
-        .ok_or_else(|| format!("{label} 용량 계산 실패"))?;
+        .fold(1_usize, |capacity, part| capacity.strict_add(part.len()));
     out.clear();
     if out.capacity() < capacity {
         out.try_reserve_exact(capacity).map_err(|source| {

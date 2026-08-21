@@ -2,7 +2,10 @@ use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
     ResponseHeaders, checked_http_buffer_len, download_error_with_source,
 };
-use crate::diagnostic::{try_string_with_capacity, try_vec_with_capacity};
+use crate::{
+    diagnostic::{try_string_with_capacity, try_vec_with_capacity},
+    u32_to_usize,
+};
 use alloc::{string::String, vec::Vec};
 use core::{
     array::from_fn,
@@ -11,11 +14,7 @@ use core::{
     result::Result as CoreResult,
     time::Duration,
 };
-use std::{
-    ffi::OsStr,
-    os::windows::ffi::OsStrExt as WindowsOsStrExt,
-    time::Instant,
-};
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt as WindowsOsStrExt, time::Instant};
 mod sys;
 const DWORD_BYTE_SIZE: u32 = 4;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -112,15 +111,12 @@ impl Client {
         body: &[u8],
     ) -> DownloadResult<(Handle, u32, Instant)> {
         let path_wide = wide(path)?;
-        let header_capacity = headers
-            .iter()
-            .try_fold(0_usize, |acc, (name, value)| {
-                acc.checked_add(name.len())?
-                    .checked_add(value.len())?
-                    .checked_add(4)
-            })
-            .and_then(|capacity| capacity.checked_add(1))
-            .ok_or("요청 헤더 용량 계산 실패")?;
+        let header_capacity = headers.iter().fold(1_usize, |capacity, (name, value)| {
+            capacity
+                .strict_add(name.len())
+                .strict_add(value.len())
+                .strict_add(4)
+        });
         self.header_buffer.clear();
         if self.header_buffer.capacity() < header_capacity {
             self.header_buffer
@@ -136,9 +132,8 @@ impl Client {
             self.header_buffer
                 .extend_from_slice(&HEADER_TERMINATOR_WIDE);
         }
-        let header_len = u32::try_from(self.header_buffer.len()).map_err(|source| {
-            download_error_with_source("요청 헤더 길이 변환 실패", source)
-        })?;
+        let header_len = u32::try_from(self.header_buffer.len())
+            .map_err(|source| download_error_with_source("요청 헤더 길이 변환 실패", source))?;
         self.header_buffer.push(0);
         let started = Instant::now();
         let connect = self.cached_connect(host)?;
@@ -174,9 +169,8 @@ impl Client {
                 HTTP_MAX_HEADER_BYTES_DWORD,
                 "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
             )?;
-            let body_len = u32::try_from(body.len()).map_err(|source| {
-                download_error_with_source("요청 본문 길이 변환 실패", source)
-            })?;
+            let body_len = u32::try_from(body.len())
+                .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
             let body_ptr = if body.is_empty() {
                 null()
             } else {
@@ -296,10 +290,8 @@ impl Client {
         let handle = NonNull::new(raw_connect)
             .map(Handle)
             .ok_or_else(|| Self::last_error_message("WinHttpConnect"))?;
-        let mut host_key = try_string_with_capacity(
-            host.len(),
-            "WinHTTP connect host key 메모리 확보 실패",
-        )?;
+        let mut host_key =
+            try_string_with_capacity(host.len(), "WinHTTP connect host key 메모리 확보 실패")?;
         host_key.push_str(host);
         let connect = handle.0;
         let entry = CachedConnect {
@@ -316,11 +308,7 @@ impl Client {
         Ok(connect)
     }
     fn check_winhttp(ok: i32, context: &str) -> DownloadResult<()> {
-        if ok == 0_i32 {
-            Err(Self::last_error_message(context).into())
-        } else {
-            Ok(())
-        }
+        (ok != 0_i32).ok_or_else(|| Self::last_error_message(context).into())
     }
     fn complete_request(
         &mut self,
@@ -362,9 +350,7 @@ impl Client {
                         "WinHTTP Content-Length header index가 진행되지 않았습니다.".into(),
                     );
                 }
-                headers.set_content_length(usize::try_from(value).map_err(|source| {
-                    download_error_with_source("Content-Length 변환 실패", source)
-                })?)?;
+                headers.set_content_length(u32_to_usize(value))?;
             }
             let mut cookie_index = 0_u32;
             let mut header_bytes_seen = 0_usize;
@@ -398,9 +384,7 @@ impl Client {
                     )
                     .into());
                 }
-                let header_bytes = usize::try_from(bytes).map_err(|source| {
-                    download_error_with_source("Set-Cookie 길이 변환 실패", source)
-                })?;
+                let header_bytes = u32_to_usize(bytes);
                 header_bytes_seen = checked_http_buffer_len(
                     "헤더",
                     header_bytes_seen,
@@ -483,15 +467,15 @@ impl Client {
         };
         if self.read_buffer.capacity() < WINHTTP_READ_BUFFER_BYTES {
             self.read_buffer
-                    .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
-                    .map_err(|source| {
-                        download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
-                    })?;
+                .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
+                .map_err(|source| {
+                    download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
+                })?;
         }
         self.read_buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
         let bytes_to_read = u32::try_from(self.read_buffer.len()).map_err(|source| {
-                download_error_with_source("응답 read 버퍼 길이 변환 실패", source)
-            })?;
+            download_error_with_source("응답 read 버퍼 길이 변환 실패", source)
+        })?;
         loop {
             if started.elapsed() >= WINHTTP_TOTAL_TIMEOUT {
                 return Err("HTTP 전체 전송 제한 시간(60초)을 초과했습니다.".into());
@@ -507,9 +491,7 @@ impl Client {
                 )
             };
             Self::check_winhttp(read_ok, "WinHttpReadData")?;
-            let read_len = usize::try_from(read).map_err(|source| {
-                download_error_with_source("응답 read 길이 변환 실패", source)
-            })?;
+            let read_len = u32_to_usize(read);
             if read_len == 0 {
                 break;
             }
@@ -517,12 +499,8 @@ impl Client {
                 .read_buffer
                 .get(..read_len)
                 .ok_or("응답 본문 chunk 범위 계산 실패")?;
-            let next_len = checked_http_buffer_len(
-                "본문",
-                body.len(),
-                read_chunk.len(),
-                HTTP_MAX_BODY_BYTES,
-            )?;
+            let next_len =
+                checked_http_buffer_len("본문", body.len(), read_chunk.len(), HTTP_MAX_BODY_BYTES)?;
             if body.capacity() < next_len {
                 body.try_reserve(read_chunk.len()).map_err(|source| {
                     download_error_with_source("응답 본문 메모리 확보 실패", source)
@@ -555,11 +533,7 @@ impl Client {
         Self::try_set_dword_option(handle, option, value)
             .map_err(|code| Self::windows_error_message(context, code).into())
     }
-    fn try_set_dword_option(
-        handle: &Handle,
-        option: u32,
-        value: u32,
-    ) -> CoreResult<(), u32> {
+    fn try_set_dword_option(handle: &Handle, option: u32, value: u32) -> CoreResult<(), u32> {
         // SAFETY: handle is valid and value points to a DWORD option value for this call.
         let ok = unsafe {
             sys::WinHttpSetOption(
@@ -569,21 +543,14 @@ impl Client {
                 DWORD_BYTE_SIZE,
             )
         };
-        if ok == 0_i32 {
-            Err(Self::last_error_code())
-        } else {
-            Ok(())
-        }
+        (ok != 0_i32).ok_or_else(Self::last_error_code)
     }
     fn windows_error_message(context: &str, code: u32) -> String {
         format!("{context} 실패: Windows error {code}")
     }
 }
 fn wide(value: &str) -> DownloadResult<Vec<u16>> {
-    let capacity = value
-        .len()
-        .checked_add(1)
-        .ok_or("wide 문자열 용량 계산 실패")?;
+    let capacity = value.len().strict_add(1);
     let mut out = try_vec_with_capacity(capacity, "wide 문자열 메모리 확보 실패")?;
     out.extend(<OsStr as WindowsOsStrExt>::encode_wide(OsStr::new(value)));
     out.push(0);

@@ -30,25 +30,23 @@ struct LoadedSource {
 impl LoadedSource {
     fn finish_validation(&self) -> Result<()> {
         let target_record_count = self.index.len();
-        if target_record_count == 0 {
-            return Err(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."));
-        }
+        (target_record_count != 0)
+            .ok_or_else(|| err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."))?;
         for (region, count) in TARGET_REGIONS.iter().zip(self.region_counts.iter()) {
-            if *count == 0 {
-                return Err(err(format!(
+            (*count != 0).ok_or_else(|| {
+                err(format!(
                     "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {}",
                     region.label(),
-                )));
-            }
+                ))
+            })?;
         }
         let required_populated_count = target_record_count.div_ceil(HALF_COUNT_DIVISOR);
         let validate_field_ratio = |populated_count: usize, label: &'static str| -> Result<()> {
-            if populated_count < required_populated_count {
-                return Err(err(format!(
+            (populated_count >= required_populated_count).ok_or_else(|| {
+                err(format!(
                     "Opinet 소스의 대상 지역 {label} 값이 비정상적으로 부족합니다: {populated_count}건 / {target_record_count}건"
-                )));
-            }
-            Ok(())
+                ))
+            })
         };
         let (brand_count, diesel_count, gasoline_count, has_premium) = self.index.values().fold(
             (0_usize, 0_usize, 0_usize, false),
@@ -64,12 +62,9 @@ impl LoadedSource {
         validate_field_ratio(brand_count, "상표")?;
         validate_field_ratio(diesel_count, "경유 가격")?;
         validate_field_ratio(gasoline_count, "휘발유 가격")?;
-        if !has_premium {
-            return Err(err(
-                "Opinet 소스의 대상 지역에서 유효한 고급휘발유 가격을 찾지 못했습니다.",
-            ));
-        }
-        Ok(())
+        has_premium.ok_or_else(|| {
+            err("Opinet 소스의 대상 지역에서 유효한 고급휘발유 가격을 찾지 못했습니다.")
+        })
     }
 }
 pub(super) struct UpdateRun<'out> {

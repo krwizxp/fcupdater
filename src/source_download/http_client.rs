@@ -6,8 +6,7 @@ use super::{
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
     download_error_with_source, try_string_with_capacity,
 };
-use crate::diagnostic::append_fmt;
-use core::{mem, time::Duration};
+use core::{fmt::NumBuffer, mem, time::Duration};
 use std::{
     thread::sleep,
     time::{SystemTime, UNIX_EPOCH},
@@ -402,14 +401,16 @@ impl SourceDownload {
             path.push_str("%3B");
             if let Some(ttl_secs) = ttl {
                 path.push_str("&ttl=");
-                append_fmt(&mut path, format_args!("{ttl_secs}"));
+                let mut ttl_buffer = NumBuffer::new();
+                path.push_str(ttl_secs.format_into(&mut ttl_buffer));
             }
             path.push_str("&sid=");
             path.push_str(NETFUNNEL_SERVICE_ID);
             path.push_str("&aid=");
             path.push_str(action_id);
             path.push_str("&js=yes&");
-            append_fmt(&mut path, format_args!("{timestamp}"));
+            let mut timestamp_buffer = NumBuffer::new();
+            path.push_str(timestamp.format_into(&mut timestamp_buffer));
             let headers = Self::request_headers(
                 &self.cookie_jars,
                 &mut self.cookie_header_buffer,

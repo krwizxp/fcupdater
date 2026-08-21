@@ -11,7 +11,7 @@ use core::{
     mem,
     range::Range,
 };
-use std::io::Write as IoWrite;
+use std::{io::Write as IoWrite, process};
 macro_rules! matching_prefix_16 {
     ($left:expr, $right:expr) => {{
         // SAFETY: The caller keeps both complete 16-byte ranges inside the input slice.
@@ -40,6 +40,7 @@ macro_rules! matching_prefix_16 {
 const DECODE_MAX_SYMBOLS: usize = FIXED_LITERAL_SYMBOLS;
 const DECODE_ROOT_BITS: u8 = 9;
 const DECODE_ROOT_SIZE: usize = 1 << DECODE_ROOT_BITS;
+const HUFFMAN_NODE_CAPACITY: usize = LITERAL_LENGTH_SYMBOLS.strict_mul(2).strict_add(1);
 const DEFLATE_SEARCH_WORK_LIMIT: usize = 512 * 1024 * 1024;
 const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
 const DEFLATE_TOKEN_RESERVE_CHUNK: usize = 64 * 1024;
@@ -165,13 +166,13 @@ struct HuffmanLengthBuilder<'frequencies> {
     max_bits: u8,
 }
 struct HuffmanBuildState {
-    depths: Vec<u16>,
-    frequencies: Vec<u32>,
-    heap: Vec<usize>,
+    depths: [u16; HUFFMAN_NODE_CAPACITY],
+    frequencies: [u32; HUFFMAN_NODE_CAPACITY],
+    heap: [usize; HUFFMAN_NODE_CAPACITY],
     heap_len: usize,
     heap_max: usize,
     max_symbol: usize,
-    parents: Vec<usize>,
+    parents: [usize; HUFFMAN_NODE_CAPACITY],
 }
 impl DecodeEntry {
     const EMPTY: Self = Self(0);
@@ -191,9 +192,7 @@ impl BitReader<'_> {
         self.bit_count = 0;
     }
     fn consume_bits(&mut self, count: u8) -> ZipResult<()> {
-        if count > self.bit_count {
-            return Err(zip_static("deflate bit buffer 소비 범위 오류"));
-        }
+        (count <= self.bit_count).ok_or_else(|| zip_static("deflate bit buffer 소비 범위 오류"))?;
         self.bit_buffer >>= u32::from(count);
         self.bit_count = self.bit_count.strict_sub(count);
         Ok(())
@@ -473,7 +472,7 @@ impl InflateState<'_> {
             .output
             .get(output_start..)
             .ok_or_else(|| zip_static("deflate back-reference 출력 범위 오류"))?;
-        self.crc32 = crc32_update(self.crc32, appended)?;
+        self.crc32 = crc32_update(self.crc32, appended);
         Ok(())
     }
     fn decode_distance(&mut self, symbol: u16) -> ZipResult<usize> {
@@ -566,7 +565,7 @@ impl InflateState<'_> {
                 0..=255 => {
                     ensure_deflate_output_len(self.output.len(), 1, self.expected_len)?;
                     let [byte, _] = symbol.to_le_bytes();
-                    self.crc32 = crc32_update_byte(self.crc32, byte)?;
+                    self.crc32 = crc32_update_byte(self.crc32, byte);
                     self.output.push(byte);
                 }
                 256 => return Ok(()),
@@ -599,7 +598,7 @@ impl InflateState<'_> {
         }
         let stored = self.reader.read_stored_bytes(usize::from(len))?;
         ensure_deflate_output_len(self.output.len(), stored.len(), self.expected_len)?;
-        self.crc32 = crc32_update(self.crc32, stored)?;
+        self.crc32 = crc32_update(self.crc32, stored);
         self.output.extend_from_slice(stored);
         Ok(())
     }
@@ -926,30 +925,19 @@ impl HuffmanLengthBuilder<'_> {
             .checked_mul(2)
             .and_then(|count| count.checked_add(1))
             .ok_or_else(|| zip_static("deflate Huffman node 용량 계산 실패"))?;
+        if node_capacity > HUFFMAN_NODE_CAPACITY {
+            return Err(zip_static(
+                "deflate Huffman symbol 수가 내부 상한을 초과했습니다.",
+            ));
+        }
         let mut state = HuffmanBuildState {
-            depths: try_vec_filled(
-                node_capacity,
-                0_u16,
-                "deflate Huffman depth 메모리 확보 실패",
-            )?,
-            frequencies: try_vec_filled(
-                node_capacity,
-                0_u32,
-                "deflate Huffman frequency 메모리 확보 실패",
-            )?,
-            heap: try_vec_filled(
-                node_capacity,
-                0_usize,
-                "deflate Huffman heap 메모리 확보 실패",
-            )?,
+            depths: [0_u16; HUFFMAN_NODE_CAPACITY],
+            frequencies: [0_u32; HUFFMAN_NODE_CAPACITY],
+            heap: [0_usize; HUFFMAN_NODE_CAPACITY],
             heap_len: 0,
             heap_max: node_capacity,
             max_symbol: 0,
-            parents: try_vec_filled(
-                node_capacity,
-                usize::MAX,
-                "deflate Huffman parent 메모리 확보 실패",
-            )?,
+            parents: [usize::MAX; HUFFMAN_NODE_CAPACITY],
         };
         state
             .frequencies
@@ -961,7 +949,7 @@ impl HuffmanLengthBuilder<'_> {
                 continue;
             }
             state.heap_len = state.heap_len.strict_add(1);
-            huffman_set(&mut state.heap, state.heap_len, symbol)?;
+            huffman_set(&mut state.heap, state.heap_len, symbol);
             state.max_symbol = symbol;
         }
         if state.heap_len == 0 {
@@ -974,63 +962,60 @@ impl HuffmanLengthBuilder<'_> {
             } else {
                 0
             };
-            huffman_set(&mut state.frequencies, symbol, 1)?;
+            huffman_set(&mut state.frequencies, symbol, 1);
             state.heap_len = state.heap_len.strict_add(1);
-            huffman_set(&mut state.heap, state.heap_len, symbol)?;
+            huffman_set(&mut state.heap, state.heap_len, symbol);
         }
         for index in (1..=state.heap_len.div_euclid(2)).rev() {
-            state.heap_down(index)?;
+            state.heap_down(index);
         }
         let mut next_node = symbol_count;
         while state.heap_len >= 2 {
-            let left = huffman_get(&state.heap, 1)?;
-            let tail = huffman_get(&state.heap, state.heap_len)?;
-            huffman_set(&mut state.heap, 1, tail)?;
+            let left = huffman_get(&state.heap, 1);
+            let tail = huffman_get(&state.heap, state.heap_len);
+            huffman_set(&mut state.heap, 1, tail);
             state.heap_len = state.heap_len.strict_sub(1);
-            state.heap_down(1)?;
-            let right = huffman_get(&state.heap, 1)?;
+            state.heap_down(1);
+            let right = huffman_get(&state.heap, 1);
             state.heap_max = state.heap_max.strict_sub(1);
-            huffman_set(&mut state.heap, state.heap_max, left)?;
+            huffman_set(&mut state.heap, state.heap_max, left);
             state.heap_max = state.heap_max.strict_sub(1);
-            huffman_set(&mut state.heap, state.heap_max, right)?;
-            let parent_frequency = huffman_get(&state.frequencies, left)?
-                .checked_add(huffman_get(&state.frequencies, right)?)
+            huffman_set(&mut state.heap, state.heap_max, right);
+            let parent_frequency = huffman_get(&state.frequencies, left)
+                .checked_add(huffman_get(&state.frequencies, right))
                 .ok_or_else(|| zip_static("deflate Huffman frequency 계산 실패"))?;
-            huffman_set(&mut state.frequencies, next_node, parent_frequency)?;
-            let parent_depth = huffman_get(&state.depths, left)?
-                .max(huffman_get(&state.depths, right)?)
+            huffman_set(&mut state.frequencies, next_node, parent_frequency);
+            let parent_depth = huffman_get(&state.depths, left)
+                .max(huffman_get(&state.depths, right))
                 .strict_add(1);
-            huffman_set(&mut state.depths, next_node, parent_depth)?;
-            huffman_set(&mut state.parents, left, next_node)?;
-            huffman_set(&mut state.parents, right, next_node)?;
-            huffman_set(&mut state.heap, 1, next_node)?;
+            huffman_set(&mut state.depths, next_node, parent_depth);
+            huffman_set(&mut state.parents, left, next_node);
+            huffman_set(&mut state.parents, right, next_node);
+            huffman_set(&mut state.heap, 1, next_node);
             next_node = next_node
                 .checked_add(1)
                 .ok_or_else(|| zip_static("deflate Huffman parent index 계산 실패"))?;
-            state.heap_down(1)?;
+            state.heap_down(1);
         }
         state.heap_max = state.heap_max.strict_sub(1);
-        let root = huffman_get(&state.heap, 1)?;
-        huffman_set(&mut state.heap, state.heap_max, root)?;
+        let root = huffman_get(&state.heap, 1);
+        huffman_set(&mut state.heap, state.heap_max, root);
         let maximum_length = usize::from(self.max_bits);
-        let mut length_counts = try_vec_filled(
-            maximum_length.strict_add(1),
-            0_usize,
-            "deflate Huffman length count 메모리 확보 실패",
-        )?;
-        let mut node_lengths = try_vec_filled(
-            node_capacity,
-            0_u8,
-            "deflate Huffman node length 메모리 확보 실패",
-        )?;
+        if maximum_length > DEFLATE_MAX_BITS {
+            return Err(zip_static(
+                "deflate Huffman bit 길이가 내부 상한을 초과했습니다.",
+            ));
+        }
+        let mut length_counts = [0_usize; DEFLATE_MAX_BITS + 1];
+        let mut node_lengths = [0_u8; HUFFMAN_NODE_CAPACITY];
         let mut overflow = 0_usize;
         let ordered_nodes = state
             .heap
-            .get(state.heap_max.strict_add(1)..)
+            .get(state.heap_max.strict_add(1)..node_capacity)
             .ok_or_else(|| zip_static("deflate Huffman ordered heap 범위 오류"))?;
         for &node in ordered_nodes {
-            let parent = huffman_get(&state.parents, node)?;
-            let mut length = usize::from(huffman_get(&node_lengths, parent)?).strict_add(1);
+            let parent = huffman_get(&state.parents, node);
+            let mut length = usize::from(huffman_get(&node_lengths, parent)).strict_add(1);
             if length > maximum_length {
                 length = maximum_length;
                 overflow = overflow.strict_add(1);
@@ -1041,10 +1026,10 @@ impl HuffmanLengthBuilder<'_> {
                 u8::try_from(length).map_err(|source| {
                     zip_with_source("deflate Huffman length 변환 실패", source)
                 })?,
-            )?;
+            );
             if node <= state.max_symbol {
-                let count = huffman_get(&length_counts, length)?.strict_add(1);
-                huffman_set(&mut length_counts, length, count)?;
+                let count = huffman_get(&length_counts, length).strict_add(1);
+                huffman_set(&mut length_counts, length, count);
             }
         }
         if overflow == 0 {
@@ -1066,15 +1051,15 @@ impl HuffmanLengthBuilder<'_> {
         while overflow != 0 {
             let shorter_bits = (1..maximum_length)
                 .rev()
-                .find(|&bits| huffman_get(&length_counts, bits).is_ok_and(|count| count != 0))
+                .find(|&bits| huffman_get(&length_counts, bits) != 0)
                 .ok_or_else(|| zip_static("deflate Huffman overflow 조정 길이가 없습니다."))?;
-            let shorter = huffman_get(&length_counts, shorter_bits)?.strict_sub(1);
-            huffman_set(&mut length_counts, shorter_bits, shorter)?;
+            let shorter = huffman_get(&length_counts, shorter_bits).strict_sub(1);
+            huffman_set(&mut length_counts, shorter_bits, shorter);
             let longer_bits = shorter_bits.strict_add(1);
-            let longer = huffman_get(&length_counts, longer_bits)?.strict_add(2);
-            huffman_set(&mut length_counts, longer_bits, longer)?;
-            let maximum = huffman_get(&length_counts, maximum_length)?.strict_sub(1);
-            huffman_set(&mut length_counts, maximum_length, maximum)?;
+            let longer = huffman_get(&length_counts, longer_bits).strict_add(2);
+            huffman_set(&mut length_counts, longer_bits, longer);
+            let maximum = huffman_get(&length_counts, maximum_length).strict_sub(1);
+            huffman_set(&mut length_counts, maximum_length, maximum);
             overflow = overflow
                 .checked_sub(2)
                 .ok_or_else(|| zip_static("deflate Huffman overflow 조정 실패"))?;
@@ -1084,15 +1069,15 @@ impl HuffmanLengthBuilder<'_> {
             0_u8,
             "deflate Huffman length 메모리 확보 실패",
         )?;
-        let mut ordered_index = state.heap.len();
-        for bits in (1..length_counts.len()).rev() {
-            let mut remaining = huffman_get(&length_counts, bits)?;
+        let mut ordered_index = node_capacity;
+        for bits in (1..=maximum_length).rev() {
+            let mut remaining = huffman_get(&length_counts, bits);
             while remaining != 0 {
                 let symbol = loop {
                     ordered_index = ordered_index
                         .checked_sub(1)
                         .ok_or_else(|| zip_static("deflate Huffman ordered symbol 부족"))?;
-                    let candidate = huffman_get(&state.heap, ordered_index)?;
+                    let candidate = huffman_get(&state.heap, ordered_index);
                     if candidate <= state.max_symbol {
                         break candidate;
                     }
@@ -1100,7 +1085,7 @@ impl HuffmanLengthBuilder<'_> {
                 let assigned = u8::try_from(bits).map_err(|source| {
                     zip_with_source("deflate Huffman assigned length 변환 실패", source)
                 })?;
-                huffman_set(&mut lengths, symbol, assigned)?;
+                huffman_set(&mut lengths, symbol, assigned);
                 remaining = remaining.strict_sub(1);
             }
         }
@@ -1108,34 +1093,34 @@ impl HuffmanLengthBuilder<'_> {
     }
 }
 impl HuffmanBuildState {
-    fn heap_down(&mut self, mut index: usize) -> ZipResult<()> {
-        let node = huffman_get(&self.heap, index)?;
+    fn heap_down(&mut self, mut index: usize) {
+        let node = huffman_get(&self.heap, index);
         let mut child = index.strict_mul(2);
         while child <= self.heap_len {
             if child < self.heap_len {
-                let left = huffman_get(&self.heap, child)?;
-                let right = huffman_get(&self.heap, child.strict_add(1))?;
-                if self.node_is_smaller(right, left)? {
+                let left = huffman_get(&self.heap, child);
+                let right = huffman_get(&self.heap, child.strict_add(1));
+                if self.node_is_smaller(right, left) {
                     child = child.strict_add(1);
                 }
             }
-            let child_node = huffman_get(&self.heap, child)?;
-            if self.node_is_smaller(node, child_node)? {
+            let child_node = huffman_get(&self.heap, child);
+            if self.node_is_smaller(node, child_node) {
                 break;
             }
-            huffman_set(&mut self.heap, index, child_node)?;
+            huffman_set(&mut self.heap, index, child_node);
             index = child;
             child = index.strict_mul(2);
         }
-        huffman_set(&mut self.heap, index, node)
+        huffman_set(&mut self.heap, index, node);
     }
-    fn node_is_smaller(&self, left: usize, right: usize) -> ZipResult<bool> {
-        let left_frequency = huffman_get(&self.frequencies, left)?;
-        let right_frequency = huffman_get(&self.frequencies, right)?;
-        let left_depth = huffman_get(&self.depths, left)?;
-        let right_depth = huffman_get(&self.depths, right)?;
-        Ok(left_frequency < right_frequency
-            || (left_frequency == right_frequency && left_depth <= right_depth))
+    fn node_is_smaller(&self, left: usize, right: usize) -> bool {
+        let left_frequency = huffman_get(&self.frequencies, left);
+        let right_frequency = huffman_get(&self.frequencies, right);
+        let left_depth = huffman_get(&self.depths, left);
+        let right_depth = huffman_get(&self.depths, right);
+        left_frequency < right_frequency
+            || (left_frequency == right_frequency && left_depth <= right_depth)
     }
 }
 impl DeflatePlan {
@@ -1264,17 +1249,15 @@ impl DeflateWriter<'_, '_> {
         let Some(hash) = hash3(bytes, position) else {
             return;
         };
-        let Some(head_slot) = head.get_mut(hash) else {
-            return;
-        };
+        let head_slot = head.get_mut(hash).unwrap_or_else(|| process::abort());
         let previous_distance = position
             .checked_sub(*head_slot)
             .and_then(|distance| u16::try_from(distance).ok())
             .filter(|distance| usize::from(*distance) <= DEFLATE_WINDOW_LEN)
             .unwrap_or(0);
-        let Some(slot) = previous.get_mut(position.rem_euclid(DEFLATE_WINDOW_LEN)) else {
-            return;
-        };
+        let slot = previous
+            .get_mut(position.rem_euclid(DEFLATE_WINDOW_LEN))
+            .unwrap_or_else(|| process::abort());
         *slot = previous_distance;
         *head_slot = position;
     }
@@ -1411,7 +1394,7 @@ impl DeflateWriter<'_, '_> {
                 token_start = block_end;
             }
             if token_start == token_end && boundary.empty_stored_after != 0 {
-                let last = blocks.last_mut().ok_or_else(|| {
+                let last = blocks.last().ok_or_else(|| {
                     zip_static("deflate empty stored block 앞에 data block이 없습니다.")
                 })?;
                 if last.token_range.end != token_end {
@@ -1564,7 +1547,7 @@ impl DeflateWriter<'_, '_> {
                 let matched = bytes
                     .get(position..next_position)
                     .ok_or_else(|| zip_static("deflate match CRC 범위 오류"))?;
-                crc32 = crc32_update(crc32, matched)?;
+                crc32 = crc32_update(crc32, matched);
                 if best_len <= XML_MAX_INSERT_MATCH_LEN {
                     for insert_position in position.strict_add(1)..next_position {
                         Self::insert_position(bytes, insert_position, head, previous);
@@ -1575,7 +1558,7 @@ impl DeflateWriter<'_, '_> {
                 let Some(&byte) = bytes.get(position) else {
                     return Err(zip_static("deflate literal 범위 오류"));
                 };
-                crc32 = crc32_update_byte(crc32, byte)?;
+                crc32 = crc32_update_byte(crc32, byte);
                 push_deflate_token(&mut tokens, DeflateToken::Literal(u16::from(byte)))?;
                 position = position.strict_add(1);
             }
@@ -1583,21 +1566,17 @@ impl DeflateWriter<'_, '_> {
         Ok(Some((tokens, !crc32)))
     }
 }
-fn huffman_get<T>(values: &[T], index: usize) -> ZipResult<T>
+fn huffman_get<T>(values: &[T], index: usize) -> T
 where
     T: Copy,
 {
     values
         .get(index)
         .copied()
-        .ok_or_else(|| zip_static("deflate Huffman 내부 범위 오류"))
+        .unwrap_or_else(|| process::abort())
 }
-fn huffman_set<T>(values: &mut [T], index: usize, value: T) -> ZipResult<()> {
-    let slot = values
-        .get_mut(index)
-        .ok_or_else(|| zip_static("deflate Huffman 내부 범위 오류"))?;
-    *slot = value;
-    Ok(())
+fn huffman_set<T>(values: &mut [T], index: usize, value: T) {
+    *values.get_mut(index).unwrap_or_else(|| process::abort()) = value;
 }
 fn try_vec_filled<T>(len: usize, value: T, context: &'static str) -> ZipResult<Vec<T>>
 where
@@ -1645,12 +1624,8 @@ fn ensure_deflate_output_len(
     let next_len = current_len
         .checked_add(additional_len)
         .ok_or_else(|| zip_static("deflate 출력 크기 계산 실패"))?;
-    if next_len > expected_len {
-        return Err(zip_static(
-            "deflate 출력이 ZIP 선언 해제 크기를 초과했습니다.",
-        ));
-    }
-    Ok(())
+    (next_len <= expected_len)
+        .ok_or_else(|| zip_static("deflate 출력이 ZIP 선언 해제 크기를 초과했습니다."))
 }
 fn hash3(bytes: &[u8], position: usize) -> Option<usize> {
     let &[first_byte, second_byte, third_byte] = bytes.get(position..)?.first_chunk::<3>()?;
@@ -1678,11 +1653,8 @@ fn push_repeated(lengths: &mut Vec<u8>, value: u8, repeat: usize, total: usize) 
         .len()
         .checked_add(repeat)
         .ok_or_else(|| zip_static("deflate repeat 길이 계산 실패"))?;
-    if next_len > total {
-        return Err(zip_static(
-            "deflate repeat 길이가 code length 총합을 초과합니다.",
-        ));
-    }
+    (next_len <= total)
+        .ok_or_else(|| zip_static("deflate repeat 길이가 code length 총합을 초과합니다."))?;
     lengths.extend(repeat_n(value, repeat));
     Ok(())
 }

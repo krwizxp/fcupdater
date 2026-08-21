@@ -7,6 +7,7 @@ use crate::{
     master_sheet::{ChangeRow, StoreRow},
     sheet_util::add_row_offset,
 };
+use core::fmt::NumBuffer;
 const CHANGELOG_DATA_START_ROW: u32 = 4;
 const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
 const CHANGELOG_COL_REGION: u32 = 1;
@@ -51,7 +52,6 @@ impl ChangeLogRowValues<'_> {
         shared_strings: &mut SharedStringTable,
         row: u32,
         formula_buffer: &mut String,
-        cache_buffer: &mut String,
     ) -> Result<()> {
         for (col, value) in [
             (CHANGELOG_COL_REGION, self.region),
@@ -71,6 +71,9 @@ impl ChangeLogRowValues<'_> {
         ] {
             worksheet.set_i32_at(col, row, value)?;
         }
+        let mut row_buffer = NumBuffer::new();
+        let row_text = row.format_into(&mut row_buffer);
+        let mut cache_buffer = NumBuffer::new();
         for (&(old_col, new_col, target_col), (old_value, new_value)) in
             DELTA_FORMULA_COLUMNS.iter().zip([
                 (self.old_fuels.gasoline, self.new_fuels.gasoline),
@@ -82,21 +85,18 @@ impl ChangeLogRowValues<'_> {
             append_fmt(
                 formula_buffer,
                 format_args!(
-                    "IF(OR({old_col}{row}=\"\",{new_col}{row}=\"\"),\"\",{new_col}{row}-{old_col}{row})"
+                    "IF(OR({old_col}{row_text}=\"\",{new_col}{row_text}=\"\"),\"\",{new_col}{row_text}-{old_col}{row_text})"
                 ),
             );
             let cached_value = old_value
                 .zip(new_value)
                 .map(|(old, new)| new.strict_sub(old));
-            cache_buffer.clear();
-            if let Some(value) = cached_value {
-                append_fmt(cache_buffer, format_args!("{value}"));
-            }
+            let cached_text = cached_value.map(|value| value.format_into(&mut cache_buffer));
             worksheet.set_formula_at_with_cache(
                 target_col,
                 row,
                 formula_buffer,
-                cached_value.map(|_| cache_buffer.as_str()),
+                cached_text,
                 false,
             )?;
         }
@@ -105,18 +105,15 @@ impl ChangeLogRowValues<'_> {
 }
 impl ChangeLogUpdater<'_, '_, '_, '_> {
     pub(super) fn update(&mut self) -> Result<u32> {
-        if !self
-            .worksheet
+        self.worksheet
             .has_any_row_format(CHANGELOG_STYLE_TEMPLATE_ROW, CHANGELOG_COL_DELTA_DIESEL)
-        {
-            return Err(err("변경내역 243행에 고정 style template이 없습니다."));
-        }
+            .ok_or_else(|| err("변경내역 243행에 고정 style template이 없습니다."))?;
         let date_text = format!("현행화 일자: {}", self.today);
         self.shared_string_table
             .set_cell(self.worksheet, 1, 2, &date_text)?;
         if let Some(last_data_row) = self
             .worksheet
-            .row_numbers_from(CHANGELOG_DATA_START_ROW)?
+            .row_numbers_from(CHANGELOG_DATA_START_ROW)
             .into_iter()
             .last()
         {
@@ -133,7 +130,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             .strict_add(self.added.len())
             .strict_add(self.deleted.len());
         if entry_count == 0 {
-            self.worksheet.truncate_rows_after(style_template_row)?;
+            self.worksheet.truncate_rows_after(style_template_row);
             return Ok(CHANGELOG_DATA_START_ROW);
         }
         let change_entries = self.changes.iter().map(|change| ChangeLogRowValues {
@@ -165,10 +162,6 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             .strict_add("IF(OR(E=\"\",F=\"\"),\"\",F-E)".len());
         let mut formula_buffer =
             try_string_with_capacity(formula_capacity, "변경내역 delta formula 메모리 확보 실패")?;
-        let mut cache_buffer = try_string_with_capacity(
-            ROW_DECIMAL_TEXT_MAX_LEN,
-            "변경내역 delta cache 메모리 확보 실패",
-        )?;
         let worksheet = &mut *self.worksheet;
         for (index, values) in change_entries
             .chain(added_entries)
@@ -184,7 +177,6 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 self.shared_string_table,
                 row,
                 &mut formula_buffer,
-                &mut cache_buffer,
             )?;
         }
         let last_change_row = add_row_offset(
@@ -193,7 +185,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             "변경내역 마지막 행 계산",
         )?;
         self.worksheet
-            .truncate_rows_after(last_change_row.max(style_template_row))?;
+            .truncate_rows_after(last_change_row.max(style_template_row));
         Ok(last_change_row)
     }
 }

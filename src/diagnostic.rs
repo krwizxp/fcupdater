@@ -12,7 +12,6 @@ pub(super) struct AppError {
     source: Option<BoxError>,
 }
 struct ControlEscapingWriter<'formatter, 'output>(&'formatter mut fmt::Formatter<'output>);
-struct TerminalSafeDisplay<'value, T: ?Sized>(&'value T);
 impl AppError {
     fn context(context: impl Into<Cow<'static, str>>, source: impl Into<BoxError>) -> Self {
         Self {
@@ -43,14 +42,6 @@ impl Display for AppError {
 impl fmt::Write for ControlEscapingWriter<'_, '_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         write_control_escaped(self.0, s)
-    }
-}
-impl<T> Display for TerminalSafeDisplay<'_, T>
-where
-    T: Display + ?Sized,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(&mut ControlEscapingWriter(f), "{}", self.0)
     }
 }
 impl fmt::Debug for AppError {
@@ -116,7 +107,7 @@ pub(super) const fn terminal_safe<T>(value: &T) -> impl Display + '_
 where
     T: Display + ?Sized,
 {
-    TerminalSafeDisplay(value)
+    fmt::from_fn(move |formatter| write!(&mut ControlEscapingWriter(formatter), "{value}"))
 }
 fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     for character in text.chars() {

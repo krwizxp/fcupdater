@@ -1,5 +1,8 @@
 use super::copy_text;
-use crate::diagnostic::{Result, err, err_with_source, try_vec_with_capacity};
+use crate::{
+    diagnostic::{Result, err, err_with_source, try_vec_with_capacity},
+    u32_to_usize,
+};
 use core::{fmt::Display, range::Range};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
@@ -126,9 +129,7 @@ impl SourceReader {
         let total_entries = fat_sector_ids.len().strict_mul(entries_per_sector);
         let mut fat = try_vec_with_capacity(total_entries, "CFB FAT 메모리 확보 실패")?;
         for &sid in fat_sector_ids {
-            let sector_idx = sector_id_to_index(sid, || {
-                prefixed_display_message("CFB sector id 변환 실패: ", sid)
-            })?;
+            let sector_idx = u32_to_usize(sid);
             let sector = get_sector_slice_at_index(&self.0, sector_idx, sid)?;
             let (chunks, &[]) = sector.as_chunks::<4>() else {
                 return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
@@ -281,9 +282,8 @@ impl SourceReader {
         read_stream_from_fat_chain(&self.0, fat, start_sector, Some(stream_size), "Workbook")
     }
     fn read_xls_workbook(self) -> Result<Vec<u8>> {
-        let parser = self;
-        let header = parser.parse_cfb_header()?;
-        let max_sector_count = parser
+        let header = self.parse_cfb_header()?;
+        let max_sector_count = self
             .0
             .len()
             .strict_sub(CFB_SECTOR_SIZE)
@@ -291,15 +291,13 @@ impl SourceReader {
         if max_sector_count == 0 {
             return Err(err("CFB sector 개수가 비정상적입니다."));
         }
-        let declared_fat_sectors = usize::try_from(header.num_fat_sectors).map_err(|source| {
-            err_with_source("CFB FAT sector 개수 변환에 실패했습니다.", source)
-        })?;
+        let declared_fat_sectors = u32_to_usize(header.num_fat_sectors);
         if declared_fat_sectors > max_sector_count {
             return Err(err(format!(
                 "CFB FAT sector 개수가 비정상적으로 큽니다: {declared_fat_sectors} (최대 {max_sector_count})"
             )));
         }
-        let difat_chunks = parser.header_difat_entries()?;
+        let difat_chunks = self.header_difat_entries()?;
         if declared_fat_sectors > difat_chunks.len() {
             return Err(err(format!(
                 "CFB FAT 엔트리 개수가 header DIFAT 용량을 초과했습니다: {declared_fat_sectors}"
@@ -329,8 +327,8 @@ impl SourceReader {
                 difat_entries.len()
             )));
         }
-        let fat = parser.build_fat_table(&difat_entries)?;
-        parser.read_workbook_stream(header, &fat)
+        let fat = self.build_fat_table(&difat_entries)?;
+        self.read_workbook_stream(header, &fat)
     }
     pub(crate) fn visit_rows(
         self,
@@ -361,10 +359,7 @@ impl SstChunkReader<'_, '_> {
             self.chunk_index = self.chunk_index.strict_add(1);
             self.offset_in_chunk = 0;
         }
-        if self.chunk_index >= self.chunks.len() {
-            return Err(err("SST data가 예상보다 짧습니다."));
-        }
-        Ok(())
+        (self.chunk_index < self.chunks.len()).ok_or_else(|| err("SST data가 예상보다 짧습니다."))
     }
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.ensure_available()?;
@@ -571,9 +566,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             }
             match record_id {
                 0x0085 => {
-                    let offset = usize::try_from(read_u32_le(data, 0)?).map_err(|source| {
-                        err_with_source("xls BoundSheet offset 변환에 실패했습니다.", source)
-                    })?;
+                    let offset = u32_to_usize(read_u32_le(data, 0)?);
                     let sheet_type = *data
                         .get(5)
                         .ok_or_else(|| err("xls BoundSheet record가 예상보다 짧습니다."))?;
@@ -648,10 +641,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             chunks: &chunks,
             offset_in_chunk: 0,
         };
-        let declared_total = usize::try_from(reader.read_u32()?)
-            .map_err(|source| err_with_source("SST total count 변환에 실패했습니다.", source))?;
-        let unique_count = usize::try_from(reader.read_u32()?)
-            .map_err(|source| err_with_source("SST unique count 변환에 실패했습니다.", source))?;
+        let declared_total = u32_to_usize(reader.read_u32()?);
+        let unique_count = u32_to_usize(reader.read_u32()?);
         if declared_total < unique_count {
             return Err(err(format!(
                 "SST total count가 unique count보다 작습니다: total={declared_total}, unique={unique_count}"
@@ -687,9 +678,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 0_usize
             };
             let ext_len = if ext {
-                usize::try_from(reader.read_u32()?).map_err(|source| {
-                    err_with_source("SST ext 길이 변환에 실패했습니다.", source)
-                })?
+                u32_to_usize(reader.read_u32()?)
             } else {
                 0_usize
             };
@@ -858,9 +847,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     }
                     current_row_num = Some(row);
                     previous_cell = Some((row, col));
-                    let idx = usize::try_from(read_u32_le(record_data, 6)?).map_err(|source| {
-                        err_with_source("SST index 변환에 실패했습니다.", source)
-                    })?;
+                    let idx = u32_to_usize(read_u32_le(record_data, 6)?);
                     let value = shared_strings.get(idx).map(String::as_str).ok_or_else(|| {
                         err(format!(
                             "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
@@ -888,18 +875,13 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         if let Some(row_num) = current_row_num {
             flush_row(row_num, &current_row)?;
         }
-        if label_sst_count != declared_total {
-            return Err(err(format!(
+        (label_sst_count == declared_total).ok_or_else(|| {
+            err(format!(
                 "SST total count가 LABELSST 레코드 수와 다릅니다: declared={declared_total}, actual={label_sst_count}"
-            )));
-        }
-        if !found_header {
-            return Err(err("Opinet 소스 헤더 행을 찾지 못했습니다."));
-        }
-        if !found_record {
-            return Err(err("xls 시트에서 유효한 소스 데이터를 찾지 못했습니다."));
-        }
-        Ok(())
+            ))
+        })?;
+        found_header.ok_or_else(|| err("Opinet 소스 헤더 행을 찾지 못했습니다."))?;
+        found_record.ok_or_else(|| err("xls 시트에서 유효한 소스 데이터를 찾지 못했습니다."))
     }
 }
 fn validate_biff_bof(
@@ -921,20 +903,18 @@ fn validate_biff_bof(
     }
     let version = read_u16_le(data, 0)?;
     let substream = read_u16_le(data, 2)?;
-    if version != BIFF_VERSION_8 || substream != expected_substream {
-        return Err(err(format!(
+    (version == BIFF_VERSION_8 && substream == expected_substream).ok_or_else(|| {
+        err(format!(
             "xls {substream_name} BOF가 예상과 다릅니다: version={version:#06x}, substream={substream:#06x}"
-        )));
-    }
-    Ok(())
+        ))
+    })
 }
 fn validate_sst_option(flags: u8, allowed_mask: u8, context: &str) -> Result<()> {
-    if flags & !allowed_mask != 0 {
-        return Err(err(format!(
+    (flags & !allowed_mask == 0).ok_or_else(|| {
+        err(format!(
             "{context}에 예약 비트가 설정되었습니다: {flags:#04x}"
-        )));
-    }
-    Ok(())
+        ))
+    })
 }
 fn row_fuel_price(
     row: &SourceRow<'_>,
@@ -1026,9 +1006,6 @@ const fn is_regular_sector_id(sector_id: u32) -> bool {
         CFB_FREE_SECT | CFB_END_OF_CHAIN | CFB_FAT_SECT | CFB_DIFAT_SECT
     )
 }
-fn sector_id_to_index(sector_id: u32, message: impl FnOnce() -> String) -> Result<usize> {
-    usize::try_from(sector_id).map_err(|source| err_with_source(message(), source))
-}
 fn get_sector_slice_at_index(data: &[u8], sector_idx: usize, sector_id: u32) -> Result<&[u8]> {
     let start_offset = sector_idx
         .checked_add(1)
@@ -1094,9 +1071,7 @@ fn read_stream_from_fat_chain(
                 "FAT chain에 잘못된 sector id가 있습니다: {stream_name} ({sid:#x})"
             )));
         }
-        let sid_usize = sector_id_to_index(sid, || {
-            format!("FAT sector 변환 실패: {stream_name} (sector={sid})")
-        })?;
+        let sid_usize = u32_to_usize(sid);
         let next_sid = *fat.get(sid_usize).ok_or_else(|| {
             err(prefixed_display_message(
                 "FAT 인덱스 범위 오류: sector=",

@@ -1,12 +1,15 @@
 use super::{
     ArchiveFingerprint, MAX_XLSX_PART_BYTES, PackagePart, PartRole, XLSX_PARTS, ZipPackageReader,
 };
-use crate::diagnostic::{
-    AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
-    err_with_source as zip_with_source, path_context_message, try_vec_with_capacity,
+use crate::{
+    diagnostic::{
+        AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
+        err_with_source as zip_with_source, path_context_message, try_vec_with_capacity,
+    },
+    u32_to_usize,
 };
 use core::str;
-use std::{fs::File, io::Read as _, path::Path};
+use std::{fs::File, io::Read as _, path::Path, process};
 mod deflate;
 mod write;
 const CENTRAL_DIRECTORY_HEADER_LEN: usize = 46;
@@ -119,7 +122,6 @@ struct ZipCentralDirectory<'bytes> {
     bytes: &'bytes [u8],
     cursor: usize,
     end: usize,
-    remaining_entries: usize,
 }
 impl ZipEntry<'_> {
     fn data(
@@ -128,8 +130,7 @@ impl ZipEntry<'_> {
         expected_len: usize,
         expected_local_offset: usize,
     ) -> Result<(Vec<u8>, usize)> {
-        let local_offset = usize::try_from(self.local_header_offset)
-            .map_err(|source| err_with_source("ZIP local header offset 변환 실패", source))?;
+        let local_offset = u32_to_usize(self.local_header_offset);
         if local_offset != expected_local_offset {
             return Err(err(format!(
                 "ZIP local record가 연속된 고정 순서가 아닙니다: {}",
@@ -218,8 +219,7 @@ impl ZipEntry<'_> {
             .get(extra_start..data_start)
             .ok_or_else(|| zip_static("ZIP local extra 범위 오류"))?;
         validate_zip_extra(local_extra, self.name)?;
-        let compressed_len = usize::try_from(self.compressed_size)
-            .map_err(|source| err_with_source("ZIP 압축 크기 변환 실패", source))?;
+        let compressed_len = u32_to_usize(self.compressed_size);
         let data_end = data_start
             .checked_add(compressed_len)
             .ok_or_else(|| zip_static("ZIP data end 계산 실패"))?;
@@ -269,7 +269,7 @@ impl ZipEntry<'_> {
             let mut output =
                 try_vec_with_capacity(expected_len, "ZIP stored entry 메모리 확보 실패")?;
             output.extend_from_slice(compressed);
-            let crc = !crc32_update(u32::MAX, &output)?;
+            let crc = !crc32_update(u32::MAX, &output);
             (output, crc)
         };
         if output.len() != expected_len {
@@ -282,13 +282,7 @@ impl ZipEntry<'_> {
     }
 }
 impl<'bytes> ZipCentralDirectory<'bytes> {
-    fn next_entry(&mut self) -> Result<Option<ZipEntry<'bytes>>> {
-        if self.remaining_entries == 0 {
-            if self.cursor != self.end {
-                return Err(zip_static(ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE));
-            }
-            return Ok(None);
-        }
+    fn next_entry(&mut self) -> Result<ZipEntry<'bytes>> {
         let (header, tail) = split_header_at::<CENTRAL_DIRECTORY_HEADER_LEN>(
             self.bytes,
             self.cursor,
@@ -349,8 +343,7 @@ impl<'bytes> ZipCentralDirectory<'bytes> {
             .ok_or_else(|| zip_static("ZIP 중앙 extra 범위 오류"))?;
         validate_zip_extra(central_extra, name)?;
         self.cursor = next_cursor;
-        self.remaining_entries = self.remaining_entries.strict_sub(1);
-        Ok(Some(ZipEntry {
+        Ok(ZipEntry {
             compressed_size: read_u32(header, 20)?,
             crc32: read_u32(header, 16)?,
             flags,
@@ -361,7 +354,7 @@ impl<'bytes> ZipCentralDirectory<'bytes> {
             name,
             uncompressed_size: read_u32(header, 24)?,
             version_needed,
-        }))
+        })
     }
 }
 impl ZipPackageReader<'_> {
@@ -423,10 +416,8 @@ impl ZipPackageReader<'_> {
                 "ZIP entry 수가 지원 상한을 초과했습니다: {entry_count}"
             )));
         }
-        let central_dir_size = usize::try_from(read_u32(eocd, 12)?)
-            .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
-        let central_dir_offset = usize::try_from(read_u32(eocd, 16)?)
-            .map_err(|source| err_with_source("ZIP 중앙 디렉터리 offset 변환 실패", source))?;
+        let central_dir_size = u32_to_usize(read_u32(eocd, 12)?);
+        let central_dir_offset = u32_to_usize(read_u32(eocd, 16)?);
         let central_dir_end = central_dir_offset
             .checked_add(central_dir_size)
             .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 범위 계산 실패"))?;
@@ -439,15 +430,12 @@ impl ZipPackageReader<'_> {
             bytes: archive_bytes.as_slice(),
             cursor: central_dir_offset,
             end: central_dir_end,
-            remaining_entries: entry_count,
         };
         let mut total_uncompressed = 0_usize;
         let mut entries: Vec<(ZipEntry<'_>, &'static str, usize)> =
             try_vec_with_capacity(entry_count, "ZIP entry 목록 메모리 확보 실패")?;
         for _ in 0..entry_count {
-            let entry = central_directory
-                .next_entry()?
-                .ok_or_else(|| zip_static("ZIP entry가 고정 스키마보다 적습니다."))?;
+            let entry = central_directory.next_entry()?;
             let Some(&(part_name, _, _)) =
                 XLSX_PARTS.iter().find(|&&(name, _, _)| name == entry.name)
             else {
@@ -459,8 +447,7 @@ impl ZipPackageReader<'_> {
             if entries.iter().any(|item| item.1 == part_name) {
                 return Err(err(format!("ZIP entry 이름이 중복되었습니다: {part_name}")));
             }
-            let expected_len = usize::try_from(entry.uncompressed_size)
-                .map_err(|source| err_with_source("ZIP 해제 크기 변환 실패", source))?;
+            let expected_len = u32_to_usize(entry.uncompressed_size);
             ensure_zip_size_limit("entry 해제", expected_len, MAX_XLSX_PART_BYTES, entry.name)?;
             total_uncompressed = total_uncompressed
                 .checked_add(expected_len)
@@ -473,10 +460,8 @@ impl ZipPackageReader<'_> {
             )?;
             entries.push((entry, part_name, expected_len));
         }
-        if central_directory.next_entry()?.is_some() {
-            return Err(zip_static(
-                "ZIP 중앙 디렉터리 entry 수가 일치하지 않습니다.",
-            ));
+        if central_directory.cursor != central_directory.end {
+            return Err(zip_static(ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE));
         }
         for (name, role, _) in XLSX_PARTS {
             if role == PartRole::Required && !entries.iter().any(|item| item.1 == name) {
@@ -583,7 +568,7 @@ pub(super) fn scan_open_archive(
         }
         bytes_read = bytes_read.strict_add(read_len);
         let (chunk, _) = buffer.split_at(read_len);
-        crc = crc32_update(crc, chunk)?;
+        crc = crc32_update(crc, chunk);
         if let Some(bytes) = retained.as_mut() {
             bytes.extend_from_slice(chunk);
         }
@@ -611,28 +596,26 @@ fn ensure_zip_size_limit(
     limit: usize,
     entry_name: &str,
 ) -> Result<()> {
-    if actual_len > limit {
-        Err(err(format!(
+    (actual_len <= limit).ok_or_else(|| {
+        err(format!(
             "ZIP {scope} 크기가 허용 한도({limit} bytes)를 초과했습니다: {entry_name}"
-        )))
-    } else {
-        Ok(())
-    }
+        ))
+    })
 }
 fn zip_entry_message(context: &str, entry_name: &str) -> String {
     format!("{context}: {entry_name}")
 }
-fn crc32_update(initial: u32, bytes: &[u8]) -> ZipResult<u32> {
+fn crc32_update(initial: u32, bytes: &[u8]) -> u32 {
     bytes
         .iter()
-        .try_fold(initial, |crc, &byte| crc32_update_byte(crc, byte))
+        .fold(initial, |crc, &byte| crc32_update_byte(crc, byte))
 }
-fn crc32_update_byte(crc: u32, byte: u8) -> ZipResult<u32> {
+fn crc32_update_byte(crc: u32, byte: u8) -> u32 {
     let table_index = usize::from((crc ^ u32::from(byte)).to_le_bytes()[0]);
-    let Some(table_value) = CRC32_TABLE.get(table_index).copied() else {
-        return Err(zip_static("ZIP CRC32 table 범위가 손상되었습니다."));
-    };
-    Ok((crc >> 8_u8) ^ table_value)
+    let table_value = *CRC32_TABLE
+        .get(table_index)
+        .unwrap_or_else(|| process::abort());
+    (crc >> 8_u8) ^ table_value
 }
 fn split_header_at<'bytes, const LEN: usize>(
     bytes: &'bytes [u8],

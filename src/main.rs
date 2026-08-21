@@ -8,6 +8,7 @@ use std::{
     fs::{File, TryLockError},
     io::{self, Write, stdout},
     path::Path,
+    process,
 };
 cfg_select! {
     target_os = "windows" => {
@@ -52,6 +53,9 @@ const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
 const RUN_LOCK_PATH: &str = ".fcupdater.lock";
 #[cfg(target_os = "windows")]
 const RUN_LOCK_SHARE_MODE: u32 = 0x0000_0003;
+fn u32_to_usize(value: u32) -> usize {
+    usize::try_from(value).unwrap_or_else(|_| process::abort())
+}
 fn main() -> Result<()> {
     let mut out = stdout().lock();
     let mut raw_args = env::args_os().skip(1);
