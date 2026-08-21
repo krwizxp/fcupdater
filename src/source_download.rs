@@ -86,14 +86,11 @@ impl ResponseHeaders {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn parse_content_length(&mut self, raw_value: &str) -> DownloadResult<()> {
         let value = raw_value.trim_ascii();
-        if value.is_empty() {
-            return Err("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.".into());
-        }
+        (!value.is_empty()).ok_or("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.")?;
         let mut parsed = 0_usize;
         for byte in value.bytes() {
-            if !byte.is_ascii_digit() {
-                return Err("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.".into());
-            }
+            byte.is_ascii_digit()
+                .ok_or("HTTP Content-Length가 음이 아닌 10진수 형식이 아닙니다.")?;
             if parsed > HTTP_MAX_BODY_BYTES {
                 continue;
             }
