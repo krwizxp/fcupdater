@@ -159,12 +159,6 @@ impl<'xml> XmlScanner<'xml> {
         }
         None
     }
-    fn find_tag_matching<F>(&mut self, predicate: F) -> Option<XmlTag<'xml>>
-    where
-        F: FnMut(&XmlTag<'xml>) -> bool,
-    {
-        iter::from_fn(|| self.next_tag()).find(predicate)
-    }
     pub(super) const fn new(xml: &'xml str) -> Self {
         Self { cursor: 0, xml }
     }
@@ -246,7 +240,7 @@ impl<'xml> XmlScanner<'xml> {
     }
     pub(super) fn next_start_named(&mut self, tag_name: &str) -> Option<XmlTag<'xml>> {
         let wanted = local_tag_name(tag_name);
-        self.find_tag_matching(|tag| tag.is_start && tag.local_name == wanted)
+        iter::from_fn(|| self.next_tag()).find(|tag| tag.is_start && tag.local_name == wanted)
     }
     pub(super) fn next_tag(&mut self) -> Option<XmlTag<'xml>> {
         while let Some(rel) = self.xml.get(self.cursor..)?.find('<') {

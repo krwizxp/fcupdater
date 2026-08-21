@@ -7,7 +7,7 @@ use super::{
 use crate::diagnostic::try_vec_with_capacity;
 use core::{
     array::from_fn,
-    iter::{once, repeat_n},
+    iter::{chain, once, repeat_n},
     mem,
     range::Range,
 };
@@ -744,9 +744,7 @@ impl DynamicFrequencies {
             literal_count.strict_add(distance_count),
             "deflate code length token 메모리 확보 실패",
         )?;
-        let mut lengths = literal_prefix
-            .iter()
-            .chain(distance_prefix)
+        let mut lengths = chain(literal_prefix, distance_prefix)
             .copied()
             .chain(once(u8::MAX));
         let mut previous = u8::MAX;
