@@ -8,7 +8,6 @@ use crate::{
     },
     u32_to_usize,
 };
-use core::str;
 use std::{fs::File, io::Read as _, path::Path, process};
 mod deflate;
 mod write;

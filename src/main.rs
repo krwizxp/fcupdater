@@ -67,7 +67,7 @@ fn main() -> Result<()> {
             if !(is_help || token == OsStr::new("--verify") || is_version) {
                 return Err(err(format!(
                     "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
-                    token.to_string_lossy()
+                    token.display()
                 )));
             }
             if let Some(extra) = raw_args.next() {
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
                 };
                 return Err(err(format!(
                     "{context}: {}\n\n{HELP_TEXT}",
-                    extra.to_string_lossy()
+                    extra.display()
                 )));
             }
             if is_help {

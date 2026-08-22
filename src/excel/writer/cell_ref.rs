@@ -1,6 +1,5 @@
 use super::CellReference;
 use crate::diagnostic::{Result, err};
-use core::str;
 use std::process;
 const COL_NAME_BUF_LEN: usize = 8;
 const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
