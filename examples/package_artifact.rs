@@ -83,7 +83,6 @@ fn main() -> io::Result<()> {
             .strict_sub(usize::try_from(remainder).unwrap_or_else(|_| process::abort()));
         output.write_all(ZERO_BLOCK.split_at(padding).0)?;
     }
-    output.write_all(&ZERO_BLOCK)?;
-    output.write_all(&ZERO_BLOCK)?;
+    output.write_all([ZERO_BLOCK; 2].as_flattened())?;
     output.flush()
 }
