@@ -135,7 +135,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
             }
             _ => None,
         };
-        let local_extra_len = local_extra.map_or(0, |(len, _)| len);
+        let local_extra_len = local_extra.map_or_default(|(len, _)| len);
         let local_header_len = LOCAL_FILE_HEADER_LEN
             .checked_add(part.name.len())
             .and_then(|len| len.checked_add(local_extra_len))

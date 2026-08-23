@@ -24,7 +24,7 @@ use core::{array, mem, str};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
     fs,
-    io::{self, Seek as _, SeekFrom, Write as _, stderr},
+    io::{self, Seek as _, Write as _, stderr},
     path::{Path, PathBuf},
     process,
     time::{SystemTime, UNIX_EPOCH},
@@ -243,7 +243,7 @@ impl ReservedTempArchive {
     fn verify_saved_archive(&mut self) -> Result<()> {
         let mut saved_handle = self.file.take().unwrap_or_else(|| process::abort());
         let saved_archive = self.path();
-        saved_handle.seek(SeekFrom::Start(0)).map_err(|source| {
+        saved_handle.rewind().map_err(|source| {
             err_with_source(
                 path_context_message("저장 검증용 xlsx seek 실패", saved_archive),
                 source,

@@ -317,7 +317,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             format_args!(
                 r#"IF($P{row_text}="","",IF($Q{row_text}="Y",IFERROR(VLOOKUP($B{row_text},$C$4:$D$13,2,FALSE()),0),0))"#
             ),
-            has_total_price.then(|| region_rate.as_i128()),
+            has_total_price.then_some(region_rate.as_i128()),
             DECIMAL_SCALE.as_i128(),
             buffers,
         )?;

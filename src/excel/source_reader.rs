@@ -998,7 +998,7 @@ fn row_fuel_price(
     Ok(Some(parsed_value))
 }
 fn row_text_trimmed<'strings>(row: &SourceRow<'strings>, idx: usize) -> &'strings str {
-    row.get(idx).copied().flatten().map_or("", str::trim)
+    row.get(idx).copied().flatten().map_or_default(str::trim)
 }
 const fn is_regular_sector_id(sector_id: u32) -> bool {
     !matches!(
