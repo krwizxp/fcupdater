@@ -446,10 +446,9 @@ pub(super) fn extract_first_tag_text<'xml>(
     tag_name: &str,
 ) -> Result<Option<&'xml str>> {
     let mut scanner = XmlScanner::new(xml);
-    let Some(element) = scanner.next_element_named(tag_name)? else {
-        return Ok(None);
-    };
-    Ok(Some(element.body))
+    scanner
+        .next_element_named(tag_name)
+        .map(|maybe_element| maybe_element.map(|element| element.body))
 }
 pub(super) fn extract_all_tag_text<'xml>(
     xml: &'xml str,
@@ -476,8 +475,7 @@ pub(super) fn extract_all_tag_text<'xml>(
                     previous.len().strict_add(decoded.len()),
                     "XML tag text 메모리 확보 실패",
                 )?;
-                out_text.push_str(previous.as_ref());
-                out_text.push_str(decoded.as_ref());
+                out_text.extend([previous.as_ref(), decoded.as_ref()]);
                 out = Some(out_text);
             } else {
                 first_text = Some(decoded);
@@ -609,8 +607,5 @@ pub(super) fn is_valid_xml_char(ch: char) -> bool {
     )
 }
 fn local_tag_name(name: &str) -> &str {
-    match name.rsplit_once(':') {
-        Some((_, local)) => local,
-        None => name,
-    }
+    name.rsplit_once(':').map_or(name, |(_, local)| local)
 }

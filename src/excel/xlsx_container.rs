@@ -684,11 +684,7 @@ impl XlsxContainer {
             };
             input_styles.push(canonical);
         }
-        let mut source_parts = mem::take(&mut self.parts);
-        let source_core = source_parts
-            .iter_mut()
-            .find(|part| part.name == "docProps/core.xml")
-            .unwrap_or_else(|| process::abort());
+        let source_core = self.part_mut("docProps/core.xml");
         let source_core_xml = str::from_utf8(&source_core.bytes)
             .map_err(|source| err_with_source("core.xml UTF-8 해석 실패", source))?;
         let mut core_xml = try_string_with_capacity(
@@ -700,15 +696,15 @@ impl XlsxContainer {
             "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">",
         ));
         let mut core_values = [None; EXCEL_CORE_PROPERTIES.len()];
-        let mut core_scanner = XmlScanner::new(source_core_xml);
-        while let Some(tag) = core_scanner.next_tag() {
-            if !tag.is_start {
-                continue;
-            }
+        let (mut core_scanner, core_root) =
+            scan_xml_root(source_core_xml, "cp:coreProperties", "core.xml")?;
+        while let Some(element) =
+            core_scanner.next_direct_element_until(core_root.name, "core.xml")?
+        {
             let Some((property, slot)) = EXCEL_CORE_PROPERTIES
                 .iter()
                 .zip(&mut core_values)
-                .find(|item| tag.name == item.0.0)
+                .find(|item| element.opening.name == item.0.0)
             else {
                 continue;
             };
@@ -718,21 +714,9 @@ impl XlsxContainer {
                     "core.xml에 {qualified} 요소가 여러 개 있습니다."
                 )));
             }
-            let body = if tag.self_closing {
-                ""
-            } else {
-                let body_start = tag.end.strict_add(1);
-                let closing = core_scanner
-                    .next_tag()
-                    .filter(|closing| !closing.is_start && closing.name == qualified)
-                    .ok_or_else(|| err(format!("core.xml의 {qualified} 종료 태그가 없습니다.")))?;
-                source_core_xml
-                    .get(body_start..closing.start)
-                    .filter(|value| !value.contains('<'))
-                    .ok_or_else(|| {
-                        err(format!("core.xml의 {qualified} 본문이 올바르지 않습니다."))
-                    })?
-            };
+            let body = (!element.body.contains('<'))
+                .then_some(element.body)
+                .ok_or_else(|| err(format!("core.xml의 {qualified} 본문이 올바르지 않습니다.")))?;
             decode_xml_entities(body).map_err(|source| {
                 err_with_source(
                     format!("core.xml의 {qualified} 본문이 올바르지 않습니다."),
@@ -746,30 +730,25 @@ impl XlsxContainer {
         {
             let body = body_value
                 .ok_or_else(|| err(format!("core.xml의 {qualified} 요소를 찾지 못했습니다.")))?;
-            core_xml.push_str(opening);
-            core_xml.push_str(body);
-            core_xml.push_str(closing);
+            core_xml.extend([opening, body, closing]);
         }
         core_xml.push_str("</cp:coreProperties>");
         source_core.bytes = core_xml.into_bytes();
-        let source_app = source_parts
-            .iter_mut()
-            .find(|part| part.name == "docProps/app.xml")
-            .unwrap_or_else(|| process::abort());
+        let source_app = self.part_mut("docProps/app.xml");
         let source_app_xml = str::from_utf8(&source_app.bytes)
             .map_err(|source_error| err_with_source("app.xml UTF-8 해석 실패", source_error))?;
-        let (_, total_time_tail) = source_app_xml
-            .split_once("<TotalTime>")
-            .ok_or_else(|| err("app.xml의 TotalTime 태그를 찾지 못했습니다."))?;
-        let (total_time, after_total_time) = total_time_tail
-            .split_once("</TotalTime>")
-            .ok_or_else(|| err("app.xml의 TotalTime 종료 태그를 찾지 못했습니다."))?;
-        if after_total_time.contains("<TotalTime>")
-            || total_time.is_empty()
-            || !total_time.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(err("app.xml의 TotalTime 형식이 올바르지 않습니다."));
+        let (mut app_scanner, app_root) = scan_xml_root(source_app_xml, "Properties", "app.xml")?;
+        let mut total_time_body = None;
+        while let Some(element) = app_scanner.next_direct_element_until(app_root.name, "app.xml")? {
+            if element.opening.name == "TotalTime"
+                && total_time_body.replace(element.body).is_some()
+            {
+                return Err(err("app.xml에 TotalTime 요소가 여러 개 있습니다."));
+            }
         }
+        let total_time = total_time_body
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| err("app.xml의 TotalTime 형식이 올바르지 않습니다."))?;
         let mut app_xml = try_string_with_capacity(
             960_usize.strict_add(total_time.len()),
             "Excel app.xml 메모리 확보 실패",
@@ -778,9 +757,9 @@ impl XlsxContainer {
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n",
             "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\"><Template></Template><TotalTime>",
         ));
-        app_xml.push_str(total_time);
-        app_xml.push_str("</TotalTime><Pages>2</Pages><Words>0</Words><Characters>0</Characters><Application>Microsoft Excel</Application><DocSecurity>0</DocSecurity><Paragraphs>0</Paragraphs><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>워크시트</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>유류비</vt:lpstr><vt:lpstr>변경내역</vt:lpstr></vt:vector></TitlesOfParts><LinksUpToDate>false</LinksUpToDate><CharactersWithSpaces>0</CharactersWithSpaces><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>16.0300</AppVersion></Properties>");
+        app_xml.extend([total_time, "</TotalTime><Pages>2</Pages><Words>0</Words><Characters>0</Characters><Application>Microsoft Excel</Application><DocSecurity>0</DocSecurity><Paragraphs>0</Paragraphs><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>워크시트</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>유류비</vt:lpstr><vt:lpstr>변경내역</vt:lpstr></vt:vector></TitlesOfParts><LinksUpToDate>false</LinksUpToDate><CharactersWithSpaces>0</CharactersWithSpaces><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>16.0300</AppVersion></Properties>"]);
         source_app.bytes = app_xml.into_bytes();
+        let mut source_parts = mem::take(&mut self.parts);
         let mut output_parts =
             try_vec_with_capacity(XLSX_PARTS.len(), "Excel package part 목록 메모리 확보 실패")?;
         for (name, role, _) in XLSX_PARTS {
@@ -1027,7 +1006,7 @@ impl XlsxContainer {
                     self,
                 )?;
                 let rid = relationships
-                    .get_mut(0)
+                    .first_mut()
                     .and_then(Option::take)
                     .ok_or_else(|| err("worksheet drawing relationship Id가 없습니다."))?
                     .into_owned();
@@ -1354,7 +1333,7 @@ fn parse_attrs<'tag, const N: usize>(
     names: [&str; N],
     context: &str,
 ) -> Result<[Option<Cow<'tag, str>>; N]> {
-    let mut values = array::from_fn(|_| None);
+    let mut values = array::repeat(None);
     let mut attributes = XmlAttrScanner::new(tag)?;
     while let Some((name, value)) = attributes.next()? {
         let Some((_, slot)) = names
@@ -1390,7 +1369,7 @@ fn validate_relationship_set<'xml, const N: usize>(
     expected: &[RelationshipSpec; N],
     container: &XlsxContainer,
 ) -> Result<[Option<Cow<'xml, str>>; N]> {
-    let mut ids: [Option<Cow<'xml, str>>; N] = array::from_fn(|_| None);
+    let mut ids: [Option<Cow<'xml, str>>; N] = array::repeat(None);
     visit_direct_xml_children(
         xml,
         "Relationships",

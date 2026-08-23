@@ -103,9 +103,7 @@ impl CookieJar {
             .try_reserve(1)
             .map_err(|source| download_error_with_source("Cookie 목록 메모리 확보 실패", source))?;
         let mut pair = try_string_with_capacity(pair_len, "Cookie 메모리 확보 실패")?;
-        pair.push_str(name);
-        pair.push('=');
-        pair.push_str(value);
+        pair.extend([name, "=", value]);
         self.cookies.push(pair);
         Ok(())
     }
@@ -390,25 +388,23 @@ impl SourceDownload {
         let mut path = mem::take(&mut self.netfunnel_path_buffer);
         let response_result = {
             path.clear();
-            path.push_str("/ts.wseq?opcode=");
-            path.push_str(opcode);
+            path.extend(["/ts.wseq?opcode=", opcode]);
             if let Some(key_text) = key {
                 path.push_str("&key=");
                 Self::push_percent_encoded(&mut path, key_text.as_bytes());
             }
-            path.push_str("&nfid=0&prefix=NetFunnel.gRtype%3D");
-            path.push_str(opcode);
-            path.push_str("%3B");
+            path.extend(["&nfid=0&prefix=NetFunnel.gRtype%3D", opcode, "%3B"]);
             if let Some(ttl_secs) = ttl {
-                path.push_str("&ttl=");
                 let mut ttl_buffer = NumBuffer::new();
-                path.push_str(ttl_secs.format_into(&mut ttl_buffer));
+                path.extend(["&ttl=", ttl_secs.format_into(&mut ttl_buffer)]);
             }
-            path.push_str("&sid=");
-            path.push_str(NETFUNNEL_SERVICE_ID);
-            path.push_str("&aid=");
-            path.push_str(action_id);
-            path.push_str("&js=yes&");
+            path.extend([
+                "&sid=",
+                NETFUNNEL_SERVICE_ID,
+                "&aid=",
+                action_id,
+                "&js=yes&",
+            ]);
             let mut timestamp_buffer = NumBuffer::new();
             path.push_str(timestamp.format_into(&mut timestamp_buffer));
             let headers = Self::request_headers(

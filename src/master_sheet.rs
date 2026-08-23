@@ -966,8 +966,7 @@ fn append_fuel_total_text(
     if !parts.is_empty() {
         parts.push_str(" / ");
     }
-    parts.push_str(label);
-    parts.push(' ');
+    parts.extend([label, " "]);
     if rounded < 0 {
         parts.push('-');
     }
