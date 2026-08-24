@@ -778,50 +778,40 @@ impl<'source> MasterSheetUpdater<'source> {
                 continue;
             }
             if digit_byte == b'.' {
-                if parsing_fraction {
-                    return Err(invalid_value());
-                }
+                (!parsing_fraction).ok_or_else(&invalid_value)?;
                 parsing_fraction = true;
                 continue;
             }
-            if !digit_byte.is_ascii_digit() {
-                return Err(invalid_value());
-            }
+            digit_byte.is_ascii_digit().ok_or_else(&invalid_value)?;
             let digit_raw = digit_byte.strict_sub(b'0');
             let digit = i64::from(digit_raw);
             if parsing_fraction {
                 if fraction_digit_count >= 6 {
-                    if digit != 0 {
-                        return Err(invalid_value());
-                    }
+                    (digit == 0).ok_or_else(&invalid_value)?;
                     continue;
                 }
                 fraction = fraction.strict_mul(10).strict_add(digit);
                 fraction_digit_count = fraction_digit_count.strict_add(1);
             } else {
                 has_whole_digit = true;
-                let Some(next_whole) = whole
+                let next_whole = whole
                     .checked_mul(10)
                     .and_then(|value| value.checked_add(digit))
-                else {
-                    return Err(invalid_value());
-                };
+                    .ok_or_else(&invalid_value)?;
                 whole = next_whole;
             }
         }
-        if !has_whole_digit {
-            return Err(invalid_value());
-        }
+        has_whole_digit.ok_or_else(&invalid_value)?;
         while fraction_digit_count < 6 {
             fraction = fraction.strict_mul(10);
             fraction_digit_count = fraction_digit_count.strict_add(1);
         }
-        let Some(whole_scaled) = whole.checked_mul(DECIMAL_SCALE.as_i64()) else {
-            return Err(invalid_value());
-        };
-        let Some(combined) = whole_scaled.checked_add(fraction) else {
-            return Err(invalid_value());
-        };
+        let whole_scaled = whole
+            .checked_mul(DECIMAL_SCALE.as_i64())
+            .ok_or_else(&invalid_value)?;
+        let combined = whole_scaled
+            .checked_add(fraction)
+            .ok_or_else(&invalid_value)?;
         combined
             .checked_mul(sign)
             .map(ScaledDecimal)

@@ -773,14 +773,11 @@ impl XlsxContainer {
                 "xl/styles.xml" => excel_static_xml(EXCEL_STYLES_XML),
                 "xl/theme/theme1.xml" => excel_static_xml(EXCEL_THEME_XML),
                 "docProps/thumbnail.emf" => {
-                    let thumbnail_len = BLANK_EXCEL_THUMBNAIL_DWORDS
-                        .len()
-                        .strict_mul(size_of::<u32>());
+                    let words = BLANK_EXCEL_THUMBNAIL_DWORDS.map(u32::to_le_bytes);
+                    let thumbnail = words.as_flattened();
                     let mut bytes =
-                        try_vec_with_capacity(thumbnail_len, "Excel thumbnail 메모리 확보 실패")?;
-                    for value in BLANK_EXCEL_THUMBNAIL_DWORDS {
-                        bytes.extend_from_slice(&value.to_le_bytes());
-                    }
+                        try_vec_with_capacity(thumbnail.len(), "Excel thumbnail 메모리 확보 실패")?;
+                    bytes.extend_from_slice(thumbnail);
                     bytes
                 }
                 _ => {

@@ -62,9 +62,9 @@ pub(super) fn with_unlocked_ref_parts<R>(
     row: u32,
     use_parts: impl FnOnce(&str, u32) -> R,
 ) -> Result<R> {
-    if !(1..=MAX_A1_COL).contains(&col) {
-        return Err(err(format!("Excel column 범위를 벗어났습니다: {col}")));
-    }
+    (1..=MAX_A1_COL)
+        .contains(&col)
+        .ok_or_else(|| err(format!("Excel column 범위를 벗어났습니다: {col}")))?;
     let mut col_buffer = [0_u8; COL_NAME_BUF_LEN];
     let mut index = col_buffer.len();
     while col > 0 {
@@ -78,8 +78,8 @@ pub(super) fn with_unlocked_ref_parts<R>(
     }
     let col_name = str::from_utf8(col_buffer.get(index..).unwrap_or_else(|| process::abort()))
         .unwrap_or_else(|_| process::abort());
-    if !(1..=MAX_A1_ROW).contains(&row) {
-        return Err(err(format!("Excel row 범위를 벗어났습니다: {row}")));
-    }
+    (1..=MAX_A1_ROW)
+        .contains(&row)
+        .ok_or_else(|| err(format!("Excel row 범위를 벗어났습니다: {row}")))?;
     Ok(use_parts(col_name, row))
 }

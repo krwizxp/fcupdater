@@ -149,12 +149,12 @@ impl SourceReader {
         Ok(header_difat_chunks)
     }
     fn parse_cfb_header(&self) -> Result<CfbHeader> {
-        let Some(data) = self.0.first_chunk::<512>() else {
-            return Err(err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."));
-        };
-        if !data.starts_with(&CFB_SIGNATURE) {
-            return Err(err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."));
-        }
+        let data = self
+            .0
+            .first_chunk::<512>()
+            .ok_or_else(|| err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."))?;
+        data.starts_with(&CFB_SIGNATURE)
+            .ok_or_else(|| err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."))?;
         for (offset, expected, label) in [
             (0x1A, 3, "major version"),
             (0x1C, CFB_BYTE_ORDER_LITTLE_ENDIAN, "byte order"),
@@ -288,9 +288,7 @@ impl SourceReader {
             .len()
             .strict_sub(CFB_SECTOR_SIZE)
             .div_euclid(CFB_SECTOR_SIZE);
-        if max_sector_count == 0 {
-            return Err(err("CFB sector 개수가 비정상적입니다."));
-        }
+        (max_sector_count != 0).ok_or_else(|| err("CFB sector 개수가 비정상적입니다."))?;
         let declared_fat_sectors = u32_to_usize(header.num_fat_sectors);
         if declared_fat_sectors > max_sector_count {
             return Err(err(format!(
@@ -318,9 +316,8 @@ impl SourceReader {
             }
             difat_entries.push(sector_id);
         }
-        if declared_fat_sectors == 0 || difat_entries.is_empty() {
-            return Err(err("CFB FAT 정보를 찾지 못했습니다."));
-        }
+        (declared_fat_sectors != 0 && !difat_entries.is_empty())
+            .ok_or_else(|| err("CFB FAT 정보를 찾지 못했습니다."))?;
         if difat_entries.len() != declared_fat_sectors {
             return Err(err(format!(
                 "CFB FAT 엔트리 개수가 선언과 다릅니다: 선언 {declared_fat_sectors}, 실제 {}",
@@ -582,9 +579,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 }
                 0x0042 => {
                     let parsed_code_page = read_u16_le(data, 0)?;
-                    if code_page_seen {
-                        return Err(err("xls CodePage record가 중복 선언되었습니다."));
-                    }
+                    (!code_page_seen)
+                        .ok_or_else(|| err("xls CodePage record가 중복 선언되었습니다."))?;
                     if parsed_code_page != EXPECTED_BIFF_CODE_PAGE {
                         return Err(err(format!(
                             "Opinet 고정 소스의 BIFF code page가 예상과 다릅니다: {parsed_code_page}"
@@ -593,12 +589,12 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     code_page_seen = true;
                 }
                 BIFF_RECORD_SST => {
-                    if shared_strings.is_some() {
-                        return Err(err("xls SST record가 중복 선언되었습니다."));
-                    }
-                    if !code_page_seen {
-                        return Err(err("BIFF CodePage record보다 SST가 먼저 선언되었습니다."));
-                    }
+                    shared_strings
+                        .is_none()
+                        .ok_or_else(|| err("xls SST record가 중복 선언되었습니다."))?;
+                    code_page_seen.ok_or_else(|| {
+                        err("BIFF CodePage record보다 SST가 먼저 선언되었습니다.")
+                    })?;
                     let (parsed_shared_strings, next_offset) = self.read_sst(data, records.pos)?;
                     shared_strings = Some(parsed_shared_strings);
                     records.pos = next_offset;
@@ -610,20 +606,14 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 break;
             }
         }
-        let Some(parsed_sheet_offset) = sheet_offset else {
-            return Err(err("xls에서 BoundSheet를 찾지 못했습니다."));
-        };
-        if !code_page_seen {
-            return Err(err(
-                "Opinet 고정 소스에서 CodePage record를 찾지 못했습니다.",
-            ));
-        }
-        let Some(parsed_shared_strings) = shared_strings else {
-            return Err(err("Opinet 고정 소스에서 SST를 찾지 못했습니다."));
-        };
-        if parsed_shared_strings.values.is_empty() {
-            return Err(err("Opinet 고정 소스의 SST가 비어 있습니다."));
-        }
+        let parsed_sheet_offset =
+            sheet_offset.ok_or_else(|| err("xls에서 BoundSheet를 찾지 못했습니다."))?;
+        code_page_seen
+            .ok_or_else(|| err("Opinet 고정 소스에서 CodePage record를 찾지 못했습니다."))?;
+        let parsed_shared_strings =
+            shared_strings.ok_or_else(|| err("Opinet 고정 소스에서 SST를 찾지 못했습니다."))?;
+        (!parsed_shared_strings.values.is_empty())
+            .ok_or_else(|| err("Opinet 고정 소스의 SST가 비어 있습니다."))?;
         Ok((parsed_sheet_offset, parsed_shared_strings))
     }
     fn read_sst(
@@ -633,9 +623,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
     ) -> Result<(BiffSharedStrings, usize)> {
         let (chunks, next_offset) = self.collect_sst_chunks(first_chunk, first_chunk_end)?;
         let total_chunk_bytes: usize = chunks.iter().map(|chunk| chunk.len()).sum();
-        if total_chunk_bytes < 8 {
-            return Err(err("SST 데이터가 비정상적으로 짧습니다."));
-        }
+        (total_chunk_bytes >= 8).ok_or_else(|| err("SST 데이터가 비정상적으로 짧습니다."))?;
         let mut reader = SstChunkReader {
             chunk_index: 0,
             chunks: &chunks,
@@ -740,9 +728,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 found_header = true;
                 return Ok(());
             }
-            if !found_header {
-                return Err(err("Opinet 소스 헤더 행을 찾지 못했습니다."));
-            }
+            found_header.ok_or_else(|| err("Opinet 소스 헤더 행을 찾지 못했습니다."))?;
             let address = row_text_trimmed(row, COL_ADDRESS);
             if address.is_empty() {
                 if row.iter().flatten().any(|text| !text.trim().is_empty()) {
@@ -755,9 +741,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             let diesel = row_fuel_price(row, COL_DIESEL, row_num, "경유")?;
             let gasoline = row_fuel_price(row, COL_GASOLINE, row_num, "휘발유")?;
             let name = row_text_trimmed(row, COL_NAME);
-            if name.is_empty() {
-                return Err(format!("Opinet 소스 {row_num}행 상호명 값이 비어 있습니다.").into());
-            }
+            (!name.is_empty())
+                .ok_or_else(|| format!("Opinet 소스 {row_num}행 상호명 값이 비어 있습니다."))?;
             let premium = row_fuel_price(row, COL_PREMIUM, row_num, "고급휘발유")?;
             let service = match row_text_trimmed(row, COL_SELF_YN) {
                 "셀프" => StationService::SelfService,

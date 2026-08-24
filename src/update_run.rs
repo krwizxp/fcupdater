@@ -162,9 +162,8 @@ impl UpdateRun<'_> {
         if let Some(message) = region_validation_error {
             return Err(err(message));
         }
-        if master_update.existing_count == 0 {
-            return Err(err("현행화 대상 레코드를 찾지 못했습니다."));
-        }
+        (master_update.existing_count != 0)
+            .ok_or_else(|| err("현행화 대상 레코드를 찾지 못했습니다."))?;
         let deleted_count = master_update.deleted.len();
         if deleted_count >= master_update.existing_count.div_ceil(HALF_COUNT_DIVISOR) {
             return Err(err(format!(

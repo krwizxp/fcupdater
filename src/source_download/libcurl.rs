@@ -194,15 +194,23 @@ impl HeaderList {
     }
 }
 impl Client {
-    fn execute_request(
+    pub(super) fn request(
         &mut self,
         request_body: Option<&[u8]>,
         host: &str,
         path: &str,
-        request_headers: &RequestHeaders<'_>,
-        body_buffer: &mut ResponseBody,
-        header_capture: &mut CurlHeaderCapture,
-    ) -> DownloadResult<u32> {
+        request_headers: RequestHeaders<'_>,
+    ) -> DownloadResult<HttpResponse> {
+        let mut body_buffer = ResponseBody {
+            bytes: Vec::new(),
+            error: None,
+        };
+        let mut header_capture = CurlHeaderCapture {
+            bytes_seen: 0,
+            completed_block: None,
+            current_block: None,
+            error: None,
+        };
         let mut url_buffer = mem::take(&mut self.url_buffer);
         let mut header_build_buffer = mem::take(&mut self.header_build_buffer);
         let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
@@ -273,8 +281,8 @@ impl Client {
                 handle.setopt_long(CURLOPT_HTTPGET, 1)?;
             }
             let perform_code = {
-                let mut body_target = CurlWriteTarget::Body(&mut *body_buffer);
-                let mut header_target = CurlWriteTarget::Header(&mut *header_capture);
+                let mut body_target = CurlWriteTarget::Body(&mut body_buffer);
+                let mut header_target = CurlWriteTarget::Header(&mut header_capture);
                 let body_data = (&raw mut body_target).cast::<c_void>();
                 let header_data = (&raw mut header_target).cast::<c_void>();
                 handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
@@ -309,33 +317,7 @@ impl Client {
         })();
         self.header_build_buffer = header_build_buffer;
         self.url_buffer = url_buffer;
-        result
-    }
-    pub(super) fn request(
-        &mut self,
-        request_body: Option<&[u8]>,
-        host: &str,
-        path: &str,
-        request_headers: RequestHeaders<'_>,
-    ) -> DownloadResult<HttpResponse> {
-        let mut body_buffer = ResponseBody {
-            bytes: Vec::new(),
-            error: None,
-        };
-        let mut header_capture = CurlHeaderCapture {
-            bytes_seen: 0,
-            completed_block: None,
-            current_block: None,
-            error: None,
-        };
-        let status = self.execute_request(
-            request_body,
-            host,
-            path,
-            &request_headers,
-            &mut body_buffer,
-            &mut header_capture,
-        )?;
+        let status = result?;
         let final_block = header_capture
             .completed_block
             .ok_or("완료된 HTTP 응답 header block을 찾지 못했습니다.")?;

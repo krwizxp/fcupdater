@@ -267,9 +267,9 @@ impl SourceDownload {
                         "Opinet 다운로드 페이지에서 key 할당 구문을 찾지 못했습니다.".into(),
                     );
                 };
-                let Some((_, raw_value)) = after_marker.split_once('=') else {
-                    return Err("Opinet key 할당 구문의 '=' 문자를 찾지 못했습니다.".into());
-                };
+                let (_, raw_value) = after_marker
+                    .split_once('=')
+                    .ok_or("Opinet key 할당 구문의 '=' 문자를 찾지 못했습니다.")?;
                 let after_eq = raw_value.trim_ascii_start();
                 let (quote, value_tail) = if let Some(value_tail) = after_eq.strip_prefix('\'') {
                     ('\'', value_tail)
@@ -278,12 +278,10 @@ impl SourceDownload {
                 } else {
                     return Err("Opinet key 값 quote 문자를 찾지 못했습니다.".into());
                 };
-                let Some((value, _)) = value_tail.split_once(quote) else {
-                    return Err("Opinet key 값 종료 quote를 찾지 못했습니다.".into());
-                };
-                if value.is_empty() {
-                    return Err("Opinet key 값이 비어 있습니다.".into());
-                }
+                let (value, _) = value_tail
+                    .split_once(quote)
+                    .ok_or("Opinet key 값 종료 quote를 찾지 못했습니다.")?;
+                (!value.is_empty()).ok_or("Opinet key 값이 비어 있습니다.")?;
                 value
             };
             let entry_key = self.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
@@ -447,13 +445,11 @@ const fn hex_digit(nibble: u8) -> u8 {
     }
 }
 fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
-    let Some((_, value_tail)) = result.split_once("key=") else {
-        return Err(format!("NetFunnel key 없음: {result}").into());
-    };
+    let (_, value_tail) = result
+        .split_once("key=")
+        .ok_or_else(|| format!("NetFunnel key 없음: {result}"))?;
     let value = split_head_or_all(value_tail, '&');
-    if value.is_empty() {
-        return Err(format!("NetFunnel key 비어 있음: {result}").into());
-    }
+    (!value.is_empty()).ok_or_else(|| format!("NetFunnel key 비어 있음: {result}"))?;
     let value_start = result.len().strict_sub(value_tail.len());
     let value_end = value_start.strict_add(value.len());
     result.truncate(value_end);
@@ -464,9 +460,8 @@ fn split_head_or_all(value: &str, separator: char) -> &str {
     value.split_once(separator).map_or(value, |(head, _)| head)
 }
 fn parse_netfunnel_u32(value: &str, context: &'static str) -> DownloadResult<u32> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("{context}: 음이 아닌 10진수 형식이 아닙니다.").into());
-    }
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| format!("{context}: 음이 아닌 10진수 형식이 아닙니다."))?;
     value
         .parse::<u32>()
         .map_err(|source| download_error_with_source(format!("{context} 해석 실패"), source))
