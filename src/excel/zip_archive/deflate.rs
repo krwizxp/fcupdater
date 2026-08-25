@@ -7,7 +7,7 @@ use super::{
 use crate::diagnostic::try_vec_with_capacity;
 use core::{
     array::from_fn,
-    iter::{chain, once, repeat_n},
+    iter::{chain, once, repeat_n, zip},
     mem,
     range::Range,
 };
@@ -349,50 +349,48 @@ impl DecodeHuffman {
             return Ok(None);
         };
         let first_codes = next_codes;
-        let mut first_symbols = [0_u16; DEFLATE_MAX_BITS + 1];
         let mut symbol_count = 0_u16;
-        for (first_symbol, count) in first_symbols.iter_mut().zip(counts).skip(1) {
-            *first_symbol = symbol_count;
+        let first_symbols = counts.map(|count| {
+            let first_symbol = symbol_count;
             symbol_count = symbol_count.strict_add(count);
-        }
+            first_symbol
+        });
         let mut root = [DecodeEntry::EMPTY; DECODE_ROOT_SIZE];
         let mut symbols = [0_u16; DECODE_MAX_SYMBOLS];
-        let mut symbol_slots = symbols.iter_mut();
-        for (bit_len, next_code) in (1_u8..=DEFLATE_MAX_BITS_U8).zip(next_codes.iter_mut().skip(1))
-        {
-            for (symbol_u16, &symbol_len) in (0_u16..).zip(lengths) {
-                if symbol_len != bit_len {
-                    continue;
+        for (symbol_u16, &bit_len) in zip(0_u16.., lengths) {
+            if bit_len == 0 {
+                continue;
+            }
+            let bit_index = usize::from(bit_len);
+            let assigned = huffman_get(&next_codes, bit_index);
+            let code_limit = 1_u16.strict_shl(u32::from(bit_len));
+            if assigned >= code_limit {
+                return Err(zip_static("deflate Huffman code가 과포화되었습니다."));
+            }
+            huffman_set(&mut next_codes, bit_index, assigned.strict_add(1));
+            let symbol_index = usize::from(
+                huffman_get(&first_symbols, bit_index)
+                    .strict_add(assigned.strict_sub(huffman_get(&first_codes, bit_index))),
+            );
+            huffman_set(&mut symbols, symbol_index, symbol_u16);
+            if bit_len > DECODE_ROOT_BITS {
+                continue;
+            }
+            let suffix_bits = DECODE_ROOT_BITS.strict_sub(bit_len);
+            let repetitions = 1_usize.strict_shl(u32::from(suffix_bits));
+            let base = usize::from(reverse_low_bits(assigned, bit_len));
+            let entry = DecodeEntry(
+                symbol_u16 | u16::from(bit_len).strict_shl(u32::from(DECODE_ROOT_BITS)),
+            );
+            for suffix in 0..repetitions {
+                let root_index = base | suffix.strict_shl(u32::from(bit_len));
+                let root_slot = root
+                    .get_mut(root_index)
+                    .ok_or_else(|| zip_static("deflate root decode table 생성 범위 오류"))?;
+                if root_slot.is_direct() {
+                    return Err(zip_static("deflate root decode code가 충돌합니다."));
                 }
-                let assigned = *next_code;
-                let code_limit = 1_u16.strict_shl(u32::from(bit_len));
-                if assigned >= code_limit {
-                    return Err(zip_static("deflate Huffman code가 과포화되었습니다."));
-                }
-                *next_code = next_code.strict_add(1);
-                let symbol_slot = symbol_slots
-                    .next()
-                    .ok_or_else(|| zip_static("deflate decode symbol table 범위 오류"))?;
-                *symbol_slot = symbol_u16;
-                if bit_len > DECODE_ROOT_BITS {
-                    continue;
-                }
-                let suffix_bits = DECODE_ROOT_BITS.strict_sub(bit_len);
-                let repetitions = 1_usize.strict_shl(u32::from(suffix_bits));
-                let base = usize::from(reverse_low_bits(assigned, bit_len));
-                let entry = DecodeEntry(
-                    symbol_u16 | u16::from(bit_len).strict_shl(u32::from(DECODE_ROOT_BITS)),
-                );
-                for suffix in 0..repetitions {
-                    let index = base | suffix.strict_shl(u32::from(bit_len));
-                    let root_slot = root
-                        .get_mut(index)
-                        .ok_or_else(|| zip_static("deflate root decode table 생성 범위 오류"))?;
-                    if root_slot.is_direct() {
-                        return Err(zip_static("deflate root decode code가 충돌합니다."));
-                    }
-                    *root_slot = entry;
-                }
+                *root_slot = entry;
             }
         }
         Ok(Some(Self {

@@ -191,8 +191,9 @@ struct RelationshipSpec {
     target: &'static str,
     type_: &'static str,
 }
+type PackageParts = [Option<Vec<u8>>; XLSX_PARTS.len()];
 pub(crate) struct XlsxContainer {
-    parts: Vec<PackagePart>,
+    parts: PackageParts,
     source_fingerprint: ArchiveFingerprint,
     source_identity: FileIdentity,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -610,11 +611,20 @@ impl XlsxContainer {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let source_permissions = source_file.permissions;
         let source_identity = source_file.identity;
-        let (source_fingerprint, parts) = ZipPackageReader {
+        let (source_fingerprint, source_parts) = ZipPackageReader {
             archive_file: source_file.file,
             archive_path: source_xlsx,
         }
         .read()?;
+        let mut parts: PackageParts = array::repeat(None);
+        for PackagePart { bytes, name } in source_parts {
+            let slot = parts
+                .get_mut(part_index(name))
+                .unwrap_or_else(|| process::abort());
+            if slot.replace(bytes).is_some() {
+                process::abort();
+            }
+        }
         let mut container = Self {
             parts,
             source_fingerprint,
@@ -647,12 +657,14 @@ impl XlsxContainer {
                 "custom.xml",
             )?;
         }
-        container.part_mut("[Content_Types].xml").bytes = Vec::new();
-        container.part_mut("_rels/.rels").bytes = Vec::new();
+        container.part_mut("[Content_Types].xml").clear();
+        container.part_mut("_rels/.rels").clear();
         Ok(container)
     }
     fn has_part(&self, name: &str) -> bool {
-        self.parts.iter().any(|part| part.name == name)
+        self.parts
+            .get(part_index(name))
+            .is_some_and(Option::is_some)
     }
     pub(super) fn package_prepare_excel_output(&mut self) -> Result<CanonicalStyleMap> {
         let source_styles = self.text("xl/styles.xml")?;
@@ -685,7 +697,7 @@ impl XlsxContainer {
             input_styles.push(canonical);
         }
         let source_core = self.part_mut("docProps/core.xml");
-        let source_core_xml = str::from_utf8(&source_core.bytes)
+        let source_core_xml = str::from_utf8(source_core)
             .map_err(|source| err_with_source("core.xml UTF-8 해석 실패", source))?;
         let mut core_xml = try_string_with_capacity(
             source_core_xml.len().strict_add(1),
@@ -733,9 +745,9 @@ impl XlsxContainer {
             core_xml.extend([opening, body, closing]);
         }
         core_xml.push_str("</cp:coreProperties>");
-        source_core.bytes = core_xml.into_bytes();
+        *source_core = core_xml.into_bytes();
         let source_app = self.part_mut("docProps/app.xml");
-        let source_app_xml = str::from_utf8(&source_app.bytes)
+        let source_app_xml = str::from_utf8(source_app)
             .map_err(|source_error| err_with_source("app.xml UTF-8 해석 실패", source_error))?;
         let (mut app_scanner, app_root) = scan_xml_root(source_app_xml, "Properties", "app.xml")?;
         let mut total_time_body = None;
@@ -758,12 +770,14 @@ impl XlsxContainer {
             "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\"><Template></Template><TotalTime>",
         ));
         app_xml.extend([total_time, "</TotalTime><Pages>2</Pages><Words>0</Words><Characters>0</Characters><Application>Microsoft Excel</Application><DocSecurity>0</DocSecurity><Paragraphs>0</Paragraphs><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>워크시트</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>유류비</vt:lpstr><vt:lpstr>변경내역</vt:lpstr></vt:vector></TitlesOfParts><LinksUpToDate>false</LinksUpToDate><CharactersWithSpaces>0</CharactersWithSpaces><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>16.0300</AppVersion></Properties>"]);
-        source_app.bytes = app_xml.into_bytes();
-        let mut source_parts = mem::take(&mut self.parts);
-        let mut output_parts =
-            try_vec_with_capacity(XLSX_PARTS.len(), "Excel package part 목록 메모리 확보 실패")?;
-        for (name, role, _) in XLSX_PARTS {
+        *source_app = app_xml.into_bytes();
+        for (index, (name, role, _)) in XLSX_PARTS.into_iter().enumerate() {
+            let slot = self
+                .parts
+                .get_mut(index)
+                .unwrap_or_else(|| process::abort());
             if role == PartRole::InputOnly {
+                *slot = None;
                 continue;
             }
             let bytes = match name {
@@ -780,35 +794,35 @@ impl XlsxContainer {
                     bytes.extend_from_slice(thumbnail);
                     bytes
                 }
-                _ => {
-                    let index = source_parts
-                        .iter()
-                        .position(|part| part.name == name)
-                        .unwrap_or_else(|| process::abort());
-                    source_parts.swap_remove(index).bytes
-                }
+                _ => slot.take().unwrap_or_else(|| process::abort()),
             };
-            output_parts.push(PackagePart { bytes, name });
+            *slot = Some(bytes);
         }
-        self.parts = output_parts;
         Ok(input_styles)
     }
-    fn part(&self, name: &str) -> &PackagePart {
+    fn part(&self, name: &str) -> &[u8] {
         self.parts
-            .iter()
-            .find(|part| part.name == name)
+            .get(part_index(name))
+            .and_then(Option::as_deref)
             .unwrap_or_else(|| process::abort())
     }
-    fn part_mut(&mut self, name: &str) -> &mut PackagePart {
+    fn part_mut(&mut self, name: &str) -> &mut Vec<u8> {
         self.parts
-            .iter_mut()
-            .find(|part| part.name == name)
+            .get_mut(part_index(name))
+            .and_then(Option::as_mut)
             .unwrap_or_else(|| process::abort())
     }
     pub(super) fn put_text(&mut self, name: &str, content: String) {
-        self.part_mut(name).bytes = content.into_bytes();
+        *self.part_mut(name) = content.into_bytes();
     }
-    pub(super) fn save(self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
+    pub(super) fn save(mut self, target_xlsx: &Path, verification: SaveVerification) -> Result<()> {
+        let mut archive_parts =
+            try_vec_with_capacity(XLSX_PARTS.len(), "Excel package part 목록 메모리 확보 실패")?;
+        for ((name, _, _), slot) in XLSX_PARTS.into_iter().zip(&mut self.parts) {
+            if let Some(bytes) = slot.take() {
+                archive_parts.push(PackagePart { bytes, name });
+            }
+        }
         let parent = target_xlsx
             .parent()
             .filter(|path| !path.is_empty())
@@ -868,10 +882,10 @@ impl XlsxContainer {
         let result = (|| -> Result<()> {
             cfg_select! {
                 any(target_os = "linux", target_os = "macos") => {
-                    tmp_archive.write_archive_from(&self.parts, self.source_permissions)?;
+                    tmp_archive.write_archive_from(&archive_parts, self.source_permissions)?;
                 }
                 target_os = "windows" => {
-                    tmp_archive.write_archive_from(&self.parts)?;
+                    tmp_archive.write_archive_from(&archive_parts)?;
                 }
             }
             match verification {
@@ -915,7 +929,7 @@ impl XlsxContainer {
         Ok(xml)
     }
     pub(super) fn take_text(&mut self, name: &str) -> Result<String> {
-        let bytes = mem::take(&mut self.part_mut(name).bytes);
+        let bytes = mem::take(self.part_mut(name));
         String::from_utf8(bytes)
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
     }
@@ -1065,8 +1079,7 @@ impl XlsxContainer {
         Ok(xml)
     }
     fn text(&self, name: &str) -> Result<&str> {
-        let part = self.part(name);
-        str::from_utf8(&part.bytes)
+        str::from_utf8(self.part(name))
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
     }
     fn validate_content_types(&self) -> Result<()> {
@@ -1154,6 +1167,12 @@ impl XlsxContainer {
         }
         Ok(())
     }
+}
+fn part_index(name: &str) -> usize {
+    XLSX_PARTS
+        .iter()
+        .position(|&(candidate, _, _)| candidate == name)
+        .unwrap_or_else(|| process::abort())
 }
 fn style_entries<'text>(
     styles_xml: &'text str,

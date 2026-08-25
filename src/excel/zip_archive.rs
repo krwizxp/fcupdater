@@ -8,6 +8,7 @@ use crate::{
     },
     u32_to_usize,
 };
+use core::mem;
 use std::{fs::File, io::Read as _, path::Path, process};
 mod deflate;
 mod write;
@@ -431,19 +432,23 @@ impl ZipPackageReader<'_> {
             end: central_dir_end,
         };
         let mut total_uncompressed = 0_usize;
-        let mut entries: Vec<(ZipEntry<'_>, &'static str, usize)> =
-            try_vec_with_capacity(entry_count, "ZIP entry 목록 메모리 확보 실패")?;
+        let mut seen = [false; XLSX_PARTS.len()];
+        let mut entries = try_vec_with_capacity(entry_count, "ZIP entry 목록 메모리 확보 실패")?;
         for _ in 0..entry_count {
             let entry = central_directory.next_entry()?;
-            let Some(&(part_name, _, _)) =
-                XLSX_PARTS.iter().find(|&&(name, _, _)| name == entry.name)
+            let Some((part_index, (part_name, _, _))) = XLSX_PARTS
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|&(_, (name, _, _))| name == entry.name)
             else {
                 return Err(err(format!(
                     "ZIP entry 이름이 고정 스키마에 없습니다: {}",
                     entry.name
                 )));
             };
-            if entries.iter().any(|item| item.1 == part_name) {
+            let present = seen.get_mut(part_index).unwrap_or_else(|| process::abort());
+            if mem::replace(present, true) {
                 return Err(err(format!("ZIP entry 이름이 중복되었습니다: {part_name}")));
             }
             let expected_len = u32_to_usize(entry.uncompressed_size);
@@ -457,27 +462,30 @@ impl ZipPackageReader<'_> {
                 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES,
                 entry.name,
             )?;
-            entries.push((entry, part_name, expected_len));
+            entries.push((entry, part_index, expected_len));
         }
         if central_directory.cursor != central_directory.end {
             return Err(zip_static(ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE));
         }
-        for (name, role, _) in XLSX_PARTS {
-            if role == PartRole::Required && !entries.iter().any(|item| item.1 == name) {
+        for ((name, role, _), present) in XLSX_PARTS.into_iter().zip(seen) {
+            if role == PartRole::Required && !present {
                 return Err(err(format!("ZIP 필수 entry가 없습니다: {name}")));
             }
         }
         entries.sort_unstable_by_key(|item| item.0.local_header_offset);
         let mut expected_local_offset = 0_usize;
-        let mut parts: Vec<PackagePart> =
+        let mut parts =
             try_vec_with_capacity(entry_count, "ZIP package part 목록 메모리 확보 실패")?;
-        for (entry, name, expected_len) in entries {
+        for (entry, part_index, expected_len) in entries {
             let (bytes, local_end) = entry.data(
                 archive_bytes.as_slice(),
                 expected_len,
                 expected_local_offset,
             )?;
             expected_local_offset = local_end;
+            let &(name, _, _) = XLSX_PARTS
+                .get(part_index)
+                .unwrap_or_else(|| process::abort());
             parts.push(PackagePart { bytes, name });
         }
         if expected_local_offset != central_dir_offset {
