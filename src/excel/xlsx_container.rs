@@ -554,30 +554,33 @@ impl XlsxContainer {
             return Err(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."));
         }
         let workbook_xml = workbook_text.as_str();
-        for (tag_name, message) in [
-            (
-                "fileRecoveryPr",
-                "workbook.xml의 fileRecoveryPr 복구 표현은 지원하지 않습니다.",
-            ),
-            (
-                "externalReferences",
-                "workbook.xml의 외부 workbook 관계는 지원하지 않습니다.",
-            ),
-            (
-                "connections",
-                "workbook.xml의 외부 데이터 연결은 지원하지 않습니다.",
-            ),
-            (
-                "workbookProtection",
-                "workbook.xml의 보호 설정은 정규 저장으로 보존할 수 없습니다.",
-            ),
-        ] {
-            if XmlScanner::new(workbook_xml)
-                .next_start_named(tag_name)
-                .is_some()
-            {
-                return Err(err(message));
+        let mut forbidden = None;
+        let mut scanner = XmlScanner::new(workbook_xml);
+        while let Some(tag) = scanner.next_tag() {
+            if !tag.is_start {
+                continue;
             }
+            let candidate = match tag.local_name {
+                "fileRecoveryPr" => (
+                    0_u8,
+                    "workbook.xml의 fileRecoveryPr 복구 표현은 지원하지 않습니다.",
+                ),
+                "externalReferences" => {
+                    (1, "workbook.xml의 외부 workbook 관계는 지원하지 않습니다.")
+                }
+                "connections" => (2, "workbook.xml의 외부 데이터 연결은 지원하지 않습니다."),
+                "workbookProtection" => (
+                    3,
+                    "workbook.xml의 보호 설정은 정규 저장으로 보존할 수 없습니다.",
+                ),
+                _ => continue,
+            };
+            if forbidden.is_none_or(|current: (u8, &str)| candidate.0 < current.0) {
+                forbidden = Some(candidate);
+            }
+        }
+        if let Some((_, message)) = forbidden {
+            return Err(err(message));
         }
         self.take_workbook_dependencies(workbook_xml)?;
         let mut properties_scanner = XmlScanner::new(workbook_xml);

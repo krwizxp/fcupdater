@@ -18,7 +18,10 @@ use core::{
     fmt::{Arguments, NumBuffer},
     mem,
 };
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    process,
+};
 mod format;
 const MASTER_HEADER_ROW: u32 = 14;
 const MASTER_DATA_START_ROW: u32 = 15;
@@ -534,7 +537,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         for (source_index, row_num) in (MASTER_DATA_START_ROW..=self.data_last_row).enumerate() {
             row_plans.push(self.build_sort_plan(source_index, row_num, &sort_context)?);
         }
-        row_plans.sort_by(|left, right| {
+        row_plans.sort_unstable_by(|left, right| {
             left.rank_total
                 .is_none()
                 .cmp(&right.rank_total.is_none())
@@ -549,6 +552,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 .then_with(|| left.region.cmp(right.region))
                 .then_with(|| left.name.cmp(right.name))
                 .then_with(|| left.address.cmp(right.address))
+                .then_with(|| left.source_index.cmp(&right.source_index))
         });
         let mut rows = self.ws.take_rows();
         let data_start_index = u32_to_usize(MASTER_DATA_START_ROW.strict_sub(1));
@@ -629,9 +633,9 @@ impl<'source> MasterSheetUpdater<'source> {
         master_address_rows
             .try_reserve(row_count)
             .map_err(|source| err_with_source("마스터 주소 행 맵 메모리 확보 실패", source))?;
-        let mut kept_source_rows = reserved_row_vec(row_count)?;
-        let mut changes = reserved_row_vec(row_count)?;
-        let mut deleted = reserved_row_vec(row_count)?;
+        let mut kept_source_rows = try_vec_with_capacity(row_count, "행 목록 메모리 확보 실패")?;
+        let mut changes = Vec::new();
+        let mut deleted = Vec::new();
         let mut existing_region_counts = [0_usize; TARGET_REGION_COUNT];
         let mut matched_existing_region_counts = [0_usize; TARGET_REGION_COUNT];
         let mut target_region_scratch = String::new();
@@ -674,13 +678,14 @@ impl<'source> MasterSheetUpdater<'source> {
             };
             let Some((matched_key, src)) = matched else {
                 record_address(Cow::Owned(mem::take(&mut target_region_scratch)))?;
-                deleted.push(StoreRow {
+                let row = StoreRow {
                     address: address.into_owned(),
                     fuels: read_master_fuels(ws, old_row, shared_strings)?,
                     name: name.into_owned(),
                     old_row,
                     region: region.into_owned(),
-                });
+                };
+                try_push_row(&mut deleted, row_count, row)?;
                 continue;
             };
             record_address(Cow::Borrowed(matched_key.as_str()))?;
@@ -716,17 +721,22 @@ impl<'source> MasterSheetUpdater<'source> {
                         reason.push_str(label);
                     }
                 }
-                changes.push(ChangeRow {
+                let row = ChangeRow {
                     old_fuels: fuels,
                     reason,
                     record: src,
-                });
+                };
+                try_push_row(&mut changes, row_count, row)?;
             }
             kept_source_rows.push((old_row, Some(src)));
         }
-        let source_count = self.source_index.len();
-        let mut added: Vec<&'source SourceRecord> =
-            try_vec_with_capacity(source_count, "신규 소스 정렬 목록 메모리 확보 실패")?;
+        let mut added: Vec<&'source SourceRecord> = try_vec_with_capacity(
+            self.source_index
+                .len()
+                .strict_add(deleted.len())
+                .strict_sub(master_address_rows.len()),
+            "신규 소스 정렬 목록 메모리 확보 실패",
+        )?;
         added.extend(
             self.source_index
                 .iter()
@@ -994,22 +1004,23 @@ fn read_master_fuels(
             .filter(|price| *price > 0_i32),
     })
 }
-fn reserved_row_vec<T>(row_count: usize) -> Result<Vec<T>> {
-    try_vec_with_capacity(row_count, "행 목록 메모리 확보 실패")
+fn try_push_row<T>(rows: &mut Vec<T>, max_len: usize, row: T) -> Result<()> {
+    if rows.len() == rows.capacity() {
+        rows.try_reserve_exact(rows.capacity().max(1).min(max_len.strict_sub(rows.len())))
+            .map_err(|source| err_with_source("행 목록 메모리 확보 실패", source))?;
+    }
+    rows.push(row);
+    Ok(())
 }
 fn trim_cow(value: Cow<'_, str>) -> Cow<'_, str> {
     match value {
         Cow::Borrowed(text) => Cow::Borrowed(text.trim()),
         Cow::Owned(mut text) => {
-            let without_leading = text.trim_start();
-            let leading_len = text.len().strict_sub(without_leading.len());
-            let trimmed_len = without_leading.trim_end().len();
-            if trimmed_len == 0 {
-                text.clear();
-            } else {
-                text.truncate(leading_len.strict_add(trimmed_len));
-                text.replace_range(..leading_len, "");
-            }
+            let range = text
+                .substr_range(text.trim())
+                .unwrap_or_else(|| process::abort());
+            text.truncate(range.end);
+            text.replace_range(..range.start, "");
             Cow::Owned(text)
         }
     }

@@ -8,6 +8,7 @@ use super::{
 };
 use core::{fmt::NumBuffer, mem, time::Duration};
 use std::{
+    process,
     thread::sleep,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -242,7 +243,7 @@ impl SourceDownload {
         }
     }
     pub(crate) fn refresh_source(mut self) -> DownloadResult<Vec<u8>> {
-        let result = (|| -> DownloadResult<Vec<u8>> {
+        (|| -> DownloadResult<Vec<u8>> {
             let headers = Self::request_headers(
                 &self.cookie_jars,
                 &mut self.cookie_header_buffer,
@@ -324,8 +325,8 @@ impl SourceDownload {
                 return Err(error_text.into());
             }
             Ok(response)
-        })();
-        result.map_err(|mut error| {
+        })()
+        .map_err(|mut error| {
             error.update_message(|message| format!("Opinet 자동 다운로드 실패: {message}"));
             error
         })
@@ -430,10 +431,9 @@ impl SourceDownload {
         let Some((value, _)) = value_tail.split_once('\'') else {
             return Err(format!("NetFunnel result 파싱 실패: {text}").into());
         };
-        let value_start = text.len().strict_sub(value_tail.len());
-        let value_end = value_start.strict_add(value.len());
-        text.truncate(value_end);
-        text.replace_range(..value_start, "");
+        let value_range = text.substr_range(value).unwrap_or_else(|| process::abort());
+        text.truncate(value_range.end);
+        text.replace_range(..value_range.start, "");
         Ok(text)
     }
 }
@@ -450,10 +450,11 @@ fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
         .ok_or_else(|| format!("NetFunnel key 없음: {result}"))?;
     let value = split_head_or_all(value_tail, '&');
     (!value.is_empty()).ok_or_else(|| format!("NetFunnel key 비어 있음: {result}"))?;
-    let value_start = result.len().strict_sub(value_tail.len());
-    let value_end = value_start.strict_add(value.len());
-    result.truncate(value_end);
-    result.replace_range(..value_start, "");
+    let value_range = result
+        .substr_range(value)
+        .unwrap_or_else(|| process::abort());
+    result.truncate(value_range.end);
+    result.replace_range(..value_range.start, "");
     Ok(result)
 }
 fn split_head_or_all(value: &str, separator: char) -> &str {

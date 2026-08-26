@@ -113,7 +113,14 @@ struct BiffRecordReader<'workbook> {
 }
 struct BiffSharedStrings {
     declared_total: usize,
-    values: Vec<String>,
+    ranges: Vec<Range<usize>>,
+    text: String,
+}
+impl BiffSharedStrings {
+    fn get(&self, index: usize) -> Option<&str> {
+        let range = self.ranges.get(index)?;
+        self.text.get(range.start..range.end)
+    }
 }
 struct BiffWorkbookReader<'workbook>(&'workbook [u8]);
 pub(crate) struct SourceReader(Vec<u8>);
@@ -337,7 +344,7 @@ impl SourceReader {
         biff.visit_worksheet(
             sheet_offset,
             shared_strings.declared_total,
-            &shared_strings.values,
+            &shared_strings,
             &mut visitor,
         )
     }
@@ -393,8 +400,13 @@ impl SstChunkReader<'_, '_> {
         self.offset_in_chunk = self.offset_in_chunk.strict_add(1);
         Ok(value)
     }
-    fn read_xl_unicode_chars(&mut self, char_count: usize, mut high_byte: bool) -> Result<String> {
-        let mut out = String::new();
+    fn read_xl_unicode_chars(
+        &mut self,
+        char_count: usize,
+        mut high_byte: bool,
+        out: &mut String,
+    ) -> Result<Range<usize>> {
+        let value_start = out.len();
         let mut remaining = char_count;
         let mut continuation = false;
         while remaining > 0 {
@@ -437,7 +449,7 @@ impl SstChunkReader<'_, '_> {
             let additional_capacity = chars_here.strict_mul(max_utf8_bytes_per_unit);
             let required_capacity = out.len().strict_add(additional_capacity);
             if out.capacity() < required_capacity {
-                out.try_reserve_exact(additional_capacity)
+                out.try_reserve(additional_capacity)
                     .map_err(|source| err_with_source("SST 문자열 메모리 확보 실패", source))?;
             }
             if high_byte {
@@ -464,7 +476,10 @@ impl SstChunkReader<'_, '_> {
                 continuation = false;
             }
         }
-        Ok(out)
+        Ok(Range {
+            start: value_start,
+            end: out.len(),
+        })
     }
     fn skip_bytes(&mut self, len: usize) -> Result<()> {
         let mut remaining = len;
@@ -612,7 +627,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             .ok_or_else(|| err("Opinet 고정 소스에서 CodePage record를 찾지 못했습니다."))?;
         let parsed_shared_strings =
             shared_strings.ok_or_else(|| err("Opinet 고정 소스에서 SST를 찾지 못했습니다."))?;
-        (!parsed_shared_strings.values.is_empty())
+        (!parsed_shared_strings.ranges.is_empty())
             .ok_or_else(|| err("Opinet 고정 소스의 SST가 비어 있습니다."))?;
         Ok((parsed_sheet_offset, parsed_shared_strings))
     }
@@ -653,7 +668,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 max_unique_count,
             )));
         }
-        let mut out = try_vec_with_capacity(unique_count, "SST 문자열 테이블 메모리 확보 실패")?;
+        let mut ranges = try_vec_with_capacity(unique_count, "SST 문자열 테이블 메모리 확보 실패")?;
+        let mut text = String::new();
         for _ in 0..unique_count {
             let char_count = usize::from(reader.read_u16()?);
             let flags = reader.read_u8()?;
@@ -670,19 +686,20 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             } else {
                 0_usize
             };
-            let value = reader.read_xl_unicode_chars(char_count, high_byte)?;
+            let value = reader.read_xl_unicode_chars(char_count, high_byte, &mut text)?;
             if rich_run_count > 0 {
                 reader.skip_bytes(rich_run_count.strict_mul(4))?;
             }
             if ext_len > 0 {
                 reader.skip_bytes(ext_len)?;
             }
-            out.push(value);
+            ranges.push(value);
         }
         Ok((
             BiffSharedStrings {
                 declared_total,
-                values: out,
+                ranges,
+                text,
             },
             next_offset,
         ))
@@ -691,7 +708,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         &self,
         sheet_offset: usize,
         declared_total: usize,
-        shared_strings: &'strings [String],
+        shared_strings: &'strings BiffSharedStrings,
         visitor: &mut impl FnMut(SourceRecordRef<'strings>) -> Result<()>,
     ) -> Result<()> {
         if sheet_offset >= self.0.len() {
@@ -833,7 +850,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     current_row_num = Some(row);
                     previous_cell = Some((row, col));
                     let idx = u32_to_usize(read_u32_le(record_data, 6)?);
-                    let value = shared_strings.get(idx).map(String::as_str).ok_or_else(|| {
+                    let value = shared_strings.get(idx).ok_or_else(|| {
                         err(format!(
                             "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
                         ))
