@@ -25,13 +25,15 @@ pub(super) struct XmlAttrScanner<'tag> {
     cursor: usize,
     tag: &'tag str,
 }
-impl XmlScanner<'_> {
-    pub(super) fn skip_to(&mut self, cursor: usize) {
-        self.cursor = cursor.min(self.xml.len());
-    }
-}
 impl<'xml> XmlScanner<'xml> {
-    fn element_from_opening(&mut self, opening: XmlTag<'xml>) -> Result<XmlElement<'xml>> {
+    fn element_from_opening(
+        &mut self,
+        opening: XmlTag<'xml>,
+        ancestor_depth: usize,
+    ) -> Result<XmlElement<'xml>> {
+        if ancestor_depth >= MAX_XML_NESTING_DEPTH {
+            return Err(err("XML 중첩 깊이가 너무 큽니다."));
+        }
         let tag_name = opening.name;
         let body_start = opening.end.strict_add(1);
         let (body_end, end) = if opening.self_closing {
@@ -49,6 +51,9 @@ impl<'xml> XmlScanner<'xml> {
                 })?;
                 if tag.is_start {
                     if !tag.self_closing {
+                        if ancestor_depth.strict_add(depth) >= MAX_XML_NESTING_DEPTH {
+                            return Err(err("XML 중첩 깊이가 너무 큽니다."));
+                        }
                         *ancestors
                             .get_mut(depth)
                             .ok_or_else(|| err("XML 중첩 깊이가 너무 큽니다."))? = tag.name;
@@ -176,15 +181,7 @@ impl<'xml> XmlScanner<'xml> {
         let content_start = self.cursor;
         let opening = self.next_tag();
         let content_end = opening.as_ref().map_or(self.xml.len(), |tag| tag.start);
-        let between = self
-            .xml
-            .get(content_start..content_end)
-            .ok_or_else(|| err(format!("{context}의 XML child 범위가 손상되었습니다.")))?;
-        if !xml_misc_only(between, false) {
-            return Err(err(format!(
-                "{context}의 XML 요소 사이 내용이 올바르지 않습니다."
-            )));
-        }
+        self.validate_direct_gap(content_start, content_end, context)?;
         let Some(opening_tag) = opening else {
             return closing_name.map_or(Ok(None), |_| {
                 Err(err(format!("{context}의 XML root 종료 태그가 없습니다.")))
@@ -204,23 +201,21 @@ impl<'xml> XmlScanner<'xml> {
                 opening_tag.name
             )));
         }
-        self.element_from_opening(opening_tag).map(Some)
+        self.element_from_opening(opening_tag, 0).map(Some)
     }
-    pub(super) fn next_direct_element_named(
+    pub(super) fn next_direct_element_named_until(
         &mut self,
         tag_name: &str,
+        closing_name: &str,
+        ancestor_depth: usize,
         context: &str,
     ) -> Result<Option<XmlElement<'xml>>> {
-        let Some(element) = self.next_direct_element(context)? else {
+        let Some(opening) =
+            self.next_direct_opening_named_until(tag_name, closing_name, context)?
+        else {
             return Ok(None);
         };
-        if element.opening.name != tag_name {
-            return Err(err(format!(
-                "{context}에 직접 자식 {tag_name} 외 요소가 있습니다: {}",
-                element.opening.name
-            )));
-        }
-        Ok(Some(element))
+        self.element_from_opening(opening, ancestor_depth).map(Some)
     }
     pub(super) fn next_direct_element_until(
         &mut self,
@@ -229,6 +224,36 @@ impl<'xml> XmlScanner<'xml> {
     ) -> Result<Option<XmlElement<'xml>>> {
         self.next_direct_element_before(Some(closing_name), context)
     }
+    pub(super) fn next_direct_opening_named_until(
+        &mut self,
+        tag_name: &str,
+        closing_name: &str,
+        context: &str,
+    ) -> Result<Option<XmlTag<'xml>>> {
+        let content_start = self.cursor;
+        let Some(opening) = self.next_tag() else {
+            return Err(err(format!(
+                "XML </{closing_name}> 종료 태그를 찾지 못했습니다."
+            )));
+        };
+        self.validate_direct_gap(content_start, opening.start, context)?;
+        if !opening.is_start {
+            if opening.name == closing_name {
+                return Ok(None);
+            }
+            return Err(err(format!(
+                "XML 태그 쌍이 일치하지 않습니다: {closing_name} / {}",
+                opening.name
+            )));
+        }
+        if opening.name != tag_name {
+            return Err(err(format!(
+                "{context}에 직접 자식 {tag_name} 외 요소가 있습니다: {}",
+                opening.name
+            )));
+        }
+        Ok(Some(opening))
+    }
     pub(super) fn next_element_named(
         &mut self,
         tag_name: &str,
@@ -236,7 +261,7 @@ impl<'xml> XmlScanner<'xml> {
         let Some(opening) = self.next_start_named(tag_name) else {
             return Ok(None);
         };
-        self.element_from_opening(opening).map(Some)
+        self.element_from_opening(opening, 0).map(Some)
     }
     pub(super) fn next_start_named(&mut self, tag_name: &str) -> Option<XmlTag<'xml>> {
         let wanted = local_tag_name(tag_name);
@@ -303,6 +328,22 @@ impl<'xml> XmlScanner<'xml> {
             });
         }
         None
+    }
+    pub(super) fn skip_to(&mut self, cursor: usize) {
+        self.cursor = cursor.min(self.xml.len());
+    }
+    fn validate_direct_gap(&self, start: usize, end: usize, context: &str) -> Result<()> {
+        let between = self
+            .xml
+            .get(start..end)
+            .ok_or_else(|| err(format!("{context}의 XML child 범위가 손상되었습니다.")))?;
+        if xml_misc_only(between, false) {
+            Ok(())
+        } else {
+            Err(err(format!(
+                "{context}의 XML 요소 사이 내용이 올바르지 않습니다."
+            )))
+        }
     }
 }
 impl<'tag> XmlAttrScanner<'tag> {

@@ -247,8 +247,7 @@ impl UpdateRun<'_> {
                 )
             }),
         )?;
-        write_line(self.out, format_args!("=====================\n"))?;
-        Ok(())
+        write_line(self.out, format_args!("=====================\n")).map_err(Into::into)
     }
     pub(super) fn run(&mut self) -> Result<()> {
         let loaded_source = self.load_source()?;

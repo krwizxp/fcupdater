@@ -304,15 +304,22 @@ impl Workbook {
         let shared_strings_xml_text = container.take_shared_strings_text()?;
         let mut shared_strings_scanner = XmlScanner::new(&shared_strings_xml_text);
         let sst = shared_strings_scanner
-            .next_element_named("sst")?
+            .next_start_named("sst")
             .ok_or_else(|| err("sharedStrings XML에 <sst>가 없습니다."))?;
         let mut entries = try_vec_with_capacity(
             SHARED_STRING_INITIAL_CAPACITY,
             "shared string entry 메모리 확보 실패",
         )?;
         let mut replacement = String::new();
-        let mut scanner = XmlScanner::new(sst.body);
-        while let Some(si) = scanner.next_direct_element_named("si", "sharedStrings.xml의 sst")? {
+        let sst_closing = (!sst.self_closing).then_some(sst.name);
+        while let Some(closing_name) = sst_closing
+            && let Some(si) = shared_strings_scanner.next_direct_element_named_until(
+                "si",
+                closing_name,
+                1,
+                "sharedStrings.xml의 sst",
+            )?
+        {
             if entries.len() >= MAX_SHARED_STRING_COUNT {
                 return Err(err(format!(
                     "sharedStrings entry 개수가 허용 한도({MAX_SHARED_STRING_COUNT})를 초과했습니다."
@@ -326,8 +333,7 @@ impl Workbook {
                     })?;
             }
             let value = extract_all_tag_text(si.body, "t")?.unwrap_or(Cow::Borrowed(""));
-            let si_xml = sst
-                .body
+            let si_xml = shared_strings_xml_text
                 .get(si.span)
                 .ok_or_else(|| err("sharedStrings.xml의 si entry 범위가 손상되었습니다."))?;
             let mut xml = copy_text(si_xml)?;
@@ -557,10 +563,17 @@ impl Workbook {
     }
 }
 impl WorksheetParser<'_, '_> {
-    fn parse_row(&mut self, row_body: &str, row_num: u32, row: &mut Row) -> Result<()> {
-        let mut scanner = XmlScanner::new(row_body);
+    fn parse_row(
+        &mut self,
+        scanner: &mut XmlScanner<'_>,
+        row_name: &str,
+        row_num: u32,
+        row: &mut Row,
+    ) -> Result<()> {
         let mut next_col = 1_u32;
-        while let Some(cell) = scanner.next_direct_element_named("c", "worksheet row")? {
+        while let Some(cell) =
+            scanner.next_direct_element_named_until("c", row_name, 2, "worksheet row")?
+        {
             let inner_xml_text = cell.body;
             let cell_info = cell.opening;
             let mut attr_scanner = XmlAttrScanner::new(cell_info.raw)?;
@@ -875,13 +888,12 @@ impl WorksheetParser<'_, '_> {
         self.cell_count = self.cell_count.strict_add(1);
         Ok(())
     }
-    fn scan_rows(&mut self, body_span: Range<usize>) -> Result<Vec<Row>> {
-        let xml = self.xml;
-        let Some(body) = xml.get(body_span) else {
-            return Err(err("worksheet XML body 범위가 손상되었습니다."));
-        };
+    fn scan_rows(
+        &mut self,
+        scanner: &mut XmlScanner<'_>,
+        sheet_data_name: &str,
+    ) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
-        let mut scanner = XmlScanner::new(body);
         let last_col = match self.sheet {
             ExcelSheetKind::ChangeLog => CHANGE_LOG_LAST_COL,
             ExcelSheetKind::Master => MASTER_LAST_COL,
@@ -889,10 +901,11 @@ impl WorksheetParser<'_, '_> {
         let mut last_col_buffer = NumBuffer::new();
         let last_col_text = last_col.format_into(&mut last_col_buffer);
         let mut style_buffer = NumBuffer::new();
-        while let Some(row_element) =
-            scanner.next_direct_element_named("row", "worksheet sheetData")?
-        {
-            let row_info = row_element.opening;
+        while let Some(row_info) = scanner.next_direct_opening_named_until(
+            "row",
+            sheet_data_name,
+            "worksheet sheetData",
+        )? {
             let row_attrs = parse_tag_attrs(row_info.raw)?;
             let row_num_text = get_attr(&row_attrs, "r")
                 .ok_or_else(|| err("고정 workbook의 worksheet row에 r 속성이 없습니다."))?;
@@ -972,21 +985,20 @@ impl WorksheetParser<'_, '_> {
                 attrs_xml,
                 cells: Vec::new(),
             };
-            self.parse_row(row_element.body, row_num, &mut row)?;
+            self.parse_row(scanner, row_info.name, row_num, &mut row)?;
             rows.push(row);
         }
         Ok(rows)
     }
     fn scan_worksheet(mut self) -> Result<Worksheet> {
         let mut scanner = XmlScanner::new(self.xml);
-        let Some(sheet_data) = scanner.next_element_named("sheetData")? else {
+        let Some(sheet_data) = scanner.next_start_named("sheetData") else {
             return Err(err("worksheet XML에 <sheetData>가 없습니다."));
         };
-        if sheet_data.opening.self_closing {
+        if sheet_data.self_closing {
             return Err(err("고정 workbook의 sheetData는 비어 있을 수 없습니다."));
         }
-        let sheet_data_body_span = sheet_data.body_span;
-        let rows = self.scan_rows(sheet_data_body_span)?;
+        let rows = self.scan_rows(&mut scanner, sheet_data.name)?;
         for (si, head) in self.shared_formula_heads {
             let expected = head.last_row.strict_sub(head.anchor_row).strict_add(1);
             if head.seen != expected {
@@ -2045,12 +2057,34 @@ fn parse_u32_decimal(
     format_error: impl FnOnce() -> Cow<'static, str>,
     parse_context: impl FnOnce() -> Cow<'static, str>,
 ) -> Result<u32> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.is_empty() {
         return Err(err(format_error()));
     }
-    value
-        .parse::<u32>()
-        .map_err(|source| err_with_source(parse_context(), source))
+    let mut parsed = 0_u32;
+    let mut overflowed = false;
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(err(format_error()));
+        }
+        if overflowed {
+            continue;
+        }
+        let digit = u32::from(byte.strict_sub(b'0'));
+        match parsed
+            .checked_mul(10)
+            .and_then(|current| current.checked_add(digit))
+        {
+            Some(next) => parsed = next,
+            None => overflowed = true,
+        }
+    }
+    if overflowed {
+        value
+            .parse::<u32>()
+            .map_err(|source| err_with_source(parse_context(), source))
+    } else {
+        Ok(parsed)
+    }
 }
 fn replace_first_tag_text(xml: &mut String, tag_name: &str, new_text: &str) -> Result<()> {
     let mut scanner = XmlScanner::new(xml);

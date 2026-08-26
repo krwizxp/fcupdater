@@ -14,22 +14,21 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         index = index.strict_add(1);
     }
     let col_start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
-        index = index.strict_add(1);
-    }
-    if index == col_start {
-        return None;
-    }
-    let col_chars = bytes.get(col_start..index)?;
-    if col_chars.len() > 3 {
-        return None;
-    }
     let mut col = 0_u32;
-    for &ch in col_chars {
+    while let Some(&ch) = bytes.get(index)
+        && ch.is_ascii_alphabetic()
+    {
+        if index.strict_sub(col_start) >= 3 {
+            return None;
+        }
         let letter = u32::from(ch.to_ascii_uppercase())
             .checked_sub(u32::from('A'))?
             .checked_add(1)?;
         col = col.checked_mul(26)?.checked_add(letter)?;
+        index = index.strict_add(1);
+    }
+    if index == col_start {
+        return None;
     }
     if !(1..=MAX_A1_COL).contains(&col) {
         return None;
@@ -40,13 +39,18 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         index = index.strict_add(1);
     }
     let row_start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+    let mut row = 0_u32;
+    while let Some(&ch) = bytes.get(index)
+        && ch.is_ascii_digit()
+    {
+        row = row
+            .checked_mul(10)?
+            .checked_add(u32::from(ch.strict_sub(b'0')))?;
         index = index.strict_add(1);
     }
     if index == row_start {
         return None;
     }
-    let row = reference.get(row_start..index)?.parse::<u32>().ok()?;
     if !(1..=MAX_A1_ROW).contains(&row) {
         return None;
     }
