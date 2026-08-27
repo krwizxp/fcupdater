@@ -425,11 +425,8 @@ impl SourceDownload {
     }
 }
 const fn hex_digit(nibble: u8) -> u8 {
-    if nibble < 10 {
-        b'0'.strict_add(nibble)
-    } else {
-        b'A'.strict_add(nibble.strict_sub(10))
-    }
+    b'0'.strict_add(nibble)
+        .strict_add(nibble.strict_add(6).wrapping_shr(4).strict_mul(7))
 }
 fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     let (_, value_tail) = result
