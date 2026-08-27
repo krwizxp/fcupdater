@@ -220,11 +220,9 @@ impl SourceDownload {
                 }
                 b' ' => out.push('+'),
                 other => {
-                    let high = other >> 4_u8;
-                    let low = other & 0x0F;
                     out.push('%');
-                    out.push(char::from(hex_digit(high)));
-                    out.push(char::from(hex_digit(low)));
+                    out.push(char::from(hex_digit(other >> 4_u8)));
+                    out.push(char::from(hex_digit(other & 0x0F)));
                 }
             }
         }

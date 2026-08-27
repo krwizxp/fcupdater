@@ -7,7 +7,6 @@ use core::{fmt::Display, range::Range};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
 const CFB_END_OF_CHAIN: u32 = 0xFFFF_FFFE;
-const CFB_FAT_SECT: u32 = 0xFFFF_FFFD;
 const CFB_DIFAT_SECT: u32 = 0xFFFF_FFFC;
 const CFB_BYTE_ORDER_LITTLE_ENDIAN: u16 = 0xFFFE;
 const CFB_MINI_STREAM_CUTOFF_SIZE: u32 = 4096;
@@ -468,12 +467,10 @@ impl SstChunkReader<'_, '_> {
             }
             self.offset_in_chunk = end;
             remaining = remaining.strict_sub(chars_here);
-            if remaining > 0 && self.offset_in_chunk >= chunk.len() {
+            continuation = remaining > 0 && self.offset_in_chunk >= chunk.len();
+            if continuation {
                 self.chunk_index = self.chunk_index.strict_add(1);
                 self.offset_in_chunk = 0;
-                continuation = true;
-            } else {
-                continuation = false;
             }
         }
         Ok(Range {
@@ -676,25 +673,19 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             let char_count = usize::from(reader.read_u16()?);
             let flags = reader.read_u8()?;
             validate_sst_option(flags, BIFF_SST_STRING_FLAGS_MASK, "SST 문자열 option")?;
-            let high_byte = (flags & 0x01) != 0;
-            let ext = (flags & 0x04) != 0;
             let rich_run_count = if flags & 0x08 != 0 {
                 usize::from(reader.read_u16()?)
             } else {
                 0_usize
             };
-            let ext_len = if ext {
+            let ext_len = if flags & 0x04 != 0 {
                 u32_to_usize(reader.read_u32()?)
             } else {
                 0_usize
             };
-            let value = reader.read_xl_unicode_chars(char_count, high_byte, &mut text)?;
-            if rich_run_count > 0 {
-                reader.skip_bytes(rich_run_count.strict_mul(4))?;
-            }
-            if ext_len > 0 {
-                reader.skip_bytes(ext_len)?;
-            }
+            let value = reader.read_xl_unicode_chars(char_count, flags & 0x01 != 0, &mut text)?;
+            reader.skip_bytes(rich_run_count.strict_mul(4))?;
+            reader.skip_bytes(ext_len)?;
             ranges.push(value);
         }
         Ok((
@@ -1005,10 +996,7 @@ fn row_text_trimmed<'strings>(row: &SourceRow<'strings>, idx: usize) -> &'string
     row.get(idx).copied().flatten().map_or_default(str::trim)
 }
 const fn is_regular_sector_id(sector_id: u32) -> bool {
-    !matches!(
-        sector_id,
-        CFB_FREE_SECT | CFB_END_OF_CHAIN | CFB_FAT_SECT | CFB_DIFAT_SECT
-    )
+    sector_id < CFB_DIFAT_SECT
 }
 fn get_sector_slice_at_index(data: &[u8], sector_idx: usize, sector_id: u32) -> Result<&[u8]> {
     let start_offset = sector_idx
