@@ -797,14 +797,10 @@ impl DynamicFrequencies {
             max_bits: 7,
         })
         .build()?;
-        let mut code_length_count = 4_usize;
-        for (index, &symbol) in CODE_LENGTH_ORDER.iter().enumerate().rev() {
-            let len = huffman_get(&code_lengths, symbol);
-            if len != 0 {
-                code_length_count = index.strict_add(1).max(4);
-                break;
-            }
-        }
+        let code_length_count = CODE_LENGTH_ORDER
+            .iter()
+            .rposition(|&symbol| huffman_get(&code_lengths, symbol) != 0)
+            .map_or(4, |index| index.strict_add(1).max(4));
         let literal_huffman = WriteHuffman::from_lengths(literal_lengths)?;
         let distance_huffman = WriteHuffman::from_lengths(distance_lengths)?;
         let code_huffman = WriteHuffman::from_lengths(code_lengths)?;
@@ -1408,11 +1404,7 @@ impl DeflateWriter<'_, '_> {
                         let left = bytes.as_ptr().wrapping_add(candidate.strict_add(len));
                         let right = bytes.as_ptr().wrapping_add(position.strict_add(len));
                         let prefix = matching_prefix_16!(left, right);
-                        let compared = if prefix < MATCH_CHUNK_BYTES {
-                            prefix.strict_add(1)
-                        } else {
-                            MATCH_CHUNK_BYTES
-                        };
+                        let compared = prefix.saturating_add(1).min(MATCH_CHUNK_BYTES);
                         work_budget.remaining = work_budget.remaining.strict_sub(compared);
                         len = len.strict_add(prefix);
                         if prefix < MATCH_CHUNK_BYTES {

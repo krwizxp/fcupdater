@@ -156,8 +156,7 @@ impl ZipEntry<'_> {
                 "ZIP local header version이 중앙 디렉터리와 다릅니다",
             ));
         }
-        let local_flags = read_u16(local_header, 6)?;
-        if local_flags != self.flags {
+        if read_u16(local_header, 6)? != self.flags {
             return Err(local_mismatch(
                 "ZIP local header flags가 중앙 디렉터리와 다릅니다",
             ));
@@ -177,24 +176,20 @@ impl ZipEntry<'_> {
         let local_crc = read_u32(local_header, 14)?;
         let local_compressed_size = read_u32(local_header, 18)?;
         let local_uncompressed_size = read_u32(local_header, 22)?;
-        if self.flags & 0x0008 == 0
-            && (local_crc != self.crc32
+        let local_data_error = if self.flags & 0x0008 == 0 {
+            (local_crc != self.crc32
                 || local_compressed_size != self.compressed_size
                 || local_uncompressed_size != self.uncompressed_size)
-        {
-            return Err(local_mismatch(
-                "ZIP local CRC 또는 크기가 중앙 디렉터리와 다릅니다",
-            ));
-        }
-        if self.flags & 0x0008 != 0
-            && ((local_crc != 0 && local_crc != self.crc32)
+                .then_some("ZIP local CRC 또는 크기가 중앙 디렉터리와 다릅니다")
+        } else {
+            ((local_crc != 0 && local_crc != self.crc32)
                 || (local_compressed_size != 0 && local_compressed_size != self.compressed_size)
                 || (local_uncompressed_size != 0
                     && local_uncompressed_size != self.uncompressed_size))
-        {
-            return Err(local_mismatch(
-                "ZIP data descriptor local CRC 또는 크기가 올바르지 않습니다",
-            ));
+                .then_some("ZIP data descriptor local CRC 또는 크기가 올바르지 않습니다")
+        };
+        if let Some(message) = local_data_error {
+            return Err(local_mismatch(message));
         }
         let name_len = usize::from(read_u16(local_header, 26)?);
         let extra_len = usize::from(read_u16(local_header, 28)?);

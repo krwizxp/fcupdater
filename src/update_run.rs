@@ -280,16 +280,8 @@ impl UpdateRun<'_> {
         let day = day_of_year
             .strict_sub(153_u64.strict_mul(march_month).strict_add(2).div_euclid(5))
             .strict_add(1);
-        let month = if march_month < 10 {
-            march_month.strict_add(3)
-        } else {
-            march_month.strict_sub(9)
-        };
-        let year = if month <= 2 {
-            year_base.strict_add(1)
-        } else {
-            year_base
-        };
+        let month = march_month.strict_add(2).rem_euclid(12).strict_add(1);
+        let year = year_base.strict_add(march_month.div_euclid(10));
         let today = format!("{year:04}-{month:02}-{day:02}");
         let (worksheet, shared_string_table) = book.change_log_sheet_mut();
         let change_log_last_row = ChangeLogUpdater {
