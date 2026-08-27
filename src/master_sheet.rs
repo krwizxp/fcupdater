@@ -816,14 +816,10 @@ impl<'source> MasterSheetUpdater<'source> {
             fraction = fraction.strict_mul(10);
             fraction_digit_count = fraction_digit_count.strict_add(1);
         }
-        let whole_scaled = whole
+        whole
             .checked_mul(DECIMAL_SCALE.as_i64())
-            .ok_or_else(&invalid_value)?;
-        let combined = whole_scaled
-            .checked_add(fraction)
-            .ok_or_else(&invalid_value)?;
-        combined
-            .checked_mul(sign)
+            .and_then(|scaled| scaled.checked_add(fraction))
+            .and_then(|combined| combined.checked_mul(sign))
             .map(ScaledDecimal)
             .map(Some)
             .ok_or_else(invalid_value)

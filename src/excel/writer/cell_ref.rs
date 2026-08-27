@@ -44,14 +44,14 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         && ch.is_ascii_digit()
     {
         row = row
-            .checked_mul(10)?
-            .checked_add(u32::from(ch.strict_sub(b'0')))?;
+            .strict_mul(10)
+            .strict_add(u32::from(ch.strict_sub(b'0')));
+        if row > MAX_A1_ROW {
+            return None;
+        }
         index = index.strict_add(1);
     }
-    if index == row_start {
-        return None;
-    }
-    if !(1..=MAX_A1_ROW).contains(&row) {
+    if index == row_start || row == 0 {
         return None;
     }
     (index == reference.len()).then_some(CellReference {
