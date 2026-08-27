@@ -528,10 +528,11 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         &self,
         first_chunk: &'workbook [u8],
         first_chunk_end: usize,
-    ) -> Result<(Vec<&'workbook [u8]>, usize)> {
+    ) -> Result<(Vec<&'workbook [u8]>, usize, usize)> {
         let mut chunks =
             try_vec_with_capacity(8, "xls SST chunk 목록 메모리 확보 실패: 8 entries")?;
         chunks.push(first_chunk);
+        let mut total_chunk_bytes = first_chunk.len();
         let mut records = BiffRecordReader {
             context: "SST Continue",
             pos: first_chunk_end,
@@ -540,10 +541,10 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         loop {
             let record_start = records.pos;
             let Some((record_id, chunk)) = records.next()? else {
-                return Ok((chunks, records.pos));
+                return Ok((chunks, records.pos, total_chunk_bytes));
             };
             if record_id != BIFF_RECORD_CONTINUE {
-                return Ok((chunks, record_start));
+                return Ok((chunks, record_start, total_chunk_bytes));
             }
             chunks.try_reserve(1).map_err(|source| {
                 err_with_source(
@@ -551,6 +552,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     source,
                 )
             })?;
+            total_chunk_bytes = total_chunk_bytes.strict_add(chunk.len());
             chunks.push(chunk);
         }
     }
@@ -636,8 +638,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         first_chunk: &[u8],
         first_chunk_end: usize,
     ) -> Result<(BiffSharedStrings, usize)> {
-        let (chunks, next_offset) = self.collect_sst_chunks(first_chunk, first_chunk_end)?;
-        let total_chunk_bytes: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        let (chunks, next_offset, total_chunk_bytes) =
+            self.collect_sst_chunks(first_chunk, first_chunk_end)?;
         (total_chunk_bytes >= 8).ok_or_else(|| err("SST 데이터가 비정상적으로 짧습니다."))?;
         let mut reader = SstChunkReader {
             chunk_index: 0,

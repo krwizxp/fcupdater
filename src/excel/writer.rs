@@ -1044,7 +1044,7 @@ impl Worksheet {
             ExcelSheetKind::Master => MASTER_FORMULA_LAYOUT,
         };
         let mut next_si = 0_u32;
-        let mut column_state = BTreeMap::<u32, (u32, bool)>::new();
+        let mut column_state = [None; MASTER_HEADERS.len().strict_add(1)];
         let mut reference = String::new();
         let row_count = worksheet_row_count(self.rows.len());
         let row_start_index = u32_to_usize(layout.data_start_row.strict_sub(1));
@@ -1058,21 +1058,26 @@ impl Worksheet {
                 .cells
                 .len();
             for cell_index in 0..cell_count {
-                let col = self
+                let current_cell = self
                     .rows
                     .get(row_index)
                     .and_then(|row_obj| row_obj.cells.get(cell_index))
-                    .map_or_else(|| process::abort(), |cell| cell.col);
+                    .unwrap_or_else(|| process::abort());
+                let col = current_cell.col;
                 if !layout.required_cols.contains(&col) && layout.optional_zero_col != Some(col) {
                     continue;
                 }
-                let previous = column_state.get(&col).copied();
+                let state = column_state
+                    .get_mut(u32_to_usize(col))
+                    .unwrap_or_else(|| process::abort());
+                let previous = *state;
                 if previous.is_some_and(|(last_formula_row, _)| row <= last_formula_row) {
                     continue;
                 }
-                let Some(anchor) = self.try_get_formula_at(col, row)? else {
+                let Some(raw_anchor) = extract_first_tag_text(&current_cell.inner_xml, "f")? else {
                     continue;
                 };
+                let anchor = decode_xml_entities(raw_anchor)?;
                 let interrupted = previous.is_some_and(|(last_formula_row, was_interrupted)| {
                     was_interrupted || row > last_formula_row.strict_add(1)
                 });
@@ -1091,7 +1096,7 @@ impl Worksheet {
                     last_row = candidate_row;
                 }
                 let group_len = last_row.strict_sub(row).strict_add(1);
-                column_state.insert(col, (last_row, interrupted));
+                *state = Some((last_row, interrupted));
                 if group_len < MIN_SHARED_FORMULA_CELLS {
                     continue;
                 }
