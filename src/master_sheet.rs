@@ -8,7 +8,7 @@ use crate::{
     excel::{FuelValues, SourceRecord},
     region::{
         TARGET_REGION_COUNT, TargetRegion, TargetRegionPolicy, increment_target_region_count,
-        normalize_address_key_into, target_region,
+        target_region,
     },
     sheet_util::{add_row_offset, usize_to_u32},
     u32_to_usize,
@@ -659,7 +659,6 @@ impl<'source> MasterSheetUpdater<'source> {
                 kept_source_rows.push((old_row, None));
                 continue;
             }
-            normalize_address_key_into(address.as_ref(), &mut target_region_scratch)?;
             let matched = self
                 .source_index
                 .get_key_value(target_region_scratch.as_str());

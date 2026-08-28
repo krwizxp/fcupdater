@@ -77,12 +77,17 @@ pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result
     out.clear();
     out.try_reserve_exact(trimmed.len())
         .map_err(|source| err_with_source("주소 key 정규화 메모리 확보 실패", source))?;
-    out.extend(trimmed.chars().filter(|ch| {
-        !ch.is_whitespace() && !matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
-    }));
-    for (from, to) in ADDRESS_KEY_REPLACEMENTS {
-        while let Some(start) = out.find(from) {
-            out.replace_range(start..start.strict_add(from.len()), to);
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.') {
+            continue;
+        }
+        out.push(ch);
+        for (from, to) in ADDRESS_KEY_REPLACEMENTS {
+            if out.ends_with(from) {
+                out.truncate(out.len().strict_sub(from.len()));
+                out.push_str(to);
+                break;
+            }
         }
     }
     Ok(())
@@ -152,11 +157,13 @@ pub(super) fn target_region(
     }
     normalize_address_key_into(region, scratch)?;
     let region_is_daejeon = scratch.as_str() == "대전";
-    if !region_is_daejeon && let Some(target) = target_region_from_normalized(scratch.as_str()) {
-        return Ok(Some(target));
-    }
+    let region_match = if region_is_daejeon {
+        None
+    } else {
+        target_region_from_normalized(scratch.as_str())
+    };
     normalize_address_key_into(address, scratch)?;
-    if let Some(target) = target_region_from_normalized(scratch.as_str()) {
+    if let Some(target) = region_match.or_else(|| target_region_from_normalized(scratch.as_str())) {
         return Ok(Some(target));
     }
     if region_is_daejeon {
