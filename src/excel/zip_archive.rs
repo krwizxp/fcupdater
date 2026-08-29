@@ -20,11 +20,11 @@ mod write;
 const CENTRAL_DIRECTORY_HEADER_LEN: usize = 46;
 const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const CODE_LENGTH_SYMBOLS: usize = 19;
-const CRC32_TABLE: [u32; 256] = {
-    let mut table = [0_u32; 256];
-    let mut remaining: &mut [u32] = &mut table;
+const CRC32_TABLES: [[u32; 256]; 16] = {
+    let mut table0 = [0_u32; 256];
+    let mut remaining: &mut [u32] = &mut table0;
     let mut seed = 0_u32;
-    while let [ref mut slot, ref mut tail @ ..] = *remaining {
+    while let Some((slot, tail)) = remaining.split_first_mut() {
         let mut value = seed;
         let mut bit = 0_u8;
         while bit < 8_u8 {
@@ -35,7 +35,25 @@ const CRC32_TABLE: [u32; 256] = {
         remaining = tail;
         seed = seed.strict_add(1);
     }
-    table
+    let table1 = crc32_advance_table(&table0);
+    let table2 = crc32_advance_table(&table1);
+    let table3 = crc32_advance_table(&table2);
+    let table4 = crc32_advance_table(&table3);
+    let table5 = crc32_advance_table(&table4);
+    let table6 = crc32_advance_table(&table5);
+    let table7 = crc32_advance_table(&table6);
+    let table8 = crc32_advance_table(&table7);
+    let table9 = crc32_advance_table(&table8);
+    let table10 = crc32_advance_table(&table9);
+    let table11 = crc32_advance_table(&table10);
+    let table12 = crc32_advance_table(&table11);
+    let table13 = crc32_advance_table(&table12);
+    let table14 = crc32_advance_table(&table13);
+    let table15 = crc32_advance_table(&table14);
+    [
+        table0, table1, table2, table3, table4, table5, table6, table7, table8, table9, table10,
+        table11, table12, table13, table14, table15,
+    ]
 };
 const DEFLATE_MAX_BITS: usize = 15;
 const DEFLATE_MAX_BITS_U8: u8 = 15;
@@ -323,7 +341,7 @@ impl<'bytes> ZipCentralDirectory<'bytes> {
         let extra_len = usize::from(read_u16(header, 30)?);
         let comment_len = usize::from(read_u16(header, 32)?);
         if read_u16(header, 34)? != 0 {
-            return Err(zip_static("분할 ZIP entry는 지원하지 않습니다."));
+            return Err(zip_static("분할 ZIP archive는 지원하지 않습니다."));
         }
         let entry_len = CENTRAL_DIRECTORY_HEADER_LEN
             .checked_add(name_len)
@@ -679,17 +697,96 @@ fn ensure_zip_size_limit(
 fn zip_entry_message(context: &str, entry_name: &str) -> String {
     format!("{context}: {entry_name}")
 }
-pub(super) fn crc32_update(initial: u32, bytes: &[u8]) -> u32 {
-    bytes
-        .iter()
-        .fold(initial, |crc, &byte| crc32_update_byte(crc, byte))
+const fn crc32_advance_table(previous: &[u32; 256]) -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut source: &[u32] = previous;
+    let mut target: &mut [u32] = &mut table;
+    while let Some((value, source_tail)) = source.split_first() {
+        let Some((slot, target_tail)) = target.split_first_mut() else {
+            break;
+        };
+        let mut advanced = *value;
+        let mut bit = 0_u8;
+        while bit < 8_u8 {
+            advanced =
+                advanced.wrapping_shr(1) ^ (0xedb8_8320_u32 & 0_u32.wrapping_sub(advanced & 1_u32));
+            bit = bit.strict_add(1);
+        }
+        *slot = advanced;
+        source = source_tail;
+        target = target_tail;
+    }
+    table
 }
-fn crc32_update_byte(crc: u32, byte: u8) -> u32 {
-    let table_index = usize::from((crc ^ u32::from(byte)).to_le_bytes()[0]);
-    let table_value = *CRC32_TABLE
+fn crc32_table_value(table_index: usize, byte: u8) -> u32 {
+    let table = CRC32_TABLES
         .get(table_index)
         .unwrap_or_else(|| process::abort());
-    (crc >> 8_u8) ^ table_value
+    *table
+        .get(usize::from(byte))
+        .unwrap_or_else(|| process::abort())
+}
+pub(super) fn crc32_update(initial: u32, bytes: &[u8]) -> u32 {
+    let mut crc = initial;
+    let mut remaining = bytes;
+    while let Some((chunk, tail)) = remaining.split_first_chunk::<16>() {
+        let [
+            b0,
+            b1,
+            b2,
+            b3,
+            b4,
+            b5,
+            b6,
+            b7,
+            b8,
+            b9,
+            b10,
+            b11,
+            b12,
+            b13,
+            b14,
+            b15,
+        ] = *chunk;
+        let [c0, c1, c2, c3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
+        crc = crc32_table_value(15, c0)
+            ^ crc32_table_value(14, c1)
+            ^ crc32_table_value(13, c2)
+            ^ crc32_table_value(12, c3)
+            ^ crc32_table_value(11, b4)
+            ^ crc32_table_value(10, b5)
+            ^ crc32_table_value(9, b6)
+            ^ crc32_table_value(8, b7)
+            ^ crc32_table_value(7, b8)
+            ^ crc32_table_value(6, b9)
+            ^ crc32_table_value(5, b10)
+            ^ crc32_table_value(4, b11)
+            ^ crc32_table_value(3, b12)
+            ^ crc32_table_value(2, b13)
+            ^ crc32_table_value(1, b14)
+            ^ crc32_table_value(0, b15);
+        remaining = tail;
+    }
+    if let Some((chunk, tail)) = remaining.split_first_chunk::<8>() {
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = *chunk;
+        let [c0, c1, c2, c3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
+        crc = crc32_table_value(7, c0)
+            ^ crc32_table_value(6, c1)
+            ^ crc32_table_value(5, c2)
+            ^ crc32_table_value(4, c3)
+            ^ crc32_table_value(3, b4)
+            ^ crc32_table_value(2, b5)
+            ^ crc32_table_value(1, b6)
+            ^ crc32_table_value(0, b7);
+        remaining = tail;
+    }
+    remaining
+        .iter()
+        .fold(crc, |value, &byte| crc32_update_byte(value, byte))
+}
+fn crc32_update_byte(crc: u32, byte: u8) -> u32 {
+    let [table_index, ..] = (crc ^ u32::from(byte)).to_le_bytes();
+    (crc >> 8_u8) ^ crc32_table_value(0, table_index)
 }
 fn split_header_at<'bytes, const LEN: usize>(
     bytes: &'bytes [u8],
