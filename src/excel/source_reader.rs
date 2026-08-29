@@ -3,6 +3,7 @@ use crate::{
     diagnostic::{Result, err, err_with_source, try_vec_with_capacity},
     u32_to_usize,
 };
+use alloc::borrow::Cow;
 use core::{fmt::Display, range::Range};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
@@ -199,7 +200,11 @@ impl SourceReader {
             num_fat_sectors: read_u32_le(data, 0x2C)?,
         })
     }
-    fn read_workbook_stream(&self, header: CfbHeader, fat: &[u32]) -> Result<Vec<u8>> {
+    fn read_workbook_stream<'source>(
+        &'source self,
+        header: CfbHeader,
+        fat: &[u32],
+    ) -> Result<Cow<'source, [u8]>> {
         let dir_stream = read_stream_from_fat_chain(
             &self.0,
             fat,
@@ -207,7 +212,7 @@ impl SourceReader {
             None,
             "CFB 디렉터리",
         )?;
-        let (chunks, &[]) = dir_stream.as_chunks::<128>() else {
+        let (chunks, &[]) = dir_stream.as_ref().as_chunks::<128>() else {
             return Err(err("CFB 디렉터리 stream 길이가 128바이트 단위가 아닙니다."));
         };
         let mut workbook_entry = None;
@@ -287,7 +292,7 @@ impl SourceReader {
         }
         read_stream_from_fat_chain(&self.0, fat, start_sector, Some(stream_size), "Workbook")
     }
-    fn read_xls_workbook(self) -> Result<Vec<u8>> {
+    fn read_xls_workbook(&self) -> Result<Cow<'_, [u8]>> {
         let header = self.parse_cfb_header()?;
         let max_sector_count = self
             .0
@@ -338,7 +343,7 @@ impl SourceReader {
         mut visitor: impl FnMut(SourceRecordRef<'_>) -> Result<()>,
     ) -> Result<()> {
         let workbook = self.read_xls_workbook()?;
-        let biff = BiffWorkbookReader(&workbook);
+        let biff = BiffWorkbookReader(workbook.as_ref());
         let (sheet_offset, shared_strings) = biff.parse_globals()?;
         biff.visit_worksheet(
             sheet_offset,
@@ -1012,16 +1017,16 @@ fn get_sector_slice_at_index(data: &[u8], sector_idx: usize, sector_id: u32) -> 
             ))
         })
 }
-fn read_stream_from_fat_chain(
-    data: &[u8],
+fn read_stream_from_fat_chain<'data>(
+    data: &'data [u8],
     fat: &[u32],
     start_sector: u32,
     size_limit: Option<u64>,
     stream_name: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Cow<'data, [u8]>> {
     if !is_regular_sector_id(start_sector) {
         if size_limit == Some(0) {
-            return Ok(Vec::new());
+            return Ok(Cow::Borrowed(&[]));
         }
         return Err(err(format!(
             "FAT stream 시작 sector가 비정상입니다: {stream_name} ({start_sector:#x})"
@@ -1040,12 +1045,11 @@ fn read_stream_from_fat_chain(
                 .map_err(|source| err_with_source("FAT stream 길이 변환 실패", source))
         })
         .transpose()?;
-    let mut out = try_vec_with_capacity(
-        remaining.unwrap_or(CFB_SECTOR_SIZE),
-        "FAT stream 메모리 확보 실패",
-    )?;
     let mut sid = start_sector;
+    let mut previous_sid = None;
     let mut traversed = 0_usize;
+    let mut stream_len = 0_usize;
+    let mut contiguous = true;
     while sid != CFB_END_OF_CHAIN {
         if traversed >= fat.len() {
             return Err(err(format!(
@@ -1063,6 +1067,9 @@ fn read_stream_from_fat_chain(
                 "FAT chain에 잘못된 sector id가 있습니다: {stream_name} ({sid:#x})"
             )));
         }
+        if previous_sid.is_some_and(|previous: u32| sid != previous.strict_add(1)) {
+            contiguous = false;
+        }
         let sid_usize = u32_to_usize(sid);
         let next_sid = *fat.get(sid_usize).ok_or_else(|| {
             err(prefixed_display_message(
@@ -1076,16 +1083,12 @@ fn read_stream_from_fat_chain(
             )));
         }
         let sector = get_sector_slice_at_index(data, sid_usize, sid)?;
+        let take = remaining.map_or(sector.len(), |remain| remain.min(sector.len()));
+        stream_len = stream_len.strict_add(take);
         if let Some(remain) = remaining.as_mut() {
-            let take = (*remain).min(sector.len());
-            let (prefix, _) = sector.split_at(take);
-            out.extend_from_slice(prefix);
             *remain = remain.strict_sub(take);
-        } else {
-            out.try_reserve(sector.len())
-                .map_err(|source| err_with_source("FAT stream 추가 메모리 확보 실패", source))?;
-            out.extend_from_slice(sector);
         }
+        previous_sid = Some(sid);
         sid = next_sid;
     }
     if let Some(remaining_bytes) = remaining.filter(|bytes| *bytes != 0) {
@@ -1093,7 +1096,40 @@ fn read_stream_from_fat_chain(
             "FAT stream이 선언 크기보다 짧습니다: {stream_name}, remaining={remaining_bytes}"
         )));
     }
-    Ok(out)
+    if contiguous {
+        let start_offset = u32_to_usize(start_sector)
+            .checked_add(1)
+            .and_then(|index| index.checked_mul(CFB_SECTOR_SIZE))
+            .ok_or_else(|| err("CFB stream 시작 범위 계산 실패"))?;
+        let end_offset = start_offset
+            .checked_add(stream_len)
+            .ok_or_else(|| err("CFB stream 끝 범위 계산 실패"))?;
+        let stream = data
+            .get(start_offset..end_offset)
+            .ok_or_else(|| err("CFB stream 범위가 파일을 벗어났습니다."))?;
+        return Ok(Cow::Borrowed(stream));
+    }
+    let mut out = try_vec_with_capacity(stream_len, "FAT stream 메모리 확보 실패")?;
+    let mut copy_remaining = stream_len;
+    let mut copy_sid = start_sector;
+    while copy_remaining != 0 {
+        let sid_usize = u32_to_usize(copy_sid);
+        let sector = get_sector_slice_at_index(data, sid_usize, copy_sid)?;
+        let take = copy_remaining.min(sector.len());
+        out.extend_from_slice(
+            sector
+                .get(..take)
+                .ok_or_else(|| err("FAT stream 복사 범위 오류"))?,
+        );
+        copy_remaining = copy_remaining.strict_sub(take);
+        copy_sid = *fat.get(sid_usize).ok_or_else(|| {
+            err(prefixed_display_message(
+                "FAT 인덱스 범위 오류: sector=",
+                copy_sid,
+            ))
+        })?;
+    }
+    Ok(Cow::Owned(out))
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
     let arr = read_le_array::<2>(bytes, offset, "u16 read out of range at ")?;

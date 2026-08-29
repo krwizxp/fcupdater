@@ -503,6 +503,7 @@ impl Workbook {
             .master_sheet
             .to_xml(ExcelSheetKind::Master, filter_last_row)?;
         self.container.put_text(MASTER_SHEET_PATH, master_xml);
+        drop(self.master_sheet.take_rows());
         self.change_log_sheet
             .validate_fixed_header(ExcelSheetKind::ChangeLog, &self.shared_strings)?;
         let (change_log_xml, change_log_shared_count) = self
@@ -510,6 +511,7 @@ impl Workbook {
             .to_xml(ExcelSheetKind::ChangeLog, change_log_last_row)?;
         self.container
             .put_text(CHANGE_LOG_SHEET_PATH, change_log_xml);
+        drop(self.change_log_sheet.take_rows());
         let shared_string_reference_count = master_shared_count.strict_add(change_log_shared_count);
         let shared_strings_xml = self.shared_strings.to_xml(shared_string_reference_count)?;
         let capacity = EXCEL_WORKBOOK_OPENING

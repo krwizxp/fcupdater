@@ -11,7 +11,7 @@ use core::{
     mem,
     range::Range,
 };
-use std::{io::Write as IoWrite, process};
+use std::{io::Write as IoWrite, process, sync::LazyLock};
 macro_rules! matching_prefix_16 {
     ($left:expr, $right:expr) => {{
         // SAFETY: The caller keeps both complete 16-byte ranges inside the input slice.
@@ -52,6 +52,25 @@ const EXCEL_TOKEN_BLOCK_LIMIT: usize = 8191;
 const MATCH_CHUNK_BYTES: usize = 16;
 const XML_MAX_INSERT_MATCH_LEN: usize = 4;
 const XML_NICE_MATCH_LEN: usize = 128;
+static FIXED_DECODE_TREES: LazyLock<DynamicTrees> = LazyLock::new(|| {
+    let literal_lengths: [u8; FIXED_LITERAL_SYMBOLS] = from_fn(|symbol| match symbol {
+        0..=143 | 280..=287 => 8,
+        144..=255 => 9,
+        256..=279 => 7,
+        _ => 0,
+    });
+    let distance_lengths = [5_u8; FIXED_DISTANCE_SYMBOLS];
+    let literal = DecodeHuffman::from_lengths(&literal_lengths)
+        .unwrap_or_else(|_| process::abort())
+        .unwrap_or_else(|| process::abort());
+    let distance = DecodeHuffman::from_lengths(&distance_lengths)
+        .unwrap_or_else(|_| process::abort())
+        .unwrap_or_else(|| process::abort());
+    DynamicTrees {
+        distance: Some(distance),
+        literal,
+    }
+});
 struct BitReader<'bytes> {
     bit_buffer: u32,
     bit_count: u8,
@@ -235,9 +254,6 @@ impl BitCounter {
     }
     const fn byte_len(&self) -> usize {
         self.bit_len.div_ceil(8)
-    }
-    const fn counting() -> Self {
-        Self { bit_len: 0 }
     }
 }
 impl BitSink for BitCounter {
@@ -603,36 +619,15 @@ impl DeflateInflater<'_> {
                 cursor: 0,
             },
         };
-        let mut fixed_trees: Option<DynamicTrees> = None;
         loop {
             let final_block = state.reader.read_bits(1)? != 0;
             let block_type = state.reader.read_bits(2)?;
             match block_type {
                 0 => state.inflate_stored_block()?,
-                1 => {
-                    if let Some(trees) = fixed_trees.as_ref() {
-                        state.inflate_compressed_block(&trees.literal, trees.distance.as_ref())?;
-                    } else {
-                        let literal_lengths: [u8; FIXED_LITERAL_SYMBOLS] =
-                            from_fn(|symbol| match symbol {
-                                0..=143 | 280..=287 => 8,
-                                144..=255 => 9,
-                                256..=279 => 7,
-                                _ => 0,
-                            });
-                        let distance_lengths = [5_u8; FIXED_DISTANCE_SYMBOLS];
-                        let literal = DecodeHuffman::from_lengths(&literal_lengths)?
-                            .ok_or_else(|| zip_static("fixed literal Huffman tree 생성 실패"))?;
-                        let distance = DecodeHuffman::from_lengths(&distance_lengths)?
-                            .ok_or_else(|| zip_static("fixed distance Huffman tree 생성 실패"))?;
-                        let trees = DynamicTrees {
-                            distance: Some(distance),
-                            literal,
-                        };
-                        state.inflate_compressed_block(&trees.literal, trees.distance.as_ref())?;
-                        fixed_trees = Some(trees);
-                    }
-                }
+                1 => state.inflate_compressed_block(
+                    &FIXED_DECODE_TREES.literal,
+                    FIXED_DECODE_TREES.distance.as_ref(),
+                )?,
                 2 => {
                     let trees = state.dynamic_trees()?;
                     state.inflate_compressed_block(&trees.literal, trees.distance.as_ref())?;
@@ -692,7 +687,50 @@ impl DynamicFrequencies {
         }
         (has_distance, fixed_bit_len.strict_add(7))
     }
-    fn plan(self) -> ZipResult<DynamicDeflatePlan> {
+    fn encoded_bit_len(&self, plan: &DynamicDeflatePlan) -> usize {
+        let mut bit_len = 17_usize.strict_add(plan.code_length_count.strict_mul(3));
+        for token in &plan.code_length_tokens {
+            bit_len = bit_len
+                .strict_add(usize::from(huffman_get(
+                    &plan.code_huffman.lengths,
+                    usize::from(token.symbol),
+                )))
+                .strict_add(usize::from(token.extra_bits));
+        }
+        for (symbol, (&frequency, &code_len)) in self
+            .literal
+            .iter()
+            .zip(&plan.literal_huffman.lengths)
+            .enumerate()
+        {
+            let extra_bits = symbol
+                .checked_sub(257)
+                .and_then(|index| LENGTH_EXTRA_BITS.get(index))
+                .copied()
+                .unwrap_or(0);
+            let symbol_bits = usize::from(code_len).strict_add(usize::from(extra_bits));
+            bit_len = bit_len.strict_add(
+                usize::try_from(frequency)
+                    .unwrap_or_else(|_| process::abort())
+                    .strict_mul(symbol_bits),
+            );
+        }
+        for ((&frequency, &code_len), &extra_bits) in self
+            .distance
+            .iter()
+            .zip(&plan.distance_huffman.lengths)
+            .zip(&DISTANCE_EXTRA_BITS)
+        {
+            let symbol_bits = usize::from(code_len).strict_add(usize::from(extra_bits));
+            bit_len = bit_len.strict_add(
+                usize::try_from(frequency)
+                    .unwrap_or_else(|_| process::abort())
+                    .strict_mul(symbol_bits),
+            );
+        }
+        bit_len
+    }
+    fn plan(&self) -> ZipResult<DynamicDeflatePlan> {
         let literal_lengths = (HuffmanLengthBuilder {
             frequencies: &self.literal,
             max_bits: DEFLATE_MAX_BITS_U8,
@@ -816,11 +854,6 @@ impl DynamicFrequencies {
     }
 }
 impl DynamicDeflatePlan {
-    fn bit_len(&self, tokens: &[DeflateToken]) -> ZipResult<usize> {
-        let mut counter = BitCounter::counting();
-        self.write_block(tokens, &mut counter)?;
-        Ok(counter.bit_len)
-    }
     fn write_block<W>(&self, tokens: &[DeflateToken], writer: &mut W) -> ZipResult<()>
     where
         W: BitSink,
@@ -1258,7 +1291,7 @@ impl DeflateWriter<'_, '_> {
         let mut output_len = 0_usize;
         let mut token_end = 0_usize;
         let mut token_start = 0_usize;
-        let mut counter = BitCounter::counting();
+        let mut counter = BitCounter { bit_len: 0 };
         for boundary in boundaries {
             while output_len < boundary.output_end {
                 let token = tokens
@@ -1297,16 +1330,15 @@ impl DeflateWriter<'_, '_> {
                 };
                 let (has_distance, fixed_bit_len) = frequencies.collect(block_tokens);
                 let dynamic_plan = has_distance.then(|| frequencies.plan()).transpose()?;
-                let (chosen_dynamic, bit_len) = if let Some(dynamic) = dynamic_plan {
-                    let dynamic_bit_len = dynamic.bit_len(block_tokens)?;
-                    if dynamic_bit_len < fixed_bit_len {
-                        (Some(dynamic), dynamic_bit_len)
-                    } else {
-                        (None, fixed_bit_len)
-                    }
-                } else {
-                    (None, fixed_bit_len)
-                };
+                let (chosen_dynamic, bit_len) =
+                    dynamic_plan.map_or((None, fixed_bit_len), |dynamic| {
+                        let dynamic_bit_len = frequencies.encoded_bit_len(&dynamic);
+                        if dynamic_bit_len < fixed_bit_len {
+                            (Some(dynamic), dynamic_bit_len)
+                        } else {
+                            (None, fixed_bit_len)
+                        }
+                    });
                 counter.add_bits(bit_len);
                 for _ in 0..empty_stored_after {
                     write_empty_stored_block(&mut counter)?;

@@ -6,7 +6,7 @@ use super::{
         MAX_XML_NESTING_DEPTH, XmlAttrScanner, XmlScanner, XmlTag, decode_xml_entities,
         xml_misc_only,
     },
-    zip_archive::scan_open_archive,
+    zip_archive::{ZIP_FINGERPRINT_BUFFER_BYTES, archive_file_len, crc32_update},
 };
 use crate::diagnostic::{
     AppError, Result, err, err_with_source, path_context_message, terminal_safe,
@@ -24,7 +24,7 @@ use core::{array, mem, str};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
     fs,
-    io::{self, Seek as _, Write as _, stderr},
+    io::{self, Read as _, Seek as _, Write as _, stderr},
     path::{Path, PathBuf},
     process,
     time::{SystemTime, UNIX_EPOCH},
@@ -528,13 +528,37 @@ impl TempArchivePromotion<'_> {
                 captured_original.display()
             )));
         }
-        let fingerprint =
-            scan_open_archive(&captured_file.file, captured_original, None).map_err(|source| {
+        let archive_len = archive_file_len(&captured_file.file, captured_original)?;
+        let archive_len_u64 = u64::try_from(archive_len)
+            .map_err(|source| err_with_source("교체된 원본 xlsx 크기 변환 실패", source))?;
+        let mut limited = (&captured_file.file).take(archive_len_u64.strict_add(1));
+        let mut buffer = vec![0_u8; ZIP_FINGERPRINT_BUFFER_BYTES].into_boxed_slice();
+        let mut crc = u32::MAX;
+        let mut bytes_read = 0_usize;
+        loop {
+            let read_len = limited.read(buffer.as_mut()).map_err(|source| {
                 err_with_source(
                     path_context_message("교체된 원본 xlsx 검증 실패", captured_original),
                     source,
                 )
             })?;
+            if read_len == 0 {
+                break;
+            }
+            bytes_read = bytes_read.strict_add(read_len);
+            let (chunk, _) = buffer.split_at(read_len);
+            crc = crc32_update(crc, chunk);
+        }
+        if bytes_read != archive_len {
+            return Err(err(format!(
+                "교체된 원본 xlsx가 검증 중 변경되었습니다: {}",
+                captured_original.display()
+            )));
+        }
+        let fingerprint = ArchiveFingerprint {
+            crc32: !crc,
+            len: bytes_read,
+        };
         (fingerprint == self.expected_fingerprint).ok_or_else(|| {
             err(format!(
                 "원본 xlsx가 실행 중 변경되어 저장을 중단했습니다: {}",
