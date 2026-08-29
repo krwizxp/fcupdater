@@ -270,12 +270,16 @@ impl SourceDownload {
                 (!value.is_empty()).ok_or("Opinet key 값이 비어 있습니다.")?;
                 value
             };
+            let mut opinet_key_owned =
+                try_string_with_capacity(opinet_key.len(), "Opinet key 메모리 확보 실패")?;
+            opinet_key_owned.push_str(opinet_key);
+            drop(opdownload_page);
             let entry_key = self.fetch_netfunnel_ticket(NETFUNNEL_ENTRY_ACTION_ID)?;
             self.post_form(
                 OPDOWNLOAD_PATH,
                 &[
                     ("netfunnel_key", entry_key.as_str()),
-                    ("opinet_key", opinet_key),
+                    ("opinet_key", opinet_key_owned.as_str()),
                 ],
                 Some(OPDOWNLOAD_URL),
                 PostHeaderProfile::Standard,

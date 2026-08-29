@@ -377,7 +377,7 @@ impl ZipPackageReader<'_> {
         read_archive_range(
             &mut self.archive_file,
             self.archive_path,
-            tail_start,
+            Some(tail_start),
             archive_len.strict_sub(tail_start),
             &mut tail_bytes,
         )?;
@@ -442,7 +442,7 @@ impl ZipPackageReader<'_> {
         read_archive_range(
             &mut self.archive_file,
             self.archive_path,
-            central_dir_offset,
+            Some(central_dir_offset),
             central_dir_size,
             &mut central_bytes,
         )?;
@@ -510,7 +510,8 @@ impl ZipPackageReader<'_> {
             read_archive_range(
                 &mut self.archive_file,
                 self.archive_path,
-                local_offset,
+                (expected_local_offset == 0 || expected_local_offset != local_offset)
+                    .then_some(local_offset),
                 record_len,
                 &mut record_bytes,
             )?;
@@ -536,7 +537,7 @@ impl ZipPackageReader<'_> {
         read_archive_range(
             &mut self.archive_file,
             self.archive_path,
-            central_dir_offset,
+            None,
             central_dir_size,
             &mut verification_bytes,
         )?;
@@ -547,7 +548,7 @@ impl ZipPackageReader<'_> {
         read_archive_range(
             &mut self.archive_file,
             self.archive_path,
-            eocd_offset,
+            None,
             archive_len.strict_sub(eocd_offset),
             &mut verification_bytes,
         )?;
@@ -598,20 +599,22 @@ pub(super) fn archive_file_len(file: &File, archive_path: &Path) -> Result<usize
 fn read_archive_range(
     file: &mut File,
     archive_path: &Path,
-    offset: usize,
+    offset: Option<usize>,
     len: usize,
     buffer: &mut Vec<u8>,
 ) -> Result<()> {
-    let offset_u64 = u64::try_from(offset)
-        .map_err(|source| err_with_source("ZIP 입력 offset 변환 실패", source))?;
+    if let Some(seek_offset) = offset {
+        let offset_u64 = u64::try_from(seek_offset)
+            .map_err(|source| err_with_source("ZIP 입력 offset 변환 실패", source))?;
+        file.seek(SeekFrom::Start(offset_u64)).map_err(|source| {
+            err_with_source(
+                path_context_message("xlsx 압축 파일 range 이동 실패", archive_path),
+                source,
+            )
+        })?;
+    }
     let len_u64 =
         u64::try_from(len).map_err(|source| err_with_source("ZIP 입력 길이 변환 실패", source))?;
-    file.seek(SeekFrom::Start(offset_u64)).map_err(|source| {
-        err_with_source(
-            path_context_message("xlsx 압축 파일 range 이동 실패", archive_path),
-            source,
-        )
-    })?;
     buffer.clear();
     buffer
         .try_reserve_exact(len)

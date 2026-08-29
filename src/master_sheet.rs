@@ -699,7 +699,6 @@ impl<'source> MasterSheetUpdater<'source> {
             let name_changed = name.as_ref() != src.name.trim();
             let brand_changed = old_brand_display.trim() != src.brand.trim();
             let self_yn_changed = !old_self_yn_display
-                .trim()
                 .chars()
                 .filter(|ch| !ch.is_whitespace())
                 .eq(src.service.label().chars());
