@@ -1377,7 +1377,7 @@ impl Worksheet {
                 let shared_string = matches!(cell.value_type, CellValueType::SharedString(_));
                 let master_address = sheet == ExcelSheetKind::Master && col == MASTER_ADDRESS_COL;
                 if shared_string || master_address {
-                    let display = self.try_get_display_at(col, row_num, shared_strings)?;
+                    let display = Self::try_get_display_for_cell(cell, shared_strings)?;
                     if master_address && !display.trim().is_empty() {
                         last_master_address_row = Some(row_num);
                     }
@@ -1735,6 +1735,12 @@ impl Worksheet {
         let Some(cell) = self.cell_at(col, row) else {
             return Ok(Cow::Borrowed(""));
         };
+        Self::try_get_display_for_cell(cell, shared_strings)
+    }
+    fn try_get_display_for_cell<'text>(
+        cell: &'text Cell,
+        shared_strings: &'text SharedStringTable,
+    ) -> Result<Cow<'text, str>> {
         if let CellValueType::SharedString(index) = cell.value_type {
             return shared_strings
                 .get(index)
@@ -1783,14 +1789,21 @@ impl Worksheet {
             ExcelSheetKind::Master => (MASTER_SHEET_NAME, 14, &MASTER_HEADERS, 23),
             ExcelSheetKind::ChangeLog => (CHANGE_LOG_SHEET_NAME, 3, &CHANGE_LOG_HEADERS, 13),
         };
-        if self.max_cell_col() != last_col {
+        let actual_last_col = self.max_cell_col();
+        if actual_last_col != last_col {
             return Err(err(format!(
-                "{sheet_name} 시트의 마지막 열이 고정 스키마와 다릅니다: expected={last_col}, actual={}",
-                self.max_cell_col()
+                "{sheet_name} 시트의 마지막 열이 고정 스키마와 다릅니다: expected={last_col}, actual={actual_last_col}"
             )));
         }
+        let header_cells: &[Cell] = row_index(header_row)
+            .and_then(|index| self.rows.get(index))
+            .map_or(&[], |row| row.cells.as_slice());
+        let mut header_iter = header_cells.iter().peekable();
         for (col, expected) in (1_u32..).zip(headers.iter().copied()) {
-            let actual = self.try_get_display_at(col, header_row, shared_strings)?;
+            let actual = header_iter.next_if(|cell| cell.col == col).map_or_else(
+                || Ok(Cow::Borrowed("")),
+                |cell| Self::try_get_display_for_cell(cell, shared_strings),
+            )?;
             if actual.as_ref() != expected {
                 return Err(err(format!(
                     "{sheet_name} 헤더가 고정 스키마와 다릅니다: row={header_row}, col={col}, expected={expected}, actual={actual}"
