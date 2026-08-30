@@ -1,8 +1,11 @@
 name: Update Master Excel
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 concurrency:
   group: update-master
   cancel-in-progress: true
@@ -12,8 +15,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
       - name: Install latest stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Install native dependencies
@@ -27,3 +28,11 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 14
+      - name: Commit refreshed workbook and restore workflow
+        run: |
+          git checkout HEAD^ -- .github/workflows/update_master.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fuel_cost_chungcheong.xlsx .github/workflows/update_master.yml
+          git diff --cached --quiet || git commit -m "Refresh fuel cost workbook"
+          git push origin HEAD:main

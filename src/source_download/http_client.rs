@@ -41,9 +41,9 @@ impl CookieJar {
         {
             return Err("Cookie 이름에 허용되지 않는 문자가 포함되어 있습니다.".into());
         }
-        let value_body = if let Some(unquoted) = value.strip_prefix('"') {
-            unquoted
-                .strip_suffix('"')
+        let value_body = if value.starts_with('"') {
+            value
+                .strip_circumfix('"', '"')
                 .ok_or("Cookie 값의 quote 형식이 올바르지 않습니다.")?
         } else {
             value
