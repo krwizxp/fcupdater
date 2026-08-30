@@ -1297,25 +1297,38 @@ fn find_equivalent_xf(
             if !source_tag.is_start {
                 continue;
             }
+            let mut source_attrs =
+                try_vec_with_capacity(4, "style source 속성 목록 메모리 확보 실패")?;
+            let mut source_attr_scanner = XmlAttrScanner::new(source_tag.raw)?;
+            while let Some((name, value)) = source_attr_scanner.next()? {
+                if source_attrs.len() == source_attrs.capacity() {
+                    source_attrs.try_reserve(1).map_err(|allocation_error| {
+                        err_with_source(
+                            "style source 속성 목록 추가 메모리 확보 실패",
+                            allocation_error,
+                        )
+                    })?;
+                }
+                source_attrs.push((name, value));
+            }
+            let source_attr_count = source_attrs.len();
             let mut candidate_attr_count = 0_usize;
             let mut candidate_attrs = XmlAttrScanner::new(candidate_tag.raw)?;
             while let Some((name, candidate_value)) = candidate_attrs.next()? {
                 candidate_attr_count = candidate_attr_count.strict_add(1);
-                let mut source_match = None;
-                let mut source_attrs = XmlAttrScanner::new(source_tag.raw)?;
-                while let Some((source_name, source_value)) = source_attrs.next()? {
-                    if source_name == name && source_match.replace(source_value).is_some() {
-                        equivalent = false;
-                        break;
-                    }
-                }
-                let Some(source_value) = source_match else {
+                let mut source_matches = source_attrs.iter().filter(|entry| entry.0 == name);
+                let Some(source_entry) = source_matches.next() else {
                     equivalent = false;
                     break;
                 };
+                if source_matches.next().is_some() {
+                    equivalent = false;
+                    break;
+                }
+                let source_value = &source_entry.1;
                 let values_match = if name == "fontId" {
                     fonts.map_or_else(
-                        || source_value == candidate_value,
+                        || source_value.as_ref() == candidate_value.as_ref(),
                         |(source_fonts, candidate_fonts)| {
                             source_value
                                 .parse::<usize>()
@@ -1338,7 +1351,7 @@ fn find_equivalent_xf(
                         ("0" | "false", "0" | "false") | ("1" | "true", "1" | "true")
                     )
                 } else {
-                    source_value == candidate_value
+                    source_value.as_ref() == candidate_value.as_ref()
                 };
                 if !values_match {
                     equivalent = false;
@@ -1347,11 +1360,6 @@ fn find_equivalent_xf(
             }
             if !equivalent {
                 break;
-            }
-            let mut source_attr_count = 0_usize;
-            let mut source_attrs = XmlAttrScanner::new(source_tag.raw)?;
-            while source_attrs.next()?.is_some() {
-                source_attr_count = source_attr_count.strict_add(1);
             }
             if source_attr_count != candidate_attr_count {
                 equivalent = false;
