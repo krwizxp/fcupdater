@@ -2023,7 +2023,7 @@ fn replace_formula_tag_at(
     output.extend([prefix, replacement.as_str(), suffix]);
     Ok(output)
 }
-fn row_index(row: u32) -> Option<usize> {
+const fn row_index(row: u32) -> Option<usize> {
     u32_to_usize(row).checked_sub(1)
 }
 fn worksheet_row_count(len: usize) -> u32 {
