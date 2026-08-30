@@ -28,12 +28,10 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 14
-      - name: Commit refreshed workbook and restore workflow
+      - name: Commit refreshed workbook
         run: |
-          git fetch --no-tags --depth=1 origin 059eef347c5c276a11bef24f5f08c177d5bfda15
-          git checkout FETCH_HEAD -- .github/workflows/update_master.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add fuel_cost_chungcheong.xlsx .github/workflows/update_master.yml
+          git add fuel_cost_chungcheong.xlsx
           git diff --cached --quiet || git commit -m "Refresh fuel cost workbook"
           git push origin HEAD:main
