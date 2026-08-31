@@ -22,6 +22,7 @@ use alloc::{
 use core::{
     fmt::NumBuffer,
     mem,
+    num::IntErrorKind,
     range::{Range, RangeInclusive},
 };
 use std::{collections::HashMap, path::Path, process};
@@ -705,15 +706,21 @@ impl WorksheetParser<'_, '_> {
                 {
                     return Err(err("shared string cell 본문 형식이 올바르지 않습니다."));
                 }
-                if value.body.is_empty() || !value.body.bytes().all(|byte| byte.is_ascii_digit()) {
+                if value.body.starts_with('+') {
                     return Err(err(
                         "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.",
                     ));
                 }
-                let index = value
-                    .body
-                    .parse::<usize>()
-                    .map_err(|source| err_with_source("shared string index 해석 실패", source))?;
+                let index = value.body.parse::<usize>().map_err(|source| {
+                    if matches!(
+                        source.kind(),
+                        IntErrorKind::Empty | IntErrorKind::InvalidDigit
+                    ) {
+                        err("shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.")
+                    } else {
+                        err_with_source("shared string index 해석 실패", source)
+                    }
+                })?;
                 Some(Cell {
                     col,
                     inner_xml: String::new(),

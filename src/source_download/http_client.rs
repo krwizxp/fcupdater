@@ -6,7 +6,7 @@ use super::{
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
     download_error_with_source, try_string_with_capacity,
 };
-use core::{fmt::NumBuffer, mem, time::Duration};
+use core::{fmt::NumBuffer, mem, num::IntErrorKind, time::Duration};
 use std::{
     process,
     thread::sleep,
@@ -447,9 +447,17 @@ fn split_head_or_all(value: &str, separator: char) -> &str {
     value.split_once(separator).map_or(value, |(head, _)| head)
 }
 fn parse_netfunnel_u32(value: &str, context: &'static str) -> DownloadResult<u32> {
-    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .ok_or_else(|| format!("{context}: 음이 아닌 10진수 형식이 아닙니다."))?;
-    value
-        .parse::<u32>()
-        .map_err(|source| download_error_with_source(format!("{context} 해석 실패"), source))
+    if value.starts_with('+') {
+        return Err(format!("{context}: 음이 아닌 10진수 형식이 아닙니다.").into());
+    }
+    value.parse::<u32>().map_err(|source| {
+        if matches!(
+            source.kind(),
+            IntErrorKind::Empty | IntErrorKind::InvalidDigit
+        ) {
+            format!("{context}: 음이 아닌 10진수 형식이 아닙니다.").into()
+        } else {
+            download_error_with_source(format!("{context} 해석 실패"), source)
+        }
+    })
 }

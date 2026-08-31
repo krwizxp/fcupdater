@@ -1,6 +1,6 @@
 use crate::diagnostic::{Result, err, err_with_source, try_string_with_capacity};
 use alloc::borrow::Cow;
-use core::{iter, range::Range};
+use core::{iter, num::IntErrorKind, range::Range};
 pub(super) const MAX_XML_NESTING_DEPTH: usize = 64;
 pub(super) struct XmlTag<'xml> {
     pub end: usize,
@@ -636,10 +636,19 @@ fn parse_numeric_entity(
     format_error: &'static str,
     parse_context: &'static str,
 ) -> Result<u32> {
-    if value.is_empty() || !value.bytes().all(|byte| char::from(byte).is_digit(radix)) {
+    if value.starts_with('+') {
         return Err(err(format_error));
     }
-    u32::from_str_radix(value, radix).map_err(|source| err_with_source(parse_context, source))
+    u32::from_str_radix(value, radix).map_err(|source| {
+        if matches!(
+            source.kind(),
+            IntErrorKind::Empty | IntErrorKind::InvalidDigit
+        ) {
+            err(format_error)
+        } else {
+            err_with_source(parse_context, source)
+        }
+    })
 }
 pub(super) fn is_valid_xml_char(ch: char) -> bool {
     matches!(

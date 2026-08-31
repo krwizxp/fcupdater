@@ -695,9 +695,9 @@ impl<'source> MasterSheetUpdater<'source> {
             let old_brand_display = ws.try_get_display_at(COL_BRAND, old_row, shared_strings)?;
             let old_self_yn_display =
                 ws.try_get_display_at(COL_SELF_YN, old_row, shared_strings)?;
-            let region_changed = region.as_ref() != src.region.trim();
-            let name_changed = name.as_ref() != src.name.trim();
-            let brand_changed = old_brand_display.trim() != src.brand.trim();
+            let region_changed = region.as_ref() != src.region;
+            let name_changed = name.as_ref() != src.name;
+            let brand_changed = old_brand_display.trim() != src.brand;
             let self_yn_changed = !old_self_yn_display
                 .chars()
                 .filter(|ch| !ch.is_whitespace())
