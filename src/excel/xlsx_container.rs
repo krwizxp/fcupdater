@@ -126,7 +126,7 @@ const EXCEL_ROOT_RELS_XML: &str = include_str!("excel_root_rels.xml");
 const EXCEL_WORKBOOK_RELS_XML: &str = include_str!("excel_workbook_rels.xml");
 const LIBREOFFICE_CELL_XFS_XML: &str = include_str!("libreoffice_cell_xfs.xml");
 const LIBREOFFICE_STYLE_MAP: [u32; 26] = [
-    0, 4, 5, 24, 2, 1, 25, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 26, 20, 21, 22, 23,
+    0, 4, 5, 25, 2, 1, 23, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 24, 19, 20, 21, 22,
 ];
 const EXCEL_CORE_PROPERTIES: [(&str, &str, &str); 9] = [
     ("dc:title", "<dc:title>", "</dc:title>"),

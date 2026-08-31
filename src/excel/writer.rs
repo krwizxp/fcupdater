@@ -238,8 +238,7 @@ impl SharedStringTable {
         }
         let index = self.entries.len();
         let stored_value = Rc::<str>::from(value);
-        let escaped_len =
-            validated_xml_escaped_len(value, XmlEscapeContext::Text, "shared string XML")?;
+        let escaped = try_xml_escape_text(value, XmlEscapeContext::Text, "shared string XML")?;
         let preserve = value.chars().next().is_some_and(char::is_whitespace)
             || value.chars().next_back().is_some_and(char::is_whitespace);
         let opening = if preserve {
@@ -249,11 +248,11 @@ impl SharedStringTable {
         };
         let capacity = opening
             .len()
-            .strict_add(escaped_len)
+            .strict_add(escaped.len())
             .strict_add("</t></si>".len());
         let mut entry = try_string_with_capacity(capacity, "shared string XML 메모리 확보 실패")?;
         entry.push_str(opening);
-        append_xml_escaped(&mut entry, value, XmlEscapeContext::Text);
+        entry.push_str(&escaped);
         entry.push_str("</t></si>");
         self.entries.push(SharedStringEntry {
             text: Rc::clone(&stored_value),
@@ -529,9 +528,7 @@ impl Workbook {
         workbook_xml.push_str("<sheets><sheet name=\"유류비\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"변경내역\" sheetId=\"2\" r:id=\"rId2\"/></sheets><definedNames><definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">");
         workbook_xml.push_str(FILTER_DATABASE_REF_PREFIX);
         push_decimal_text!(&mut workbook_xml, filter_last_row);
-        workbook_xml.push_str(
-            "</definedName></definedNames><calcPr calcId=\"191029\" fullCalcOnLoad=\"1\"/>",
-        );
+        workbook_xml.push_str("</definedName></definedNames><calcPr calcId=\"191029\"/>");
         workbook_xml.extend([EXCEL_CALC_EXTENSIONS_XML, "</workbook>"]);
         self.container.put_text("xl/workbook.xml", workbook_xml);
         self.container
@@ -1876,6 +1873,16 @@ fn canonical_excel_style(
     col: Option<u32>,
     input_styles: &CanonicalStyleMap,
 ) -> Result<u32> {
+    if sheet == ExcelSheetKind::Master
+        && let Some(column) = col
+    {
+        match (row, column) {
+            (1, 1..=7) => return Ok(25),
+            (2, 1..=20) => return Ok(26),
+            (3, 1..=2) => return Ok(23),
+            _ => {}
+        }
+    }
     let canonical = input_styles
         .get(u32_to_usize(style))
         .copied()
@@ -1885,9 +1892,6 @@ fn canonical_excel_style(
                 "worksheet가 참조한 style을 Excel 정규형으로 변환할 수 없습니다: {style}"
             ))
         })?;
-    if sheet == ExcelSheetKind::Master && row == 3 && col.is_some_and(|column| column <= 2) {
-        return Ok(25);
-    }
     Ok(canonical)
 }
 fn xml_bool_attr(attrs: &[XmlAttr<'_>], name: &str) -> Result<bool> {
