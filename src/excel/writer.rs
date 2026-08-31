@@ -301,6 +301,9 @@ impl Workbook {
     }
     pub(crate) fn from_container(mut container: XlsxContainer) -> Result<Self> {
         container.ensure_supported_workbook()?;
+        let master_xml = container.take_worksheet_text(MASTER_SHEET_PATH, MASTER_SHEET_NAME)?;
+        let change_log_xml =
+            container.take_worksheet_text(CHANGE_LOG_SHEET_PATH, CHANGE_LOG_SHEET_NAME)?;
         let input_styles = container.package_prepare_excel_output()?;
         let shared_strings_xml_text = container.take_shared_strings_text()?;
         let mut shared_strings_scanner = XmlScanner::new(&shared_strings_xml_text);
@@ -403,7 +406,6 @@ impl Workbook {
             }
         }
         let shared_strings = SharedStringTable { entries, index };
-        let master_xml = container.take_worksheet_text(MASTER_SHEET_PATH, MASTER_SHEET_NAME)?;
         let master_sheet = WorksheetParser {
             cell_count: 0,
             input_styles: &input_styles,
@@ -413,8 +415,6 @@ impl Workbook {
         }
         .scan_worksheet()?;
         master_sheet.validate_fixed_header(ExcelSheetKind::Master, &shared_strings)?;
-        let change_log_xml =
-            container.take_worksheet_text(CHANGE_LOG_SHEET_PATH, CHANGE_LOG_SHEET_NAME)?;
         let change_log_sheet = WorksheetParser {
             cell_count: 0,
             input_styles: &input_styles,

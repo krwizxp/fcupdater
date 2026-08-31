@@ -126,7 +126,7 @@ const EXCEL_ROOT_RELS_XML: &str = include_str!("excel_root_rels.xml");
 const EXCEL_WORKBOOK_RELS_XML: &str = include_str!("excel_workbook_rels.xml");
 const LIBREOFFICE_CELL_XFS_XML: &str = include_str!("libreoffice_cell_xfs.xml");
 const LIBREOFFICE_STYLE_MAP: [u32; 26] = [
-    0, 4, 5, 24, 2, 1, 25, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 27, 20, 21, 22, 23,
+    0, 4, 5, 24, 2, 1, 25, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 26, 20, 21, 22, 23,
 ];
 const EXCEL_CORE_PROPERTIES: [(&str, &str, &str); 9] = [
     ("dc:title", "<dc:title>", "</dc:title>"),
@@ -578,12 +578,13 @@ impl XlsxContainer {
             return Err(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."));
         }
         let workbook_xml = workbook_text.as_str();
+        let (mut scanner, workbook_root) = scan_xml_root(workbook_xml, "workbook", "workbook.xml")?;
         let mut forbidden = None;
-        let mut scanner = XmlScanner::new(workbook_xml);
-        while let Some(tag) = scanner.next_tag() {
-            if !tag.is_start {
-                continue;
-            }
+        let mut empty_protection_seen = false;
+        while let Some(element) =
+            scanner.next_direct_element_until(workbook_root.name, "workbook.xml")?
+        {
+            let tag = element.opening;
             let candidate = match tag.local_name {
                 "fileRecoveryPr" => (
                     0_u8,
@@ -593,10 +594,21 @@ impl XlsxContainer {
                     (1, "workbook.xml의 외부 workbook 관계는 지원하지 않습니다.")
                 }
                 "connections" => (2, "workbook.xml의 외부 데이터 연결은 지원하지 않습니다."),
-                "workbookProtection" => (
-                    3,
-                    "workbook.xml의 보호 설정은 정규 저장으로 보존할 수 없습니다.",
-                ),
+                "workbookProtection" => {
+                    let mut attributes = XmlAttrScanner::new(tag.raw)?;
+                    if tag.name == "workbookProtection"
+                        && !empty_protection_seen
+                        && attributes.next()?.is_none()
+                        && xml_misc_only(element.body, false)
+                    {
+                        empty_protection_seen = true;
+                        continue;
+                    }
+                    (
+                        3,
+                        "workbook.xml의 보호 설정은 정규 저장으로 보존할 수 없습니다.",
+                    )
+                }
                 _ => continue,
             };
             if forbidden.is_none_or(|current: (u8, &str)| candidate.0 < current.0) {
