@@ -1043,10 +1043,11 @@ impl WorksheetParser<'_, '_> {
                 });
                 continue;
             }
-            let mut row = Row {
-                attrs_xml,
-                cells: Vec::new(),
-            };
+            let cells = try_vec_with_capacity(
+                u32_to_usize(last_col),
+                "worksheet row cell 메모리 확보 실패",
+            )?;
+            let mut row = Row { attrs_xml, cells };
             self.parse_row(scanner, row_info.name, row_num, &mut row)?;
             rows.push(row);
         }
