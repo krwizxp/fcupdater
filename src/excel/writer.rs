@@ -1170,7 +1170,10 @@ impl Worksheet {
                 let mut last_row = row;
                 while last_row < max_last_row {
                     let candidate_row = last_row.strict_add(1);
-                    if self.try_get_formula_at(col, candidate_row)?.is_none() {
+                    let Some(candidate_cell) = self.cell_at(col, candidate_row) else {
+                        break;
+                    };
+                    if extract_first_tag_text(&candidate_cell.inner_xml, "f")?.is_none() {
                         break;
                     }
                     last_row = candidate_row;

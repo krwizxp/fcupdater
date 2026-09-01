@@ -1198,8 +1198,13 @@ impl DeflateWriter<'_, '_> {
             symbol: u16::try_from(index).unwrap_or_else(|_| process::abort()),
         }
     }
-    fn insert_position(bytes: &[u8], position: usize, head: &mut [usize], previous: &mut [u16]) {
-        let Some(hash) = hash3(bytes, position) else {
+    fn insert_position(
+        position: usize,
+        hash_index: Option<usize>,
+        head: &mut [usize],
+        previous: &mut [u16],
+    ) {
+        let Some(hash) = hash_index else {
             return;
         };
         let head_slot = head.get_mut(hash).unwrap_or_else(|| process::abort());
@@ -1409,15 +1414,13 @@ impl DeflateWriter<'_, '_> {
                 .map_or(bytes.len(), |boundary| boundary.output_end);
             let mut best_len = 0_usize;
             let mut best_distance = 0_usize;
-            if let Some(hash) = hash3(bytes, position)
+            let position_hash = hash3(bytes, position);
+            if let Some(hash) = position_hash
                 && let Some(&head_candidate) = head.get(hash)
             {
                 let mut candidate = head_candidate;
                 let min_candidate = position.saturating_sub(DEFLATE_MAX_DISTANCE);
-                let max_len = boundary_end
-                    .strict_sub(position)
-                    .min(bytes.len().strict_sub(position))
-                    .min(MAX_MATCH);
+                let max_len = boundary_end.strict_sub(position).min(MAX_MATCH);
                 let mut chain_len = 0_usize;
                 while candidate != usize::MAX
                     && candidate >= min_candidate
@@ -1483,7 +1486,7 @@ impl DeflateWriter<'_, '_> {
             if skip_next_hash_insert {
                 skip_next_hash_insert = false;
             } else {
-                Self::insert_position(bytes, position, head, previous);
+                Self::insert_position(position, position_hash, head, previous);
             }
             if best_len >= MIN_MATCH {
                 push_deflate_token(
@@ -1498,7 +1501,12 @@ impl DeflateWriter<'_, '_> {
                     .ok_or_else(|| zip_static("deflate 위치 계산 실패"))?;
                 if best_len <= XML_MAX_INSERT_MATCH_LEN {
                     for insert_position in position.strict_add(1)..next_position {
-                        Self::insert_position(bytes, insert_position, head, previous);
+                        Self::insert_position(
+                            insert_position,
+                            hash3(bytes, insert_position),
+                            head,
+                            previous,
+                        );
                     }
                 }
                 position = next_position;
