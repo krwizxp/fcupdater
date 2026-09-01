@@ -1,6 +1,6 @@
 use super::copy_text;
 use crate::{
-    diagnostic::{Result, err, err_with_source, try_vec_with_capacity},
+    diagnostic::{Result, err, err_with_source, try_string_with_capacity, try_vec_with_capacity},
     u32_to_usize,
 };
 use alloc::borrow::Cow;
@@ -673,7 +673,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             )));
         }
         let mut ranges = try_vec_with_capacity(unique_count, "SST 문자열 테이블 메모리 확보 실패")?;
-        let mut text = String::new();
+        let mut text = try_string_with_capacity(total_chunk_bytes, "SST 문자열 메모리 확보 실패")?;
         for _ in 0..unique_count {
             let char_count = usize::from(reader.read_u16()?);
             let flags = reader.read_u8()?;
