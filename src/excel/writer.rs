@@ -274,16 +274,21 @@ impl SharedStringTable {
         Ok(())
     }
     fn to_xml(&self, reference_count: usize) -> Result<String> {
-        let mut xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<sst xmlns=\"{SPREADSHEETML_NAMESPACE}\" count=\"{reference_count}\" uniqueCount=\"{}\">",
-            self.entries.len()
-        );
         let additional_capacity = self
             .entries
             .iter()
             .fold("</sst>".len(), |sum, entry| sum.strict_add(entry.xml.len()));
-        xml.try_reserve_exact(additional_capacity)
-            .map_err(|source| err_with_source("sharedStrings XML 메모리 확보 실패", source))?;
+        let mut xml = try_string_with_capacity(
+            additional_capacity.strict_add(256),
+            "sharedStrings XML 메모리 확보 실패",
+        )?;
+        append_fmt(
+            &mut xml,
+            format_args!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<sst xmlns=\"{SPREADSHEETML_NAMESPACE}\" count=\"{reference_count}\" uniqueCount=\"{}\">",
+                self.entries.len()
+            ),
+        );
         for entry in &self.entries {
             xml.push_str(&entry.xml);
         }
@@ -1113,6 +1118,12 @@ impl Worksheet {
             ExcelSheetKind::Master => MASTER_FORMULA_LAYOUT,
         };
         let mut next_si = 0_u32;
+        let formula_col_mask = layout
+            .required_cols
+            .iter()
+            .copied()
+            .chain(layout.optional_zero_col)
+            .fold(0_u32, |mask, col| mask | 1_u32.strict_shl(col));
         let mut column_state = [None; MASTER_HEADERS.len().strict_add(1)];
         let mut reference = String::new();
         let row_count = worksheet_row_count(self.rows.len());
@@ -1133,7 +1144,7 @@ impl Worksheet {
                     .and_then(|row_obj| row_obj.cells.get(cell_index))
                     .unwrap_or_else(|| process::abort());
                 let col = current_cell.col;
-                if !layout.required_cols.contains(&col) && layout.optional_zero_col != Some(col) {
+                if col >= u32::BITS || formula_col_mask & 1_u32.strict_shl(col) == 0 {
                     continue;
                 }
                 let state = column_state
