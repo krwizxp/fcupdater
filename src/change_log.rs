@@ -172,6 +172,12 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             if row > style_template_row {
                 worksheet.copy_row_style(style_template_row, row, CHANGELOG_COL_DELTA_DIESEL)?;
             }
+            worksheet.set_existing_cell_style_in_range(
+                row,
+                CHANGELOG_COL_OLD_GAS,
+                CHANGELOG_COL_DELTA_DIESEL,
+                26,
+            )?;
             values.write_to(
                 worksheet,
                 self.shared_string_table,

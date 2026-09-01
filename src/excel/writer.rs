@@ -623,7 +623,13 @@ impl WorksheetParser<'_, '_> {
                     col,
                 )));
             }
-            let style = style_value
+            let omit_empty_master_note_cell = self.sheet == ExcelSheetKind::Master
+                && row_num == 2
+                && col != 1
+                && cell_info.self_closing;
+            let style = (!omit_empty_master_note_cell)
+                .then_some(style_value)
+                .flatten()
                 .map(|value| {
                     parse_u32_decimal(
                         &value,
@@ -955,8 +961,14 @@ impl WorksheetParser<'_, '_> {
                 })
                 .transpose()?;
             let custom_format = xml_bool_attr(&row_attrs, "customFormat")?;
-            let custom_height = xml_bool_attr(&row_attrs, "customHeight")?;
-            let height = get_attr(&row_attrs, "ht");
+            let input_custom_height = xml_bool_attr(&row_attrs, "customHeight")?;
+            let input_height = get_attr(&row_attrs, "ht");
+            let (height, custom_height) =
+                if self.sheet == ExcelSheetKind::Master && matches!(row_num, 12 | 13) {
+                    (Some("27"), true)
+                } else {
+                    (input_height, input_custom_height)
+                };
             let mut attrs_xml = try_string_with_capacity(
                 row_info.raw.len().strict_add(16),
                 "worksheet row 속성 직렬화 메모리 확보 실패",
@@ -1476,6 +1488,39 @@ impl Worksheet {
         }
         Ok(())
     }
+    pub(crate) fn set_existing_cell_style_in_range(
+        &mut self,
+        row: u32,
+        start_col: u32,
+        end_col: u32,
+        style: u32,
+    ) -> Result<()> {
+        let row_obj = row_index(row)
+            .and_then(|index| self.rows.get_mut(index))
+            .ok_or_else(|| err(format!("worksheet style 대상 row가 없습니다: {row}")))?;
+        let start = row_obj.cells.partition_point(|cell| cell.col < start_col);
+        let cell_count = end_col
+            .checked_sub(start_col)
+            .and_then(|value| value.checked_add(1))
+            .map(u32_to_usize)
+            .ok_or_else(|| err("worksheet style 대상 column 범위가 올바르지 않습니다."))?;
+        let end = start
+            .checked_add(cell_count)
+            .ok_or_else(|| err("worksheet style 대상 cell 범위 계산 실패"))?;
+        let cells = row_obj
+            .cells
+            .get_mut(start..end)
+            .ok_or_else(|| err("worksheet style 대상 cell 범위가 올바르지 않습니다."))?;
+        for (expected_col, cell) in (start_col..=end_col).zip(cells) {
+            if cell.col != expected_col {
+                return Err(err(format!(
+                    "worksheet style 대상 cell이 없습니다: row={row}, col={expected_col}"
+                )));
+            }
+            cell.style = Some(style);
+        }
+        Ok(())
+    }
     pub(crate) fn set_formula_at_with_cache(
         &mut self,
         col: u32,
@@ -1877,9 +1922,9 @@ fn canonical_excel_style(
         && let Some(column) = col
     {
         match (row, column) {
-            (1, 1..=7) => return Ok(25),
-            (2, 1..=20) => return Ok(26),
-            (3, 1..=2) => return Ok(23),
+            (1, 1..=7) => return Ok(24),
+            (2, 1) => return Ok(25),
+            (3, 1..=2) => return Ok(22),
             _ => {}
         }
     }

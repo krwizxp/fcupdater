@@ -14,7 +14,7 @@ use core::{
     result::Result as CoreResult,
     time::Duration,
 };
-use std::{ffi::OsStr, os::windows::ffi::OsStrExt as WindowsOsStrExt, time::Instant};
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt as WindowsOsStrExt, process, time::Instant};
 mod sys;
 const DWORD_BYTE_SIZE: u32 = 4;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -269,13 +269,13 @@ impl Client {
                 session,
             })
         };
-        if let Some(entry) = cache
-            .connects
-            .iter()
-            .filter_map(Option::as_ref)
-            .find(|entry| entry.host == host)
-        {
-            return Ok(entry.handle.0);
+        let mut empty_slot = None;
+        for (index, slot) in cache.connects.iter().enumerate() {
+            match slot.as_ref() {
+                Some(entry) if entry.host == host => return Ok(entry.handle.0),
+                None if empty_slot.is_none() => empty_slot = Some(index),
+                Some(_) | None => {}
+            }
         }
         let host_wide = wide(host)?;
         // SAFETY: host_wide is NUL-terminated and cache.session is a valid session handle.
@@ -298,7 +298,11 @@ impl Client {
             handle,
             host: host_key,
         };
-        if let Some(slot) = cache.connects.iter_mut().find(|slot| slot.is_none()) {
+        if let Some(index) = empty_slot {
+            let slot = cache
+                .connects
+                .get_mut(index)
+                .unwrap_or_else(|| process::abort());
             *slot = Some(entry);
         } else {
             cache.connects.rotate_left(1);

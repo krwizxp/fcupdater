@@ -125,8 +125,9 @@ const EXCEL_CONTENT_TYPES_XML: &str = include_str!("excel_content_types.xml");
 const EXCEL_ROOT_RELS_XML: &str = include_str!("excel_root_rels.xml");
 const EXCEL_WORKBOOK_RELS_XML: &str = include_str!("excel_workbook_rels.xml");
 const LIBREOFFICE_CELL_XFS_XML: &str = include_str!("libreoffice_cell_xfs.xml");
+const LIBREOFFICE_UNMAPPED_STYLE_INDEX: usize = 7;
 const LIBREOFFICE_STYLE_MAP: [u32; 26] = [
-    0, 4, 5, 25, 2, 1, 23, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 24, 19, 20, 21, 22,
+    0, 3, 4, 24, 2, 1, 22, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 23, 18, 19, 20, 21,
 ];
 const EXCEL_CORE_PROPERTIES: [(&str, &str, &str); 9] = [
     ("dc:title", "<dc:title>", "</dc:title>"),
@@ -709,8 +710,10 @@ impl XlsxContainer {
         let source_styles = self.text("xl/styles.xml")?;
         let source_xfs = style_entries(source_styles, "cellXfs", "xf")?;
         let source_fonts = style_entries(source_styles, "fonts", "font")?;
+        let source_borders = style_entries(source_styles, "borders", "border")?;
         let excel_xfs = style_entries(EXCEL_STYLES_XML, "cellXfs", "xf")?;
         let excel_fonts = style_entries(EXCEL_STYLES_XML, "fonts", "font")?;
+        let excel_borders = style_entries(EXCEL_STYLES_XML, "borders", "border")?;
         let libreoffice_xfs = style_entries(LIBREOFFICE_CELL_XFS_XML, "cellXfs", "xf")?;
         if libreoffice_xfs.len() != LIBREOFFICE_STYLE_MAP.len() {
             return Err(err(
@@ -723,13 +726,17 @@ impl XlsxContainer {
             let canonical = match find_equivalent_xf(
                 source_xf,
                 &excel_xfs,
-                Some((&source_fonts, &excel_fonts)),
+                Some(&source_fonts),
+                Some(&excel_fonts),
+                Some(&source_borders),
+                Some(&excel_borders),
             )? {
                 Some(index) => Some(
                     u32::try_from(index)
                         .map_err(|error| err_with_source("Excel style index 변환 실패", error))?,
                 ),
-                None => find_equivalent_xf(source_xf, &libreoffice_xfs, None)?
+                None => find_equivalent_xf(source_xf, &libreoffice_xfs, None, None, None, None)?
+                    .filter(|&index| index != LIBREOFFICE_UNMAPPED_STYLE_INDEX)
                     .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
                     .copied(),
             };
@@ -1265,7 +1272,10 @@ fn style_entries<'text>(
 fn find_equivalent_xf(
     source: &str,
     catalog: &[&str],
-    fonts: Option<(&[&str], &[&str])>,
+    source_fonts: Option<&[&str]>,
+    candidate_fonts: Option<&[&str]>,
+    source_borders: Option<&[&str]>,
+    candidate_borders: Option<&[&str]>,
 ) -> Result<Option<usize>> {
     const BOOLEAN_ATTRS: [&str; 13] = [
         "applyAlignment",
@@ -1338,25 +1348,29 @@ fn find_equivalent_xf(
                     break;
                 }
                 let source_value = &source_entry.1;
-                let values_match = if name == "fontId" {
-                    fonts.map_or_else(
-                        || source_value.as_ref() == candidate_value.as_ref(),
-                        |(source_fonts, candidate_fonts)| {
-                            source_value
+                let indexed_resources = match name {
+                    "fontId" => source_fonts.zip(candidate_fonts),
+                    "borderId" => source_borders.zip(candidate_borders),
+                    _ => None,
+                };
+                let values_match = if let Some((source_entries, candidate_entries)) =
+                    indexed_resources
+                {
+                    source_value
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|resource_index| source_entries.get(resource_index))
+                        .zip(
+                            candidate_value
                                 .parse::<usize>()
                                 .ok()
-                                .and_then(|font_index| source_fonts.get(font_index))
-                                .zip(
-                                    candidate_value
-                                        .parse::<usize>()
-                                        .ok()
-                                        .and_then(|font_index| candidate_fonts.get(font_index)),
-                                )
-                                .is_some_and(|(source_font, candidate_font)| {
-                                    source_font == candidate_font
-                                })
-                        },
-                    )
+                                .and_then(|resource_index| candidate_entries.get(resource_index)),
+                        )
+                        .is_some_and(|(source_resource, candidate_resource)| {
+                            source_resource == candidate_resource
+                        })
+                } else if name == "fontId" || name == "borderId" {
+                    source_value.as_ref() == candidate_value.as_ref()
                 } else if BOOLEAN_ATTRS.contains(&name) {
                     matches!(
                         (source_value.as_ref(), candidate_value.as_ref()),
