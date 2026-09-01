@@ -4,8 +4,7 @@ use super::{
     MASTER_SHEET_NAME, MASTER_SHEET_PATH, SPREADSHEETML_NAMESPACE, SaveVerification, copy_text,
     xlsx_container::{XlsxContainer, validate_spreadsheet_xml_document},
     xml::{
-        XmlAttrScanner, XmlScanner, decode_xml_entities, extract_all_tag_text,
-        extract_first_tag_text, is_valid_xml_char,
+        XmlAttrScanner, XmlScanner, decode_xml_entities, extract_first_tag_text, is_valid_xml_char,
     },
 };
 use crate::{
@@ -312,7 +311,6 @@ impl Workbook {
             SHARED_STRING_INITIAL_CAPACITY,
             "shared string entry 메모리 확보 실패",
         )?;
-        let mut replacement = String::new();
         let sst_closing = (!sst.self_closing).then_some(sst.name);
         while let Some(closing_name) = sst_closing
             && let Some(si) = shared_strings_scanner.next_direct_element_named_until(
@@ -334,24 +332,24 @@ impl Workbook {
                         err_with_source("shared string entry 메모리 확보 실패", source)
                     })?;
             }
-            let value = extract_all_tag_text(si.body, "t")?.unwrap_or(Cow::Borrowed(""));
             let si_xml = shared_strings_xml_text
                 .get(si.span)
                 .ok_or_else(|| err("sharedStrings.xml의 si entry 범위가 손상되었습니다."))?;
-            let mut xml = copy_text(si_xml)?;
-            let mut cursor = 0_usize;
-            loop {
-                let mut text_scanner = XmlScanner::new(&xml);
-                text_scanner.skip_to(cursor);
-                let Some(element) = text_scanner.next_element_named("t")? else {
-                    break;
-                };
-                let start = element.span.start;
+            let mut xml =
+                try_string_with_capacity(si_xml.len(), "shared string XML 메모리 확보 실패")?;
+            let mut text_scanner = XmlScanner::new(si_xml);
+            let mut source_cursor = 0_usize;
+            let mut first_text: Option<Cow<'_, str>> = None;
+            let mut text_out: Option<String> = None;
+            while let Some(element) = text_scanner.next_element_named("t")? {
+                let prefix = si_xml
+                    .get(source_cursor..element.span.start)
+                    .ok_or_else(|| err("shared string t 시작 범위가 손상되었습니다."))?;
+                xml.push_str(prefix);
                 let mut attrs = parse_tag_attrs(element.opening.raw)?;
                 if element.opening.self_closing {
-                    let empty_tag = build_tag("t", &attrs, true)?;
-                    xml.replace_range(element.span, &empty_tag);
-                    cursor = start.strict_add(empty_tag.len());
+                    xml.push_str(&build_tag("t", &attrs, true)?);
+                    source_cursor = element.span.end;
                     continue;
                 }
                 let decoded = decode_xml_entities(element.body)?;
@@ -378,15 +376,36 @@ impl Workbook {
                     XmlEscapeContext::Text,
                     "shared string XML",
                 )?;
-                let capacity = sum_lengths(&[opening.len(), escaped.len(), "</t>".len()]);
-                replacement.clear();
-                replacement.try_reserve_exact(capacity).map_err(|source| {
-                    err_with_source("shared string t 직렬화 메모리 확보 실패", source)
-                })?;
-                replacement.extend([opening.as_str(), escaped.as_ref(), "</t>"]);
-                xml.replace_range(element.span, &replacement);
-                cursor = start.strict_add(replacement.len());
+                xml.extend([opening.as_str(), escaped.as_ref(), "</t>"]);
+                if !decoded.is_empty() {
+                    if let Some(out_text) = text_out.as_mut() {
+                        out_text
+                            .try_reserve_exact(decoded.len())
+                            .map_err(|source| {
+                                err_with_source("XML tag text 메모리 확보 실패", source)
+                            })?;
+                        out_text.push_str(decoded.as_ref());
+                    } else if let Some(previous) = first_text.take() {
+                        let mut out_text = try_string_with_capacity(
+                            previous.len().strict_add(decoded.len()),
+                            "XML tag text 메모리 확보 실패",
+                        )?;
+                        out_text.extend([previous.as_ref(), decoded.as_ref()]);
+                        text_out = Some(out_text);
+                    } else {
+                        first_text = Some(decoded);
+                    }
+                }
+                source_cursor = element.span.end;
             }
+            let suffix = si_xml
+                .get(source_cursor..)
+                .ok_or_else(|| err("shared string t 종료 범위가 손상되었습니다."))?;
+            xml.push_str(suffix);
+            let value = text_out
+                .map(Cow::Owned)
+                .or(first_text)
+                .unwrap_or(Cow::Borrowed(""));
             entries.push(SharedStringEntry {
                 text: Rc::<str>::from(value.as_ref()),
                 xml,
@@ -1413,6 +1432,10 @@ impl Worksheet {
             ),
             ExcelSheetKind::Master => (MASTER_SHEET_NAME, MASTER_FORMULA_LAYOUT, MASTER_LAST_COL),
         };
+        let required_col_mask = layout
+            .required_cols
+            .iter()
+            .fold(0_u32, |mask, &col| mask | 1_u32.strict_shl(col));
         let mut last_data_row = None;
         let mut last_master_address_row = None;
         let mut first_layout_issue = None;
@@ -1430,7 +1453,12 @@ impl Worksheet {
                         last_master_address_row = Some(row_num);
                     }
                 }
-                let formula_text = extract_first_tag_text(&cell.inner_xml, "f")?;
+                let mut content_scanner = XmlScanner::new(&cell.inner_xml);
+                let content = content_scanner.next_direct_element("worksheet cell")?;
+                let formula_text = content
+                    .as_ref()
+                    .filter(|element| element.opening.name == "f")
+                    .map(|element| element.body);
                 let has_formula = formula_text.is_some();
                 if let Some(raw_formula) = formula_text {
                     let formula = decode_xml_entities(raw_formula)?;
@@ -1457,9 +1485,10 @@ impl Worksheet {
                         }
                         fixed_formula_count = fixed_formula_count.strict_add(1);
                     }
+                    let required_col =
+                        col <= last_col && required_col_mask & 1_u32.strict_shl(col) != 0;
                     let data = row_num >= layout.data_start_row
-                        && (layout.required_cols.contains(&col)
-                            || layout.optional_zero_col == Some(col));
+                        && (required_col || layout.optional_zero_col == Some(col));
                     if fixed.is_none() && !data {
                         return Err(err(format!(
                             "{sheet_name} 시트의 고정 위치 밖에 formula가 있습니다: row={row_num}, col={col}"
@@ -1474,15 +1503,10 @@ impl Worksheet {
                         }
                     }
                 }
-                let inner = &cell.inner_xml;
-                let has_payload = if inner.is_empty() {
-                    false
-                } else if has_formula {
-                    true
-                } else if let Some(raw_value) = extract_first_tag_text(inner, "v")? {
-                    !decode_xml_entities(raw_value)?.trim().is_empty()
-                } else {
-                    extract_all_tag_text(inner, "t")?.is_some_and(|text| !text.is_empty())
+                let has_payload = match content {
+                    None => false,
+                    Some(_) if has_formula => true,
+                    Some(element) => !decode_xml_entities(element.body)?.trim().is_empty(),
                 };
                 if row_num >= layout.data_start_row && col <= last_col && has_payload {
                     last_data_row = Some(row_num);
@@ -1759,18 +1783,22 @@ impl Worksheet {
     }
     fn to_xml(&self, sheet: ExcelSheetKind, last_data_row: u32) -> Result<(String, usize)> {
         let (mut out, suffix) = self.to_fragments(sheet, last_data_row)?;
+        let additional_capacity = self.rows.iter().fold(suffix.len(), |capacity, row| {
+            row.cells.iter().fold(
+                capacity.strict_add(row.attrs_xml.len()).strict_add(64),
+                |cell_capacity, cell| {
+                    cell_capacity
+                        .strict_add(cell.inner_xml.len())
+                        .strict_add(80)
+                },
+            )
+        });
+        out.try_reserve(additional_capacity)
+            .map_err(|source| err_with_source("worksheet XML 메모리 확보 실패", source))?;
         let mut shared_string_reference_count = 0_usize;
         for (row_num, row) in (1_u32..=MAX_A1_ROW).zip(&self.rows) {
             let mut row_buffer = NumBuffer::new();
             let row_text = row_num.format_into(&mut row_buffer);
-            let row_capacity = row
-                .cells
-                .iter()
-                .fold(row.attrs_xml.len().strict_add(64), |capacity, cell| {
-                    capacity.strict_add(cell.inner_xml.len()).strict_add(80)
-                });
-            out.try_reserve(row_capacity)
-                .map_err(|source| err_with_source("worksheet row XML 메모리 확보 실패", source))?;
             out.extend(["<row", " r=\"", row_text, "\"", row.attrs_xml.as_str()]);
             if row.cells.is_empty() {
                 out.push_str("/>");
@@ -1805,8 +1833,6 @@ impl Worksheet {
             }
             out.push_str("</row>");
         }
-        out.try_reserve(suffix.len())
-            .map_err(|source| err_with_source("worksheet suffix 메모리 확보 실패", source))?;
         out.push_str(&suffix);
         Ok((out, shared_string_reference_count))
     }

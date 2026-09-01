@@ -494,43 +494,6 @@ pub(super) fn extract_first_tag_text<'xml>(
         .next_element_named(tag_name)
         .map(|maybe_element| maybe_element.map(|element| element.body))
 }
-pub(super) fn extract_all_tag_text<'xml>(
-    xml: &'xml str,
-    tag_name: &str,
-) -> Result<Option<Cow<'xml, str>>> {
-    let mut scanner = XmlScanner::new(xml);
-    let mut first_text: Option<Cow<'xml, str>> = None;
-    let mut out: Option<String> = None;
-    let mut saw_text_tag = false;
-    while let Some(element) = scanner.next_element_named(tag_name)? {
-        saw_text_tag = true;
-        if element.opening.self_closing {
-            continue;
-        }
-        let decoded = decode_xml_entities(element.body)?;
-        if !decoded.is_empty() {
-            if let Some(out_text) = out.as_mut() {
-                out_text
-                    .try_reserve_exact(decoded.len())
-                    .map_err(|source| err_with_source("XML tag text 메모리 확보 실패", source))?;
-                out_text.push_str(decoded.as_ref());
-            } else if let Some(previous) = first_text.take() {
-                let mut out_text = try_string_with_capacity(
-                    previous.len().strict_add(decoded.len()),
-                    "XML tag text 메모리 확보 실패",
-                )?;
-                out_text.extend([previous.as_ref(), decoded.as_ref()]);
-                out = Some(out_text);
-            } else {
-                first_text = Some(decoded);
-            }
-        }
-    }
-    Ok(out
-        .map(Cow::Owned)
-        .or(first_text)
-        .or_else(|| saw_text_tag.then_some(Cow::Borrowed(""))))
-}
 pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
     let mut out: Option<String> = None;
     let mut cursor = 0_usize;
