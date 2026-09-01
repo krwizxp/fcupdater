@@ -26,6 +26,9 @@ pub(super) struct XmlAttrScanner<'tag> {
     tag: &'tag str,
 }
 impl<'xml> XmlScanner<'xml> {
+    pub(super) const fn cursor(&self) -> usize {
+        self.cursor
+    }
     fn element_from_opening(
         &mut self,
         opening: XmlTag<'xml>,

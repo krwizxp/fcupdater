@@ -2,7 +2,7 @@ use self::cell_ref::{MAX_A1_COL, MAX_A1_ROW, parse_ref_with_locks, with_unlocked
 use super::{
     CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH, CanonicalStyleMap, FILTER_DATABASE_REF_PREFIX,
     MASTER_SHEET_NAME, MASTER_SHEET_PATH, SPREADSHEETML_NAMESPACE, SaveVerification, copy_text,
-    xlsx_container::XlsxContainer,
+    xlsx_container::{XlsxContainer, validate_spreadsheet_xml_document},
     xml::{
         XmlAttrScanner, XmlScanner, decode_xml_entities, extract_all_tag_text,
         extract_first_tag_text, is_valid_xml_char,
@@ -300,9 +300,8 @@ impl Workbook {
     }
     pub(crate) fn from_container(mut container: XlsxContainer) -> Result<Self> {
         container.ensure_supported_workbook()?;
-        let master_xml = container.take_worksheet_text(MASTER_SHEET_PATH, MASTER_SHEET_NAME)?;
-        let change_log_xml =
-            container.take_worksheet_text(CHANGE_LOG_SHEET_PATH, CHANGE_LOG_SHEET_NAME)?;
+        let master_xml = container.take_worksheet_text(MASTER_SHEET_PATH)?;
+        let change_log_xml = container.take_worksheet_text(CHANGE_LOG_SHEET_PATH)?;
         let input_styles = container.package_prepare_excel_output()?;
         let shared_strings_xml_text = container.take_shared_strings_text()?;
         let mut shared_strings_scanner = XmlScanner::new(&shared_strings_xml_text);
@@ -760,6 +759,21 @@ impl WorksheetParser<'_, '_> {
             let mut formula_element = None;
             let mut has_cache = false;
             while let Some(child) = formula_scanner.next_direct_element("worksheet cell")? {
+                if child.opening.raw.contains("xmlns") {
+                    let mut attributes = XmlAttrScanner::new(child.opening.raw)?;
+                    while let Some((name, _)) = attributes.next()? {
+                        if name == "xmlns" || name.starts_with("xmlns:") {
+                            return Err(err(format!(
+                                "worksheet cell 자식의 namespace 재정의는 지원하지 않습니다: {name}"
+                            )));
+                        }
+                    }
+                }
+                if child.body.contains('<') {
+                    return Err(err(format!(
+                        "worksheet cell 자식에 중첩 요소가 있습니다: row={row_num}, col={col}"
+                    )));
+                }
                 match child.opening.name {
                     "f" if formula_element.is_none() && !has_cache => formula_element = Some(child),
                     "v" if !has_cache => has_cache = true,
@@ -941,6 +955,12 @@ impl WorksheetParser<'_, '_> {
                 )));
             }
             for attr in &row_attrs {
+                if attr.name == "xmlns" || attr.name.starts_with("xmlns:") {
+                    return Err(err(format!(
+                        "worksheet row의 namespace 재정의는 지원하지 않습니다: {}",
+                        attr.name
+                    )));
+                }
                 validated_xml_escaped_len(
                     &attr.value,
                     XmlEscapeContext::Attribute,
@@ -1017,6 +1037,18 @@ impl WorksheetParser<'_, '_> {
             return Err(err("고정 workbook의 sheetData는 비어 있을 수 없습니다."));
         }
         let rows = self.scan_rows(&mut scanner, sheet_data.name)?;
+        let sheet_data_span = sheet_data.start..scanner.cursor();
+        let context = match self.sheet {
+            ExcelSheetKind::ChangeLog => "worksheet XML namespace 검증: 변경내역",
+            ExcelSheetKind::Master => "worksheet XML namespace 검증: 유류비",
+        };
+        validate_spreadsheet_xml_document(
+            self.xml,
+            "worksheet",
+            context,
+            false,
+            Some(&sheet_data_span),
+        )?;
         for (si, head) in self.shared_formula_heads {
             let expected = head.last_row.strict_sub(head.anchor_row).strict_add(1);
             if head.seen != expected {
@@ -1398,19 +1430,25 @@ impl Worksheet {
                         last_master_address_row = Some(row_num);
                     }
                 }
-                if let Some(raw_formula) = extract_first_tag_text(&cell.inner_xml, "f")? {
+                let formula_text = extract_first_tag_text(&cell.inner_xml, "f")?;
+                let has_formula = formula_text.is_some();
+                if let Some(raw_formula) = formula_text {
                     let formula = decode_xml_entities(raw_formula)?;
                     if formula.contains("#REF!") {
                         return Err(err(format!(
                             "worksheet에 #REF! 수식이 있습니다: {sheet_name}!row={row_num}, col={col}"
                         )));
                     }
-                    let fixed = layout
-                        .fixed_formulas
-                        .iter()
-                        .find(|&&(fixed_col, fixed_row, _)| {
-                            (col, row_num) == (fixed_col, fixed_row)
-                        });
+                    let fixed = if row_num < layout.data_start_row {
+                        layout
+                            .fixed_formulas
+                            .iter()
+                            .find(|&&(fixed_col, fixed_row, _)| {
+                                (col, row_num) == (fixed_col, fixed_row)
+                            })
+                    } else {
+                        None
+                    };
                     if let Some(&(_, _, expected)) = fixed {
                         if formula.as_ref() != expected {
                             return Err(err(format!(
@@ -1439,7 +1477,7 @@ impl Worksheet {
                 let inner = &cell.inner_xml;
                 let has_payload = if inner.is_empty() {
                     false
-                } else if XmlScanner::new(inner).next_start_named("f").is_some() {
+                } else if has_formula {
                     true
                 } else if let Some(raw_value) = extract_first_tag_text(inner, "v")? {
                     !decode_xml_entities(raw_value)?.trim().is_empty()

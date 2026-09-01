@@ -19,7 +19,7 @@ use crate::temp_entry::{
     validate_regular_file,
 };
 use alloc::borrow::Cow;
-use core::{array, mem, str};
+use core::{array, mem, ops::Range, str};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
@@ -571,8 +571,13 @@ impl TempArchivePromotion<'_> {
 impl XlsxContainer {
     pub(super) fn ensure_supported_workbook(&mut self) -> Result<()> {
         let workbook_text = self.take_text("xl/workbook.xml")?;
-        let root =
-            validate_spreadsheet_xml_document(&workbook_text, "workbook", "workbook.xml", true)?;
+        let root = validate_spreadsheet_xml_document(
+            &workbook_text,
+            "workbook",
+            "workbook.xml",
+            true,
+            None,
+        )?;
         if required_xml_attr(root.raw, "xmlns:r", "workbook.xml")?.as_ref()
             != OFFICE_DOCUMENT_REL_NAMESPACE
         {
@@ -971,7 +976,7 @@ impl XlsxContainer {
     }
     pub(super) fn take_shared_strings_text(&mut self) -> Result<String> {
         let xml = self.take_text("xl/sharedStrings.xml")?;
-        validate_spreadsheet_xml_document(&xml, "sst", "sharedStrings.xml", false)?;
+        validate_spreadsheet_xml_document(&xml, "sst", "sharedStrings.xml", false, None)?;
         Ok(xml)
     }
     pub(super) fn take_text(&mut self, name: &str) -> Result<String> {
@@ -1045,7 +1050,7 @@ impl XlsxContainer {
         }
         Ok(())
     }
-    pub(super) fn take_worksheet_text(&mut self, name: &str, sheet_name: &str) -> Result<String> {
+    pub(super) fn take_worksheet_text(&mut self, name: &str) -> Result<String> {
         let drawing_rid = if name == super::MASTER_SHEET_PATH {
             let has_relationships = self.has_part("xl/worksheets/_rels/sheet1.xml.rels");
             let has_drawing = self.has_part("xl/drawings/drawing1.xml");
@@ -1120,8 +1125,6 @@ impl XlsxContainer {
             }
             (None, None) => {}
         }
-        let context = format!("worksheet XML namespace 검증: {sheet_name}");
-        validate_spreadsheet_xml_document(&xml, "worksheet", &context, false)?;
         Ok(xml)
     }
     fn text(&self, name: &str) -> Result<&str> {
@@ -1529,11 +1532,12 @@ fn scan_xml_root<'xml>(
     }
     Ok((scanner, root))
 }
-fn validate_spreadsheet_xml_document<'xml>(
+pub(super) fn validate_spreadsheet_xml_document<'xml>(
     xml: &'xml str,
     expected_root: &str,
     context: &str,
     allow_extensions: bool,
+    parsed_sheet_data: Option<&Range<usize>>,
 ) -> Result<XmlTag<'xml>> {
     let (mut scanner, root) = scan_xml_root(xml, expected_root, context)?;
     if root.self_closing {
@@ -1576,6 +1580,19 @@ fn validate_spreadsheet_xml_document<'xml>(
                     )));
                 }
                 sheet_data_seen = true;
+                if let Some(parsed_span) = parsed_sheet_data {
+                    if tag.self_closing
+                        || tag.start != parsed_span.start
+                        || parsed_span.end <= tag.end
+                        || xml.get(parsed_span.start..parsed_span.end).is_none()
+                    {
+                        return Err(err(format!(
+                            "{context}의 사전 해석된 sheetData 범위가 올바르지 않습니다."
+                        )));
+                    }
+                    scanner.skip_to(parsed_span.end);
+                    continue;
+                }
             }
             if !tag.self_closing {
                 let slot = ancestors
