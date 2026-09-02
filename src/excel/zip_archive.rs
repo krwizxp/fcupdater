@@ -551,32 +551,31 @@ impl ZipPackageReader<'_> {
                 "ZIP local/central record 범위가 고정 package 표현과 다릅니다.",
             ));
         }
-        let mut verification_bytes = Vec::new();
         read_archive_range(
             &mut self.archive_file,
             self.archive_path,
             None,
             central_dir_size,
-            &mut verification_bytes,
+            &mut record_bytes,
         )?;
-        if verification_bytes != central_bytes {
+        if record_bytes != central_bytes {
             return Err(archive_changed(self.archive_path));
         }
-        archive_crc = crc32_update(archive_crc, &verification_bytes);
+        archive_crc = crc32_update(archive_crc, &record_bytes);
         read_archive_range(
             &mut self.archive_file,
             self.archive_path,
             None,
             archive_len.strict_sub(eocd_offset),
-            &mut verification_bytes,
+            &mut record_bytes,
         )?;
         let expected_end = tail_bytes
             .get(eocd_relative_offset..)
             .ok_or_else(|| zip_static("ZIP EOCD 검증 범위 오류"))?;
-        if verification_bytes != expected_end {
+        if record_bytes != expected_end {
             return Err(archive_changed(self.archive_path));
         }
-        archive_crc = crc32_update(archive_crc, &verification_bytes);
+        archive_crc = crc32_update(archive_crc, &record_bytes);
         if archive_file_len(&self.archive_file, self.archive_path)? != archive_len {
             return Err(archive_changed(self.archive_path));
         }

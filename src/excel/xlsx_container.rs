@@ -1322,6 +1322,7 @@ fn find_equivalent_xf(
     if let Some(index) = catalog.iter().position(|&candidate| candidate == source) {
         return Ok(Some(index));
     }
+    let mut source_attrs = try_vec_with_capacity(4, "style source 속성 목록 메모리 확보 실패")?;
     for (index, candidate) in catalog.iter().enumerate() {
         let mut source_scanner = XmlScanner::new(source);
         let mut candidate_scanner = XmlScanner::new(candidate);
@@ -1346,8 +1347,7 @@ fn find_equivalent_xf(
             if !source_tag.is_start {
                 continue;
             }
-            let mut source_attrs =
-                try_vec_with_capacity(4, "style source 속성 목록 메모리 확보 실패")?;
+            source_attrs.clear();
             let mut source_attr_scanner = XmlAttrScanner::new(source_tag.raw)?;
             while let Some((name, value)) = source_attr_scanner.next()? {
                 if source_attrs.len() == source_attrs.capacity() {
