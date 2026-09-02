@@ -82,6 +82,9 @@ pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result
             continue;
         }
         out.push(ch);
+        if !matches!(ch, '도' | '시') {
+            continue;
+        }
         for (from, to) in ADDRESS_KEY_REPLACEMENTS {
             if out.ends_with(from) {
                 out.truncate(out.len().strict_sub(from.len()));

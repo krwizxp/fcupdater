@@ -713,40 +713,64 @@ impl XlsxContainer {
     }
     pub(super) fn package_prepare_excel_output(&mut self) -> Result<CanonicalStyleMap> {
         let source_styles = self.text("xl/styles.xml")?;
-        let source_xfs = style_entries(source_styles, "cellXfs", "xf")?;
-        let source_fonts = style_entries(source_styles, "fonts", "font")?;
-        let source_borders = style_entries(source_styles, "borders", "border")?;
         let excel_xfs = style_entries(EXCEL_STYLES_XML, "cellXfs", "xf")?;
-        let excel_fonts = style_entries(EXCEL_STYLES_XML, "fonts", "font")?;
-        let excel_borders = style_entries(EXCEL_STYLES_XML, "borders", "border")?;
-        let libreoffice_xfs = style_entries(LIBREOFFICE_CELL_XFS_XML, "cellXfs", "xf")?;
-        if libreoffice_xfs.len() != LIBREOFFICE_STYLE_MAP.len() {
-            return Err(err(
-                "내장 LibreOffice style mapping 수가 올바르지 않습니다.",
-            ));
-        }
-        let mut input_styles =
-            try_vec_with_capacity(source_xfs.len(), "입력 style mapping 메모리 확보 실패")?;
-        for source_xf in source_xfs {
-            let canonical = match find_equivalent_xf(
-                source_xf,
-                &excel_xfs,
-                Some(&source_fonts),
-                Some(&excel_fonts),
-                Some(&source_borders),
-                Some(&excel_borders),
-            )? {
-                Some(index) => Some(
-                    u32::try_from(index)
-                        .map_err(|error| err_with_source("Excel style index 변환 실패", error))?,
-                ),
-                None => find_equivalent_xf(source_xf, &libreoffice_xfs, None, None, None, None)?
-                    .filter(|&index| index != LIBREOFFICE_UNMAPPED_STYLE_INDEX)
-                    .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
-                    .copied(),
-            };
-            input_styles.push(canonical);
-        }
+        let static_styles = EXCEL_STYLES_XML
+            .strip_suffix('\n')
+            .unwrap_or(EXCEL_STYLES_XML);
+        let canonical_styles =
+            static_styles
+                .split_once('\n')
+                .is_some_and(|(declaration, style_sheet)| {
+                    source_styles
+                        .strip_prefix(declaration)
+                        .and_then(|tail| tail.strip_prefix("\r\n"))
+                        == Some(style_sheet)
+                });
+        let input_styles = if canonical_styles {
+            let count = u32::try_from(excel_xfs.len())
+                .map_err(|error| err_with_source("Excel style 수 변환 실패", error))?;
+            let mut mapping =
+                try_vec_with_capacity(excel_xfs.len(), "입력 style mapping 메모리 확보 실패")?;
+            mapping.extend((0..count).map(Some));
+            mapping
+        } else {
+            let source_xfs = style_entries(source_styles, "cellXfs", "xf")?;
+            let source_fonts = style_entries(source_styles, "fonts", "font")?;
+            let source_borders = style_entries(source_styles, "borders", "border")?;
+            let excel_fonts = style_entries(EXCEL_STYLES_XML, "fonts", "font")?;
+            let excel_borders = style_entries(EXCEL_STYLES_XML, "borders", "border")?;
+            let libreoffice_xfs = style_entries(LIBREOFFICE_CELL_XFS_XML, "cellXfs", "xf")?;
+            if libreoffice_xfs.len() != LIBREOFFICE_STYLE_MAP.len() {
+                return Err(err(
+                    "내장 LibreOffice style mapping 수가 올바르지 않습니다.",
+                ));
+            }
+            let mut mapping =
+                try_vec_with_capacity(source_xfs.len(), "입력 style mapping 메모리 확보 실패")?;
+            for source_xf in source_xfs {
+                let canonical =
+                    match find_equivalent_xf(
+                        source_xf,
+                        &excel_xfs,
+                        Some(&source_fonts),
+                        Some(&excel_fonts),
+                        Some(&source_borders),
+                        Some(&excel_borders),
+                    )? {
+                        Some(index) => Some(u32::try_from(index).map_err(|error| {
+                            err_with_source("Excel style index 변환 실패", error)
+                        })?),
+                        None => {
+                            find_equivalent_xf(source_xf, &libreoffice_xfs, None, None, None, None)?
+                                .filter(|&index| index != LIBREOFFICE_UNMAPPED_STYLE_INDEX)
+                                .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
+                                .copied()
+                        }
+                    };
+                mapping.push(canonical);
+            }
+            mapping
+        };
         let source_core = self.part_mut("docProps/core.xml");
         let source_core_xml = str::from_utf8(source_core)
             .map_err(|source| err_with_source("core.xml UTF-8 해석 실패", source))?;
