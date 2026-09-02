@@ -2181,7 +2181,7 @@ fn sum_lengths(parts: &[usize]) -> usize {
     parts.iter().copied().fold(0_usize, usize::strict_add)
 }
 fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr<'_>>> {
-    let mut out: Vec<XmlAttr<'_>> = try_vec_with_capacity(4, "XML 속성 목록 메모리 확보 실패")?;
+    let mut out: Vec<XmlAttr<'_>> = Vec::new();
     let mut scanner = XmlAttrScanner::new(tag)?;
     while let Some((name, value)) = scanner.next()? {
         if out.len() >= MAX_XML_ATTRIBUTE_COUNT {
