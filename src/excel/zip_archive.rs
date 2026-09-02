@@ -780,13 +780,10 @@ pub(super) fn crc32_update(initial: u32, bytes: &[u8]) -> u32 {
             ^ crc32_table_value(0, b7);
         remaining = tail;
     }
-    remaining
-        .iter()
-        .fold(crc, |value, &byte| crc32_update_byte(value, byte))
-}
-fn crc32_update_byte(crc: u32, byte: u8) -> u32 {
-    let [table_index, ..] = (crc ^ u32::from(byte)).to_le_bytes();
-    (crc >> 8_u8) ^ crc32_table_value(0, table_index)
+    remaining.iter().fold(crc, |value, &byte| {
+        let [table_index, ..] = (value ^ u32::from(byte)).to_le_bytes();
+        (value >> 8_u8) ^ crc32_table_value(0, table_index)
+    })
 }
 fn split_header_at<'bytes, const LEN: usize>(
     bytes: &'bytes [u8],

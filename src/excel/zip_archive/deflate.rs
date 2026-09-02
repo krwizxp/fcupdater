@@ -2,7 +2,7 @@ use super::{
     CODE_LENGTH_ORDER, CODE_LENGTH_SYMBOLS, DEFLATE_MAX_BITS, DEFLATE_MAX_BITS_U8, DISTANCE_BASES,
     DISTANCE_EXTRA_BITS, DISTANCE_SYMBOLS, FIXED_DISTANCE_SYMBOLS, FIXED_LITERAL_SYMBOLS,
     HASH_SIZE, LENGTH_BASES, LENGTH_EXTRA_BITS, LITERAL_LENGTH_SYMBOLS, MAX_CHAIN, MAX_MATCH,
-    MIN_MATCH, ZipResult, crc32_update, crc32_update_byte, read_u16, zip_static, zip_with_source,
+    MIN_MATCH, ZipResult, crc32_update, read_u16, zip_static, zip_with_source,
 };
 use crate::diagnostic::try_vec_with_capacity;
 use core::{
@@ -445,7 +445,6 @@ impl WriteHuffman {
     }
 }
 struct InflateState<'bytes> {
-    crc32: u32,
     expected_len: usize,
     output: Vec<u8>,
     reader: BitReader<'bytes>,
@@ -458,7 +457,6 @@ impl InflateState<'_> {
             ));
         }
         ensure_deflate_output_len(self.output.len(), length, self.expected_len)?;
-        let output_start = self.output.len();
         let source_start = self.output.len().strict_sub(distance);
         let initial_copy = length.min(distance);
         let initial_end = source_start.strict_add(initial_copy);
@@ -470,11 +468,6 @@ impl InflateState<'_> {
             self.output.extend_from_within(source_start..copy_end);
             copied = copied.strict_add(copy_len);
         }
-        let appended = self
-            .output
-            .get(output_start..)
-            .ok_or_else(|| zip_static("deflate back-reference 출력 범위 오류"))?;
-        self.crc32 = crc32_update(self.crc32, appended);
         Ok(())
     }
     fn decode_distance(&mut self, symbol: u16) -> ZipResult<usize> {
@@ -567,7 +560,6 @@ impl InflateState<'_> {
                 0..=255 => {
                     ensure_deflate_output_len(self.output.len(), 1, self.expected_len)?;
                     let [byte, _] = symbol.to_le_bytes();
-                    self.crc32 = crc32_update_byte(self.crc32, byte);
                     self.output.push(byte);
                 }
                 256 => return Ok(()),
@@ -600,7 +592,6 @@ impl InflateState<'_> {
         }
         let stored = self.reader.read_stored_bytes(usize::from(len))?;
         ensure_deflate_output_len(self.output.len(), stored.len(), self.expected_len)?;
-        self.crc32 = crc32_update(self.crc32, stored);
         self.output.extend_from_slice(stored);
         Ok(())
     }
@@ -609,7 +600,6 @@ impl DeflateInflater<'_> {
     pub(super) fn inflate(self) -> ZipResult<(Vec<u8>, u32)> {
         let output = try_vec_with_capacity(self.expected_len, "deflate 출력 메모리 확보 실패")?;
         let mut state = InflateState {
-            crc32: u32::MAX,
             expected_len: self.expected_len,
             output,
             reader: BitReader {
@@ -635,7 +625,8 @@ impl DeflateInflater<'_> {
                 _ => return Err(zip_static("지원하지 않는 deflate block type입니다.")),
             }
             if final_block {
-                return Ok((state.output, !state.crc32));
+                let crc32 = !crc32_update(u32::MAX, &state.output);
+                return Ok((state.output, crc32));
             }
         }
     }
