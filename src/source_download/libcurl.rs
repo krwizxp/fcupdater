@@ -11,7 +11,7 @@ use core::{
     ptr::{NonNull, null_mut},
     slice, str,
 };
-use std::sync::LazyLock;
+use std::{process, sync::LazyLock};
 mod sys;
 macro_rules! curl_setopt {
     ($handle:expr, $option:expr, $value:expr) => {{
@@ -405,9 +405,7 @@ impl CurlHeaderCapture {
             return;
         };
         let (raw_name, tail) = trimmed_line.split_at(colon);
-        let Some((_, raw_value_tail)) = tail.split_first() else {
-            return;
-        };
+        let raw_value_tail = tail.get(1..).unwrap_or_else(|| process::abort());
         let name = raw_name.trim_ascii();
         let is_content_length = name.eq_ignore_ascii_case(RESPONSE_HEADER_CONTENT_LENGTH);
         if !(is_content_length || name.eq_ignore_ascii_case(RESPONSE_HEADER_SET_COOKIE)) {

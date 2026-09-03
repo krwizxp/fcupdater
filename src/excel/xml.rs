@@ -87,10 +87,7 @@ impl<'xml> XmlScanner<'xml> {
             start: body_start,
             end: body_end,
         };
-        let body = self
-            .xml
-            .get(body_span)
-            .ok_or_else(|| err(format!("XML <{tag_name}> 본문 범위가 손상되었습니다.")))?;
+        let body = self.xml.get(body_span).unwrap_or_else(|| process::abort());
         let span = Range {
             start: opening.start,
             end,
@@ -335,10 +332,7 @@ impl<'xml> XmlScanner<'xml> {
         self.cursor = cursor.min(self.xml.len());
     }
     fn validate_direct_gap(&self, start: usize, end: usize, context: &str) -> Result<()> {
-        let between = self
-            .xml
-            .get(start..end)
-            .ok_or_else(|| err(format!("{context}의 XML child 범위가 손상되었습니다.")))?;
+        let between = self.xml.get(start..end).unwrap_or_else(|| process::abort());
         if xml_misc_only(between, false) {
             Ok(())
         } else {
@@ -405,9 +399,10 @@ impl<'tag> XmlAttrScanner<'tag> {
             return Err(err("XML 속성 값 quote 문자가 올바르지 않습니다."));
         }
         let value_start = self.cursor.strict_add(1);
-        let Some(value_tail) = self.tag.get(value_start..) else {
-            return Err(err("XML 속성 값 범위가 손상되었습니다."));
-        };
+        let value_tail = self
+            .tag
+            .get(value_start..)
+            .unwrap_or_else(|| process::abort());
         let Some(value_end_rel) = value_tail.find(char::from(quote)) else {
             return Err(err("XML 속성 값 종료 quote를 찾지 못했습니다."));
         };
@@ -415,11 +410,11 @@ impl<'tag> XmlAttrScanner<'tag> {
         let name = self
             .tag
             .get(name_start..name_end)
-            .ok_or_else(|| err("XML 속성 이름 범위가 손상되었습니다."))?;
+            .unwrap_or_else(|| process::abort());
         let value = self
             .tag
             .get(value_start..value_end)
-            .ok_or_else(|| err("XML 속성 값 범위가 손상되었습니다."))?;
+            .unwrap_or_else(|| process::abort());
         self.cursor = value_end.strict_add(1);
         Ok(Some((name, decode_xml_entities(value)?)))
     }
@@ -478,10 +473,7 @@ pub(super) fn xml_misc_only(mut xml: &str, allow_bom: bool) -> bool {
         else {
             return false;
         };
-        let Some(remaining) = xml.get(next..) else {
-            return false;
-        };
-        xml = remaining;
+        xml = xml.get(next..).unwrap_or_else(|| process::abort());
     }
 }
 pub(super) fn extract_first_tag_text<'xml>(
@@ -497,9 +489,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
     let mut out: Option<String> = None;
     let mut cursor = 0_usize;
     while cursor < text.len() {
-        let tail = text
-            .get(cursor..)
-            .ok_or_else(|| err("XML entity decode cursor 범위가 손상되었습니다."))?;
+        let tail = text.get(cursor..).unwrap_or_else(|| process::abort());
         let mut amp = None;
         for (relative, ch) in tail.char_indices() {
             if !is_valid_xml_char(ch) {
@@ -534,7 +524,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
         let amp_index = cursor.strict_add(relative_amp);
         let after_amp = tail
             .get(relative_amp.strict_add(1)..)
-            .ok_or_else(|| err("XML entity decode 범위가 손상되었습니다."))?;
+            .unwrap_or_else(|| process::abort());
         let Some((entity, _)) = after_amp.split_once(';') else {
             return Err(err("XML entity 종료 세미콜론을 찾지 못했습니다."));
         };
@@ -588,7 +578,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
         };
         out_text.push_str(
             text.get(cursor..amp_index)
-                .ok_or_else(|| err("XML entity decode prefix 범위가 손상되었습니다."))?,
+                .unwrap_or_else(|| process::abort()),
         );
         out_text.push(decoded_char);
         cursor = amp_index.strict_add(entity.len()).strict_add(2);

@@ -371,7 +371,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                     .as_i128()
                     .checked_mul(DECIMAL_SCALE.as_i128())
                     .ok_or_else(|| err("단가 분모 계산 중 overflow가 발생했습니다."))?;
-                format_excel_ratio_into(&mut buffers.cache, total.as_i128(), denominator)?;
+                format_excel_ratio_into(&mut buffers.cache, total.as_i128(), denominator);
                 true
             } else {
                 false

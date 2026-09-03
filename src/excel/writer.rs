@@ -339,7 +339,7 @@ impl Workbook {
             }
             let si_xml = shared_strings_xml_text
                 .get(si.span)
-                .ok_or_else(|| err("sharedStrings.xml의 si entry 범위가 손상되었습니다."))?;
+                .unwrap_or_else(|| process::abort());
             let mut xml =
                 try_string_with_capacity(si_xml.len(), "shared string XML 메모리 확보 실패")?;
             let mut text_scanner = XmlScanner::new(si_xml);
@@ -349,7 +349,7 @@ impl Workbook {
             while let Some(element) = text_scanner.next_element_named("t")? {
                 let prefix = si_xml
                     .get(source_cursor..element.span.start)
-                    .ok_or_else(|| err("shared string t 시작 범위가 손상되었습니다."))?;
+                    .unwrap_or_else(|| process::abort());
                 xml.push_str(prefix);
                 let mut attrs = parse_tag_attrs(element.opening.raw)?;
                 if element.opening.self_closing {
@@ -405,7 +405,7 @@ impl Workbook {
             }
             let suffix = si_xml
                 .get(source_cursor..)
-                .ok_or_else(|| err("shared string t 종료 범위가 손상되었습니다."))?;
+                .unwrap_or_else(|| process::abort());
             xml.push_str(suffix);
             let value = text_out
                 .map(Cow::Owned)
@@ -487,7 +487,7 @@ impl Workbook {
             let numerator = gasoline_qty
                 .strict_mul(gasoline_weight)
                 .strict_add(premium_qty.strict_mul(premium_weight));
-            format_excel_ratio_into(&mut cache, numerator, fuel_denominator)?;
+            format_excel_ratio_into(&mut cache, numerator, fuel_denominator);
             Some(cache.as_str())
         };
         self.master_sheet
@@ -501,7 +501,7 @@ impl Workbook {
             let numerator = gasoline_qty
                 .strict_mul(gasoline_weight)
                 .strict_add(premium_qty.strict_mul(diesel_weight));
-            format_excel_ratio_into(&mut cache, numerator, fuel_denominator)?;
+            format_excel_ratio_into(&mut cache, numerator, fuel_denominator);
             Some(cache.as_str())
         };
         self.master_sheet
@@ -1769,9 +1769,7 @@ impl Worksheet {
                         col,
                     )?;
                     if last_data_row <= CHANGE_LOG_FORMULA_LAYOUT.data_start_row {
-                        let colon = reference.find(':').ok_or_else(|| {
-                            err("Excel conditionalFormatting 범위가 손상되었습니다.")
-                        })?;
+                        let colon = reference.find(':').unwrap_or_else(|| process::abort());
                         reference.truncate(colon);
                     }
                     replace_canonical_text(
@@ -2021,14 +2019,7 @@ fn xml_bool_attr(attrs: &[XmlAttr<'_>], name: &str) -> Result<bool> {
         ))),
     }
 }
-pub(crate) fn format_excel_ratio_into(
-    out: &mut String,
-    numerator: i128,
-    denominator: i128,
-) -> Result<()> {
-    if denominator == 0 {
-        return Err(err("Excel 숫자 cache 분모가 0입니다."));
-    }
+pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denominator: i128) {
     let negative = numerator != 0 && numerator.is_negative() != denominator.is_negative();
     let denominator_abs = denominator.unsigned_abs();
     let numerator_abs = numerator.unsigned_abs();
@@ -2042,9 +2033,7 @@ pub(crate) fn format_excel_ratio_into(
     if remainder != 0 {
         out.push('.');
         for _ in 0_u32..32_u32 {
-            remainder = remainder
-                .checked_mul(10)
-                .ok_or_else(|| err("Excel 숫자 cache 소수부 계산 중 overflow가 발생했습니다."))?;
+            remainder = remainder.strict_mul(10);
             let [digit, ..] = remainder.div_euclid(denominator_abs).to_le_bytes();
             out.push(char::from(b'0'.strict_add(digit)));
             remainder = remainder.rem_euclid(denominator_abs);
@@ -2054,43 +2043,27 @@ pub(crate) fn format_excel_ratio_into(
         }
     }
     if remainder == 0 {
-        return Ok(());
+        return;
     }
-    let value = out
-        .parse::<f64>()
-        .map_err(|source| err_with_source("Excel 숫자 cache 해석 실패", source))?;
-    if !value.is_finite() {
-        return Err(err("Excel 숫자 cache가 유한한 값이 아닙니다."));
-    }
+    let value = out.parse::<f64>().unwrap_or_else(|_| process::abort());
     out.clear();
     append_fmt(out, format_args!("{value:.16e}"));
-    let exponent_marker = out
-        .rfind('e')
-        .ok_or_else(|| err("Excel 숫자 cache 지수 표기가 손상되었습니다."))?;
+    let exponent_marker = out.rfind('e').unwrap_or_else(|| process::abort());
     let exponent = out
         .get(exponent_marker.strict_add(1)..)
-        .ok_or_else(|| err("Excel 숫자 cache 지수 범위가 손상되었습니다."))?
+        .unwrap_or_else(|| process::abort())
         .parse::<i32>()
-        .map_err(|source| err_with_source("Excel 숫자 cache 지수 해석 실패", source))?;
+        .unwrap_or_else(|_| process::abort());
     let sign_len = usize::from(out.starts_with('-'));
     let mantissa = out
         .get(sign_len..exponent_marker)
-        .ok_or_else(|| err("Excel 숫자 cache 가수 범위가 손상되었습니다."))?;
+        .unwrap_or_else(|| process::abort());
     let point = mantissa
         .find('.')
-        .map(|index| sign_len.strict_add(index))
-        .ok_or_else(|| err("Excel 숫자 cache 가수 소수점이 없습니다."))?;
-    let zero = mantissa.bytes().all(|byte| matches!(byte, b'.' | b'0'));
-    let decimal_position = exponent
-        .checked_add(1)
-        .ok_or_else(|| err("Excel 숫자 cache 소수점 위치 계산 실패"))?;
+        .map_or_else(|| process::abort(), |index| sign_len.strict_add(index));
+    let decimal_position = exponent.strict_add(1);
     out.truncate(exponent_marker);
     out.remove(point);
-    if zero {
-        out.clear();
-        out.push('0');
-        return Ok(());
-    }
     let digit_count = out.len().strict_sub(sign_len);
     if decimal_position <= 0_i32 {
         out.insert_str(sign_len, "0.");
@@ -2099,8 +2072,7 @@ pub(crate) fn format_excel_ratio_into(
             out.insert(zero_position, '0');
         }
     } else {
-        let position = usize::try_from(decimal_position)
-            .map_err(|source| err_with_source("Excel 숫자 cache 소수점 위치 변환 실패", source))?;
+        let position = usize::try_from(decimal_position).unwrap_or_else(|_| process::abort());
         if position >= digit_count {
             for _ in digit_count..position {
                 out.push('0');
@@ -2115,7 +2087,6 @@ pub(crate) fn format_excel_ratio_into(
             out.pop();
         }
     }
-    Ok(())
 }
 fn replace_formula_tag_at(
     inner_xml: &str,
@@ -2124,10 +2095,10 @@ fn replace_formula_tag_at(
 ) -> Result<String> {
     let prefix = inner_xml
         .get(..formula_span.start)
-        .ok_or_else(|| err("cell formula prefix 범위가 손상되었습니다."))?;
+        .unwrap_or_else(|| process::abort());
     let suffix = inner_xml
         .get(formula_span.end..)
-        .ok_or_else(|| err("cell formula suffix 범위가 손상되었습니다."))?;
+        .unwrap_or_else(|| process::abort());
     let mut replacement = String::new();
     match tag {
         FormulaTag::Plain(formula) => {

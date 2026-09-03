@@ -1261,7 +1261,7 @@ fn style_entries<'text>(
             element
                 .body
                 .get(entry.span)
-                .ok_or_else(|| err("styles.xml 항목 범위가 손상되었습니다."))?,
+                .unwrap_or_else(|| process::abort()),
         );
     }
     if scanner.next_start_named(group_name).is_some() {
@@ -1525,9 +1525,7 @@ fn scan_xml_root<'xml>(
         .next_tag()
         .filter(|tag| tag.is_start && tag.name == expected_name)
         .ok_or_else(|| err(format!("{context}의 XML root 태그가 올바르지 않습니다.")))?;
-    let leading = xml
-        .get(..root.start)
-        .ok_or_else(|| err(format!("{context}의 XML root 범위가 손상되었습니다.")))?;
+    let leading = xml.get(..root.start).unwrap_or_else(|| process::abort());
     if !xml_misc_only(leading, true) {
         return Err(err(format!(
             "{context}의 XML root 앞 내용이 올바르지 않습니다."
@@ -1612,7 +1610,7 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
         let open = ancestors
             .get(depth)
             .copied()
-            .ok_or_else(|| err(format!("{context}의 XML 중첩 깊이가 손상되었습니다.")))?;
+            .unwrap_or_else(|| process::abort());
         if open != tag.name {
             return Err(err(format!(
                 "{context}의 XML 태그 쌍이 일치하지 않습니다: {open} / {}",
@@ -1649,7 +1647,7 @@ fn validate_empty_xml_root<const N: usize>(
     let empty = if root.self_closing {
         let trailing = xml
             .get(root.end.strict_add(1)..)
-            .ok_or_else(|| err(format!("{context}의 XML root 범위가 손상되었습니다.")))?;
+            .unwrap_or_else(|| process::abort());
         xml_misc_only(trailing, false)
     } else {
         scanner
