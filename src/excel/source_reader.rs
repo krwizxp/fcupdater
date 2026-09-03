@@ -451,11 +451,8 @@ impl SstChunkReader<'_, '_> {
                 MAX_UTF8_BYTES_PER_COMPRESSED_XL_CHAR
             };
             let additional_capacity = chars_here.strict_mul(max_utf8_bytes_per_unit);
-            let required_capacity = out.len().strict_add(additional_capacity);
-            if out.capacity() < required_capacity {
-                out.try_reserve(additional_capacity)
-                    .map_err(|source| err_with_source("SST 문자열 메모리 확보 실패", source))?;
-            }
+            out.try_reserve(additional_capacity)
+                .map_err(|source| err_with_source("SST 문자열 메모리 확보 실패", source))?;
             if high_byte {
                 let (chunks, &[]) = bytes.as_chunks::<2>() else {
                     return Err(err("SST UTF-16 문자열 길이가 홀수입니다."));
@@ -784,7 +781,6 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             })
         };
         let mut current_row = SourceRow::default();
-        let mut current_row_num = None;
         let mut first_record = true;
         let mut label_sst_count = 0_usize;
         let mut previous_cell = None;
@@ -839,13 +835,12 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                             col.strict_add(1)
                         )));
                     }
-                    if let Some(completed_row_num) =
-                        current_row_num.filter(|&current| current != row)
+                    if let Some((completed_row_num, _)) =
+                        previous_cell.filter(|&(current, _)| current != row)
                     {
                         flush_row(completed_row_num, &current_row)?;
                         current_row = SourceRow::default();
                     }
-                    current_row_num = Some(row);
                     previous_cell = Some((row, col));
                     let idx = u32_to_usize(read_u32_le(record_data, 6)?);
                     let value = shared_strings.get(idx).ok_or_else(|| {
@@ -872,7 +867,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 _ => {}
             }
         }
-        if let Some(row_num) = current_row_num {
+        if let Some((row_num, _)) = previous_cell {
             flush_row(row_num, &current_row)?;
         }
         (label_sst_count == declared_total).ok_or_else(|| {

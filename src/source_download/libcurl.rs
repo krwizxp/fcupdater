@@ -343,21 +343,13 @@ impl Client {
 }
 impl ResponseBody {
     fn append(&mut self, bytes: &[u8]) -> bool {
-        let next_len = match checked_http_buffer_len(
-            "본문",
-            self.bytes.len(),
-            bytes.len(),
-            HTTP_MAX_BODY_BYTES,
-        ) {
-            Ok(next_len) => next_len,
-            Err(error) => {
-                self.error = Some(error);
-                return false;
-            }
-        };
-        if self.bytes.capacity() < next_len
-            && let Err(source) = self.bytes.try_reserve(bytes.len())
+        if let Err(error) =
+            checked_http_buffer_len("본문", self.bytes.len(), bytes.len(), HTTP_MAX_BODY_BYTES)
         {
+            self.error = Some(error);
+            return false;
+        }
+        if let Err(source) = self.bytes.try_reserve(bytes.len()) {
             self.error = Some(download_error_with_source(
                 "HTTP 응답 본문 메모리 확보 실패",
                 source,
@@ -451,11 +443,8 @@ fn nul_terminated_buffer<'buffer>(
         .iter()
         .fold(1_usize, |capacity, part| capacity.strict_add(part.len()));
     out.clear();
-    if out.capacity() < capacity {
-        out.try_reserve_exact(capacity).map_err(|source| {
-            download_error_with_source("libcurl 문자열 메모리 확보 실패", source)
-        })?;
-    }
+    out.try_reserve_exact(capacity)
+        .map_err(|source| download_error_with_source("libcurl 문자열 메모리 확보 실패", source))?;
     for part in parts {
         out.extend_from_slice(part);
     }

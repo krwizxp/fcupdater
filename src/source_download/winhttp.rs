@@ -118,13 +118,9 @@ impl Client {
                 .strict_add(4)
         });
         self.header_buffer.clear();
-        if self.header_buffer.capacity() < header_capacity {
-            self.header_buffer
-                .try_reserve_exact(header_capacity)
-                .map_err(|source| {
-                    download_error_with_source("요청 헤더 메모리 확보 실패", source)
-                })?;
-        }
+        self.header_buffer
+            .try_reserve_exact(header_capacity)
+            .map_err(|source| download_error_with_source("요청 헤더 메모리 확보 실패", source))?;
         for (name, value) in headers.iter() {
             self.header_buffer.extend(name.encode_utf16());
             self.header_buffer.extend_from_slice(&HEADER_SEPARATOR_WIDE);
@@ -400,11 +396,9 @@ impl Client {
                 }
                 let units = header_bytes.div_euclid(2);
                 self.header_buffer.clear();
-                if self.header_buffer.capacity() < units {
-                    self.header_buffer.try_reserve_exact(units).map_err(|source| {
-                        download_error_with_source("Set-Cookie 메모리 확보 실패", source)
-                    })?;
-                }
+                self.header_buffer.try_reserve_exact(units).map_err(|source| {
+                    download_error_with_source("Set-Cookie 메모리 확보 실패", source)
+                })?;
                 self.header_buffer.resize(units, 0_u16);
                 cookie_index = current_index;
                 // SAFETY: buffer has the probed size and request is valid.
@@ -503,13 +497,10 @@ impl Client {
                 .read_buffer
                 .get(..read_len)
                 .ok_or("응답 본문 chunk 범위 계산 실패")?;
-            let next_len =
-                checked_http_buffer_len("본문", body.len(), read_chunk.len(), HTTP_MAX_BODY_BYTES)?;
-            if body.capacity() < next_len {
-                body.try_reserve(read_chunk.len()).map_err(|source| {
-                    download_error_with_source("응답 본문 메모리 확보 실패", source)
-                })?;
-            }
+            checked_http_buffer_len("본문", body.len(), read_chunk.len(), HTTP_MAX_BODY_BYTES)?;
+            body.try_reserve(read_chunk.len()).map_err(|source| {
+                download_error_with_source("응답 본문 메모리 확보 실패", source)
+            })?;
             body.extend_from_slice(read_chunk);
         }
         Ok(body)
