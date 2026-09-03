@@ -111,18 +111,15 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
         let date_text = format!("현행화 일자: {}", self.today);
         self.shared_string_table
             .set_cell(self.worksheet, 1, 2, &date_text)?;
-        if let Some(last_data_row) = self
+        let last_data_row = self
             .worksheet
             .row_numbers_from(CHANGELOG_DATA_START_ROW)
-            .into_iter()
-            .last()
-        {
-            self.worksheet.clear_cells_in_rows_through_col(
-                CHANGELOG_DATA_START_ROW,
-                last_data_row,
-                CHANGELOG_COL_DELTA_DIESEL,
-            );
-        }
+            .last;
+        self.worksheet.clear_cells_in_rows_through_col(
+            CHANGELOG_DATA_START_ROW,
+            last_data_row,
+            CHANGELOG_COL_DELTA_DIESEL,
+        );
         let style_template_row = CHANGELOG_STYLE_TEMPLATE_ROW;
         let entry_count = self
             .changes

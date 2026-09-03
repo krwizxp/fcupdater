@@ -112,7 +112,6 @@ fn main() -> Result<()> {
     cfg_select! {
         target_os = "windows" => {
             validate_regular_file(&run_lock)
-                .map(|_| ())
                 .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
         }
         any(target_os = "linux", target_os = "macos") => {
