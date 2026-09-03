@@ -1331,14 +1331,12 @@ fn find_equivalent_xf(
             source_attrs.clear();
             let mut source_attr_scanner = XmlAttrScanner::new(source_tag.raw)?;
             while let Some((name, value)) = source_attr_scanner.next()? {
-                if source_attrs.len() == source_attrs.capacity() {
-                    source_attrs.try_reserve(1).map_err(|allocation_error| {
-                        err_with_source(
-                            "style source 속성 목록 추가 메모리 확보 실패",
-                            allocation_error,
-                        )
-                    })?;
-                }
+                source_attrs.try_reserve(1).map_err(|allocation_error| {
+                    err_with_source(
+                        "style source 속성 목록 추가 메모리 확보 실패",
+                        allocation_error,
+                    )
+                })?;
                 source_attrs.push((name, value));
             }
             let source_attr_count = source_attrs.len();

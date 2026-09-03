@@ -567,7 +567,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         for row_plan in &row_plans {
             let source_row = source_rows
                 .get_mut(row_plan.source_index)
-                .ok_or_else(|| err("유류비 정렬 원본 XML index가 범위를 벗어났습니다."))?;
+                .unwrap_or_else(|| process::abort());
             rows.push(mem::take(source_row));
         }
         rows.extend(trailing_rows);

@@ -1,6 +1,7 @@
 use crate::diagnostic::{Result, err, err_with_source, try_string_with_capacity};
 use alloc::borrow::Cow;
 use core::{iter, num::IntErrorKind, range::Range};
+use std::process;
 pub(super) const MAX_XML_NESTING_DEPTH: usize = 64;
 pub(super) struct XmlTag<'xml> {
     pub end: usize,
@@ -57,9 +58,7 @@ impl<'xml> XmlScanner<'xml> {
                         if ancestor_depth.strict_add(depth) >= MAX_XML_NESTING_DEPTH {
                             return Err(err("XML 중첩 깊이가 너무 큽니다."));
                         }
-                        *ancestors
-                            .get_mut(depth)
-                            .ok_or_else(|| err("XML 중첩 깊이가 너무 큽니다."))? = tag.name;
+                        *ancestors.get_mut(depth).unwrap_or_else(|| process::abort()) = tag.name;
                         depth = depth.strict_add(1);
                     }
                     continue;
@@ -70,7 +69,7 @@ impl<'xml> XmlScanner<'xml> {
                 let open = ancestors
                     .get(depth)
                     .copied()
-                    .ok_or_else(|| err("XML 중첩 깊이가 손상되었습니다."))?;
+                    .unwrap_or_else(|| process::abort());
                 if open != tag.name {
                     return Err(err(format!(
                         "XML 태그 쌍이 일치하지 않습니다: {open} / {}",

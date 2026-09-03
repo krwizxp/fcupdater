@@ -1272,8 +1272,7 @@ impl Worksheet {
             attrs_xml: copy_text(&src.attrs_xml)?,
             cells,
         };
-        let target_index = row_index(target_row)
-            .ok_or_else(|| err("worksheet style 대상 row 번호가 올바르지 않습니다."))?;
+        let target_index = row_index(target_row).unwrap_or_else(|| process::abort());
         let required_len = target_index.strict_add(1);
         if self.rows.len() < required_len {
             self.rows
@@ -1286,7 +1285,7 @@ impl Worksheet {
         let target = self
             .rows
             .get_mut(target_index)
-            .ok_or_else(|| err("worksheet style 대상 row 범위 오류"))?;
+            .unwrap_or_else(|| process::abort());
         *target = copied;
         Ok(())
     }
@@ -1366,22 +1365,19 @@ impl Worksheet {
         Ok(i32::try_from(signed).ok())
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
-        let row_index =
-            row_index(row).ok_or_else(|| err("worksheet cell row 번호가 올바르지 않습니다."))?;
+        let row_index = row_index(row).unwrap_or_else(|| process::abort());
         let required_len = row_index.strict_add(1);
         if rows.len() < required_len {
             rows.try_reserve(required_len.strict_sub(rows.len()))
                 .map_err(|source| err_with_source("worksheet cell row 메모리 확보 실패", source))?;
             rows.resize_with(required_len, Row::default);
         }
-        let row_obj = rows
-            .get_mut(row_index)
-            .ok_or_else(|| err("worksheet cell row 범위 오류"))?;
+        let row_obj = rows.get_mut(row_index).unwrap_or_else(|| process::abort());
         match row_obj.cells.binary_search_by_key(&col, |cell| cell.col) {
-            Ok(index) => row_obj
+            Ok(index) => Ok(row_obj
                 .cells
                 .get_mut(index)
-                .ok_or_else(|| err("worksheet cell index 범위 오류")),
+                .unwrap_or_else(|| process::abort())),
             Err(index) => {
                 if row_obj.cells.len() == row_obj.cells.capacity() {
                     row_obj
@@ -2188,10 +2184,8 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr<'_>>> {
         if out.iter().any(|attr| attr.name == name) {
             return Err(err("XML 태그에 중복 속성이 있습니다."));
         }
-        if out.len() == out.capacity() {
-            out.try_reserve(1)
-                .map_err(|source| err_with_source("XML 속성 목록 추가 메모리 확보 실패", source))?;
-        }
+        out.try_reserve(1)
+            .map_err(|source| err_with_source("XML 속성 목록 추가 메모리 확보 실패", source))?;
         out.push(XmlAttr {
             name: Cow::Borrowed(name),
             value,
