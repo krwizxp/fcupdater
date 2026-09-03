@@ -1415,13 +1415,6 @@ impl Worksheet {
                             .is_some_and(|cell| cell.col <= max_col))
             })
     }
-    fn max_cell_col(&self) -> u32 {
-        self.rows
-            .iter()
-            .filter_map(|row| row.cells.last().map(|cell| cell.col))
-            .max()
-            .unwrap_or(1)
-    }
     pub(crate) fn replace_rows(&mut self, rows: Vec<Row>) {
         self.rows = rows;
     }
@@ -1917,7 +1910,12 @@ impl Worksheet {
             ExcelSheetKind::Master => (MASTER_SHEET_NAME, 14, &MASTER_HEADERS, 23),
             ExcelSheetKind::ChangeLog => (CHANGE_LOG_SHEET_NAME, 3, &CHANGE_LOG_HEADERS, 13),
         };
-        let actual_last_col = self.max_cell_col();
+        let actual_last_col = self
+            .rows
+            .iter()
+            .filter_map(|row| row.cells.last().map(|cell| cell.col))
+            .max()
+            .unwrap_or(1);
         if actual_last_col != last_col {
             return Err(err(format!(
                 "{sheet_name} 시트의 마지막 열이 고정 스키마와 다릅니다: expected={last_col}, actual={actual_last_col}"

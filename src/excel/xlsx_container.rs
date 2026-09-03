@@ -677,7 +677,6 @@ impl XlsxContainer {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             source_permissions,
         };
-        container.text("xl/theme/theme1.xml")?;
         container.validate_content_types()?;
         validate_relationship_set(
             container.text("_rels/.rels")?,
@@ -1016,24 +1015,6 @@ impl XlsxContainer {
             &WORKBOOK_RELATIONSHIPS,
             self,
         )?;
-        if self.has_part(CALC_CHAIN_PATH) {
-            let xml = self.take_text(CALC_CHAIN_PATH)?;
-            let child_count = visit_direct_xml_children(
-                &xml,
-                "calcChain",
-                SPREADSHEETML_NAMESPACE,
-                "calcChain.xml",
-                |local_name, _raw| {
-                    if local_name != "c" {
-                        return Err(err("calcChain.xml에 고정 스키마 외 요소가 있습니다."));
-                    }
-                    Ok(())
-                },
-            )?;
-            if child_count == 0 {
-                return Err(err("calcChain.xml에 formula cell이 없습니다."));
-            }
-        }
         let [_, change_log_rid, master_rid, _, _, _] = relationship_ids;
         let sheet_ids = [
             master_rid

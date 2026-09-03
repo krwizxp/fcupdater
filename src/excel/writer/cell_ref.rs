@@ -1,8 +1,7 @@
 use super::CellReference;
 use crate::diagnostic::{Result, err};
 use std::process;
-const COL_NAME_BUF_LEN: usize = 8;
-const _: () = assert!(COL_NAME_BUF_LEN >= 7, "COL_NAME_BUF_LEN too small");
+const MAX_A1_COLUMN_LETTERS: usize = 3;
 pub(super) const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
 pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
@@ -18,7 +17,7 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     while let Some(&ch) = bytes.get(index)
         && ch.is_ascii_alphabetic()
     {
-        if index.strict_sub(col_start) >= 3 {
+        if index.strict_sub(col_start) >= MAX_A1_COLUMN_LETTERS {
             return None;
         }
         let letter = u32::from(ch.to_ascii_uppercase())
@@ -69,7 +68,7 @@ pub(super) fn with_unlocked_ref_parts<R>(
     (1..=MAX_A1_COL)
         .contains(&col)
         .ok_or_else(|| err(format!("Excel column 범위를 벗어났습니다: {col}")))?;
-    let mut col_buffer = [0_u8; COL_NAME_BUF_LEN];
+    let mut col_buffer = [0_u8; MAX_A1_COLUMN_LETTERS];
     let mut index = col_buffer.len();
     while col > 0 {
         let base = col.strict_sub(1);

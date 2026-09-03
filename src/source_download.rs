@@ -20,10 +20,6 @@ const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
 const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
 const OLE2_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-const _: () = assert!(
-    OLE2_SIGNATURE.len() <= HTTP_ERROR_PREVIEW_BYTES,
-    "OLE2 signature preview must include the full signature"
-);
 const OPINET_HOST: &str = "www.opinet.co.kr";
 const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
 const OPDOWNLOAD_PATH: &str = "/user/opdown/opDownload.do";
