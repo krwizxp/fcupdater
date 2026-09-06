@@ -1612,16 +1612,34 @@ impl Worksheet {
             CellValueType::General
         };
         let cached = value_text.as_deref().unwrap_or("");
-        if let Some(formula_span) = XmlScanner::new(&cell.inner_xml)
-            .next_element_named("f")?
-            .map(|element| element.span)
-        {
-            cell.inner_xml = replace_formula_tag_at(
-                &cell.inner_xml,
-                formula_span,
-                FormulaTag::PlainEscaped(formula_text.as_ref()),
-            )?;
-            replace_first_tag_text(&mut cell.inner_xml, "v", cached)?;
+        if let Some(element) = XmlScanner::new(&cell.inner_xml).next_element_named("f")? {
+            let value_start = if element.span.start == 0 {
+                formula_text.len().strict_add("<f></f>".len())
+            } else {
+                0
+            };
+            if element.opening.raw == "<f>"
+                && cell.inner_xml.get(element.body_span.end..element.span.end) == Some("</f>")
+            {
+                if element.body != formula_text.as_ref() {
+                    let body_span = element.body_span;
+                    let additional = formula_text.len().saturating_sub(element.body.len());
+                    cell.inner_xml
+                        .try_reserve_exact(additional)
+                        .map_err(|source| {
+                            err_with_source("cell formula replacement 메모리 확보 실패", source)
+                        })?;
+                    cell.inner_xml
+                        .replace_range(body_span, formula_text.as_ref());
+                }
+            } else {
+                cell.inner_xml = replace_formula_tag_at(
+                    &cell.inner_xml,
+                    element.span,
+                    FormulaTag::PlainEscaped(formula_text.as_ref()),
+                )?;
+            }
+            replace_first_tag_text(&mut cell.inner_xml, "v", cached, value_start)?;
         } else {
             let capacity = sum_lengths(&[
                 "<f></f>".len(),
@@ -1673,7 +1691,7 @@ impl Worksheet {
             })
             .transpose()?;
         let value_text = encoded.as_deref().unwrap_or("");
-        replace_first_tag_text(&mut cell.inner_xml, "v", value_text)
+        replace_first_tag_text(&mut cell.inner_xml, "v", value_text, 0)
     }
     pub(crate) fn set_i32_at(&mut self, col: u32, row: u32, value: Option<i32>) -> Result<()> {
         let cell = Self::get_or_create_cell_mut(&mut self.rows, col, row)?;
@@ -2210,8 +2228,14 @@ fn parse_u32_decimal(
         Ok(parsed)
     }
 }
-fn replace_first_tag_text(xml: &mut String, tag_name: &str, new_text: &str) -> Result<()> {
+fn replace_first_tag_text(
+    xml: &mut String,
+    tag_name: &str,
+    new_text: &str,
+    search_start: usize,
+) -> Result<()> {
     let mut scanner = XmlScanner::new(xml);
+    scanner.skip_to(search_start);
     let Some(element) = scanner.next_element_named(tag_name)? else {
         return Err(err(format!("{tag_name} 태그를 찾지 못했습니다.")));
     };
