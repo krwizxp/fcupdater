@@ -605,11 +605,8 @@ fn parse_numeric_entity(
         }
     })
 }
-pub(super) fn is_valid_xml_char(ch: char) -> bool {
-    matches!(
-        u32::from(ch),
-        0x09 | 0x0A | 0x0D | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x0001_0000..=0x0010_FFFF
-    )
+pub(super) const fn is_valid_xml_char(ch: char) -> bool {
+    (ch >= ' ' && ch != '\u{fffe}' && ch != '\u{ffff}') || matches!(ch, '\t' | '\n' | '\r')
 }
 fn local_tag_name(name: &str) -> &str {
     name.rsplit_once(':').map_or(name, |(_, local)| local)
