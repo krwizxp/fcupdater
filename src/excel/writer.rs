@@ -152,7 +152,7 @@ struct SharedFormulaHead {
 }
 #[derive(Clone, Copy)]
 enum FormulaTag<'text> {
-    Plain(&'text str),
+    PlainEscaped(&'text str),
     SharedFollower(&'text str),
     SharedRoot {
         formula: &'text str,
@@ -926,10 +926,15 @@ impl WorksheetParser<'_, '_> {
                     }
                     head.seen = head.seen.strict_add(1);
                 } else {
+                    let escaped = try_xml_escape_text(
+                        decoded_formula.as_ref(),
+                        XmlEscapeContext::Text,
+                        "cell formula XML escape",
+                    )?;
                     cell.inner_xml = replace_formula_tag_at(
                         inner_xml,
                         formula_span,
-                        FormulaTag::Plain(decoded_formula.as_ref()),
+                        FormulaTag::PlainEscaped(escaped.as_ref()),
                     )?;
                 }
             }
@@ -1611,8 +1616,11 @@ impl Worksheet {
             .next_element_named("f")?
             .map(|element| element.span)
         {
-            cell.inner_xml =
-                replace_formula_tag_at(&cell.inner_xml, formula_span, FormulaTag::Plain(formula))?;
+            cell.inner_xml = replace_formula_tag_at(
+                &cell.inner_xml,
+                formula_span,
+                FormulaTag::PlainEscaped(formula_text.as_ref()),
+            )?;
             replace_first_tag_text(&mut cell.inner_xml, "v", cached)?;
         } else {
             let capacity = sum_lengths(&[
@@ -2101,13 +2109,11 @@ fn replace_formula_tag_at(
         .unwrap_or_else(|| process::abort());
     let mut replacement = String::new();
     match tag {
-        FormulaTag::Plain(formula) => {
-            let escaped =
-                try_xml_escape_text(formula, XmlEscapeContext::Text, "cell formula XML escape")?;
+        FormulaTag::PlainEscaped(escaped) => {
             replacement
                 .try_reserve_exact(sum_lengths(&[escaped.len(), "<f></f>".len()]))
                 .map_err(|source| err_with_source("cell formula XML 메모리 확보 실패", source))?;
-            replacement.extend(["<f>", escaped.as_ref(), "</f>"]);
+            replacement.extend(["<f>", escaped, "</f>"]);
         }
         FormulaTag::SharedFollower(si) => {
             replacement.extend(["<f t=\"shared\" si=\"", si, "\"/>"]);
