@@ -23,17 +23,12 @@ macro_rules! matching_prefix_16 {
             let second = unsafe { $left.add(8).cast::<u64>().read_unaligned() }
                 // SAFETY: The caller keeps both complete 16-byte ranges inside the input slice.
                 ^ unsafe { $right.add(8).cast::<u64>().read_unaligned() };
-            let [prefix, ..] = second
+            let prefix = second
                 .trailing_zeros()
-                .div_euclid(u8::BITS)
-                .to_le_bytes();
-            8_usize.strict_add(usize::from(prefix))
+                .div_euclid(u8::BITS) as usize;
+            8_usize.strict_add(prefix)
         } else {
-            let [prefix, ..] = first
-                .trailing_zeros()
-                .div_euclid(u8::BITS)
-                .to_le_bytes();
-            usize::from(prefix)
+            first.trailing_zeros().div_euclid(u8::BITS) as usize
         }
     }};
 }
