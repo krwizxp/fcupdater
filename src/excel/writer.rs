@@ -1607,54 +1607,20 @@ impl Worksheet {
             CellValueType::General
         };
         let cached = value_text.as_deref().unwrap_or("");
-        if let Some(element) = XmlScanner::new(&cell.inner_xml).next_element_named("f")? {
-            let value_start = if element.span.start == 0 {
-                formula_text.len().strict_add("<f></f>".len())
-            } else {
-                0
-            };
-            if element.opening.raw == "<f>"
-                && cell.inner_xml.get(element.body_span.end..element.span.end) == Some("</f>")
-            {
-                if element.body != formula_text.as_ref() {
-                    let body_span = element.body_span;
-                    let additional = formula_text.len().saturating_sub(element.body.len());
-                    cell.inner_xml
-                        .try_reserve_exact(additional)
-                        .map_err(|source| {
-                            err_with_source("cell formula replacement 메모리 확보 실패", source)
-                        })?;
-                    cell.inner_xml
-                        .replace_range(body_span, formula_text.as_ref());
-                }
-            } else {
-                cell.inner_xml = replace_formula_tag_at(
-                    &cell.inner_xml,
-                    element.span,
-                    FormulaTag::PlainEscaped(formula_text.as_ref()),
-                )?;
-            }
-            replace_first_tag_text(&mut cell.inner_xml, "v", cached, value_start)?;
-        } else {
-            let capacity = sum_lengths(&[
-                "<f></f>".len(),
-                if cached.is_empty() {
-                    "<v/>".len()
-                } else {
-                    "<v></v>".len()
-                },
+        let inner = &mut cell.inner_xml;
+        inner.clear();
+        inner
+            .try_reserve_exact(sum_lengths(&[
+                "<f></f><v></v>".len(),
                 formula_text.len(),
                 cached.len(),
-            ]);
-            let mut inner =
-                try_string_with_capacity(capacity, "formula/cache XML 메모리 확보 실패")?;
-            inner.extend(["<f>", formula_text.as_ref(), "</f>"]);
-            if cached.is_empty() {
-                inner.push_str("<v/>");
-            } else {
-                inner.extend(["<v>", cached, "</v>"]);
-            }
-            cell.inner_xml = inner;
+            ]))
+            .map_err(|source| err_with_source("formula/cache XML 메모리 확보 실패", source))?;
+        inner.extend(["<f>", formula_text.as_ref(), "</f>"]);
+        if cached.is_empty() {
+            inner.push_str("<v/>");
+        } else {
+            inner.extend(["<v>", cached, "</v>"]);
         }
         Ok(())
     }
@@ -1686,7 +1652,34 @@ impl Worksheet {
             })
             .transpose()?;
         let value_text = encoded.as_deref().unwrap_or("");
-        replace_first_tag_text(&mut cell.inner_xml, "v", value_text, 0)
+        let xml = &mut cell.inner_xml;
+        let Some(element) = XmlScanner::new(xml).next_element_named("v")? else {
+            return Err(err("v 태그를 찾지 못했습니다."));
+        };
+        let trimmed_open_tag = element.opening.raw.trim_ascii_end();
+        if value_text.is_empty() {
+            if element.opening.self_closing {
+                return Ok(());
+            }
+            let prefix = trimmed_open_tag
+                .strip_suffix('>')
+                .unwrap_or_else(|| process::abort());
+            let mut replacement = copy_text(prefix)?;
+            replacement.push_str("/>");
+            xml.replace_range(element.span, &replacement);
+        } else if element.opening.self_closing {
+            let prefix = trimmed_open_tag
+                .strip_suffix("/>")
+                .unwrap_or_else(|| process::abort());
+            let capacity = sum_lengths(&[prefix.len(), "></v>".len(), value_text.len()]);
+            let mut replacement =
+                try_string_with_capacity(capacity, "XML self-closing 치환 메모리 확보 실패")?;
+            replacement.extend([prefix, ">", value_text, "</v>"]);
+            xml.replace_range(element.span, &replacement);
+        } else {
+            xml.replace_range(element.body_span, value_text);
+        }
+        Ok(())
     }
     pub(crate) fn set_i32_at(&mut self, col: u32, row: u32, value: Option<i32>) -> Result<()> {
         let cell = Self::get_or_create_cell_mut(&mut self.rows, col, row)?;
@@ -2222,51 +2215,6 @@ fn parse_u32_decimal(
     } else {
         Ok(parsed)
     }
-}
-fn replace_first_tag_text(
-    xml: &mut String,
-    tag_name: &str,
-    new_text: &str,
-    search_start: usize,
-) -> Result<()> {
-    let mut scanner = XmlScanner::new(xml);
-    scanner.skip_to(search_start);
-    let Some(element) = scanner.next_element_named(tag_name)? else {
-        return Err(err(format!("{tag_name} 태그를 찾지 못했습니다.")));
-    };
-    let trimmed_open_tag = element.opening.raw.trim_ascii_end();
-    if new_text.is_empty() {
-        if element.opening.self_closing {
-            return Ok(());
-        }
-        let prefix = trimmed_open_tag
-            .strip_suffix('>')
-            .unwrap_or_else(|| process::abort());
-        let mut replacement = copy_text(prefix)?;
-        replacement.push_str("/>");
-        xml.replace_range(element.span, &replacement);
-        return Ok(());
-    }
-    if element.opening.self_closing {
-        let prefix = trimmed_open_tag
-            .strip_suffix("/>")
-            .unwrap_or_else(|| process::abort());
-        let capacity = sum_lengths(&[
-            prefix.len(),
-            ">".len(),
-            new_text.len(),
-            "</".len(),
-            tag_name.len(),
-            ">".len(),
-        ]);
-        let mut replacement =
-            try_string_with_capacity(capacity, "XML self-closing 치환 메모리 확보 실패")?;
-        replacement.extend([prefix, ">", new_text, "</", tag_name, ">"]);
-        xml.replace_range(element.span, &replacement);
-        return Ok(());
-    }
-    xml.replace_range(element.body_span, new_text);
-    Ok(())
 }
 fn try_xml_escape_text<'text>(
     text: &'text str,
