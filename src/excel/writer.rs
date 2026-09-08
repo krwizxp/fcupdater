@@ -7,11 +7,8 @@ use super::{
         XmlAttrScanner, XmlScanner, decode_xml_entities, extract_first_tag_text, is_valid_xml_char,
     },
 };
-use crate::{
-    diagnostic::{
-        Result, append_fmt, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
-    },
-    u32_to_usize,
+use crate::diagnostic::{
+    Result, append_fmt, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
 };
 use alloc::{
     borrow::Cow,
@@ -1048,10 +1045,8 @@ impl WorksheetParser<'_, '_> {
                 });
                 continue;
             }
-            let cells = try_vec_with_capacity(
-                u32_to_usize(last_col),
-                "worksheet row cell 메모리 확보 실패",
-            )?;
+            let cells =
+                try_vec_with_capacity(last_col as usize, "worksheet row cell 메모리 확보 실패")?;
             let mut row = Row { attrs_xml, cells };
             self.parse_row(scanner, row_info.name, row_num, &mut row)?;
             rows.push(row);
@@ -1133,7 +1128,7 @@ impl Worksheet {
         let mut column_state = [None; MASTER_HEADERS.len().strict_add(1)];
         let mut reference = String::new();
         let row_count = worksheet_row_count(self.rows.len());
-        let row_start_index = u32_to_usize(layout.data_start_row.strict_sub(1));
+        let row_start_index = layout.data_start_row.strict_sub(1) as usize;
         for (row, row_index) in
             (layout.data_start_row..=row_count).zip(row_start_index..self.rows.len())
         {
@@ -1154,7 +1149,7 @@ impl Worksheet {
                     continue;
                 }
                 let state = column_state
-                    .get_mut(u32_to_usize(col))
+                    .get_mut(col as usize)
                     .unwrap_or_else(|| process::abort());
                 let previous = *state;
                 if previous.is_some_and(|(last_formula_row, _)| row <= last_formula_row) {
@@ -1573,7 +1568,7 @@ impl Worksheet {
         let cell_count = end_col
             .checked_sub(start_col)
             .and_then(|value| value.checked_add(1))
-            .map(u32_to_usize)
+            .map(|value| value as usize)
             .ok_or_else(|| err("worksheet style 대상 column 범위가 올바르지 않습니다."))?;
         let end = start
             .checked_add(cell_count)
@@ -1865,7 +1860,7 @@ impl Worksheet {
         Ok((out, shared_string_reference_count))
     }
     pub(crate) fn truncate_rows_after(&mut self, last_row_to_keep: u32) {
-        self.rows.truncate(u32_to_usize(last_row_to_keep));
+        self.rows.truncate(last_row_to_keep as usize);
     }
     pub(crate) fn try_get_display_at<'text>(
         &'text self,
@@ -2026,7 +2021,7 @@ fn canonical_excel_style(
         }
     }
     let canonical = input_styles
-        .get(u32_to_usize(style))
+        .get(style as usize)
         .copied()
         .flatten()
         .ok_or_else(|| {
@@ -2161,7 +2156,7 @@ fn replace_formula_tag_at(
     Ok(output)
 }
 const fn row_index(row: u32) -> Option<usize> {
-    u32_to_usize(row).checked_sub(1)
+    (row as usize).checked_sub(1)
 }
 fn worksheet_row_count(len: usize) -> u32 {
     u32::try_from(len).unwrap_or_else(|_| process::abort())

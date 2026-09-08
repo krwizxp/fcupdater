@@ -19,7 +19,7 @@ pub(super) fn format_scaled_value_into(text: &mut String, value: i128, scale: i1
         return;
     }
     text.push('.');
-    let width = usize::from(scale_abs.ilog10().to_le_bytes()[0]);
+    let width = scale_abs.ilog10() as usize;
     let frac_text = frac.format_into(&mut buffer);
     for _ in frac_text.len()..width {
         text.push('0');

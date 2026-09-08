@@ -1,12 +1,9 @@
 use super::{
     ArchiveFingerprint, MAX_XLSX_PART_BYTES, PackagePart, PartRole, XLSX_PARTS, ZipPackageReader,
 };
-use crate::{
-    diagnostic::{
-        AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
-        err_with_source as zip_with_source, path_context_message, try_vec_with_capacity,
-    },
-    u32_to_usize,
+use crate::diagnostic::{
+    AppError, Result, Result as ZipResult, err, err as zip_static, err_with_source,
+    err_with_source as zip_with_source, path_context_message, try_vec_with_capacity,
 };
 use core::mem;
 use std::{
@@ -145,7 +142,7 @@ impl ZipEntry<'_> {
         expected_len: usize,
         expected_local_offset: usize,
     ) -> Result<(Vec<u8>, usize)> {
-        let local_offset = u32_to_usize(self.local_header_offset);
+        let local_offset = self.local_header_offset as usize;
         if local_offset != expected_local_offset {
             return Err(err(format!(
                 "ZIP local record가 연속된 고정 순서가 아닙니다: {}",
@@ -232,7 +229,7 @@ impl ZipEntry<'_> {
             .get(extra_start..data_start)
             .ok_or_else(|| zip_static("ZIP local extra 범위 오류"))?;
         validate_zip_extra(local_extra, self.name)?;
-        let compressed_len = u32_to_usize(self.compressed_size);
+        let compressed_len = self.compressed_size as usize;
         let data_end = data_start
             .checked_add(compressed_len)
             .ok_or_else(|| zip_static("ZIP data end 계산 실패"))?;
@@ -437,8 +434,8 @@ impl ZipPackageReader<'_> {
                 "ZIP entry 수가 지원 상한을 초과했습니다: {entry_count}"
             )));
         }
-        let central_dir_size = u32_to_usize(read_u32(eocd, 12)?);
-        let central_dir_offset = u32_to_usize(read_u32(eocd, 16)?);
+        let central_dir_size = read_u32(eocd, 12)? as usize;
+        let central_dir_offset = read_u32(eocd, 16)? as usize;
         let central_dir_end = central_dir_offset
             .checked_add(central_dir_size)
             .ok_or_else(|| zip_static("ZIP 중앙 디렉터리 범위 계산 실패"))?;
@@ -478,7 +475,7 @@ impl ZipPackageReader<'_> {
             if mem::replace(present, true) {
                 return Err(err(format!("ZIP entry 이름이 중복되었습니다: {part_name}")));
             }
-            let expected_len = u32_to_usize(entry.uncompressed_size);
+            let expected_len = entry.uncompressed_size as usize;
             ensure_zip_size_limit("entry 해제", expected_len, MAX_XLSX_PART_BYTES, entry.name)?;
             total_uncompressed = total_uncompressed
                 .checked_add(expected_len)
@@ -507,9 +504,9 @@ impl ZipPackageReader<'_> {
         let mut archive_crc = u32::MAX;
         let mut entry_iter = entries.into_iter().peekable();
         while let Some((entry, part_index, expected_len)) = entry_iter.next() {
-            let local_offset = u32_to_usize(entry.local_header_offset);
+            let local_offset = entry.local_header_offset as usize;
             let next_offset = entry_iter.peek().map_or(central_dir_offset, |item| {
-                u32_to_usize(item.0.local_header_offset)
+                item.0.local_header_offset as usize
             });
             let record_len = next_offset
                 .checked_sub(local_offset)
@@ -610,27 +607,26 @@ fn read_archive_range(
     buffer: &mut Vec<u8>,
 ) -> Result<()> {
     if let Some(seek_offset) = offset {
-        let offset_u64 = u64::try_from(seek_offset)
-            .map_err(|source| err_with_source("ZIP 입력 offset 변환 실패", source))?;
-        file.seek(SeekFrom::Start(offset_u64)).map_err(|source| {
-            err_with_source(
-                path_context_message("xlsx 압축 파일 range 이동 실패", archive_path),
-                source,
-            )
-        })?;
+        file.seek(SeekFrom::Start(seek_offset as u64))
+            .map_err(|source| {
+                err_with_source(
+                    path_context_message("xlsx 압축 파일 range 이동 실패", archive_path),
+                    source,
+                )
+            })?;
     }
-    let len_u64 =
-        u64::try_from(len).map_err(|source| err_with_source("ZIP 입력 길이 변환 실패", source))?;
     buffer.clear();
     buffer
         .try_reserve_exact(len)
         .map_err(|source| err_with_source("ZIP 입력 range 메모리 확보 실패", source))?;
-    file.take(len_u64).read_to_end(buffer).map_err(|source| {
-        err_with_source(
-            path_context_message("xlsx 압축 파일 range 읽기 실패", archive_path),
-            source,
-        )
-    })?;
+    file.take(len as u64)
+        .read_to_end(buffer)
+        .map_err(|source| {
+            err_with_source(
+                path_context_message("xlsx 압축 파일 range 읽기 실패", archive_path),
+                source,
+            )
+        })?;
     if buffer.len() != len {
         return Err(archive_changed(archive_path));
     }

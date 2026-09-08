@@ -2,10 +2,7 @@ use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
     ResponseHeaders, checked_http_buffer_len, download_error_with_source,
 };
-use crate::{
-    diagnostic::{try_string_with_capacity, try_vec_with_capacity},
-    u32_to_usize,
-};
+use crate::diagnostic::{try_string_with_capacity, try_vec_with_capacity};
 use alloc::{string::String, vec::Vec};
 use core::{
     array::from_fn,
@@ -350,7 +347,7 @@ impl Client {
                         "WinHTTP Content-Length header index가 진행되지 않았습니다.".into(),
                     );
                 }
-                headers.set_content_length(u32_to_usize(value))?;
+                headers.set_content_length(value as usize)?;
             }
             let mut cookie_index = 0_u32;
             let mut header_bytes_seen = 0_usize;
@@ -384,7 +381,7 @@ impl Client {
                     )
                     .into());
                 }
-                let header_bytes = u32_to_usize(bytes);
+                let header_bytes = bytes as usize;
                 header_bytes_seen = checked_http_buffer_len(
                     "헤더",
                     header_bytes_seen,
@@ -489,7 +486,7 @@ impl Client {
                 )
             };
             Self::check_winhttp(read_ok, "WinHttpReadData")?;
-            let read_len = u32_to_usize(read);
+            let read_len = read as usize;
             if read_len == 0 {
                 break;
             }

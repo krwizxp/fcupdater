@@ -52,9 +52,6 @@ const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
 const RUN_LOCK_PATH: &str = ".fcupdater.lock";
 #[cfg(target_os = "windows")]
 const RUN_LOCK_SHARE_MODE: u32 = 0x0000_0003;
-const fn u32_to_usize(value: u32) -> usize {
-    value as usize
-}
 fn main() -> Result<()> {
     let mut out = stdout().lock();
     let mut raw_args = env::args_os().skip(1);

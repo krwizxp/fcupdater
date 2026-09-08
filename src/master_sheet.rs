@@ -11,7 +11,6 @@ use crate::{
         target_region,
     },
     sheet_util::{add_row_offset, usize_to_u32},
-    u32_to_usize,
 };
 use alloc::borrow::Cow;
 use core::{
@@ -527,11 +526,10 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             .unwrap_or(ScaledDecimal::ZERO),
             region_rates,
         };
-        let row_count = u32_to_usize(
-            self.data_last_row
-                .strict_sub(MASTER_DATA_START_ROW)
-                .strict_add(1),
-        );
+        let row_count = self
+            .data_last_row
+            .strict_sub(MASTER_DATA_START_ROW)
+            .strict_add(1) as usize;
         let mut row_plans: Vec<SortableRankRow<'strings>> =
             try_vec_with_capacity(row_count, "정렬 대상 행 메모리 확보 실패")?;
         for (source_index, row_num) in (MASTER_DATA_START_ROW..=self.data_last_row).enumerate() {
@@ -555,8 +553,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 .then_with(|| left.source_index.cmp(&right.source_index))
         });
         let mut rows = self.ws.take_rows();
-        let data_start_index = u32_to_usize(MASTER_DATA_START_ROW.strict_sub(1));
-        let data_end_index = u32_to_usize(self.data_last_row);
+        let data_start_index = MASTER_DATA_START_ROW.strict_sub(1) as usize;
+        let data_end_index = self.data_last_row as usize;
         (data_end_index <= rows.len())
             .ok_or_else(|| err("정렬 대상 row 범위가 worksheet를 벗어났습니다."))?;
         let trailing_rows = rows.split_off(data_end_index);
@@ -849,7 +847,7 @@ impl<'source> MasterSheetUpdater<'source> {
         let added_template_row = if added.is_empty() {
             None
         } else {
-            let template_index = u32_to_usize(template_row_num.strict_sub(1));
+            let template_index = template_row_num.strict_sub(1) as usize;
             let template_row = original_rows.get(template_index).ok_or_else(|| {
                 err(format!(
                     "유류비 신규행 template이 없습니다: row={template_row_num}"
@@ -857,8 +855,8 @@ impl<'source> MasterSheetUpdater<'source> {
             })?;
             Some(template_row.try_copy()?)
         };
-        let data_start_index = u32_to_usize(MASTER_HEADER_ROW);
-        let trailing_start_index = u32_to_usize(last_old_row.unwrap_or(MASTER_HEADER_ROW));
+        let data_start_index = MASTER_HEADER_ROW as usize;
+        let trailing_start_index = last_old_row.unwrap_or(MASTER_HEADER_ROW) as usize;
         (trailing_start_index <= original_rows.len())
             .ok_or_else(|| err("유류비 기존 데이터 row 범위가 worksheet를 벗어났습니다."))?;
         let trailing_rows = original_rows.split_off(trailing_start_index);

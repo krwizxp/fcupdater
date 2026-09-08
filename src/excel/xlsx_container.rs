@@ -530,9 +530,7 @@ impl TempArchivePromotion<'_> {
             )));
         }
         let archive_len = archive_file_len(&captured_file.file, captured_original)?;
-        let archive_len_u64 = u64::try_from(archive_len)
-            .map_err(|source| err_with_source("교체된 원본 xlsx 크기 변환 실패", source))?;
-        let mut limited = (&captured_file.file).take(archive_len_u64.strict_add(1));
+        let mut limited = (&captured_file.file).take((archive_len as u64).strict_add(1));
         let mut buffer = vec![0_u8; ZIP_FINGERPRINT_BUFFER_BYTES].into_boxed_slice();
         let mut crc = u32::MAX;
         let mut bytes_read = 0_usize;

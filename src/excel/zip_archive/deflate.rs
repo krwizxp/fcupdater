@@ -700,11 +700,7 @@ impl DynamicFrequencies {
                 .copied()
                 .unwrap_or(0);
             let symbol_bits = usize::from(code_len).strict_add(usize::from(extra_bits));
-            bit_len = bit_len.strict_add(
-                usize::try_from(frequency)
-                    .unwrap_or_else(|_| process::abort())
-                    .strict_mul(symbol_bits),
-            );
+            bit_len = bit_len.strict_add((frequency as usize).strict_mul(symbol_bits));
         }
         for ((&frequency, &code_len), &extra_bits) in self
             .distance
@@ -713,11 +709,7 @@ impl DynamicFrequencies {
             .zip(&DISTANCE_EXTRA_BITS)
         {
             let symbol_bits = usize::from(code_len).strict_add(usize::from(extra_bits));
-            bit_len = bit_len.strict_add(
-                usize::try_from(frequency)
-                    .unwrap_or_else(|_| process::abort())
-                    .strict_mul(symbol_bits),
-            );
+            bit_len = bit_len.strict_add((frequency as usize).strict_mul(symbol_bits));
         }
         bit_len
     }

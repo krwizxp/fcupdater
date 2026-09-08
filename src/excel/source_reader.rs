@@ -1,7 +1,6 @@
 use super::copy_text;
-use crate::{
-    diagnostic::{Result, err, err_with_source, try_string_with_capacity, try_vec_with_capacity},
-    u32_to_usize,
+use crate::diagnostic::{
+    Result, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
 };
 use alloc::borrow::Cow;
 use core::{fmt::Display, range::Range};
@@ -136,7 +135,7 @@ impl SourceReader {
         let total_entries = fat_sector_ids.len().strict_mul(entries_per_sector);
         let mut fat = try_vec_with_capacity(total_entries, "CFB FAT 메모리 확보 실패")?;
         for &sid in fat_sector_ids {
-            let sector_idx = u32_to_usize(sid);
+            let sector_idx = sid as usize;
             let sector = get_sector_slice_at_index(&self.0, sector_idx, sid)?;
             let (chunks, &[]) = sector.as_chunks::<4>() else {
                 return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
@@ -300,7 +299,7 @@ impl SourceReader {
             .strict_sub(CFB_SECTOR_SIZE)
             .div_euclid(CFB_SECTOR_SIZE);
         (max_sector_count != 0).ok_or_else(|| err("CFB sector 개수가 비정상적입니다."))?;
-        let declared_fat_sectors = u32_to_usize(header.num_fat_sectors);
+        let declared_fat_sectors = header.num_fat_sectors as usize;
         if declared_fat_sectors > max_sector_count {
             return Err(err(format!(
                 "CFB FAT sector 개수가 비정상적으로 큽니다: {declared_fat_sectors} (최대 {max_sector_count})"
@@ -579,7 +578,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             }
             match record_id {
                 0x0085 => {
-                    let offset = u32_to_usize(read_u32_le(data, 0)?);
+                    let offset = read_u32_le(data, 0)? as usize;
                     let sheet_type = *data
                         .get(5)
                         .ok_or_else(|| err("xls BoundSheet record가 예상보다 짧습니다."))?;
@@ -645,8 +644,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             chunks: &chunks,
             offset_in_chunk: 0,
         };
-        let declared_total = u32_to_usize(reader.read_u32()?);
-        let unique_count = u32_to_usize(reader.read_u32()?);
+        let declared_total = reader.read_u32()? as usize;
+        let unique_count = reader.read_u32()? as usize;
         if declared_total < unique_count {
             return Err(err(format!(
                 "SST total count가 unique count보다 작습니다: total={declared_total}, unique={unique_count}"
@@ -681,7 +680,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 0_usize
             };
             let ext_len = if flags & 0x04 != 0 {
-                u32_to_usize(reader.read_u32()?)
+                reader.read_u32()? as usize
             } else {
                 0_usize
             };
@@ -842,7 +841,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                         current_row = SourceRow::default();
                     }
                     previous_cell = Some((row, col));
-                    let idx = u32_to_usize(read_u32_le(record_data, 6)?);
+                    let idx = read_u32_le(record_data, 6)? as usize;
                     let value = shared_strings.get(idx).ok_or_else(|| {
                         err(format!(
                             "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"
@@ -1029,8 +1028,7 @@ fn read_stream_from_fat_chain<'data>(
     }
     let mut remaining = size_limit
         .map(|limit| {
-            let data_len = u64::try_from(data.len())
-                .map_err(|source| err_with_source("CFB 파일 크기 변환 실패", source))?;
+            let data_len = data.len() as u64;
             if limit > data_len {
                 return Err(err(format!(
                     "FAT stream 선언 크기가 파일 크기보다 큽니다: {stream_name}, size={limit}, file_size={data_len}"
@@ -1065,7 +1063,7 @@ fn read_stream_from_fat_chain<'data>(
         if previous_sid.is_some_and(|previous: u32| sid != previous.strict_add(1)) {
             contiguous = false;
         }
-        let sid_usize = u32_to_usize(sid);
+        let sid_usize = sid as usize;
         let next_sid = *fat.get(sid_usize).ok_or_else(|| {
             err(prefixed_display_message(
                 "FAT 인덱스 범위 오류: sector=",
@@ -1092,7 +1090,7 @@ fn read_stream_from_fat_chain<'data>(
         )));
     }
     if contiguous {
-        let start_offset = u32_to_usize(start_sector)
+        let start_offset = (start_sector as usize)
             .checked_add(1)
             .and_then(|index| index.checked_mul(CFB_SECTOR_SIZE))
             .ok_or_else(|| err("CFB stream 시작 범위 계산 실패"))?;
@@ -1108,7 +1106,7 @@ fn read_stream_from_fat_chain<'data>(
     let mut copy_remaining = stream_len;
     let mut copy_sid = start_sector;
     while copy_remaining != 0 {
-        let sid_usize = u32_to_usize(copy_sid);
+        let sid_usize = copy_sid as usize;
         let sector = get_sector_slice_at_index(data, sid_usize, copy_sid)?;
         let take = copy_remaining.min(sector.len());
         out.extend_from_slice(
