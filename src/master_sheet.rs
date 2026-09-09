@@ -182,20 +182,11 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         scale: i128,
         buffers: &mut FormulaBuffers,
     ) -> Result<()> {
-        if let Some(scaled) = value {
+        let cached = value.map(|scaled| {
             format_scaled_value_into(&mut buffers.cache, scaled, scale);
-            let cached = buffers.cache.as_str();
-            self.apply_formula_cache(
-                row,
-                col,
-                formula_args,
-                Some(cached),
-                false,
-                &mut buffers.formula,
-            )
-        } else {
-            self.apply_formula_cache(row, col, formula_args, None, false, &mut buffers.formula)
-        }
+            buffers.cache.as_str()
+        });
+        self.apply_formula_cache(row, col, formula_args, cached, false, &mut buffers.formula)
     }
     fn apply_row_formulas_and_caches(
         &mut self,

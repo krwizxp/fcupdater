@@ -63,9 +63,7 @@ impl<'xml> XmlScanner<'xml> {
                     }
                     continue;
                 }
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| err("XML 종료 태그 순서가 올바르지 않습니다."))?;
+                depth = depth.strict_sub(1);
                 let open = ancestors
                     .get(depth)
                     .copied()
