@@ -110,7 +110,9 @@ where
     fmt::from_fn(move |formatter| write!(&mut ControlEscapingWriter(formatter), "{value}"))
 }
 fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
-    for character in text.chars() {
+    let mut remaining = text;
+    let mut consumed = 0;
+    for (index, character) in text.char_indices() {
         if character.is_control()
             || matches!(
                 character,
@@ -121,12 +123,19 @@ fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt:
                     | '\u{2066}'..='\u{2069}'
             )
         {
-            for escaped in character.escape_debug() {
-                formatter.write_char(escaped)?;
+            let (plain, escaped_tail) = remaining.split_at(index.strict_sub(consumed));
+            if !plain.is_empty() {
+                formatter.write_str(plain)?;
             }
-        } else {
-            formatter.write_char(character)?;
+            write!(formatter, "{}", character.escape_debug())?;
+            let char_len = character.len_utf8();
+            remaining = escaped_tail.split_at(char_len).1;
+            consumed = index.strict_add(char_len);
         }
     }
-    Ok(())
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        formatter.write_str(remaining)
+    }
 }
