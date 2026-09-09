@@ -2113,39 +2113,36 @@ fn replace_formula_tag_at(
     let suffix = inner_xml
         .get(formula_span.end..)
         .unwrap_or_else(|| process::abort());
-    let mut replacement = String::new();
-    match tag {
-        FormulaTag::PlainEscaped(escaped) => {
-            replacement
-                .try_reserve_exact(sum_lengths(&[escaped.len(), "<f></f>".len()]))
-                .map_err(|source| err_with_source("cell formula XML 메모리 확보 실패", source))?;
-            replacement.extend(["<f>", escaped, "</f>"]);
-        }
-        FormulaTag::SharedFollower(si) => {
-            replacement.extend(["<f t=\"shared\" si=\"", si, "\"/>"]);
-        }
+    let shared_escaped;
+    let parts: &[&str] = match tag {
+        FormulaTag::PlainEscaped(escaped) => &[prefix, "<f>", escaped, "</f>", suffix],
+        FormulaTag::SharedFollower(si) => &[prefix, "<f t=\"shared\" si=\"", si, "\"/>", suffix],
         FormulaTag::SharedRoot {
             formula,
             reference,
             si,
         } => {
-            let escaped =
+            shared_escaped =
                 try_xml_escape_text(formula, XmlEscapeContext::Text, "shared formula XML escape")?;
-            replacement.extend([
+            &[
+                prefix,
                 "<f t=\"shared\" ref=\"",
                 reference,
                 "\" si=\"",
                 si,
                 "\">",
-                escaped.as_ref(),
+                shared_escaped.as_ref(),
                 "</f>",
-            ]);
+                suffix,
+            ]
         }
-    }
-    let capacity = sum_lengths(&[prefix.len(), replacement.len(), suffix.len()]);
+    };
+    let capacity = parts
+        .iter()
+        .fold(0_usize, |length, part| length.strict_add(part.len()));
     let mut output =
         try_string_with_capacity(capacity, "cell formula replacement 메모리 확보 실패")?;
-    output.extend([prefix, replacement.as_str(), suffix]);
+    output.extend(parts.iter().copied());
     Ok(output)
 }
 const fn row_index(row: u32) -> Option<usize> {
