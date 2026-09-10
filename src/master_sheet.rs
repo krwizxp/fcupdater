@@ -209,7 +209,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             ScaledDecimal::ZERO
         };
         let regional_discount = total_price.and_then(|value| value.regional_discount(region_rate));
-        let rank_total = total_qty.and(plan.rank_total);
+        let rank_total = plan.rank_total;
         let data_start = MASTER_DATA_START_ROW;
         let data_last = self.data_last_row;
         self.apply_formula_cache(
@@ -330,13 +330,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             DECIMAL_SCALE_SQUARED.as_i128(),
             buffers,
         )?;
-        if let Some(value) = rank_total {
-            format_scaled_value_into(
-                &mut buffers.cache,
-                value.as_i128(),
-                DECIMAL_SCALE_SQUARED.as_i128(),
-            );
-        } else {
+        if rank_total.is_none() {
             buffers.cache.clear();
             buffers.cache.push_str("1000000000000000");
         }
@@ -354,9 +348,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             (COL_UNIT_PRICE_WITHOUT_CURRENCY, "P", total_price),
         ] {
             buffers.cache.clear();
-            let has_value = if let Some((total, qty)) = value.zip(total_qty)
-                && qty != ScaledDecimal::ZERO
-            {
+            let has_value = if let Some((total, qty)) = value.zip(total_qty) {
                 let denominator = qty
                     .as_i128()
                     .checked_mul(DECIMAL_SCALE.as_i128())
@@ -408,17 +400,13 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 row_num,
                 self.shared_strings,
             )? == Some(ScaledDecimal::ZERO);
-        let default_smart_discount = if name.contains(SMART_DISCOUNT_BRAND_KEYWORD)
+        let smart_discount = if !smart_discount_excluded
+            && name.contains(SMART_DISCOUNT_BRAND_KEYWORD)
             && name.contains(SMART_DISCOUNT_DIRECT_KEYWORD)
         {
             sort_context.smart_discount
         } else {
             ScaledDecimal::ZERO
-        };
-        let smart_discount = if smart_discount_excluded {
-            ScaledDecimal::ZERO
-        } else {
-            default_smart_discount
         };
         let adjusted_prices = fuels.map(|price| {
             i64::from(price?)
@@ -450,15 +438,11 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
                 .map(ScaledSortKey)
         });
-        let rank_total = sort_context.total_qty.and_then(|total_qty| {
-            if total_qty == ScaledDecimal::ZERO {
-                None
-            } else {
-                let total_price =
-                    MasterSheetUpdater::compute_total_price(sort_context, adjusted_prices)?;
-                let discount = total_price.regional_discount(region_rate)?;
-                total_price.checked_sub(discount)
-            }
+        let rank_total = sort_context.total_qty.and_then(|_| {
+            let total_price =
+                MasterSheetUpdater::compute_total_price(sort_context, adjusted_prices)?;
+            let discount = total_price.regional_discount(region_rate)?;
+            total_price.checked_sub(discount)
         });
         Ok(SortableRankRow {
             address,
@@ -573,21 +557,18 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             "지역화폐 순위 문자열 메모리 확보 실패",
         )?;
         let mut rank_buffer = NumBuffer::new();
-        let ranking_enabled = sort_context.total_qty.is_some();
         let mut ranked_count = 0_usize;
         let mut previous_total = None;
         for (row, plan) in (MASTER_DATA_START_ROW..=self.data_last_row).zip(&row_plans) {
-            let rank_cache = if ranking_enabled && let Some(current) = plan.rank_total {
+            let rank_cache = plan.rank_total.map(|current| {
                 ranked_count = ranked_count.strict_add(1);
                 if previous_total != Some(current) {
                     rank_text.clear();
                     rank_text.push_str(ranked_count.format_into(&mut rank_buffer));
                     previous_total = Some(current);
                 }
-                Some(rank_text.as_str())
-            } else {
-                None
-            };
+                rank_text.as_str()
+            });
             self.apply_row_formulas_and_caches(row, plan, &sort_context, rank_cache, &mut buffers)?;
         }
         Ok(())
