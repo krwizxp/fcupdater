@@ -111,7 +111,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
             bytes: &part.bytes,
             workspace: &mut self.deflate_workspace,
         })
-        .plan(part.name)?
+        .plan()?
         else {
             return Err(err(format!(
                 "고정 XLSX part 압축 작업 한도를 초과했습니다: {}",
@@ -126,19 +126,8 @@ impl<'part> StreamingZipWriter<'part, '_> {
         let crc32 = plan.crc32();
         let local_header_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
-        let local_extra = match part.name {
-            "[Content_Types].xml" | "_rels/.rels" => {
-                Some((520, [0x20, 0xa2, 0x04, 0x02, 0x28, 0xa0, 0x00, 0x02]))
-            }
-            "xl/_rels/workbook.xml.rels" | "docProps/core.xml" | "docProps/app.xml" => {
-                Some((264, [0x20, 0xa2, 0x04, 0x01, 0x28, 0xa0, 0x00, 0x01]))
-            }
-            _ => None,
-        };
-        let local_extra_len = local_extra.map_or_default(|(len, _)| len);
         let local_header_len = LOCAL_FILE_HEADER_LEN
             .checked_add(part.name.len())
-            .and_then(|len| len.checked_add(local_extra_len))
             .ok_or_else(|| err("ZIP local header 길이 계산 실패"))?;
         let entry_output_size = local_header_len
             .checked_add(compressed_size)
@@ -159,25 +148,8 @@ impl<'part> StreamingZipWriter<'part, '_> {
             u16::try_from(part.name.len())
                 .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?,
         );
-        write_u16(
-            &mut self.header_buffer,
-            u16::try_from(local_extra_len)
-                .map_err(|source| err_with_source("ZIP local extra 길이 변환 실패", source))?,
-        );
+        write_u16(&mut self.header_buffer, 0);
         self.header_buffer.extend_from_slice(part.name.as_bytes());
-        if let Some((extra_len, header)) = local_extra {
-            self.header_buffer.extend_from_slice(&header);
-            let padding_len = extra_len
-                .checked_sub(header.len())
-                .ok_or_else(|| err("ZIP local extra header가 선언 길이를 초과했습니다."))?;
-            self.header_buffer.resize(
-                self.header_buffer
-                    .len()
-                    .checked_add(padding_len)
-                    .ok_or_else(|| err("ZIP local extra 크기 계산 실패"))?,
-                0,
-            );
-        }
         self.write_header_buffer("xlsx 압축 local header 쓰기 실패")?;
         let actual_written = plan.write_to(&mut self.file)?;
         if actual_written != compressed_size {

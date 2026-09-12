@@ -45,7 +45,7 @@ const EXCEL_MASTER_PREFIX: &str = include_str!("excel_sheet1_prefix.xml");
 const EXCEL_MASTER_SUFFIX: &str = include_str!("excel_sheet1_suffix.xml");
 const EXCEL_CHANGE_LOG_PREFIX: &str = include_str!("excel_sheet2_prefix.xml");
 const EXCEL_CHANGE_LOG_SUFFIX: &str = include_str!("excel_sheet2_suffix.xml");
-const EXCEL_BOOK_VIEWS_XML: &str = "<bookViews><workbookView xWindow=\"-120\" yWindow=\"-120\" windowWidth=\"29040\" windowHeight=\"15720\" tabRatio=\"500\" xr2:uid=\"{00000000-000D-0000-FFFF-FFFF00000000}\"/></bookViews>";
+const EXCEL_BOOK_VIEWS_XML: &str = "<bookViews><workbookView/></bookViews>";
 const EXCEL_CALC_EXTENSIONS_XML: &str = concat!(
     "<extLst>",
     "<ext uri=\"{B58B0392-4F1F-4190-BB64-5DF3571DCE5F}\" xmlns:xcalcf=\"http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures\"><xcalcf:calcFeatures><xcalcf:feature name=\"microsoft.com:RD\"/><xcalcf:feature name=\"microsoft.com:Single\"/><xcalcf:feature name=\"microsoft.com:FV\"/><xcalcf:feature name=\"microsoft.com:CNMTM\"/><xcalcf:feature name=\"microsoft.com:LET_WF\"/><xcalcf:feature name=\"microsoft.com:LAMBDA_WF\"/><xcalcf:feature name=\"microsoft.com:ARRAYTEXT_WF\"/></xcalcf:calcFeatures></ext>",
@@ -543,12 +543,12 @@ impl Workbook {
         let mut workbook_xml =
             try_string_with_capacity(capacity, "Excel workbook XML 메모리 확보 실패")?;
         workbook_xml.push_str(EXCEL_WORKBOOK_OPENING);
-        workbook_xml.push_str("<fileVersion appName=\"xl\" lastEdited=\"7\" lowestEdited=\"7\" rupBuild=\"27932\"/><workbookPr/>");
+        workbook_xml.push_str("<workbookPr/>");
         workbook_xml.push_str(EXCEL_BOOK_VIEWS_XML);
         workbook_xml.push_str("<sheets><sheet name=\"유류비\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"변경내역\" sheetId=\"2\" r:id=\"rId2\"/></sheets><definedNames><definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">");
         workbook_xml.push_str(FILTER_DATABASE_REF_PREFIX);
         push_decimal_text!(&mut workbook_xml, filter_last_row);
-        workbook_xml.push_str("</definedName></definedNames><calcPr calcId=\"191029\"/>");
+        workbook_xml.push_str("</definedName></definedNames><calcPr/>");
         workbook_xml.extend([EXCEL_CALC_EXTENSIONS_XML, "</workbook>"]);
         self.container.put_text("xl/workbook.xml", workbook_xml);
         self.container

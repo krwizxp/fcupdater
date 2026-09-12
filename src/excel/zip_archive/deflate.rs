@@ -41,9 +41,7 @@ const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
 const DEFLATE_TOKEN_RESERVE_CHUNK: usize = 64 * 1024;
 const DEFLATE_WINDOW_LEN: usize = 0x8000;
 const DEFLATE_MAX_DISTANCE: usize = DEFLATE_WINDOW_LEN - MAX_MATCH - MIN_MATCH - 1;
-const EXCEL_FLUSH_BLOCK_COUNT: u8 = 2;
-const FINAL_BLOCK_BOUNDARY_COUNT: usize = 1;
-const EXCEL_TOKEN_BLOCK_LIMIT: usize = 8191;
+const TOKEN_BLOCK_LIMIT: usize = 8191;
 const MATCH_CHUNK_BYTES: usize = 16;
 const XML_MAX_INSERT_MATCH_LEN: usize = 4;
 const XML_NICE_MATCH_LEN: usize = 128;
@@ -76,7 +74,6 @@ struct BitCounter {
     bit_len: usize,
 }
 trait BitSink {
-    fn align_to_byte(&mut self) -> ZipResult<()>;
     fn write_bits(&mut self, value: u16, count: u8) -> ZipResult<()>;
 }
 struct BitWriter<'writer> {
@@ -104,14 +101,6 @@ struct WriteHuffman {
 enum DeflateToken {
     Literal(u16),
     Match { distance: u16, length: u16 },
-}
-impl DeflateToken {
-    fn output_len(self) -> usize {
-        match self {
-            Self::Literal(_) => 1,
-            Self::Match { length, .. } => usize::from(length),
-        }
-    }
 }
 #[derive(Clone, Copy)]
 struct CodeLengthToken {
@@ -145,12 +134,7 @@ pub(super) struct DeflatePlan {
 }
 struct DeflateBlockPlan {
     dynamic_plan: Option<DynamicDeflatePlan>,
-    empty_stored_after: u8,
     token_range: Range<usize>,
-}
-struct DeflateOutputBoundary {
-    empty_stored_after: u8,
-    output_end: usize,
 }
 struct DynamicDeflatePlan {
     code_huffman: WriteHuffman,
@@ -252,20 +236,12 @@ impl BitCounter {
     }
 }
 impl BitSink for BitCounter {
-    fn align_to_byte(&mut self) -> ZipResult<()> {
-        self.bit_len = self.bit_len.next_multiple_of(8);
-        Ok(())
-    }
     fn write_bits(&mut self, _value: u16, count: u8) -> ZipResult<()> {
         self.add_bits(usize::from(count));
         Ok(())
     }
 }
 impl BitSink for BitWriter<'_> {
-    fn align_to_byte(&mut self) -> ZipResult<()> {
-        let padding = 8_u8.strict_sub(self.bit_count).rem_euclid(8);
-        self.write_bits(0, padding)
-    }
     fn write_bits(&mut self, value: u16, count: u8) -> ZipResult<()> {
         let mask = u16::MAX.unbounded_shr(u16::BITS.strict_sub(u32::from(count)));
         self.bit_buffer |= u64::from(value & mask) << self.bit_count;
@@ -1092,11 +1068,7 @@ impl DeflatePlan {
                 }
                 write_fixed_symbol(writer, 256)?;
             }
-            for _ in 0..block.empty_stored_after {
-                write_empty_stored_block(writer)?;
-            }
         }
-        write_empty_stored_block(writer)?;
         writer.write_bits(1, 1)?;
         writer.write_bits(1, 2)?;
         write_fixed_symbol(writer, 256)
@@ -1214,142 +1186,41 @@ impl DeflateWriter<'_, '_> {
             symbol: 257_u16.strict_add(u16::try_from(index).unwrap_or_else(|_| process::abort())),
         }
     }
-    pub(super) fn plan(&mut self, part_name: &str) -> ZipResult<Option<DeflatePlan>> {
-        let mut boundaries = try_vec_with_capacity(
-            FINAL_BLOCK_BOUNDARY_COUNT,
-            "deflate block 경계 메모리 확보 실패",
-        )?;
-        if matches!(
-            part_name,
-            "xl/worksheets/sheet1.xml" | "xl/worksheets/sheet2.xml"
-        ) {
-            let sheet_data_open = b"<sheetData>";
-            let sheet_data_close = b"</sheetData>";
-            let open_start = find_bytes(self.bytes, sheet_data_open)
-                .ok_or_else(|| zip_static("worksheet sheetData 시작 태그가 없습니다."))?;
-            let content_start = open_start
-                .checked_add(sheet_data_open.len())
-                .ok_or_else(|| zip_static("worksheet sheetData 내용 시작 계산 실패"))?;
-            let after_open = self
-                .bytes
-                .get(content_start..)
-                .ok_or_else(|| zip_static("worksheet sheetData 내용 범위 오류"))?;
-            let close_start = find_bytes(after_open, sheet_data_close)
-                .and_then(|offset| content_start.checked_add(offset))
-                .ok_or_else(|| zip_static("worksheet sheetData 종료 태그가 없습니다."))?;
-            let close_end = close_start
-                .checked_add(sheet_data_close.len())
-                .ok_or_else(|| zip_static("worksheet sheetData 종료 경계 계산 실패"))?;
-            if open_start >= close_start || close_end > self.bytes.len() {
-                return Err(zip_static(
-                    "worksheet sheetData 경계 순서가 올바르지 않습니다.",
-                ));
-            }
-            boundaries
-                .try_reserve_exact(2)
-                .map_err(|source| zip_with_source("deflate block 경계 메모리 확보 실패", source))?;
-            boundaries.push(DeflateOutputBoundary {
-                empty_stored_after: EXCEL_FLUSH_BLOCK_COUNT,
-                output_end: open_start,
-            });
-            boundaries.push(DeflateOutputBoundary {
-                empty_stored_after: EXCEL_FLUSH_BLOCK_COUNT,
-                output_end: close_end,
-            });
-        }
-        boundaries.push(DeflateOutputBoundary {
-            empty_stored_after: 0,
-            output_end: self.bytes.len(),
-        });
-        let Some((tokens, crc32)) = self.tokens(&boundaries)? else {
+    pub(super) fn plan(&mut self) -> ZipResult<Option<DeflatePlan>> {
+        let Some((tokens, crc32)) = self.tokens()? else {
             return Ok(None);
         };
-        let maximum_block_count = tokens
-            .len()
-            .div_ceil(EXCEL_TOKEN_BLOCK_LIMIT)
-            .checked_add(boundaries.len())
-            .ok_or_else(|| zip_static("deflate block plan 수 계산 실패"))?;
-        let mut blocks: Vec<DeflateBlockPlan> =
-            try_vec_with_capacity(maximum_block_count, "deflate block plan 메모리 확보 실패")?;
-        let mut output_len = 0_usize;
-        let mut token_end = 0_usize;
-        let mut token_start = 0_usize;
+        let mut blocks = try_vec_with_capacity(
+            tokens.len().div_ceil(TOKEN_BLOCK_LIMIT),
+            "deflate block plan 메모리 확보 실패",
+        )?;
         let mut counter = BitCounter { bit_len: 0 };
-        for boundary in boundaries {
-            while output_len < boundary.output_end {
-                let token = tokens
-                    .get(token_end)
-                    .copied()
-                    .ok_or_else(|| zip_static("deflate block 출력 경계가 token을 초과합니다."))?;
-                output_len = output_len
-                    .checked_add(token.output_len())
-                    .ok_or_else(|| zip_static("deflate block 출력 길이 계산 실패"))?;
-                token_end = token_end
-                    .checked_add(1)
-                    .ok_or_else(|| zip_static("deflate block token 위치 계산 실패"))?;
-            }
-            if output_len != boundary.output_end {
-                return Err(zip_static("deflate token이 출력 경계를 교차했습니다."));
-            }
-            while token_start < token_end {
-                let block_end = token_start
-                    .checked_add(EXCEL_TOKEN_BLOCK_LIMIT)
-                    .map_or(token_end, |candidate| candidate.min(token_end));
-                let empty_stored_after = if block_end == token_end {
-                    boundary.empty_stored_after
+        for (block_index, block_tokens) in tokens.chunks(TOKEN_BLOCK_LIMIT).enumerate() {
+            let start = block_index.strict_mul(TOKEN_BLOCK_LIMIT);
+            let token_range = Range {
+                start,
+                end: start.strict_add(block_tokens.len()),
+            };
+            let mut frequencies = DynamicFrequencies {
+                distance: [0_u32; DISTANCE_SYMBOLS],
+                literal: [0_u32; LITERAL_LENGTH_SYMBOLS],
+            };
+            let (has_distance, fixed_bit_len) = frequencies.collect(block_tokens);
+            let dynamic_plan = has_distance.then(|| frequencies.plan()).transpose()?;
+            let (chosen_dynamic, bit_len) = dynamic_plan.map_or((None, fixed_bit_len), |dynamic| {
+                let dynamic_bit_len = frequencies.encoded_bit_len(&dynamic);
+                if dynamic_bit_len < fixed_bit_len {
+                    (Some(dynamic), dynamic_bit_len)
                 } else {
-                    0
-                };
-                let token_range = Range {
-                    start: token_start,
-                    end: block_end,
-                };
-                let block_tokens = tokens
-                    .get(token_range)
-                    .ok_or_else(|| zip_static("deflate block token 범위 오류"))?;
-                let mut frequencies = DynamicFrequencies {
-                    distance: [0_u32; DISTANCE_SYMBOLS],
-                    literal: [0_u32; LITERAL_LENGTH_SYMBOLS],
-                };
-                let (has_distance, fixed_bit_len) = frequencies.collect(block_tokens);
-                let dynamic_plan = has_distance.then(|| frequencies.plan()).transpose()?;
-                let (chosen_dynamic, bit_len) =
-                    dynamic_plan.map_or((None, fixed_bit_len), |dynamic| {
-                        let dynamic_bit_len = frequencies.encoded_bit_len(&dynamic);
-                        if dynamic_bit_len < fixed_bit_len {
-                            (Some(dynamic), dynamic_bit_len)
-                        } else {
-                            (None, fixed_bit_len)
-                        }
-                    });
-                counter.add_bits(bit_len);
-                for _ in 0..empty_stored_after {
-                    write_empty_stored_block(&mut counter)?;
+                    (None, fixed_bit_len)
                 }
-                blocks.push(DeflateBlockPlan {
-                    dynamic_plan: chosen_dynamic,
-                    empty_stored_after,
-                    token_range,
-                });
-                token_start = block_end;
-            }
-            if token_start == token_end && boundary.empty_stored_after != 0 {
-                let last = blocks.last().ok_or_else(|| {
-                    zip_static("deflate empty stored block 앞에 data block이 없습니다.")
-                })?;
-                if last.token_range.end != token_end {
-                    return Err(zip_static(
-                        "deflate empty stored block 경계가 올바르지 않습니다.",
-                    ));
-                }
-            }
+            });
+            counter.add_bits(bit_len);
+            blocks.push(DeflateBlockPlan {
+                dynamic_plan: chosen_dynamic,
+                token_range,
+            });
         }
-        if token_end != tokens.len() || output_len != self.bytes.len() {
-            return Err(zip_static(
-                "deflate block plan이 전체 입력을 포함하지 않습니다.",
-            ));
-        }
-        write_empty_stored_block(&mut counter)?;
         counter.write_bits(1, 1)?;
         counter.write_bits(1, 2)?;
         write_fixed_symbol(&mut counter, 256)?;
@@ -1361,10 +1232,7 @@ impl DeflateWriter<'_, '_> {
             tokens,
         }))
     }
-    fn tokens(
-        &mut self,
-        boundaries: &[DeflateOutputBoundary],
-    ) -> ZipResult<Option<(Vec<DeflateToken>, u32)>> {
+    fn tokens(&mut self) -> ZipResult<Option<(Vec<DeflateToken>, u32)>> {
         let bytes = self.bytes;
         let workspace = &mut *self.workspace;
         workspace.prepare_for_input(bytes.len())?;
@@ -1372,24 +1240,9 @@ impl DeflateWriter<'_, '_> {
         let head = &mut workspace.head;
         let previous = &mut workspace.previous;
         let work_budget = &mut workspace.work_budget;
-        let mut boundary_index = 0_usize;
         let mut skip_next_hash_insert = true;
         let mut position = 0_usize;
         while position < bytes.len() {
-            while let Some(boundary) = boundaries
-                .get(boundary_index)
-                .filter(|boundary| boundary.output_end <= position)
-            {
-                if boundary.empty_stored_after != 0 {
-                    head.fill(usize::MAX);
-                    previous.fill(0);
-                    skip_next_hash_insert = true;
-                }
-                boundary_index = boundary_index.strict_add(1);
-            }
-            let boundary_end = boundaries
-                .get(boundary_index)
-                .map_or(bytes.len(), |boundary| boundary.output_end);
             let mut best_len = 0_usize;
             let mut best_distance = 0_usize;
             let position_hash = hash3(bytes, position);
@@ -1398,7 +1251,7 @@ impl DeflateWriter<'_, '_> {
             {
                 let mut candidate = head_candidate;
                 let min_candidate = position.saturating_sub(DEFLATE_MAX_DISTANCE);
-                let max_len = boundary_end.strict_sub(position).min(MAX_MATCH);
+                let max_len = bytes.len().strict_sub(position).min(MAX_MATCH);
                 let mut chain_len = 0_usize;
                 while candidate != usize::MAX
                     && candidate >= min_candidate
@@ -1576,11 +1429,6 @@ fn push_deflate_token(tokens: &mut Vec<DeflateToken>, token: DeflateToken) -> Zi
     tokens.push(token);
     Ok(())
 }
-fn find_bytes(bytes: &[u8], needle: &[u8]) -> Option<usize> {
-    bytes
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
 fn push_repeated(lengths: &mut Vec<u8>, value: u8, repeat: usize, total: usize) -> ZipResult<()> {
     let next_len = lengths
         .len()
@@ -1595,15 +1443,6 @@ fn reverse_low_bits(value: u16, count: u8) -> u16 {
     value
         .reverse_bits()
         .unbounded_shr(u16::BITS.strict_sub(u32::from(count)))
-}
-fn write_empty_stored_block<W>(writer: &mut W) -> ZipResult<()>
-where
-    W: BitSink,
-{
-    writer.write_bits(0, 3)?;
-    writer.align_to_byte()?;
-    writer.write_bits(0, 16)?;
-    writer.write_bits(u16::MAX, 16)
 }
 fn write_fixed_symbol<W>(writer: &mut W, symbol: u16) -> ZipResult<()>
 where

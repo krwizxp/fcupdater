@@ -51,7 +51,7 @@ const XLSX_PARTS: [(&str, PartRole, Option<&str>); 16] = [
     xlsx_part!("xl/theme/theme1.xml", Required, CT_THEME),
     xlsx_part!("xl/styles.xml", Required, CT_STYLES),
     xlsx_part!("xl/sharedStrings.xml", Required, CT_SHARED_STRINGS),
-    xlsx_part!("docProps/thumbnail.emf", OptionalInput),
+    xlsx_part!("docProps/thumbnail.emf", InputOnly),
     xlsx_part!(CALC_CHAIN_PATH, InputOnly, CT_CALC_CHAIN),
     xlsx_part!("docProps/core.xml", Required, CT_CORE_PROPERTIES),
     xlsx_part!("docProps/app.xml", Required, CT_APP_PROPERTIES),

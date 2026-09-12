@@ -216,10 +216,14 @@ impl<'xml> XmlScanner<'xml> {
     }
     pub(super) fn next_direct_element_until(
         &mut self,
-        closing_name: &str,
+        root: &XmlTag<'_>,
         context: &str,
     ) -> Result<Option<XmlElement<'xml>>> {
-        self.next_direct_element_before(Some(closing_name), context)
+        if root.self_closing {
+            self.validate_direct_gap(self.cursor, self.xml.len(), context)?;
+            return Ok(None);
+        }
+        self.next_direct_element_before(Some(root.name), context)
     }
     pub(super) fn next_direct_opening_named_until(
         &mut self,
@@ -539,7 +543,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                 let Some(body) = entity.strip_prefix('#') else {
                     return Err(err(format!("지원하지 않는 XML entity입니다: &{entity};")));
                 };
-                let value = if let Some(hex) = body.strip_prefix(['x', 'X']) {
+                let value = if let Some(hex) = body.strip_prefix('x') {
                     parse_numeric_entity(
                         hex,
                         16,

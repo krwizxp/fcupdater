@@ -152,40 +152,6 @@ const EXCEL_CORE_PROPERTIES: [(&str, &str, &str); 9] = [
     ),
     ("dc:language", "<dc:language>", "</dc:language>"),
 ];
-const BLANK_EXCEL_THUMBNAIL_DWORDS: [u32; 32] = [
-    1,
-    108,
-    0,
-    0,
-    1,
-    1,
-    0,
-    0,
-    26,
-    26,
-    0x464d_4520,
-    0x0001_0000,
-    128,
-    2,
-    1,
-    0,
-    0,
-    0,
-    96,
-    96,
-    25,
-    25,
-    0,
-    0,
-    0,
-    25_000,
-    25_000,
-    14,
-    20,
-    0,
-    0,
-    20,
-];
 #[derive(Clone, Copy)]
 struct RelationshipSpec {
     optional_part: Option<&'static str>,
@@ -586,7 +552,7 @@ impl XlsxContainer {
         let mut forbidden = None;
         let mut empty_protection_seen = false;
         while let Some(element) =
-            scanner.next_direct_element_until(workbook_root.name, "workbook.xml")?
+            scanner.next_direct_element_until(&workbook_root, "workbook.xml")?
         {
             let tag = element.opening;
             let candidate = match tag.local_name {
@@ -782,9 +748,7 @@ impl XlsxContainer {
         let mut core_values = [None; EXCEL_CORE_PROPERTIES.len()];
         let (mut core_scanner, core_root) =
             scan_xml_root(source_core_xml, "cp:coreProperties", "core.xml")?;
-        while let Some(element) =
-            core_scanner.next_direct_element_until(core_root.name, "core.xml")?
-        {
+        while let Some(element) = core_scanner.next_direct_element_until(&core_root, "core.xml")? {
             let Some((property, slot)) = EXCEL_CORE_PROPERTIES
                 .iter()
                 .zip(&mut core_values)
@@ -809,12 +773,12 @@ impl XlsxContainer {
             })?;
             *slot = Some(body);
         }
-        for ((qualified, opening, closing), body_value) in
+        for ((_, opening, closing), body_value) in
             EXCEL_CORE_PROPERTIES.into_iter().zip(core_values)
         {
-            let body = body_value
-                .ok_or_else(|| err(format!("core.xml의 {qualified} 요소를 찾지 못했습니다.")))?;
-            core_xml.extend([opening, body, closing]);
+            if let Some(body) = body_value {
+                core_xml.extend([opening, body, closing]);
+            }
         }
         core_xml.push_str("</cp:coreProperties>");
         *source_core = core_xml.into_bytes();
@@ -823,25 +787,32 @@ impl XlsxContainer {
             .map_err(|source_error| err_with_source("app.xml UTF-8 해석 실패", source_error))?;
         let (mut app_scanner, app_root) = scan_xml_root(source_app_xml, "Properties", "app.xml")?;
         let mut total_time_body = None;
-        while let Some(element) = app_scanner.next_direct_element_until(app_root.name, "app.xml")? {
+        while let Some(element) = app_scanner.next_direct_element_until(&app_root, "app.xml")? {
             if element.opening.name == "TotalTime"
                 && total_time_body.replace(element.body).is_some()
             {
                 return Err(err("app.xml에 TotalTime 요소가 여러 개 있습니다."));
             }
         }
-        let total_time = total_time_body
-            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-            .ok_or_else(|| err("app.xml의 TotalTime 형식이 올바르지 않습니다."))?;
         let mut app_xml = try_string_with_capacity(
-            960_usize.strict_add(total_time.len()),
+            960_usize.strict_add(total_time_body.map_or(0, str::len)),
             "Excel app.xml 메모리 확보 실패",
         )?;
         app_xml.push_str(concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n",
-            "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\"><Template></Template><TotalTime>",
+            "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">",
         ));
-        app_xml.extend([total_time, "</TotalTime><Pages>2</Pages><Words>0</Words><Characters>0</Characters><Application>Microsoft Excel</Application><DocSecurity>0</DocSecurity><Paragraphs>0</Paragraphs><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>워크시트</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>유류비</vt:lpstr><vt:lpstr>변경내역</vt:lpstr></vt:vector></TitlesOfParts><LinksUpToDate>false</LinksUpToDate><CharactersWithSpaces>0</CharactersWithSpaces><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>16.0300</AppVersion></Properties>"]);
+        if let Some(body) = total_time_body {
+            let value = decode_xml_entities(body)?
+                .trim_matches([' ', '\t', '\r', '\n'])
+                .parse::<i32>()
+                .map_err(|source| err_with_source("app.xml의 TotalTime 해석 실패", source))?;
+            if value < 0_i32 {
+                return Err(err("app.xml의 TotalTime은 음수일 수 없습니다."));
+            }
+            app_xml.extend(["<TotalTime>", body, "</TotalTime>"]);
+        }
+        app_xml.extend(["<Application>", crate::APP_NAME, "</Application><HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>워크시트</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>유류비</vt:lpstr><vt:lpstr>변경내역</vt:lpstr></vt:vector></TitlesOfParts></Properties>"]);
         *source_app = app_xml.into_bytes();
         for (index, (name, role, _)) in XLSX_PARTS.into_iter().enumerate() {
             let slot = self
@@ -858,14 +829,6 @@ impl XlsxContainer {
                 "xl/_rels/workbook.xml.rels" => excel_static_xml(EXCEL_WORKBOOK_RELS_XML),
                 "xl/styles.xml" => excel_static_xml(EXCEL_STYLES_XML),
                 "xl/theme/theme1.xml" => excel_static_xml(EXCEL_THEME_XML),
-                "docProps/thumbnail.emf" => {
-                    let words = BLANK_EXCEL_THUMBNAIL_DWORDS.map(u32::to_le_bytes);
-                    let thumbnail = words.as_flattened();
-                    let mut bytes =
-                        try_vec_with_capacity(thumbnail.len(), "Excel thumbnail 메모리 확보 실패")?;
-                    bytes.extend_from_slice(thumbnail);
-                    bytes
-                }
                 _ => slot.take().unwrap_or_else(|| process::abort()),
             };
             *slot = Some(bytes);
@@ -1640,16 +1603,7 @@ fn validate_empty_xml_root<const N: usize>(
 ) -> Result<()> {
     let (mut scanner, root) = scan_xml_root(xml, expected_name, context)?;
     validate_exact_attrs(root.raw, expected_attrs, context)?;
-    let empty = if root.self_closing {
-        let trailing = xml
-            .get(root.end.strict_add(1)..)
-            .unwrap_or_else(|| process::abort());
-        xml_misc_only(trailing, false)
-    } else {
-        scanner
-            .next_direct_element_until(root.name, context)?
-            .is_none()
-    };
+    let empty = scanner.next_direct_element_until(&root, context)?.is_none();
     empty.ok_or_else(|| err(format!("{context}의 XML root가 비어 있지 않습니다.")))
 }
 fn required_xml_attr<'tag>(
@@ -1685,7 +1639,7 @@ fn visit_direct_xml_children<'xml>(
         &format!("{context} root"),
     )?;
     let mut child_count = 0_usize;
-    while let Some(child) = scanner.next_direct_element_until(root.name, context)? {
+    while let Some(child) = scanner.next_direct_element_until(&root, context)? {
         let tag = child.opening;
         if tag.name != tag.local_name {
             return Err(err(format!(
