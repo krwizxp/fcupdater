@@ -1208,8 +1208,13 @@ fn style_entries<'text>(
         .map_err(|source| {
             err_with_source(format!("styles.xml {group_name} count 해석 실패"), source)
         })?;
-    let mut entries =
-        try_vec_with_capacity(declared_count, "styles.xml 항목 목록 메모리 확보 실패")?;
+    let capacity = declared_count.min(
+        element
+            .body
+            .len()
+            .div_euclid(entry_name.len().strict_add(3)),
+    );
+    let mut entries = try_vec_with_capacity(capacity, "styles.xml 항목 목록 메모리 확보 실패")?;
     let mut child_scanner = XmlScanner::new(element.body);
     while let Some(entry) = child_scanner.next_direct_element(group_name)? {
         if entry.opening.name != entry_name {
@@ -1218,6 +1223,9 @@ fn style_entries<'text>(
                 entry.opening.name
             )));
         }
+        entries
+            .try_reserve(1)
+            .map_err(|source| err_with_source("styles.xml 항목 목록 메모리 확보 실패", source))?;
         entries.push(
             element
                 .body

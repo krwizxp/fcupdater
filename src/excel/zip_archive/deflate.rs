@@ -35,6 +35,7 @@ macro_rules! matching_prefix_16 {
 const DECODE_MAX_SYMBOLS: usize = FIXED_LITERAL_SYMBOLS;
 const DECODE_ROOT_BITS: u8 = 9;
 const DECODE_ROOT_SIZE: usize = 1 << DECODE_ROOT_BITS;
+const FINAL_FIXED_BLOCK_BITS: usize = 3 + 7;
 const HUFFMAN_NODE_CAPACITY: usize = LITERAL_LENGTH_SYMBOLS.strict_mul(2).strict_add(1);
 const DEFLATE_SEARCH_WORK_LIMIT: usize = 512 * 1024 * 1024;
 const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
@@ -69,12 +70,6 @@ struct BitReader<'bytes> {
     bit_count: u8,
     bytes: &'bytes [u8],
     cursor: usize,
-}
-struct BitCounter {
-    bit_len: usize,
-}
-trait BitSink {
-    fn write_bits(&mut self, value: u16, count: u8) -> ZipResult<()>;
 }
 struct BitWriter<'writer> {
     bit_buffer: u64,
@@ -227,33 +222,6 @@ impl BitReader<'_> {
         Some(u16::from_le_bytes([low, high]))
     }
 }
-impl BitCounter {
-    const fn add_bits(&mut self, count: usize) {
-        self.bit_len = self.bit_len.strict_add(count);
-    }
-    const fn byte_len(&self) -> usize {
-        self.bit_len.div_ceil(8)
-    }
-}
-impl BitSink for BitCounter {
-    fn write_bits(&mut self, _value: u16, count: u8) -> ZipResult<()> {
-        self.add_bits(usize::from(count));
-        Ok(())
-    }
-}
-impl BitSink for BitWriter<'_> {
-    fn write_bits(&mut self, value: u16, count: u8) -> ZipResult<()> {
-        let mask = u16::MAX.unbounded_shr(u16::BITS.strict_sub(u32::from(count)));
-        self.bit_buffer |= u64::from(value & mask) << self.bit_count;
-        self.bit_count = self.bit_count.strict_add(count);
-        while self.bit_count >= 8 {
-            self.write_byte(self.bit_buffer.to_le_bytes()[0])?;
-            self.bit_buffer >>= 8_u8;
-            self.bit_count = self.bit_count.strict_sub(8);
-        }
-        Ok(())
-    }
-}
 impl BitWriter<'_> {
     fn flush_buffer(&mut self) -> ZipResult<()> {
         if self.buffered_len == 0 {
@@ -267,6 +235,17 @@ impl BitWriter<'_> {
             .write_all(buffered)
             .map_err(|source| zip_with_source("deflate stream 쓰기 실패", source))?;
         self.buffered_len = 0;
+        Ok(())
+    }
+    fn write_bits(&mut self, value: u16, count: u8) -> ZipResult<()> {
+        let mask = u16::MAX.unbounded_shr(u16::BITS.strict_sub(u32::from(count)));
+        self.bit_buffer |= u64::from(value & mask) << self.bit_count;
+        self.bit_count = self.bit_count.strict_add(count);
+        while self.bit_count >= 8 {
+            self.write_byte(self.bit_buffer.to_le_bytes()[0])?;
+            self.bit_buffer >>= 8_u8;
+            self.bit_count = self.bit_count.strict_sub(8);
+        }
         Ok(())
     }
     fn write_byte(&mut self, byte: u8) -> ZipResult<()> {
@@ -402,10 +381,7 @@ impl WriteHuffman {
         }
         Ok(Self { codes, lengths })
     }
-    fn write_symbol<W>(&self, writer: &mut W, symbol: u16) -> ZipResult<()>
-    where
-        W: BitSink,
-    {
+    fn write_symbol(&self, writer: &mut BitWriter<'_>, symbol: u16) -> ZipResult<()> {
         let index = usize::from(symbol);
         let len = huffman_get(&self.lengths, index);
         if len == 0 {
@@ -808,10 +784,7 @@ impl DynamicFrequencies {
     }
 }
 impl DynamicDeflatePlan {
-    fn write_block<W>(&self, tokens: &[DeflateToken], writer: &mut W) -> ZipResult<()>
-    where
-        W: BitSink,
-    {
+    fn write_block(&self, tokens: &[DeflateToken], writer: &mut BitWriter<'_>) -> ZipResult<()> {
         writer.write_bits(0, 1)?;
         writer.write_bits(2, 2)?;
         writer.write_bits(
@@ -1039,10 +1012,7 @@ impl DeflatePlan {
     pub(super) const fn len(&self) -> usize {
         self.compressed_len
     }
-    fn write<W>(&self, writer: &mut W) -> ZipResult<()>
-    where
-        W: BitSink,
-    {
+    fn write(&self, writer: &mut BitWriter<'_>) -> ZipResult<()> {
         for block in &self.blocks {
             let tokens = self
                 .tokens
@@ -1132,20 +1102,20 @@ impl DeflateWorkspace {
 }
 impl DeflateWriter<'_, '_> {
     fn distance_symbol(distance: u16) -> DeflateSymbol {
-        let distance_value = usize::from(distance);
-        let index = DISTANCE_BASES
-            .partition_point(|&base| base <= distance_value)
-            .checked_sub(1)
-            .unwrap_or_else(|| process::abort());
-        let (&base, &extra_bits) = DISTANCE_BASES
-            .get(index)
-            .zip(DISTANCE_EXTRA_BITS.get(index))
-            .unwrap_or_else(|| process::abort());
+        let value = distance.strict_sub(1);
+        let [extra_bits, _, _, _] = u16::BITS
+            .strict_sub(value.leading_zeros())
+            .saturating_sub(2)
+            .to_le_bytes();
+        let symbol = if extra_bits == 0 {
+            value
+        } else {
+            u16::from(extra_bits).strict_add(1).strict_mul(2) | ((value >> extra_bits) & 1)
+        };
         DeflateSymbol {
-            extra: u16::try_from(distance_value.strict_sub(base))
-                .unwrap_or_else(|_| process::abort()),
+            extra: value & 1_u16.strict_shl(u32::from(extra_bits)).strict_sub(1),
             extra_bits,
-            symbol: u16::try_from(index).unwrap_or_else(|_| process::abort()),
+            symbol,
         }
     }
     fn insert_position(
@@ -1170,20 +1140,27 @@ impl DeflateWriter<'_, '_> {
         *head_slot = position;
     }
     fn length_symbol(length: u16) -> DeflateSymbol {
-        let length_value = usize::from(length);
-        let index = LENGTH_BASES
-            .partition_point(|&base| base <= length_value)
-            .checked_sub(1)
-            .unwrap_or_else(|| process::abort());
-        let (&base, &extra_bits) = LENGTH_BASES
-            .get(index)
-            .zip(LENGTH_EXTRA_BITS.get(index))
-            .unwrap_or_else(|| process::abort());
+        if length == 258 {
+            return DeflateSymbol {
+                extra: 0,
+                extra_bits: 0,
+                symbol: 285,
+            };
+        }
+        let value = length.strict_sub(3);
+        let [extra_bits, _, _, _] = u16::BITS
+            .strict_sub(value.leading_zeros())
+            .saturating_sub(3)
+            .to_le_bytes();
+        let index = if extra_bits == 0 {
+            value
+        } else {
+            u16::from(extra_bits).strict_add(1).strict_mul(4) | ((value >> extra_bits) & 3)
+        };
         DeflateSymbol {
-            extra: u16::try_from(length_value.strict_sub(base))
-                .unwrap_or_else(|_| process::abort()),
+            extra: value & 1_u16.strict_shl(u32::from(extra_bits)).strict_sub(1),
             extra_bits,
-            symbol: 257_u16.strict_add(u16::try_from(index).unwrap_or_else(|_| process::abort())),
+            symbol: 257_u16.strict_add(index),
         }
     }
     pub(super) fn plan(&mut self) -> ZipResult<Option<DeflatePlan>> {
@@ -1194,7 +1171,7 @@ impl DeflateWriter<'_, '_> {
             tokens.len().div_ceil(TOKEN_BLOCK_LIMIT),
             "deflate block plan 메모리 확보 실패",
         )?;
-        let mut counter = BitCounter { bit_len: 0 };
+        let mut total_bits = FINAL_FIXED_BLOCK_BITS;
         for (block_index, block_tokens) in tokens.chunks(TOKEN_BLOCK_LIMIT).enumerate() {
             let start = block_index.strict_mul(TOKEN_BLOCK_LIMIT);
             let token_range = Range {
@@ -1215,16 +1192,13 @@ impl DeflateWriter<'_, '_> {
                     (None, fixed_bit_len)
                 }
             });
-            counter.add_bits(bit_len);
+            total_bits = total_bits.strict_add(bit_len);
             blocks.push(DeflateBlockPlan {
                 dynamic_plan: chosen_dynamic,
                 token_range,
             });
         }
-        counter.write_bits(1, 1)?;
-        counter.write_bits(1, 2)?;
-        write_fixed_symbol(&mut counter, 256)?;
-        let compressed_len = counter.byte_len();
+        let compressed_len = total_bits.div_ceil(8);
         Ok(Some(DeflatePlan {
             blocks,
             compressed_len,
@@ -1444,10 +1418,7 @@ fn reverse_low_bits(value: u16, count: u8) -> u16 {
         .reverse_bits()
         .unbounded_shr(u16::BITS.strict_sub(u32::from(count)))
 }
-fn write_fixed_symbol<W>(writer: &mut W, symbol: u16) -> ZipResult<()>
-where
-    W: BitSink,
-{
+fn write_fixed_symbol(writer: &mut BitWriter<'_>, symbol: u16) -> ZipResult<()> {
     let (code, bit_count) = match symbol {
         0..=143 => (0x30_u16.strict_add(symbol), 8),
         144..=255 => (0x190_u16.strict_add(symbol.strict_sub(144)), 9),
