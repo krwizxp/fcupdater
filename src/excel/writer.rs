@@ -418,11 +418,7 @@ impl Workbook {
             err_with_source("shared string index map 메모리 확보 실패", source)
         })?;
         for (value_index, entry) in entries.iter().enumerate() {
-            if index.insert(Rc::clone(&entry.text), value_index).is_some() {
-                return Err(err(format!(
-                    "고정 sharedStrings에 중복 문자열이 있습니다: index={value_index}"
-                )));
-            }
+            index.entry(Rc::clone(&entry.text)).or_insert(value_index);
         }
         let shared_strings = SharedStringTable { entries, index };
         let master_sheet = WorksheetParser {

@@ -103,7 +103,9 @@ impl SourceRecordRef<'_> {
 #[derive(Clone, Copy)]
 struct CfbHeader {
     first_dir_sector: u32,
+    first_mini_fat_sector: u32,
     num_fat_sectors: u32,
+    num_mini_fat_sectors: u32,
 }
 struct BiffRecordReader<'workbook> {
     context: &'static str,
@@ -135,8 +137,7 @@ impl SourceReader {
         let total_entries = fat_sector_ids.len().strict_mul(entries_per_sector);
         let mut fat = try_vec_with_capacity(total_entries, "CFB FAT 메모리 확보 실패")?;
         for &sid in fat_sector_ids {
-            let sector_idx = sid as usize;
-            let sector = get_sector_slice_at_index(&self.0, sector_idx, sid)?;
+            let sector = get_sector_slice(&self.0, sid)?;
             let (chunks, &[]) = sector.as_chunks::<4>() else {
                 return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
             };
@@ -183,8 +184,6 @@ impl SourceReader {
         for (offset, expected, label) in [
             (0x48, 0, "DIFAT sector 개수"),
             (0x44, CFB_END_OF_CHAIN, "DIFAT 시작 sector"),
-            (0x40, 0, "mini FAT sector 개수"),
-            (0x3C, CFB_END_OF_CHAIN, "mini FAT 시작 sector"),
             (0x38, CFB_MINI_STREAM_CUTOFF_SIZE, "mini stream cutoff"),
         ] {
             let actual = read_u32_le(data, offset)?;
@@ -196,21 +195,27 @@ impl SourceReader {
         }
         Ok(CfbHeader {
             first_dir_sector: read_u32_le(data, 0x30)?,
+            first_mini_fat_sector: read_u32_le(data, 0x3C)?,
             num_fat_sectors: read_u32_le(data, 0x2C)?,
+            num_mini_fat_sectors: read_u32_le(data, 0x40)?,
         })
     }
     fn read_workbook_stream<'source>(
         &'source self,
         header: CfbHeader,
         fat: &[u32],
+        mini_fat_last_sector: Option<u32>,
     ) -> Result<Cow<'source, [u8]>> {
-        let dir_stream = read_stream_from_fat_chain(
+        let (dir_stream, dir_last_sector) = read_stream_from_fat_chain(
             &self.0,
             fat,
             header.first_dir_sector,
             None,
             "CFB 디렉터리",
         )?;
+        if dir_last_sector.is_some() && dir_last_sector == mini_fat_last_sector {
+            return Err(err("CFB 디렉터리와 Mini FAT의 sector가 겹칩니다."));
+        }
         let (chunks, &[]) = dir_stream.as_ref().as_chunks::<128>() else {
             return Err(err("CFB 디렉터리 stream 길이가 128바이트 단위가 아닙니다."));
         };
@@ -289,7 +294,14 @@ impl SourceReader {
                 "Opinet 고정 소스에서 예상하지 않은 mini stream입니다: Workbook",
             ));
         }
-        read_stream_from_fat_chain(&self.0, fat, start_sector, Some(stream_size), "Workbook")
+        let (workbook, last_sector) =
+            read_stream_from_fat_chain(&self.0, fat, start_sector, Some(stream_size), "Workbook")?;
+        if last_sector.is_some()
+            && (last_sector == dir_last_sector || last_sector == mini_fat_last_sector)
+        {
+            return Err(err("CFB Workbook과 메타데이터의 sector가 겹칩니다."));
+        }
+        Ok(workbook)
     }
     fn read_xls_workbook(&self) -> Result<Cow<'_, [u8]>> {
         let header = self.parse_cfb_header()?;
@@ -335,7 +347,25 @@ impl SourceReader {
             )));
         }
         let fat = self.build_fat_table(&difat_entries)?;
-        self.read_workbook_stream(header, &fat)
+        let mini_fat_last_sector = if header.num_mini_fat_sectors == 0 {
+            if header.first_mini_fat_sector != CFB_END_OF_CHAIN {
+                return Err(err(format!(
+                    "Opinet 고정 소스에서 예상하지 않은 CFB mini FAT 시작 sector: {:#010x}",
+                    header.first_mini_fat_sector
+                )));
+            }
+            None
+        } else {
+            read_stream_from_fat_chain(
+                &self.0,
+                &fat,
+                header.first_mini_fat_sector,
+                Some(u64::from(header.num_mini_fat_sectors).strict_mul(CFB_SECTOR_SIZE as u64)),
+                "CFB Mini FAT",
+            )?
+            .1
+        };
+        self.read_workbook_stream(header, &fat, mini_fat_last_sector)
     }
     pub(crate) fn visit_rows(
         self,
@@ -997,8 +1027,8 @@ fn row_text_trimmed<'strings>(row: &SourceRow<'strings>, idx: usize) -> &'string
 const fn is_regular_sector_id(sector_id: u32) -> bool {
     sector_id < CFB_DIFAT_SECT
 }
-fn get_sector_slice_at_index(data: &[u8], sector_idx: usize, sector_id: u32) -> Result<&[u8]> {
-    let start_offset = sector_idx
+fn get_sector_slice(data: &[u8], sector_id: u32) -> Result<&[u8]> {
+    let start_offset = (sector_id as usize)
         .checked_add(1)
         .and_then(|index| index.checked_mul(CFB_SECTOR_SIZE));
     let sector_range =
@@ -1017,10 +1047,10 @@ fn read_stream_from_fat_chain<'data>(
     start_sector: u32,
     size_limit: Option<u64>,
     stream_name: &str,
-) -> Result<Cow<'data, [u8]>> {
+) -> Result<(Cow<'data, [u8]>, Option<u32>)> {
     if !is_regular_sector_id(start_sector) {
         if size_limit == Some(0) {
-            return Ok(Cow::Borrowed(&[]));
+            return Ok((Cow::Borrowed(&[]), None));
         }
         return Err(err(format!(
             "FAT stream 시작 sector가 비정상입니다: {stream_name} ({start_sector:#x})"
@@ -1075,7 +1105,7 @@ fn read_stream_from_fat_chain<'data>(
                 "FAT chain이 free sector를 참조합니다: {stream_name} (sector={next_sid})"
             )));
         }
-        let sector = get_sector_slice_at_index(data, sid_usize, sid)?;
+        let sector = get_sector_slice(data, sid)?;
         let take = remaining.map_or(sector.len(), |remain| remain.min(sector.len()));
         stream_len = stream_len.strict_add(take);
         if let Some(remain) = remaining.as_mut() {
@@ -1100,14 +1130,14 @@ fn read_stream_from_fat_chain<'data>(
         let stream = data
             .get(start_offset..end_offset)
             .ok_or_else(|| err("CFB stream 범위가 파일을 벗어났습니다."))?;
-        return Ok(Cow::Borrowed(stream));
+        return Ok((Cow::Borrowed(stream), previous_sid));
     }
     let mut out = try_vec_with_capacity(stream_len, "FAT stream 메모리 확보 실패")?;
     let mut copy_remaining = stream_len;
     let mut copy_sid = start_sector;
     while copy_remaining != 0 {
         let sid_usize = copy_sid as usize;
-        let sector = get_sector_slice_at_index(data, sid_usize, copy_sid)?;
+        let sector = get_sector_slice(data, copy_sid)?;
         let take = copy_remaining.min(sector.len());
         out.extend_from_slice(
             sector
@@ -1122,7 +1152,7 @@ fn read_stream_from_fat_chain<'data>(
             ))
         })?;
     }
-    Ok(Cow::Owned(out))
+    Ok((Cow::Owned(out), previous_sid))
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
     let arr = read_le_array::<2>(bytes, offset, "u16 read out of range at ")?;

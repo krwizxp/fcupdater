@@ -103,58 +103,20 @@ impl<'xml> XmlScanner<'xml> {
         if tail.starts_with("<!--") {
             return find_delimited_markup_end(self.xml, tag_start, 4, "-->");
         }
-        if tail.starts_with("<![CDATA[") {
-            return find_delimited_markup_end(self.xml, tag_start, 9, "]]>");
+        if tail.starts_with("<!") {
+            return None;
         }
         if tail.starts_with("<?") {
             return find_delimited_markup_end(self.xml, tag_start, 2, "?>");
         }
-        if !tail.starts_with('<') {
-            return None;
-        }
-        let is_declaration = tail.starts_with("<!");
         let bytes = self.xml.as_bytes();
-        let mut cursor = if is_declaration {
-            tag_start.strict_add(2)
-        } else {
-            tag_start
-        };
-        let mut in_comment = false;
+        let mut cursor = tag_start;
         let mut quote = None;
-        let mut subset_depth = 0_usize;
         while let Some(&byte) = bytes.get(cursor) {
-            if in_comment {
-                if bytes
-                    .get(cursor..)
-                    .is_some_and(|remaining| remaining.starts_with(b"-->"))
-                {
-                    in_comment = false;
-                    cursor = cursor.strict_add(3);
-                } else {
-                    cursor = cursor.strict_add(1);
-                }
-                continue;
-            }
-            if is_declaration
-                && quote.is_none()
-                && bytes
-                    .get(cursor..)
-                    .is_some_and(|remaining| remaining.starts_with(b"<!--"))
-            {
-                in_comment = true;
-                cursor = cursor.strict_add(4);
-                continue;
-            }
             match quote {
                 Some(active_quote) if byte == active_quote => quote = None,
                 None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
-                None if is_declaration && byte == b'[' => {
-                    subset_depth = subset_depth.strict_add(1);
-                }
-                None if is_declaration && byte == b']' && subset_depth != 0 => {
-                    subset_depth = subset_depth.strict_sub(1);
-                }
-                None if byte == b'>' && subset_depth == 0 => return Some(cursor),
+                None if byte == b'>' => return Some(cursor),
                 Some(_) | None => {}
             }
             cursor = cursor.strict_add(1);
@@ -280,10 +242,8 @@ impl<'xml> XmlScanner<'xml> {
             let is_start = if first == b'/' {
                 name_start = name_start.strict_add(1);
                 false
-            } else if first == b'?' || first == b'!' && self.xml.get(start..)?.starts_with("<!--") {
+            } else if matches!(first, b'?' | b'!') {
                 continue;
-            } else if first == b'!' {
-                return None;
             } else {
                 true
             };
