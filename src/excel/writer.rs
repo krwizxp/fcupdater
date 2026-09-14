@@ -10,6 +10,7 @@ use super::{
 use crate::diagnostic::{
     Result, append_fmt, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
 };
+use crate::master_sheet::{DECIMAL_SCALE, MasterSheetUpdater};
 use alloc::{
     borrow::Cow,
     collections::{BTreeMap, btree_map::Entry},
@@ -453,12 +454,20 @@ impl Workbook {
     }
     fn request_recalculation_caches(&mut self) -> Result<()> {
         let strings = &self.shared_strings;
-        let mut input = [0_i32; 6];
+        let mut input = [0_i128; 6];
         for (slot, row) in input.iter_mut().zip(4_u32..=9_u32) {
-            *slot = self
+            let required_value = || err(format!("유류비 고정 입력값이 비어 있습니다: B{row}"));
+            let integer = self
                 .master_sheet
                 .get_i32_at(2, row, strings)?
-                .ok_or_else(|| err(format!("유류비 고정 입력값이 비어 있습니다: B{row}")))?;
+                .ok_or_else(required_value)?;
+            *slot = if row <= 6 {
+                MasterSheetUpdater::get_f64_at(&self.master_sheet, 2, row, strings)?
+                    .ok_or_else(required_value)?
+                    .as_i128()
+            } else {
+                i128::from(integer).strict_mul(DECIMAL_SCALE.as_i128())
+            };
         }
         let [
             gasoline_qty,
@@ -467,10 +476,10 @@ impl Workbook {
             gasoline_weight,
             premium_weight,
             diesel_weight,
-        ] = input.map(i128::from);
+        ] = input;
         let total_qty = gasoline_qty.strict_add(premium_qty).strict_add(diesel_qty);
         let mut cache = String::new();
-        push_decimal_text!(&mut cache, total_qty);
+        format_excel_ratio_into(&mut cache, total_qty, DECIMAL_SCALE.as_i128());
         self.master_sheet
             .set_formula_cached_value_at(2, 10, Some(&cache), false)?;
         let fuel_denominator = gasoline_qty.strict_add(premium_qty);
@@ -480,7 +489,11 @@ impl Workbook {
             let numerator = gasoline_qty
                 .strict_mul(gasoline_weight)
                 .strict_add(premium_qty.strict_mul(premium_weight));
-            format_excel_ratio_into(&mut cache, numerator, fuel_denominator);
+            format_excel_ratio_into(
+                &mut cache,
+                numerator,
+                fuel_denominator.strict_mul(DECIMAL_SCALE.as_i128()),
+            );
             Some(cache.as_str())
         };
         self.master_sheet
@@ -494,7 +507,11 @@ impl Workbook {
             let numerator = gasoline_qty
                 .strict_mul(gasoline_weight)
                 .strict_add(premium_qty.strict_mul(diesel_weight));
-            format_excel_ratio_into(&mut cache, numerator, fuel_denominator);
+            format_excel_ratio_into(
+                &mut cache,
+                numerator,
+                fuel_denominator.strict_mul(DECIMAL_SCALE.as_i128()),
+            );
             Some(cache.as_str())
         };
         self.master_sheet

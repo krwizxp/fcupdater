@@ -78,11 +78,11 @@ fn main() -> Result<()> {
                 )));
             }
             if is_help {
-                write_line(&mut out, format_args!("{HELP_TEXT}"))?;
+                writeln!(&mut out, "{HELP_TEXT}")?;
                 return Ok(());
             }
             if is_version {
-                write_line(&mut out, format_args!("{APP_NAME} {APP_VERSION}"))?;
+                writeln!(&mut out, "{APP_NAME} {APP_VERSION}")?;
                 return Ok(());
             }
             SaveVerification::Verify

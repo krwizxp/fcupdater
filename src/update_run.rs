@@ -75,7 +75,7 @@ pub(super) struct UpdateRun<'out> {
 impl UpdateRun<'_> {
     fn load_source(&mut self) -> Result<LoadedSource> {
         let source_data = SourceDownload::default().refresh_source()?;
-        write_line(self.out, format_args!("Opinet 소스 데이터 준비 완료"))?;
+        writeln!(self.out, "Opinet 소스 데이터 준비 완료")?;
         let mut loaded_source = LoadedSource {
             index: HashMap::new(),
             region_counts: [0; TARGET_REGION_COUNT],
@@ -122,7 +122,7 @@ impl UpdateRun<'_> {
         &mut self,
         loaded_source: &'source LoadedSource,
     ) -> Result<(StdWorkbook, MasterSheetUpdateResult<'source>)> {
-        write_line(self.out, format_args!("마스터 파일 처리 중..."))?;
+        writeln!(self.out, "마스터 파일 처리 중...")?;
         let master_file = open_regular(self.master_path, false).map_err(|source| {
             err_with_source(
                 path_context_message("마스터 xlsx 파일 열기 실패", self.master_path),
@@ -135,7 +135,7 @@ impl UpdateRun<'_> {
             source_index: &loaded_source.index,
         }
         .update(&mut book)?;
-        write_line(self.out, format_args!("대상 지역별 건수 확인:"))?;
+        writeln!(self.out, "대상 지역별 건수 확인:")?;
         let mut region_validation_error = None;
         for (((region, existing_count), matched_existing_count), source_count) in TARGET_REGIONS
             .iter()
@@ -144,11 +144,9 @@ impl UpdateRun<'_> {
             .zip(loaded_source.region_counts.iter())
         {
             let label = region.label();
-            write_line(
+            writeln!(
                 self.out,
-                format_args!(
-                    "  {label}: 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
-                ),
+                "  {label}: 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
             )?;
             if region_validation_error.is_none()
                 && *existing_count != 0
@@ -208,29 +206,17 @@ impl UpdateRun<'_> {
         added: &[&'source SourceRecord],
         deleted: &[StoreRow],
     ) -> Result<()> {
-        write_line(self.out, format_args!("\n==== 현행화 요약 ===="))?;
-        write_line(
-            self.out,
-            format_args!("- 파일: {}", self.master_path.display()),
-        )?;
-        write_line(self.out, format_args!("- 소스: Opinet 자동 다운로드"))?;
-        write_line(
-            self.out,
-            format_args!("- 기존 업체 변경: {}건", changes.len()),
-        )?;
-        write_line(
-            self.out,
-            format_args!("- 신규 업체 추가: {}건", added.len()),
-        )?;
-        write_line(
-            self.out,
-            format_args!("- 폐업 업체 삭제: {}건", deleted.len()),
-        )?;
+        writeln!(self.out, "\n==== 현행화 요약 ====")?;
+        writeln!(self.out, "- 파일: {}", self.master_path.display())?;
+        writeln!(self.out, "- 소스: Opinet 자동 다운로드")?;
+        writeln!(self.out, "- 기존 업체 변경: {}건", changes.len())?;
+        writeln!(self.out, "- 신규 업체 추가: {}건", added.len())?;
+        writeln!(self.out, "- 폐업 업체 삭제: {}건", deleted.len())?;
         let verification_state = match self.save_verification {
             SaveVerification::Verify => "사용",
             SaveVerification::Skip => "생략",
         };
-        write_line(self.out, format_args!("- 저장 검증: {verification_state}"))?;
+        writeln!(self.out, "- 저장 검증: {verification_state}")?;
         self.print_summary_rows(
             "신규 업체 추가 목록 (상위 20개)",
             added
@@ -247,7 +233,7 @@ impl UpdateRun<'_> {
                 )
             }),
         )?;
-        write_line(self.out, format_args!("=====================\n")).map_err(Into::into)
+        writeln!(self.out, "=====================\n").map_err(Into::into)
     }
     pub(super) fn run(&mut self) -> Result<()> {
         let loaded_source = self.load_source()?;
@@ -293,7 +279,7 @@ impl UpdateRun<'_> {
             worksheet,
         }
         .update()?;
-        write_line(self.out, format_args!("마스터 파일 저장 중..."))?;
+        writeln!(self.out, "마스터 파일 저장 중...")?;
         book.save(
             self.master_path,
             self.save_verification,

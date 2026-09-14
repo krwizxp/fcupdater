@@ -52,7 +52,7 @@ const SMART_DISCOUNT_BRAND_KEYWORD: &str = "현대오일뱅크";
 const SMART_DISCOUNT_DIRECT_KEYWORD: &str = "직영";
 const SMART_DISCOUNT_INPUT_COL: u32 = 2;
 const SMART_DISCOUNT_INPUT_ROW: u32 = 13;
-const DECIMAL_SCALE: ScaledDecimal = ScaledDecimal(1_000_000);
+pub(super) const DECIMAL_SCALE: ScaledDecimal = ScaledDecimal(1_000_000);
 const DECIMAL_SCALE_SQUARED: ScaledSortKey = ScaledSortKey(1_000_000_000_000);
 const DECIMAL_SCALE_CUBED: ScaledSortKey = ScaledSortKey(1_000_000_000_000_000_000);
 pub(super) struct MasterSheetUpdater<'source> {
@@ -80,12 +80,12 @@ pub(super) struct MasterSheetUpdateResult<'source> {
     pub matched_existing_region_counts: [usize; TARGET_REGION_COUNT],
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
-struct ScaledDecimal(i64);
+pub(super) struct ScaledDecimal(i64);
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct ScaledSortKey(i128);
 impl ScaledDecimal {
     const ZERO: Self = Self(0);
-    fn as_i128(self) -> i128 {
+    pub(super) fn as_i128(self) -> i128 {
         i128::from(self.0)
     }
     const fn as_i64(self) -> i64 {
@@ -585,7 +585,7 @@ impl<'source> MasterSheetUpdater<'source> {
             (sort_context.quantities.premium, adjusted.premium),
             (sort_context.quantities.diesel, adjusted.diesel),
         ] {
-            if quantity != ScaledDecimal::ZERO {
+            if quantity.as_i64() > 0 {
                 total = total.checked_add(ScaledSortKey(
                     quantity.as_i128().checked_mul(price?.as_i128())?,
                 ))?;
@@ -726,7 +726,7 @@ impl<'source> MasterSheetUpdater<'source> {
             matched_existing_region_counts,
         })
     }
-    fn get_f64_at(
+    pub(super) fn get_f64_at(
         ws: &excel::writer::Worksheet,
         col: u32,
         row: u32,
@@ -913,7 +913,7 @@ fn append_fuel_total_text(
     price: Option<ScaledDecimal>,
     label: &str,
 ) -> Result<bool> {
-    if quantity == ScaledDecimal::ZERO {
+    if quantity.as_i64() <= 0 {
         return Ok(true);
     }
     let Some(price_value) = price else {
