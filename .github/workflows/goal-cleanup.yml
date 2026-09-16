@@ -1,0 +1,23 @@
+name: Cleanup completed Goal verification
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/goal-cleanup.yml
+permissions:
+  contents: write
+  actions: write
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Remove verified temporary run 35094091236
+        run: gh api --method DELETE repos/krwizxp/fcupdater/actions/runs/35094091236
+      - name: Remove verified temporary run 35094210050
+        run: gh api --method DELETE repos/krwizxp/fcupdater/actions/runs/35094210050
+      - name: Remove verified temporary branch
+        run: gh api --method DELETE repos/krwizxp/fcupdater/git/refs/heads/optimize/goal-20260916
