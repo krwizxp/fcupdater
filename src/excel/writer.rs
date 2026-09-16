@@ -2197,34 +2197,18 @@ fn parse_u32_decimal(
     format_error: impl FnOnce() -> Cow<'static, str>,
     parse_context: impl FnOnce() -> Cow<'static, str>,
 ) -> Result<u32> {
-    if value.is_empty() {
+    if value.starts_with('+') {
         return Err(err(format_error()));
     }
-    let mut parsed = 0_u32;
-    let mut overflowed = false;
-    for byte in value.bytes() {
-        if !byte.is_ascii_digit() {
-            return Err(err(format_error()));
-        }
-        if overflowed {
-            continue;
-        }
-        let digit = u32::from(byte.strict_sub(b'0'));
-        match parsed
-            .checked_mul(10)
-            .and_then(|current| current.checked_add(digit))
+    value.parse::<u32>().map_err(|source| {
+        if source.kind() == &IntErrorKind::PosOverflow
+            && value.bytes().all(|byte| byte.is_ascii_digit())
         {
-            Some(next) => parsed = next,
-            None => overflowed = true,
+            err_with_source(parse_context(), source)
+        } else {
+            err(format_error())
         }
-    }
-    if overflowed {
-        value
-            .parse::<u32>()
-            .map_err(|source| err_with_source(parse_context(), source))
-    } else {
-        Ok(parsed)
-    }
+    })
 }
 fn try_xml_escape_text<'text>(
     text: &'text str,
