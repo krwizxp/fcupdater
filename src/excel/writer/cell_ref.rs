@@ -37,23 +37,16 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         row_locked = true;
         index = index.strict_add(1);
     }
-    let row_start = index;
-    let mut row = 0_u32;
-    while let Some(&ch) = bytes.get(index)
-        && ch.is_ascii_digit()
-    {
-        row = row
-            .strict_mul(10)
-            .strict_add(u32::from(ch.strict_sub(b'0')));
-        if row > MAX_A1_ROW {
+    let row = bytes.get(index..)?.iter().try_fold(0_u32, |row, &ch| {
+        if !ch.is_ascii_digit() {
             return None;
         }
-        index = index.strict_add(1);
-    }
-    if index == row_start || row == 0 {
-        return None;
-    }
-    (index == reference.len()).then_some(CellReference {
+        let value = row
+            .strict_mul(10)
+            .strict_add(u32::from(ch.strict_sub(b'0')));
+        (value <= MAX_A1_ROW).then_some(value)
+    })?;
+    (row != 0).then_some(CellReference {
         col,
         col_locked,
         row,
