@@ -25,7 +25,7 @@ jobs:
           - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: rustup toolchain install 1.98.1 --profile minimal --no-self-update --target "${{ matrix.target }}"
+      - run: rustup toolchain install 1.98.1 --profile minimal --no-self-update --component clippy --target "${{ matrix.target }}"
       - run: cargo +1.98.1 clippy --all-targets --target "${{ matrix.target }}" --frozen -- -D warnings
   native-release:
     name: Release ${{ matrix.os }}
