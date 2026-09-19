@@ -1,0 +1,70 @@
+name: Goal temporary verification
+on:
+  push:
+    branches:
+      - codex/goal-opt-20260919
+permissions:
+  contents: read
+concurrency:
+  group: goal-temp-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  target-clippy:
+    name: Clippy ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: rustup toolchain install 1.98.1 --profile minimal --no-self-update --target "${{ matrix.target }}"
+      - run: cargo +1.98.1 clippy --all-targets --target "${{ matrix.target }}" --frozen -- -D warnings
+  native-release:
+    name: Release ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-26-intel
+          - macos-26
+          - windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - run: cargo +1.98.1 build --release --frozen
+  workbook:
+    name: Refresh and verify workbook
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - run: cargo +1.98.1 build --release --frozen
+      - name: Run verified workbook refresh
+        shell: bash
+        run: |
+          set -o pipefail
+          /usr/bin/time -v ./target/release/fcupdater --verify 2>&1 | tee workbook-refresh.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: goal-workbook-20260919
+          path: |
+            fuel_cost_chungcheong.xlsx
+            workbook-refresh.log
+          if-no-files-found: error
+          retention-days: 1
