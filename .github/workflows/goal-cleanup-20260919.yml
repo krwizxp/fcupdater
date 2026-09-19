@@ -1,0 +1,96 @@
+name: Goal verification cleanup
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/goal-cleanup-20260919.yml]
+permissions: {}
+jobs:
+  cleanup:
+    if: github.repository == 'krwizxp/fcupdater' && github.event.deleted == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Delete only the verified branch and recorded temporary runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          REPOSITORY = "krwizxp/fcupdater"
+          SOURCE_BRANCH = "codex/goal-opt-20260919"
+          SOURCE_SHA = "e6d88170c773b30d7415755a8189f5d87fa6cae5"
+          MERGED_SHA = "5897fa607c92c2b54e4349fbb3e7879d1983e683"
+          CI_ID = 35447505804
+          RUNS = [[35434719756,"37ae191c01f0c2135ca8940b04f799330b945fd5"],[35434954122,"e6d88170c773b30d7415755a8189f5d87fa6cae5"]]
+          ROOT = "https://api.github.com/repos/" + REPOSITORY
+
+          if os.environ["GITHUB_REPOSITORY"] != REPOSITORY or os.environ["GITHUB_REF"] != "refs/heads/main":
+              raise RuntimeError("Unexpected repository or ref")
+
+          def api(method, path, missing=False):
+              request = Request(ROOT + "/" + path, method=method, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "X-GitHub-Api-Version": "2026-03-10",
+                  "User-Agent": "goal-verification-cleanup",
+              })
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      data = response.read()
+                      if method == "DELETE" and response.status != 204:
+                          raise RuntimeError("Unexpected delete status")
+                      return json.loads(data) if data else None
+              except HTTPError as error:
+                  if missing and error.code == 404:
+                      return None
+                  raise RuntimeError(f"{method} {path}: HTTP {error.code}") from None
+
+          main_sha = api("GET", "git/ref/heads/main")["object"]["sha"]
+          for ancestor in (SOURCE_SHA, MERGED_SHA):
+              comparison = api("GET", "compare/" + ancestor + "..." + main_sha)
+              if comparison["merge_base_commit"]["sha"] != ancestor or comparison["behind_by"] != 0:
+                  raise RuntimeError("Validated source is not contained in main")
+          ci = api("GET", f"actions/runs/{CI_ID}")
+          if (ci["head_branch"], ci["head_sha"], ci["status"], ci["conclusion"]) != ("main", MERGED_SHA, "completed", "success"):
+              raise RuntimeError("Main release CI is not successful")
+
+          source_path = "git/ref/heads/" + SOURCE_BRANCH
+          source = api("GET", source_path, missing=True)
+          if source is not None and source["object"]["sha"] != SOURCE_SHA:
+              raise RuntimeError("Temporary branch moved")
+          pending = []
+          for run_id, sha in RUNS:
+              run = api("GET", f"actions/runs/{run_id}", missing=True)
+              if run is None:
+                  continue
+              if (run["head_branch"], run["head_sha"], run["status"]) != (SOURCE_BRANCH, sha, "completed"):
+                  raise RuntimeError("Run does not match exact reviewed temporary target")
+              pending.append(run_id)
+
+          source = api("GET", source_path, missing=True)
+          if source is not None:
+              if source["object"]["sha"] != SOURCE_SHA:
+                  raise RuntimeError("Temporary branch moved during preflight")
+              api("DELETE", "git/refs/heads/" + SOURCE_BRANCH)
+              print("Deleted verified temporary branch:", SOURCE_BRANCH, flush=True)
+          for run_id in pending:
+              api("DELETE", f"actions/runs/{run_id}")
+              print("Deleted temporary run:", run_id, flush=True)
+          if api("GET", source_path, missing=True) is not None:
+              raise RuntimeError("Temporary branch still present")
+          for run_id, _ in RUNS:
+              if api("GET", f"actions/runs/{run_id}", missing=True) is not None:
+                  raise RuntimeError("Temporary run still present")
+          summary = f"Verified branch absent: {SOURCE_BRANCH}\n\nVerified temporary runs absent: {len(RUNS)}\n"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write(summary)
+          print(summary, flush=True)
+          PY
