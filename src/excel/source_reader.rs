@@ -1155,12 +1155,10 @@ fn read_stream_from_fat_chain<'data>(
     Ok((Cow::Owned(out), previous_sid))
 }
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16> {
-    let arr = read_le_array::<2>(bytes, offset, "u16 read out of range at ")?;
-    Ok(u16::from_le_bytes(arr))
+    read_le_array::<2>(bytes, offset, "u16 read out of range at ").map(u16::from_le_bytes)
 }
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
-    let arr = read_le_array::<4>(bytes, offset, "u32 read out of range at ")?;
-    Ok(u32::from_le_bytes(arr))
+    read_le_array::<4>(bytes, offset, "u32 read out of range at ").map(u32::from_le_bytes)
 }
 fn read_le_array<const N: usize>(
     bytes: &[u8],
