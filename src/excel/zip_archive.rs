@@ -18,39 +18,31 @@ const CENTRAL_DIRECTORY_HEADER_LEN: usize = 46;
 const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const CODE_LENGTH_SYMBOLS: usize = 19;
 const CRC32_TABLES: [[u32; 256]; 16] = {
-    let mut table0 = [0_u32; 256];
-    let mut remaining: &mut [u32] = &mut table0;
+    let mut previous = [0_u32; 256];
+    let mut seeds: &mut [u32] = &mut previous;
     let mut seed = 0_u32;
-    while let Some((slot, tail)) = remaining.split_first_mut() {
-        let mut value = seed;
-        let mut bit = 0_u8;
-        while bit < 8_u8 {
-            value = value.wrapping_shr(1) ^ (0xedb8_8320_u32 & 0_u32.wrapping_sub(value & 1_u32));
-            bit = bit.strict_add(1);
-        }
-        *slot = value;
-        remaining = tail;
+    while let Some((slot, tail)) = seeds.split_first_mut() {
+        *slot = seed;
+        seeds = tail;
         seed = seed.strict_add(1);
     }
-    let table1 = crc32_advance_table(&table0);
-    let table2 = crc32_advance_table(&table1);
-    let table3 = crc32_advance_table(&table2);
-    let table4 = crc32_advance_table(&table3);
-    let table5 = crc32_advance_table(&table4);
-    let table6 = crc32_advance_table(&table5);
-    let table7 = crc32_advance_table(&table6);
-    let table8 = crc32_advance_table(&table7);
-    let table9 = crc32_advance_table(&table8);
-    let table10 = crc32_advance_table(&table9);
-    let table11 = crc32_advance_table(&table10);
-    let table12 = crc32_advance_table(&table11);
-    let table13 = crc32_advance_table(&table12);
-    let table14 = crc32_advance_table(&table13);
-    let table15 = crc32_advance_table(&table14);
-    [
-        table0, table1, table2, table3, table4, table5, table6, table7, table8, table9, table10,
-        table11, table12, table13, table14, table15,
-    ]
+    let mut tables = [[0_u32; 256]; 16];
+    let mut remaining: &mut [[u32; 256]] = &mut tables;
+    while let Some((slot, tail)) = remaining.split_first_mut() {
+        let mut values: &mut [u32] = &mut previous;
+        while let Some((value, values_tail)) = values.split_first_mut() {
+            let mut bit = 0_u8;
+            while bit < 8_u8 {
+                *value =
+                    value.wrapping_shr(1) ^ (0xedb8_8320_u32 & 0_u32.wrapping_sub(*value & 1_u32));
+                bit = bit.strict_add(1);
+            }
+            values = values_tail;
+        }
+        *slot = previous;
+        remaining = tail;
+    }
+    tables
 };
 const DEFLATE_MAX_BITS: usize = 15;
 const DEFLATE_MAX_BITS_U8: u8 = 15;
@@ -680,27 +672,6 @@ fn ensure_zip_size_limit(
 }
 fn zip_entry_message(context: &str, entry_name: &str) -> String {
     format!("{context}: {entry_name}")
-}
-const fn crc32_advance_table(previous: &[u32; 256]) -> [u32; 256] {
-    let mut table = [0_u32; 256];
-    let mut source: &[u32] = previous;
-    let mut target: &mut [u32] = &mut table;
-    while let Some((value, source_tail)) = source.split_first() {
-        let Some((slot, target_tail)) = target.split_first_mut() else {
-            break;
-        };
-        let mut advanced = *value;
-        let mut bit = 0_u8;
-        while bit < 8_u8 {
-            advanced =
-                advanced.wrapping_shr(1) ^ (0xedb8_8320_u32 & 0_u32.wrapping_sub(advanced & 1_u32));
-            bit = bit.strict_add(1);
-        }
-        *slot = advanced;
-        source = source_tail;
-        target = target_tail;
-    }
-    table
 }
 fn crc32_table_value(table_index: usize, byte: u8) -> u32 {
     let table = CRC32_TABLES
