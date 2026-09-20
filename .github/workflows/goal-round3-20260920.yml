@@ -1,0 +1,74 @@
+name: Goal round 3 validation
+on:
+  push:
+    branches:
+      - codex/goal-round3-20260920
+permissions:
+  contents: read
+jobs:
+  target-clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.1 --profile minimal --component clippy --target ${{ matrix.target }} --no-self-update
+      - run: cargo +1.98.1 clippy --all-targets --target ${{ matrix.target }} --frozen -- -D warnings
+      - run: git diff --check
+  native-release:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            probe_args: ""
+          - os: macos-26-intel
+            probe_args: --native-only
+          - os: macos-26
+            probe_args: --native-only
+          - os: windows-latest
+            probe_args: --native-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --no-self-update
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - if: runner.os == 'Linux'
+        run: cargo +1.98.1 fmt --all -- --check --config newline_style=Unix
+      - run: python3 .github/validation/round3_verify.py fcupdater 22409497f81f1f8b869dee19fa1631832af90bf0 ${{ matrix.probe_args }} --unchanged-source
+  workbook:
+    needs: [target-clippy, native-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - run: python3 .github/validation/round3-workbook.py 22409497f81f1f8b869dee19fa1631832af90bf0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: round3-verified-workbook
+          path: |
+            ${{ runner.temp }}/goal-round3-workbook/fuel_cost_chungcheong.xlsx
+            ${{ runner.temp }}/goal-round3-workbook/workbook-refresh.log
+          if-no-files-found: error
+          retention-days: 1
