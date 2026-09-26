@@ -180,7 +180,10 @@ impl DecodeEntry {
     }
 }
 impl BitReader<'_> {
-    const fn align_to_byte(&mut self) {
+    fn align_to_byte(&mut self) {
+        self.cursor = self
+            .cursor
+            .strict_sub(usize::from(self.bit_count).div_euclid(8));
         self.bit_buffer = 0;
         self.bit_count = 0;
     }
