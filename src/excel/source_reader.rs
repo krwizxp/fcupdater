@@ -138,9 +138,7 @@ impl SourceReader {
         let mut fat = try_vec_with_capacity(total_entries, "CFB FAT 메모리 확보 실패")?;
         for &sid in fat_sector_ids {
             let sector = get_sector_slice(&self.0, sid)?;
-            let (chunks, &[]) = sector.as_chunks::<4>() else {
-                return Err(err("CFB FAT sector 길이가 4바이트 단위가 아닙니다."));
-            };
+            let (chunks, _) = sector.as_chunks::<4>();
             fat.extend(chunks.iter().map(|chunk| u32::from_le_bytes(*chunk)));
         }
         Ok(fat)
@@ -150,10 +148,7 @@ impl SourceReader {
             .0
             .get(0x4C..512)
             .ok_or_else(|| err("CFB DIFAT 헤더 범위가 손상되었습니다."))?;
-        let (header_difat_chunks, &[]) = header_difat.as_chunks::<4>() else {
-            return Err(err("CFB DIFAT 헤더 길이가 4바이트 단위가 아닙니다."));
-        };
-        Ok(header_difat_chunks)
+        Ok(header_difat.as_chunks::<4>().0)
     }
     fn parse_cfb_header(&self) -> Result<CfbHeader> {
         let data = self
@@ -1027,14 +1022,13 @@ fn row_text_trimmed<'strings>(row: &SourceRow<'strings>, idx: usize) -> &'string
 const fn is_regular_sector_id(sector_id: u32) -> bool {
     sector_id < CFB_DIFAT_SECT
 }
-fn get_sector_slice(data: &[u8], sector_id: u32) -> Result<&[u8]> {
+fn get_sector_slice(data: &[u8], sector_id: u32) -> Result<&[u8; CFB_SECTOR_SIZE]> {
     let start_offset = (sector_id as usize)
         .checked_add(1)
         .and_then(|index| index.checked_mul(CFB_SECTOR_SIZE));
-    let sector_range =
-        start_offset.and_then(|offset| offset.checked_add(CFB_SECTOR_SIZE).map(|end| offset..end));
-    sector_range
-        .and_then(|bounds| data.get(bounds))
+    start_offset
+        .and_then(|offset| data.get(offset..))
+        .and_then(<[u8]>::first_chunk::<CFB_SECTOR_SIZE>)
         .ok_or_else(|| {
             err(format!(
                 "CFB sector 범위를 벗어났습니다: sector={sector_id}, size={CFB_SECTOR_SIZE}"
