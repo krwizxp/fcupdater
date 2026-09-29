@@ -960,8 +960,7 @@ fn row_fuel_price(
     };
     let mut value = 0_i64;
     let mut group_len = 0_usize;
-    let mut whole_digits = 0_usize;
-    let mut fraction_digits = 0_usize;
+    let mut fraction_seen = false;
     let mut comma_seen = false;
     let mut decimal_seen = false;
     let mut round_up = false;
@@ -970,17 +969,16 @@ fn row_fuel_price(
             b'0'..=b'9' => {
                 let digit = i64::from(byte.strict_sub(b'0'));
                 if decimal_seen {
-                    if fraction_digits == 0 {
+                    if !fraction_seen {
                         round_up = digit >= 5;
+                        fraction_seen = true;
                     }
-                    fraction_digits = fraction_digits.strict_add(1);
                 } else {
                     value = value
                         .checked_mul(10)
                         .and_then(|scaled| scaled.checked_add(digit))
                         .ok_or_else(&invalid_price)?;
                     group_len = group_len.strict_add(1);
-                    whole_digits = whole_digits.strict_add(1);
                 }
             }
             b',' if !decimal_seen => {
@@ -991,7 +989,7 @@ fn row_fuel_price(
                 group_len = 0;
             }
             b'.' if !decimal_seen => {
-                if whole_digits == 0 || comma_seen && group_len != 3 {
+                if group_len == 0 || comma_seen && group_len != 3 {
                     return Err(invalid_price());
                 }
                 decimal_seen = true;
@@ -999,7 +997,7 @@ fn row_fuel_price(
             _ => return Err(invalid_price()),
         }
     }
-    if whole_digits == 0 || comma_seen && group_len != 3 || decimal_seen && fraction_digits == 0 {
+    if group_len == 0 || comma_seen && group_len != 3 || decimal_seen && !fraction_seen {
         return Err(invalid_price());
     }
     if round_up {
