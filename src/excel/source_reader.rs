@@ -977,7 +977,7 @@ fn row_fuel_price(
                     value = value
                         .checked_mul(10)
                         .and_then(|scaled| scaled.checked_add(digit))
-                        .ok_or_else(&invalid_price)?;
+                        .ok_or_else(invalid_price)?;
                     group_len = group_len.strict_add(1);
                 }
             }
@@ -1001,7 +1001,7 @@ fn row_fuel_price(
         return Err(invalid_price());
     }
     if round_up {
-        value = value.checked_add(1).ok_or_else(&invalid_price)?;
+        value = value.checked_add(1).ok_or_else(invalid_price)?;
     }
     let parsed_value = i32::try_from(value).map_err(|_conversion_error| invalid_price())?;
     if parsed_value == 0_i32 {

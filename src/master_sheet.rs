@@ -756,16 +756,16 @@ impl<'source> MasterSheetUpdater<'source> {
                 continue;
             }
             if digit_byte == b'.' {
-                (!parsing_fraction).ok_or_else(&invalid_value)?;
+                (!parsing_fraction).ok_or_else(invalid_value)?;
                 parsing_fraction = true;
                 continue;
             }
-            digit_byte.is_ascii_digit().ok_or_else(&invalid_value)?;
+            digit_byte.is_ascii_digit().ok_or_else(invalid_value)?;
             let digit_raw = digit_byte.strict_sub(b'0');
             let digit = i64::from(digit_raw);
             if parsing_fraction {
                 if fraction_digit_count >= 6 {
-                    (digit == 0).ok_or_else(&invalid_value)?;
+                    (digit == 0).ok_or_else(invalid_value)?;
                     continue;
                 }
                 fraction = fraction.strict_mul(10).strict_add(digit);
@@ -775,11 +775,11 @@ impl<'source> MasterSheetUpdater<'source> {
                 let next_whole = whole
                     .checked_mul(10)
                     .and_then(|value| value.checked_add(digit))
-                    .ok_or_else(&invalid_value)?;
+                    .ok_or_else(invalid_value)?;
                 whole = next_whole;
             }
         }
-        has_whole_digit.ok_or_else(&invalid_value)?;
+        has_whole_digit.ok_or_else(invalid_value)?;
         while fraction_digit_count < 6 {
             fraction = fraction.strict_mul(10);
             fraction_digit_count = fraction_digit_count.strict_add(1);
