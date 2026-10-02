@@ -19,7 +19,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Use the latest GA Ubuntu image without waiting for ubuntu-latest migration.
+          - os: ubuntu-26.04
             binary_name: fcupdater-linux-x64
           - os: macos-26-intel
             binary_name: fcupdater-macos-x64
