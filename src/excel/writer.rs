@@ -2026,7 +2026,7 @@ fn canonical_excel_style(
             _ => {}
         }
     }
-    let canonical = input_styles
+    input_styles
         .get(style as usize)
         .copied()
         .flatten()
@@ -2034,8 +2034,7 @@ fn canonical_excel_style(
             err(format!(
                 "worksheet가 참조한 style을 Excel 정규형으로 변환할 수 없습니다: {style}"
             ))
-        })?;
-    Ok(canonical)
+        })
 }
 fn xml_bool_attr(attrs: &[XmlAttr<'_>], name: &str) -> Result<bool> {
     match get_attr(attrs, name) {
