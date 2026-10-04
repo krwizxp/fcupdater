@@ -68,16 +68,14 @@ impl CookieJar {
                 .strip_prefix(name)
                 .is_some_and(|tail| tail.starts_with('='))
         }) {
-            let value_start = name.len().strict_add(1);
-            let old_value_len = cookie.len().strict_sub(value_start);
-            if value.len() > old_value_len {
+            if pair_len > cookie.len() {
                 cookie
-                    .try_reserve_exact(value.len().strict_sub(old_value_len))
+                    .try_reserve_exact(pair_len.strict_sub(cookie.len()))
                     .map_err(|source| {
                         download_error_with_source("Cookie 값 메모리 확보 실패", source)
                     })?;
             }
-            cookie.truncate(value_start);
+            cookie.truncate(name.len().strict_add(1));
             cookie.push_str(value);
             return Ok(());
         }
@@ -414,12 +412,10 @@ impl SourceDownload {
         let mut text = String::from_utf8(response).map_err(|source| {
             download_error_with_source("NetFunnel 응답 UTF-8 변환 실패", source)
         })?;
-        let Some((_, value_tail)) = text.split_once("result='") else {
-            return Err(format!("NetFunnel result 파싱 실패: {text}").into());
-        };
-        let Some((value, _)) = value_tail.split_once('\'') else {
-            return Err(format!("NetFunnel result 파싱 실패: {text}").into());
-        };
+        let (value, _) = text
+            .split_once("result='")
+            .and_then(|(_, tail)| tail.split_once('\''))
+            .ok_or_else(|| format!("NetFunnel result 파싱 실패: {text}"))?;
         let value_range = text.substr_range(value).unwrap_or_else(|| process::abort());
         text.truncate(value_range.end);
         text.replace_range(..value_range.start, "");

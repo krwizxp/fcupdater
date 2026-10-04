@@ -1131,11 +1131,7 @@ fn read_stream_from_fat_chain<'data>(
         let sid_usize = copy_sid as usize;
         let sector = get_sector_slice(data, copy_sid)?;
         let take = copy_remaining.min(sector.len());
-        out.extend_from_slice(
-            sector
-                .get(..take)
-                .ok_or_else(|| err("FAT stream 복사 범위 오류"))?,
-        );
+        out.extend_from_slice(sector.split_at(take).0);
         copy_remaining = copy_remaining.strict_sub(take);
         copy_sid = *fat.get(sid_usize).ok_or_else(|| {
             err(prefixed_display_message(

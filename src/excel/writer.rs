@@ -1314,11 +1314,7 @@ impl Worksheet {
             return Ok(None);
         }
         let (negative, digits) = trimmed.strip_prefix('-').map_or_else(
-            || {
-                trimmed
-                    .strip_prefix('+')
-                    .map_or((false, trimmed), |unsigned| (false, unsigned))
-            },
+            || (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
             |unsigned| (true, unsigned),
         );
         if digits.is_empty() {

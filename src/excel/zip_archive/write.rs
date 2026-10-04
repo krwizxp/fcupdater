@@ -39,13 +39,11 @@ impl<'part> StreamingZipWriter<'part, '_> {
         let central_dir_offset = u32::try_from(self.bytes_written)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 offset 변환 실패", source))?;
         let entries = mem::take(&mut self.entries);
-        let mut central_dir_size_usize = 0_usize;
-        for entry in &entries {
-            central_dir_size_usize = central_dir_size_usize
-                .checked_add(CENTRAL_DIRECTORY_HEADER_LEN)
-                .and_then(|size| size.checked_add(entry.part.name.len()))
-                .ok_or_else(|| err("ZIP 중앙 디렉터리 크기 계산 실패"))?;
-        }
+        let central_dir_size_usize = entries
+            .iter()
+            .map(|entry| CENTRAL_DIRECTORY_HEADER_LEN.saturating_add(entry.part.name.len()))
+            .try_fold(0_usize, usize::checked_add)
+            .ok_or_else(|| err("ZIP 중앙 디렉터리 크기 계산 실패"))?;
         let entry_count_u16 = u16::try_from(entries.len())
             .map_err(|source| err_with_source("ZIP entry 수 변환 실패", source))?;
         let central_output_size = central_dir_size_usize
