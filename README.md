@@ -14,7 +14,7 @@
 
 ## 지원 환경
 
-- Rust 1.98.1 이상
+- Rust 1.99.0 이상 (소스 빌드 및 개발)
 - Windows 10 22H2 이상 또는 Windows 11
 - Linux 및 macOS
 - Linux/macOS의 libcurl 7.85.0 이상
