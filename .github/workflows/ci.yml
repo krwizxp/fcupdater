@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
-    name: ${{ matrix.os }} / latest stable Rust
+    name: ${{ matrix.os }} / Rust 1.99.0
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -21,26 +21,32 @@ jobs:
         include:
           # Use the latest GA Ubuntu image without waiting for ubuntu-latest migration.
           - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
             binary_name: fcupdater-linux-x64
           - os: macos-26-intel
+            target: x86_64-apple-darwin
             binary_name: fcupdater-macos-x64
           - os: macos-26
+            target: aarch64-apple-darwin
             binary_name: fcupdater-macos-arm64
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             binary_name: fcupdater-windows-x64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install latest stable Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Install Rust 1.99.0
+        run: rustup toolchain install 1.99.0 --profile minimal --no-self-update
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Build Release Binary
-        run: cargo +stable build --release --frozen --bin fcupdater
+        run: cargo +1.99.0 build-pgo
       - name: Prepare binary artifact with Rust
-        run: cargo +stable run --frozen --example package_artifact -- "${{ matrix.binary_name }}"
+        env:
+          CARGO_TARGET_DIR: target/${{ matrix.target }}
+        run: cargo +1.99.0 run --frozen --example package_artifact -- "${{ matrix.binary_name }}"
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

@@ -24,13 +24,14 @@ Linux에서 직접 빌드할 때는 배포판의 libcurl 개발 패키지를 사
 ## 빌드
 
 ```bash
-cargo build --release --locked
+cargo +1.99.0 build-pgo
 ```
 
 빌드 결과는 다음 위치에 생성됩니다.
 
-- Windows: `target\release\fcupdater.exe`
-- Linux/macOS: `target/release/fcupdater`
+- Windows x64: `target\x86_64-pc-windows-msvc\release\fcupdater.exe`
+- Linux x64: `target/x86_64-unknown-linux-gnu/release/fcupdater`
+- macOS: `target/<host-triple>/release/fcupdater`
 
 ## 사용 방법
 
@@ -91,3 +92,11 @@ Microsoft Excel 또는 LibreOffice Calc로 저장한 제공 워크북을 사용�
 CI 워크플로는 `main` 브랜치와 태그에서 Windows, Linux, Intel Mac, Apple Silicon Mac용 release Artifact를 제공합니다.
 
 워크북 현행화 워크플로는 최신 Opinet 자료를 반영한 `fuel_cost_chungcheong.xlsx`를 Artifact로 제공합니다.
+
+## PGO 릴리스 빌드
+
+저장소 루트에서 `cargo +1.99.0 build-pgo`를 실행하면 Linux x64 GNU 또는 Windows x64 MSVC의 전용 프로파일을 적용합니다. CI 배포 바이너리와 수동 실행 워크플로도 같은 명령을 사용합니다. macOS 등 프로파일이 없는 타깃은 기존 release 설정으로 빌드합니다. 학습 때와 동일하게 호스트 타깃을 명시하므로 실행 파일은 `target/<host-triple>/release/`에 생성됩니다. 다른 타깃은 `--target <triple>`로 선택합니다.
+
+`rust-toolchain.toml`은 프로파일을 학습한 Rust 1.99.0을 고정합니다. `cargo build --release --frozen --target <triple>`은 PGO 없이 빌드하는 비교·재학습 경로입니다. PGO 빌드에서는 외부 `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`가 Cargo 설정을 덮어쓰지 않도록 확인하십시오. 컴파일러, 타깃, 최적화 옵션 또는 제품 소스를 바꾸면 프로파일을 재학습하고 검증해야 합니다.
+
+프로파일의 출처·해시는 [pgo/manifest.json](pgo/manifest.json), 학습·측정 범위와 한계는 [pgo/README.md](pgo/README.md)에 기록했습니다.

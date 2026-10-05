@@ -15,12 +15,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install latest stable Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Install Rust 1.99.0
+        run: rustup toolchain install 1.99.0 --profile minimal --no-self-update
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Run updater
-        run: cargo +stable run --release --frozen -- --verify
+        run: |
+          cargo +1.99.0 build-pgo
+          ./target/x86_64-unknown-linux-gnu/release/fcupdater --verify
       - name: Upload result artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

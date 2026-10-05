@@ -1,0 +1,8 @@
+[build]
+target = "host-tuple"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Cprofile-use=pgo/x86_64-unknown-linux-gnu.profdata", "-Cllvm-args=-pgo-warn-missing-function"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Cprofile-use=pgo/x86_64-pc-windows-msvc.profdata", "-Cllvm-args=-pgo-warn-missing-function"]
