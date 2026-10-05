@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
-    name: ${{ matrix.os }} / Rust 1.99.0
+    name: ${{ matrix.os }} / latest stable Rust
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -36,17 +36,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install Rust 1.99.0
-        run: rustup toolchain install 1.99.0 --profile minimal --no-self-update
+      - name: Install latest stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Build Release Binary
-        run: cargo +1.99.0 build-pgo
+        run: cargo +stable build-pgo
       - name: Prepare binary artifact with Rust
         env:
           CARGO_TARGET_DIR: target/${{ matrix.target }}
-        run: cargo +1.99.0 run --frozen --example package_artifact -- "${{ matrix.binary_name }}"
+        run: cargo +stable run --frozen --example package_artifact -- "${{ matrix.binary_name }}"
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
