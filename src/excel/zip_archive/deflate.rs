@@ -1106,10 +1106,7 @@ impl DeflateWorkspace {
 impl DeflateWriter<'_, '_> {
     fn distance_symbol(distance: u16) -> DeflateSymbol {
         let value = distance.strict_sub(1);
-        let [extra_bits, _, _, _] = u16::BITS
-            .strict_sub(value.leading_zeros())
-            .saturating_sub(2)
-            .to_le_bytes();
+        let [extra_bits, _, _, _] = value.bit_width().saturating_sub(2).to_le_bytes();
         let symbol = if extra_bits == 0 {
             value
         } else {
@@ -1151,10 +1148,7 @@ impl DeflateWriter<'_, '_> {
             };
         }
         let value = length.strict_sub(3);
-        let [extra_bits, _, _, _] = u16::BITS
-            .strict_sub(value.leading_zeros())
-            .saturating_sub(3)
-            .to_le_bytes();
+        let [extra_bits, _, _, _] = value.bit_width().saturating_sub(3).to_le_bytes();
         let index = if extra_bits == 0 {
             value
         } else {
