@@ -42,7 +42,7 @@ for label,folder in [('baseline',baseline),('candidate',root)]:
  marker='fn main() -> Result<()> {';assert s.count(marker)==1;s=s.replace(marker,marker+hook);s+='\n'+(v/'allocator.rs').read_text();p.write_text(s)
  cargo(['build','--release','--frozen'],probe);probes[label]=binary(probe)
 source=v/'source.xls';source.write_bytes(gzip.decompress((v/'source.xls.gz').read_bytes()));replay=v/('winhttp.dll' if win else 'replay.dylib' if sys.platform=='darwin' else 'replay.so')
-command(['clang','-shared','-O2',str(v/'replay.c'),'-o',str(replay)] if win else ['clang','-dynamiclib','-O2',str(v/'replay.c'),'-o',str(replay)] if sys.platform=='darwin' else ['gcc','-shared','-fPIC','-O2',str(v/'replay.c'),'-o',str(replay)])
+command(['clang','-shared','-O2',str(v/'replay.c'),'-o',str(replay)] if win else ['clang','-dynamiclib','-O2',str(v/'replay.c'),'-lcurl','-o',str(replay)] if sys.platform=='darwin' else ['gcc','-shared','-fPIC','-O2',str(v/'replay.c'),'-o',str(replay)])
 replayenv=dict(os.environ,PGO_XLS=str(source.resolve()))
 if win:
  for exe in [*probes.values(),binary(baseline),binary(root)]:shutil.copy2(replay,exe.parent/'winhttp.dll')

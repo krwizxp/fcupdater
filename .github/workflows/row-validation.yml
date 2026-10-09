@@ -14,10 +14,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
           - os: macos-26-intel
             target: x86_64-apple-darwin
           - os: macos-26
@@ -29,8 +25,6 @@ jobs:
           persist-credentials: false
       - name: Exact stable Rust and matching LLVM
         run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview --no-self-update
-      - name: Exact compiler provenance
-        run: rustc +1.99.0 -Vv
       - name: Native Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev

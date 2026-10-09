@@ -25,9 +25,29 @@ API BOOL WINAPI WinHttpReadData(void*v,void*out,DWORD cap,DWORD*read){Fake*h=v;s
 #include <stdarg.h>
 #define CURL_DISABLE_TYPECHECK
 #include <curl/curl.h>
+#ifdef __APPLE__
+#define curl_easy_reset replay_curl_easy_reset
+#define curl_easy_setopt replay_curl_easy_setopt
+#define curl_easy_getinfo replay_curl_easy_getinfo
+#define curl_easy_perform replay_curl_easy_perform
+#endif
 static char url[4096];static curl_write_callback body_cb,header_cb;static void *body_data,*header_data;
 void curl_easy_reset(CURL*h){url[0]=0;body_cb=header_cb=NULL;body_data=header_data=NULL;}
 CURLcode curl_easy_setopt(CURL*h,CURLoption o,...){va_list a;va_start(a,o);if(o==CURLOPT_URL){snprintf(url,sizeof(url),"%s",va_arg(a,char*));}else if(o==CURLOPT_WRITEFUNCTION){body_cb=va_arg(a,curl_write_callback);}else if(o==CURLOPT_HEADERFUNCTION){header_cb=va_arg(a,curl_write_callback);}else if(o==CURLOPT_WRITEDATA){body_data=va_arg(a,void*);}else if(o==CURLOPT_HEADERDATA){header_data=va_arg(a,void*);}va_end(a);return CURLE_OK;}
 CURLcode curl_easy_getinfo(CURL*h,CURLINFO q,...){va_list a;va_start(a,q);if(q==CURLINFO_RESPONSE_CODE)*va_arg(a,long*)=200;else if(q==CURLINFO_SCHEME)*va_arg(a,char**)="https";else abort();va_end(a);return CURLE_OK;}
 CURLcode curl_easy_perform(CURL*h){size_t n;char *body=response(url,&n);char header[128];snprintf(header,sizeof(header),"HTTP/1.1 200 OK\r\n");if(header_cb(header,1,strlen(header),header_data)!=strlen(header))return CURLE_WRITE_ERROR;snprintf(header,sizeof(header),"Content-Length: %zu\r\n",n);if(header_cb(header,1,strlen(header),header_data)!=strlen(header))return CURLE_WRITE_ERROR;if(header_cb("\r\n",1,2,header_data)!=2)return CURLE_WRITE_ERROR;for(size_t pos=0;pos<n;){size_t len=n-pos;if(len>16384)len=16384;if(body_cb(body+pos,1,len,body_data)!=len){free(body);return CURLE_WRITE_ERROR;}pos+=len;}free(body);return CURLE_OK;}
+#ifdef __APPLE__
+#undef curl_easy_reset
+#undef curl_easy_setopt
+#undef curl_easy_getinfo
+#undef curl_easy_perform
+#define DYLD_INTERPOSE(replacement, replacee) \
+ __attribute__((used)) static struct {const void *replacement;const void *replacee;} \
+ interpose_##replacee __attribute__((section("__DATA,__interpose"))) = \
+ {(const void *)(unsigned long)&replacement,(const void *)(unsigned long)&replacee};
+DYLD_INTERPOSE(replay_curl_easy_reset,curl_easy_reset)
+DYLD_INTERPOSE(replay_curl_easy_setopt,curl_easy_setopt)
+DYLD_INTERPOSE(replay_curl_easy_getinfo,curl_easy_getinfo)
+DYLD_INTERPOSE(replay_curl_easy_perform,curl_easy_perform)
+#endif
 #endif
