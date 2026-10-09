@@ -532,18 +532,24 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let data_end_index = self.data_last_row as usize;
         (data_end_index <= rows.len())
             .ok_or(err("정렬 대상 row 범위가 worksheet를 벗어났습니다."))?;
-        let trailing_rows = rows.split_off(data_end_index);
-        let mut source_rows = rows.split_off(data_start_index);
-        let additional = source_rows.len().strict_add(trailing_rows.len());
-        rows.try_reserve(additional)
-            .map_err(|source| err_with_source("정렬 결과 행 메모리 확보 실패", source))?;
-        for row_plan in &row_plans {
-            let source_row = source_rows
-                .get_mut(row_plan.source_index)
-                .unwrap_or_else(|| process::abort());
-            rows.push(mem::take(source_row));
+        let data_rows = rows
+            .get_mut(data_start_index..data_end_index)
+            .unwrap_or_else(|| process::abort());
+        // Resolve each permutation cycle in place, retaining the sorted formula plans.
+        for index in 0..row_plans.len() {
+            let mut current = index;
+            loop {
+                let source = row_plans
+                    .get_mut(current)
+                    .unwrap_or_else(|| process::abort());
+                let next = mem::replace(&mut source.source_index, current);
+                if next == index || next == current {
+                    break;
+                }
+                data_rows.swap(current, next);
+                current = next;
+            }
         }
-        rows.extend(trailing_rows);
         self.ws.replace_rows(rows);
         let mut buffers = FormulaBuffers {
             cache: String::new(),

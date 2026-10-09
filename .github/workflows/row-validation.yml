@@ -1,0 +1,50 @@
+name: Temporary in-place row optimization validation
+on:
+  push:
+    branches: [codex/row-optimization-20261010]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+          - os: macos-26
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Exact stable Rust and matching LLVM
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview --no-self-update
+      - name: Native Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Native release, allocation, behavior and PGO validation
+        env:
+          VALIDATION_APP: fcupdater
+          VALIDATION_TARGET: ${{ matrix.target }}
+          VALIDATION_BASE: 8ecd1f17b46290e092e81872008d01185793be8e
+        run: python validation/native.py
+      - name: Evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: row-optimization-${{ matrix.target }}
+          path: |
+            validation/native-release-results.json
+            validation/profiles/*.profdata
+            validation/profiles/manifest.json
+          retention-days: 3
