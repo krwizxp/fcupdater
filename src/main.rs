@@ -114,11 +114,9 @@ fn main() -> Result<()> {
         any(target_os = "linux", target_os = "macos") => {
             let (lock_metadata, _) = validate_regular_file(&run_lock)
                 .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
-            if lock_metadata.mode() & 0o022 != 0 {
-                return Err(err(
-                    "실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.",
-                ));
-            }
+            (lock_metadata.mode() & 0o022 == 0).ok_or(err(
+                "실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.",
+            ))?;
         }
         _ => {}
     }

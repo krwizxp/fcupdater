@@ -31,7 +31,7 @@ impl LoadedSource {
     fn finish_validation(&self) -> Result<()> {
         let target_record_count = self.index.len();
         (target_record_count != 0)
-            .ok_or_else(|| err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."))?;
+            .ok_or(err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."))?;
         for (region, count) in TARGET_REGIONS.iter().zip(self.region_counts.iter()) {
             (*count != 0).ok_or_else(|| {
                 err(format!(
@@ -62,9 +62,9 @@ impl LoadedSource {
         validate_field_ratio(brand_count, "상표")?;
         validate_field_ratio(diesel_count, "경유 가격")?;
         validate_field_ratio(gasoline_count, "휘발유 가격")?;
-        has_premium.ok_or_else(|| {
-            err("Opinet 소스의 대상 지역에서 유효한 고급휘발유 가격을 찾지 못했습니다.")
-        })
+        has_premium.ok_or(err(
+            "Opinet 소스의 대상 지역에서 유효한 고급휘발유 가격을 찾지 못했습니다.",
+        ))
     }
 }
 pub(super) struct UpdateRun<'out> {

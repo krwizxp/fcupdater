@@ -1,5 +1,5 @@
 {
-  "source_commit": "9c48071267a33f0c3792a9473cb8a8de3c22ffb6",
+  "source_commit": "50a51748277dde8df5bf409d1483a0477ee0881e",
   "rustc": "1.99.0",
   "rustc_commit": "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
   "LLVM": "23.1.1",
@@ -7,16 +7,100 @@
   "profiles": {
     "x86_64-unknown-linux-gnu": {
       "file": "x86_64-unknown-linux-gnu.profdata",
-      "sha256": "ad62b331d60f2b9fc68c225d2a839085b557cc531ae8b529c7fe96beb21ceab2",
-      "bytes": 180152,
+      "sha256": "860325e0b0eab52903bcc3a6ccc289965a4cccf5ca91ae49d08585da2c791348",
+      "bytes": 180264,
       "windows_validation_run": null
     },
     "x86_64-pc-windows-msvc": {
       "file": "x86_64-pc-windows-msvc.profdata",
-      "sha256": "5f0d8f88c7b77430c785e07750c59b4ac482f1575e97be70229da222ae65e327",
-      "bytes": 174936,
-      "windows_validation_run": 37253479758
+      "sha256": "fa96da3bbffa9ea93344b287cb04657c4dd111187998d5b81da382d8bc733b88",
+      "bytes": 175136,
+      "windows_validation_run": 37938918839
     }
   },
-  "diagnostic_profile_applied": false
+  "diagnostic_profile_applied": false,
+  "training": "Actual product CLI; 16 workbook update runs with fixed captured Opinet response; help, invalid options and malformed workbook rejection; diagnostic probes excluded",
+  "validation_run": 37938918839,
+  "product_rust_source_sha256": "73f8d6ec5bcf3c8376c3a2ededdb362ef9c856e187240a1a20160cb0c794ed3b",
+  "release_api_validation": {
+    "ordinary_release_native_targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ],
+    "pgo_comparison_run": 37941929175,
+    "non_regression_upper_95ci": 0.03,
+    "status": "passed",
+    "pgo_results": {
+      "x86_64-unknown-linux-gnu": {
+        "binary_bytes": [
+          980168,
+          977184
+        ],
+        "cases": {
+          "updated": {
+            "median_seconds": [
+              0.047882688999997924,
+              0.048108051625000314
+            ],
+            "median_change": 0.003445834509362644,
+            "ci95": [
+              0.002050609720813501,
+              0.006602662986074037
+            ],
+            "pairs": 128,
+            "invocations_per_sample": 4
+          },
+          "prior": {
+            "median_seconds": [
+              0.04888093774999902,
+              0.0489824171249964
+            ],
+            "median_change": 0.002960860417172917,
+            "ci95": [
+              0.0014855136712508266,
+              0.005024494180931871
+            ],
+            "pairs": 128,
+            "invocations_per_sample": 4
+          }
+        }
+      },
+      "x86_64-pc-windows-msvc": {
+        "binary_bytes": [
+          802304,
+          797184
+        ],
+        "cases": {
+          "updated": {
+            "median_seconds": [
+              0.09811829999999588,
+              0.09829108749998738
+            ],
+            "median_change": 0.008957712529854556,
+            "ci95": [
+              0.00244001721859588,
+              0.013929558054469826
+            ],
+            "pairs": 128,
+            "invocations_per_sample": 4
+          },
+          "prior": {
+            "median_seconds": [
+              0.10717858750001596,
+              0.1067128750000137
+            ],
+            "median_change": 0.002853987664454216,
+            "ci95": [
+              -0.01683558059900525,
+              0.014921538313121818
+            ],
+            "pairs": 128,
+            "invocations_per_sample": 4
+          }
+        }
+      }
+    }
+  }
 }

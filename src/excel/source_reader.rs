@@ -156,7 +156,7 @@ impl SourceReader {
             .first_chunk::<512>()
             .ok_or_else(|| err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."))?;
         data.starts_with(&CFB_SIGNATURE)
-            .ok_or_else(|| err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."))?;
+            .ok_or(err("유효한 OLE2(CFB) Opinet xls 응답이 아닙니다."))?;
         for (offset, expected, label) in [
             (0x1A, 3, "major version"),
             (0x1C, CFB_BYTE_ORDER_LITTLE_ENDIAN, "byte order"),
@@ -208,9 +208,8 @@ impl SourceReader {
             None,
             "CFB 디렉터리",
         )?;
-        if dir_last_sector.is_some() && dir_last_sector == mini_fat_last_sector {
-            return Err(err("CFB 디렉터리와 Mini FAT의 sector가 겹칩니다."));
-        }
+        (dir_last_sector.is_none() || dir_last_sector != mini_fat_last_sector)
+            .ok_or(err("CFB 디렉터리와 Mini FAT의 sector가 겹칩니다."))?;
         let (chunks, &[]) = dir_stream.as_ref().as_chunks::<128>() else {
             return Err(err("CFB 디렉터리 stream 길이가 128바이트 단위가 아닙니다."));
         };
@@ -271,14 +270,12 @@ impl SourceReader {
                     item.map_err(|source| err_with_source("CFB UTF-16 문자열 해석 실패", source))?;
                 workbook_name &= WORKBOOK_STREAM_NAME.get(index) == Some(&decoded);
             }
-            if object_type == CFB_OBJECT_STREAM
-                && workbook_name
-                && workbook_entry
+            (object_type != CFB_OBJECT_STREAM
+                || !workbook_name
+                || workbook_entry
                     .replace((start_sector, stream_size))
-                    .is_some()
-            {
-                return Err(err("CFB stream이 중복 선언되었습니다: Workbook"));
-            }
+                    .is_none())
+            .ok_or(err("CFB stream이 중복 선언되었습니다: Workbook"))?;
         }
         let (start_sector, stream_size) =
             workbook_entry.ok_or_else(|| err("CFB stream을 찾지 못했습니다: Workbook"))?;
@@ -305,7 +302,7 @@ impl SourceReader {
             .len()
             .strict_sub(CFB_SECTOR_SIZE)
             .div_euclid(CFB_SECTOR_SIZE);
-        (max_sector_count != 0).ok_or_else(|| err("CFB sector 개수가 비정상적입니다."))?;
+        (max_sector_count != 0).ok_or(err("CFB sector 개수가 비정상적입니다."))?;
         let declared_fat_sectors = header.num_fat_sectors as usize;
         if declared_fat_sectors > max_sector_count {
             return Err(err(format!(
@@ -391,7 +388,7 @@ impl SstChunkReader<'_, '_> {
             self.chunk_index = self.chunk_index.strict_add(1);
             self.offset_in_chunk = 0;
         }
-        (self.chunk_index < self.chunks.len()).ok_or_else(|| err("SST data가 예상보다 짧습니다."))
+        (self.chunk_index < self.chunks.len()).ok_or(err("SST data가 예상보다 짧습니다."))
     }
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.ensure_available()?;
@@ -613,9 +610,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                             sheet_type,
                         )));
                     }
-                    if sheet_offset.replace(offset).is_some() {
-                        return Err(err("Opinet 고정 소스와 다른 worksheet 개수입니다."));
-                    }
+                    (sheet_offset.replace(offset).is_none())
+                        .ok_or(err("Opinet 고정 소스와 다른 worksheet 개수입니다."))?;
                 }
                 0x0042 => {
                     let parsed_code_page = read_u16_le(data, 0)?;
@@ -631,7 +627,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 BIFF_RECORD_SST => {
                     shared_strings
                         .is_none()
-                        .ok_or_else(|| err("xls SST record가 중복 선언되었습니다."))?;
+                        .ok_or(err("xls SST record가 중복 선언되었습니다."))?;
                     code_page_seen.ok_or_else(|| {
                         err("BIFF CodePage record보다 SST가 먼저 선언되었습니다.")
                     })?;
@@ -653,7 +649,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         let parsed_shared_strings =
             shared_strings.ok_or_else(|| err("Opinet 고정 소스에서 SST를 찾지 못했습니다."))?;
         (!parsed_shared_strings.ranges.is_empty())
-            .ok_or_else(|| err("Opinet 고정 소스의 SST가 비어 있습니다."))?;
+            .ok_or(err("Opinet 고정 소스의 SST가 비어 있습니다."))?;
         Ok((parsed_sheet_offset, parsed_shared_strings))
     }
     fn read_sst(
@@ -663,7 +659,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
     ) -> Result<(BiffSharedStrings, usize)> {
         let (chunks, next_offset, total_chunk_bytes) =
             self.collect_sst_chunks(first_chunk, first_chunk_end)?;
-        (total_chunk_bytes >= 8).ok_or_else(|| err("SST 데이터가 비정상적으로 짧습니다."))?;
+        (total_chunk_bytes >= 8).ok_or(err("SST 데이터가 비정상적으로 짧습니다."))?;
         let mut reader = SstChunkReader {
             chunk_index: 0,
             chunks: &chunks,

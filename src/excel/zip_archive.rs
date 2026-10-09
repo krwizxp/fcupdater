@@ -292,9 +292,8 @@ impl<'bytes> ZipCentralDirectory<'bytes> {
             self.cursor,
             ZIP_CENTRAL_HEADER_RANGE,
         )?;
-        if read_u32(header, 0)? != CENTRAL_DIRECTORY_SIGNATURE {
-            return Err(zip_static(ZIP_BAD_CENTRAL_SIGNATURE_MESSAGE));
-        }
+        (read_u32(header, 0)? == CENTRAL_DIRECTORY_SIGNATURE)
+            .ok_or(zip_static(ZIP_BAD_CENTRAL_SIGNATURE_MESSAGE))?;
         let version_needed = read_u16(header, 6)?;
         let flags = read_u16(header, 8)?;
         let method = read_u16(header, 10)?;
@@ -302,9 +301,8 @@ impl<'bytes> ZipCentralDirectory<'bytes> {
             return Err(zip_static("ZIP entry 압축 방식을 지원하지 않습니다."));
         }
         let minimum_version = if method == METHOD_DEFLATE { 20 } else { 10 };
-        if version_needed < minimum_version || version_needed > VERSION_NEEDED {
-            return Err(zip_static("ZIP entry version이 지원 범위를 벗어났습니다."));
-        }
+        (version_needed >= minimum_version && version_needed <= VERSION_NEEDED)
+            .ok_or(zip_static("ZIP entry version이 지원 범위를 벗어났습니다."))?;
         if flags & !SUPPORTED_FLAGS != 0 {
             return Err(zip_static(
                 "ZIP entry flags에 지원하지 않는 기능이 있습니다.",

@@ -35,9 +35,7 @@ impl<'xml> XmlScanner<'xml> {
         opening: XmlTag<'xml>,
         ancestor_depth: usize,
     ) -> Result<XmlElement<'xml>> {
-        if ancestor_depth >= MAX_XML_NESTING_DEPTH {
-            return Err(err("XML 중첩 깊이가 너무 큽니다."));
-        }
+        (ancestor_depth < MAX_XML_NESTING_DEPTH).ok_or(err("XML 중첩 깊이가 너무 큽니다."))?;
         let tag_name = opening.name;
         let body_start = opening.end.strict_add(1);
         let (body_end, end) = if opening.self_closing {
@@ -55,9 +53,8 @@ impl<'xml> XmlScanner<'xml> {
                 })?;
                 if tag.is_start {
                     if !tag.self_closing {
-                        if ancestor_depth.strict_add(depth) >= MAX_XML_NESTING_DEPTH {
-                            return Err(err("XML 중첩 깊이가 너무 큽니다."));
-                        }
+                        (ancestor_depth.strict_add(depth) < MAX_XML_NESTING_DEPTH)
+                            .ok_or(err("XML 중첩 깊이가 너무 큽니다."))?;
                         *ancestors.get_mut(depth).unwrap_or_else(|| process::abort()) = tag.name;
                         depth = depth.strict_add(1);
                     }
@@ -345,9 +342,7 @@ impl<'tag> XmlAttrScanner<'tag> {
             self.cursor = self.cursor.strict_add(1);
         }
         let name_end = self.cursor;
-        if name_start == name_end {
-            return Err(err("XML 속성 이름이 비어 있습니다."));
-        }
+        (name_start != name_end).ok_or(err("XML 속성 이름이 비어 있습니다."))?;
         skip_xml_whitespace(bytes, &mut self.cursor);
         if bytes.get(self.cursor) != Some(&b'=') {
             return Err(err("XML 속성의 '=' 문자를 찾지 못했습니다."));
@@ -460,18 +455,14 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                     u32::from(ch)
                 )));
             }
-            if ch == '<' {
-                return Err(err("XML text에 raw '<' 문자가 포함되어 있습니다."));
-            }
-            if ch == ']'
-                && tail
+            (ch != '<').ok_or(err("XML text에 raw '<' 문자가 포함되어 있습니다."))?;
+            (ch != ']'
+                || !tail
                     .get(relative..)
-                    .is_some_and(|remaining| remaining.starts_with("]]>"))
-            {
-                return Err(err(
-                    "XML text에 허용되지 않는 ']]>' 시퀀스가 포함되어 있습니다.",
-                ));
-            }
+                    .is_some_and(|remaining| remaining.starts_with("]]>")))
+            .ok_or(err(
+                "XML text에 허용되지 않는 ']]>' 시퀀스가 포함되어 있습니다.",
+            ))?;
             if ch == '&' {
                 amp = Some(relative);
                 break;
@@ -490,9 +481,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
         let Some((entity, _)) = after_amp.split_once(';') else {
             return Err(err("XML entity 종료 세미콜론을 찾지 못했습니다."));
         };
-        if entity.is_empty() {
-            return Err(err("XML entity 이름이 비어 있습니다."));
-        }
+        (!entity.is_empty()).ok_or(err("XML entity 이름이 비어 있습니다."))?;
         let decoded = match entity {
             "lt" => Some('<'),
             "gt" => Some('>'),

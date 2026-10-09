@@ -30,17 +30,15 @@ pub(super) struct CookieJar {
 }
 impl CookieJar {
     fn add_cookie(&mut self, name: &str, value: &str) -> DownloadResult<()> {
-        if name.is_empty()
-            || name.bytes().any(|byte| {
+        (!name.is_empty()
+            && !name.bytes().any(|byte| {
                 !(byte.is_ascii_alphanumeric()
                     || matches!(
                         byte,
                         b'!' | b'#'..=b'\'' | b'*'..=b'+' | b'-'..=b'.' | b'^'..=b'`' | b'|' | b'~'
                     ))
-            })
-        {
-            return Err("Cookie 이름에 허용되지 않는 문자가 포함되어 있습니다.".into());
-        }
+            }))
+        .ok_or("Cookie 이름에 허용되지 않는 문자가 포함되어 있습니다.")?;
         let value_body = if value.starts_with('"') {
             value
                 .strip_circumfix('"', '"')
@@ -48,14 +46,13 @@ impl CookieJar {
         } else {
             value
         };
-        if value_body.bytes().any(|byte| {
+        (!value_body.bytes().any(|byte| {
             !matches!(
                 byte,
                 b'!' | b'#'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~'
             )
-        }) {
-            return Err("Cookie 값에 허용되지 않는 문자가 포함되어 있습니다.".into());
-        }
+        }))
+        .ok_or("Cookie 값에 허용되지 않는 문자가 포함되어 있습니다.")?;
         let pair_len = name.len().strict_add(1).strict_add(value.len());
         if pair_len > MAX_COOKIE_PAIR_BYTES {
             return Err(format!(

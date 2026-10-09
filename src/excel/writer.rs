@@ -501,9 +501,7 @@ impl Workbook {
         let diesel_cache = if premium_qty.strict_add(diesel_qty) == 0 {
             None
         } else {
-            if fuel_denominator == 0 {
-                return Err(err("유류비 경유 평균 단가 분모가 0입니다."));
-            }
+            (fuel_denominator != 0).ok_or(err("유류비 경유 평균 단가 분모가 0입니다."))?;
             let numerator = gasoline_qty
                 .strict_mul(gasoline_weight)
                 .strict_add(premium_qty.strict_mul(diesel_weight));
@@ -624,9 +622,7 @@ impl WorksheetParser<'_, '_> {
                         )));
                     }
                 };
-                if slot.replace(value).is_some() {
-                    return Err(err("XML 태그에 중복 속성이 있습니다."));
-                }
+                (slot.replace(value).is_none()).ok_or(err("XML 태그에 중복 속성이 있습니다."))?;
             }
             let reference_text = reference_value
                 .as_deref()
@@ -729,24 +725,19 @@ impl WorksheetParser<'_, '_> {
                     .filter(|element| element.opening.name == "v" && !element.opening.self_closing)
                     .ok_or_else(|| err("shared string cell에 v 태그가 없습니다."))?;
                 let mut value_attrs = XmlAttrScanner::new(value.opening.raw)?;
-                if value_attrs.next()?.is_some() {
-                    return Err(err("shared string v 태그에 속성이 있습니다."));
-                }
-                if value_scanner.next_tag().is_some()
-                    || !inner_xml_text
+                (value_attrs.next()?.is_none())
+                    .ok_or(err("shared string v 태그에 속성이 있습니다."))?;
+                (value_scanner.next_tag().is_none()
+                    && inner_xml_text
                         .get(..value.span.start)
                         .is_some_and(|text| text.trim().is_empty())
-                    || !inner_xml_text
+                    && inner_xml_text
                         .get(value.span.end..)
-                        .is_some_and(|text| text.trim().is_empty())
-                {
-                    return Err(err("shared string cell 본문 형식이 올바르지 않습니다."));
-                }
-                if value.body.starts_with('+') {
-                    return Err(err(
-                        "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.",
-                    ));
-                }
+                        .is_some_and(|text| text.trim().is_empty()))
+                .ok_or(err("shared string cell 본문 형식이 올바르지 않습니다."))?;
+                (!value.body.starts_with('+')).ok_or(err(
+                    "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.",
+                ))?;
                 let index = value.body.parse::<usize>().map_err(|source| {
                     if matches!(
                         source.kind(),
@@ -979,9 +970,7 @@ impl WorksheetParser<'_, '_> {
                 || Cow::Borrowed("worksheet row 번호가 양의 10진수 형식이 아닙니다."),
                 || Cow::Borrowed("worksheet row 번호 해석 실패"),
             )?;
-            if row_num == 0 {
-                return Err(err("worksheet row 번호는 1 이상이어야 합니다."));
-            }
+            (row_num != 0).ok_or(err("worksheet row 번호는 1 이상이어야 합니다."))?;
             if !(1..=MAX_A1_ROW).contains(&row_num) {
                 return Err(err(format!(
                     "worksheet row 번호가 Excel 범위를 벗어났습니다: {row_num}"
@@ -1071,9 +1060,8 @@ impl WorksheetParser<'_, '_> {
         let Some(sheet_data) = scanner.next_start_named("sheetData") else {
             return Err(err("worksheet XML에 <sheetData>가 없습니다."));
         };
-        if sheet_data.self_closing {
-            return Err(err("고정 workbook의 sheetData는 비어 있을 수 없습니다."));
-        }
+        (!sheet_data.self_closing)
+            .ok_or(err("고정 workbook의 sheetData는 비어 있을 수 없습니다."))?;
         let rows = self.scan_rows(&mut scanner, sheet_data.name)?;
         let sheet_data_span = sheet_data.start..scanner.cursor();
         let context = match self.sheet {
@@ -1211,9 +1199,7 @@ impl Worksheet {
                 for shared_row in row..=last_row {
                     let cell = Self::get_or_create_cell_mut(&mut self.rows, col, shared_row)?;
                     let inner = &cell.inner_xml;
-                    if inner.is_empty() {
-                        return Err(err("shared formula 대상 cell 본문이 없습니다."));
-                    }
+                    (!inner.is_empty()).ok_or(err("shared formula 대상 cell 본문이 없습니다."))?;
                     let tag = if shared_row == row {
                         FormulaTag::SharedRoot {
                             formula: &owned_anchor,
@@ -2166,12 +2152,10 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr<'_>>> {
     let mut out: Vec<XmlAttr<'_>> = Vec::new();
     let mut scanner = XmlAttrScanner::new(tag)?;
     while let Some((name, value)) = scanner.next()? {
-        if out.len() >= MAX_XML_ATTRIBUTE_COUNT {
-            return Err(err("XML 속성 개수가 허용 한도를 초과했습니다."));
-        }
-        if out.iter().any(|attr| attr.name == name) {
-            return Err(err("XML 태그에 중복 속성이 있습니다."));
-        }
+        (out.len() < MAX_XML_ATTRIBUTE_COUNT)
+            .ok_or(err("XML 속성 개수가 허용 한도를 초과했습니다."))?;
+        (!out.iter().any(|attr| attr.name == name))
+            .ok_or(err("XML 태그에 중복 속성이 있습니다."))?;
         out.try_reserve(1)
             .map_err(|source| err_with_source("XML 속성 목록 추가 메모리 확보 실패", source))?;
         out.push(XmlAttr {

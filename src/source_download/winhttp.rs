@@ -342,11 +342,7 @@ impl Client {
                     )
                     .into());
                 }
-                if content_length_index <= previous_index {
-                    return Err(
-                        "WinHTTP Content-Length header index가 진행되지 않았습니다.".into(),
-                    );
-                }
+                (content_length_index > previous_index).ok_or("WinHTTP Content-Length header index가 진행되지 않았습니다.")?;
                 headers.set_content_length(value as usize)?;
             }
             let mut cookie_index = 0_u32;
@@ -365,11 +361,7 @@ impl Client {
                         &raw mut cookie_index,
                     )
                 };
-                if probe != 0_i32 {
-                    return Err(
-                        "WinHTTP Set-Cookie 크기 조회가 예기치 않게 성공했습니다.".into(),
-                    );
-                }
+                (probe == 0_i32).ok_or("WinHTTP Set-Cookie 크기 조회가 예기치 않게 성공했습니다.")?;
                 let code = Self::last_error_code();
                 if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
                     break;
@@ -388,9 +380,7 @@ impl Client {
                     header_bytes,
                     HTTP_MAX_HEADER_BYTES,
                 )?;
-                if !header_bytes.is_multiple_of(2) {
-                    return Err("Set-Cookie UTF-16 길이가 2바이트 단위가 아닙니다.".into());
-                }
+                (header_bytes.is_multiple_of(2)).ok_or("Set-Cookie UTF-16 길이가 2바이트 단위가 아닙니다.")?;
                 let units = header_bytes.div_euclid(2);
                 self.header_buffer.clear();
                 self.header_buffer.try_reserve_exact(units).map_err(|source| {
@@ -410,9 +400,7 @@ impl Client {
                     )
                 };
                 Self::check_winhttp(fetched, "WinHttpQueryHeaders Set-Cookie")?;
-                if cookie_index <= current_index {
-                    return Err("WinHTTP Set-Cookie header index가 진행되지 않았습니다.".into());
-                }
+                (cookie_index > current_index).ok_or("WinHTTP Set-Cookie header index가 진행되지 않았습니다.")?;
                 while self.header_buffer.pop_if(|unit| *unit == 0).is_some() {}
                 let value = String::from_utf16(&self.header_buffer).map_err(|source| {
                     download_error_with_source("Set-Cookie UTF-16 변환 실패", source)
@@ -472,9 +460,8 @@ impl Client {
             download_error_with_source("응답 read 버퍼 길이 변환 실패", source)
         })?;
         loop {
-            if started.elapsed() >= WINHTTP_TOTAL_TIMEOUT {
-                return Err("HTTP 전체 전송 제한 시간(60초)을 초과했습니다.".into());
-            }
+            (started.elapsed() < WINHTTP_TOTAL_TIMEOUT)
+                .ok_or("HTTP 전체 전송 제한 시간(60초)을 초과했습니다.")?;
             let mut read = 0_u32;
             // SAFETY: request is valid, self.read_buffer is writable, and read is an output buffer.
             let read_ok = unsafe {

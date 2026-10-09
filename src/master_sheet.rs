@@ -531,7 +531,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let data_start_index = MASTER_DATA_START_ROW.strict_sub(1) as usize;
         let data_end_index = self.data_last_row as usize;
         (data_end_index <= rows.len())
-            .ok_or_else(|| err("정렬 대상 row 범위가 worksheet를 벗어났습니다."))?;
+            .ok_or(err("정렬 대상 row 범위가 worksheet를 벗어났습니다."))?;
         let trailing_rows = rows.split_off(data_end_index);
         let mut source_rows = rows.split_off(data_start_index);
         let additional = source_rows.len().strict_add(trailing_rows.len());
@@ -829,8 +829,9 @@ impl<'source> MasterSheetUpdater<'source> {
         };
         let data_start_index = MASTER_HEADER_ROW as usize;
         let trailing_start_index = last_old_row.unwrap_or(MASTER_HEADER_ROW) as usize;
-        (trailing_start_index <= original_rows.len())
-            .ok_or_else(|| err("유류비 기존 데이터 row 범위가 worksheet를 벗어났습니다."))?;
+        (trailing_start_index <= original_rows.len()).ok_or(err(
+            "유류비 기존 데이터 row 범위가 worksheet를 벗어났습니다.",
+        ))?;
         let trailing_rows = original_rows.split_off(trailing_start_index);
         let source_rows = original_rows.split_off(data_start_index);
         let additional = kept_count

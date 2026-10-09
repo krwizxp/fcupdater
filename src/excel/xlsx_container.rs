@@ -411,9 +411,8 @@ impl TempArchivePromotion<'_> {
                     source,
                 )
             })?;
-            if saved_file.identity != self.temp_archive.identity {
-                return Err(err("저장된 xlsx identity가 임시 archive와 다릅니다."));
-            }
+            (saved_file.identity == self.temp_archive.identity)
+                .ok_or(err("저장된 xlsx identity가 임시 archive와 다릅니다."))?;
             saved_file.file.sync_all().map_err(|source| {
                 err_with_source(
                     path_context_message(
@@ -542,11 +541,9 @@ impl XlsxContainer {
             true,
             None,
         )?;
-        if required_xml_attr(root.raw, "xmlns:r", "workbook.xml")?.as_ref()
-            != OFFICE_DOCUMENT_REL_NAMESPACE
-        {
-            return Err(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."));
-        }
+        (required_xml_attr(root.raw, "xmlns:r", "workbook.xml")?.as_ref()
+            == OFFICE_DOCUMENT_REL_NAMESPACE)
+            .ok_or(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."))?;
         let workbook_xml = workbook_text.as_str();
         let (mut scanner, workbook_root) = scan_xml_root(workbook_xml, "workbook", "workbook.xml")?;
         let mut forbidden = None;
@@ -1003,13 +1000,11 @@ impl XlsxContainer {
                 ["name", "sheetId", "state", "r:id"],
                 "workbook.xml sheet",
             )?;
-            if name.as_deref() != Some(expected_name)
-                || sheet_id.as_deref() != Some(expected_sheet_id)
-                || rid.as_deref() != Some(expected_rid)
-                || state.as_deref().is_some_and(|value| value != "visible")
-            {
-                return Err(err("workbook.xml sheet 구성이 고정 스키마와 다릅니다."));
-            }
+            (name.as_deref() == Some(expected_name)
+                && sheet_id.as_deref() == Some(expected_sheet_id)
+                && rid.as_deref() == Some(expected_rid)
+                && state.as_deref().is_none_or(|value| value == "visible"))
+            .ok_or(err("workbook.xml sheet 구성이 고정 스키마와 다릅니다."))?;
         }
         if workbook_scanner.next_start_named("sheet").is_some() {
             return Err(err("workbook sheet 수가 고정 스키마의 2개보다 많습니다."));
@@ -1020,11 +1015,9 @@ impl XlsxContainer {
         let drawing_rid = if name == super::MASTER_SHEET_PATH {
             let has_relationships = self.has_part("xl/worksheets/_rels/sheet1.xml.rels");
             let has_drawing = self.has_part("xl/drawings/drawing1.xml");
-            if has_relationships != has_drawing {
-                return Err(err(
-                    "worksheet drawing 관계와 drawing part는 함께 존재해야 합니다.",
-                ));
-            }
+            (has_relationships == has_drawing).ok_or(err(
+                "worksheet drawing 관계와 drawing part는 함께 존재해야 합니다.",
+            ))?;
             if has_relationships {
                 let relationships_xml = self.take_text("xl/worksheets/_rels/sheet1.xml.rels")?;
                 let mut relationships = validate_relationship_set(

@@ -188,7 +188,7 @@ impl BitReader<'_> {
         self.bit_count = 0;
     }
     fn consume_bits(&mut self, count: u8) -> ZipResult<()> {
-        (count <= self.bit_count).ok_or_else(|| zip_static("deflate bit buffer 소비 범위 오류"))?;
+        (count <= self.bit_count).ok_or(zip_static("deflate bit buffer 소비 범위 오류"))?;
         self.bit_buffer >>= u32::from(count);
         self.bit_count = self.bit_count.strict_sub(count);
         Ok(())
@@ -303,9 +303,8 @@ impl DecodeHuffman {
         Err(zip_static("deflate Huffman code를 해석하지 못했습니다."))
     }
     fn from_lengths(lengths: &[u8]) -> ZipResult<Option<Self>> {
-        if lengths.len() > DECODE_MAX_SYMBOLS {
-            return Err(zip_static("deflate decode symbol 수가 너무 많습니다."));
-        }
+        (lengths.len() <= DECODE_MAX_SYMBOLS)
+            .ok_or(zip_static("deflate decode symbol 수가 너무 많습니다."))?;
         let mut counts = [0_u16; DEFLATE_MAX_BITS + 1];
         let Some(mut next_codes) = canonical_next_codes(lengths, &mut counts)? else {
             return Ok(None);
@@ -326,9 +325,8 @@ impl DecodeHuffman {
             let bit_index = usize::from(bit_len);
             let assigned = huffman_get(&next_codes, bit_index);
             let code_limit = 1_u16.strict_shl(u32::from(bit_len));
-            if assigned >= code_limit {
-                return Err(zip_static("deflate Huffman code가 과포화되었습니다."));
-            }
+            (assigned < code_limit)
+                .ok_or(zip_static("deflate Huffman code가 과포화되었습니다."))?;
             huffman_set(&mut next_codes, bit_index, assigned.strict_add(1));
             let symbol_index = usize::from(
                 huffman_get(&first_symbols, bit_index)
@@ -349,9 +347,8 @@ impl DecodeHuffman {
                 let root_slot = root
                     .get_mut(root_index)
                     .ok_or_else(|| zip_static("deflate root decode table 생성 범위 오류"))?;
-                if root_slot.is_direct() {
-                    return Err(zip_static("deflate root decode code가 충돌합니다."));
-                }
+                (!root_slot.is_direct())
+                    .ok_or(zip_static("deflate root decode code가 충돌합니다."))?;
                 *root_slot = entry;
             }
         }
@@ -401,11 +398,9 @@ struct InflateState<'bytes> {
 }
 impl InflateState<'_> {
     fn copy_previous(&mut self, distance: usize, length: usize) -> ZipResult<()> {
-        if distance == 0 || distance > self.output.len() {
-            return Err(zip_static(
-                "deflate back-reference distance가 올바르지 않습니다.",
-            ));
-        }
+        (distance != 0 && distance <= self.output.len()).ok_or(zip_static(
+            "deflate back-reference distance가 올바르지 않습니다.",
+        ))?;
         ensure_deflate_output_len(self.output.len(), length, self.expected_len)?;
         let source_start = self.output.len().strict_sub(distance);
         let initial_copy = length.min(distance);
@@ -442,9 +437,7 @@ impl InflateState<'_> {
     }
     fn dynamic_trees(&mut self) -> ZipResult<DynamicTrees> {
         let literal_count = usize::from(self.reader.read_bits(5)?).strict_add(257);
-        if literal_count > LITERAL_LENGTH_SYMBOLS {
-            return Err(zip_static("deflate HLIT 범위 오류"));
-        }
+        (literal_count <= LITERAL_LENGTH_SYMBOLS).ok_or(zip_static("deflate HLIT 범위 오류"))?;
         let distance_count = usize::from(self.reader.read_bits(5)?).strict_add(1);
         let code_length_count = usize::from(self.reader.read_bits(4)?).strict_add(4);
         let mut code_lengths = [0_u8; 19];
@@ -535,11 +528,9 @@ impl InflateState<'_> {
         let header = self.reader.read_stored_bytes(4)?;
         let len = read_u16(header, 0)?;
         let nlen = read_u16(header, 2)?;
-        if len != !nlen {
-            return Err(zip_static(
-                "deflate 저장 블록 LEN/NLEN이 일치하지 않습니다.",
-            ));
-        }
+        (len == !nlen).ok_or(zip_static(
+            "deflate 저장 블록 LEN/NLEN이 일치하지 않습니다.",
+        ))?;
         let stored = self.reader.read_stored_bytes(usize::from(len))?;
         ensure_deflate_output_len(self.output.len(), stored.len(), self.expected_len)?;
         self.output.extend_from_slice(stored);
@@ -1381,8 +1372,9 @@ fn ensure_deflate_output_len(
     let next_len = current_len
         .checked_add(additional_len)
         .ok_or_else(|| zip_static("deflate 출력 크기 계산 실패"))?;
-    (next_len <= expected_len)
-        .ok_or_else(|| zip_static("deflate 출력이 ZIP 선언 해제 크기를 초과했습니다."))
+    (next_len <= expected_len).ok_or(zip_static(
+        "deflate 출력이 ZIP 선언 해제 크기를 초과했습니다.",
+    ))
 }
 fn hash3(bytes: &[u8], position: usize) -> Option<usize> {
     let &[first_byte, second_byte, third_byte] = bytes.get(position..)?.first_chunk::<3>()?;
@@ -1405,8 +1397,9 @@ fn push_repeated(lengths: &mut Vec<u8>, value: u8, repeat: usize, total: usize) 
         .len()
         .checked_add(repeat)
         .ok_or_else(|| zip_static("deflate repeat 길이 계산 실패"))?;
-    (next_len <= total)
-        .ok_or_else(|| zip_static("deflate repeat 길이가 code length 총합을 초과합니다."))?;
+    (next_len <= total).ok_or(zip_static(
+        "deflate repeat 길이가 code length 총합을 초과합니다.",
+    ))?;
     lengths.extend(repeat_n(value, repeat));
     Ok(())
 }
