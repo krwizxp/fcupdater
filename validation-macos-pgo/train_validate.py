@@ -63,6 +63,7 @@ def update(exe,fixture,verify,e=env,loops=1,independent=False):
    shutil.copy2(fixture,target);start=time.perf_counter();p=cmd([exe,*(['--verify'] if verify else [])],work,e);elapsed+=time.perf_counter()-start
    sig=(p.stdout.hex(),p.stderr.hex(),canonical(target))
   if independent:
+   shutil.copy2(target,OUT/('result-release.xlsx' if exe==normal else 'result-pgo.xlsx'))
    from openpyxl import load_workbook
    book=load_workbook(target,read_only=True,data_only=False)
    assert book.sheetnames==['유류비','변경내역'],book.sheetnames
@@ -110,7 +111,9 @@ def interval(rows):
  return {'median_seconds':[statistics.median(r[k] for r in rows) for k in exes],'paired_median_change':statistics.median(ratios),'ci95':[boots[250],boots[9749]],'pairs':len(rows),'p95_seconds':[sorted(r[k] for r in rows)[int(.95*len(rows))] for k in exes]}
 cases=[('verify-current',ROOT/'fuel_cost_chungcheong.xlsx',True),('verify-prior',TASK/'before.xlsx',True),('skip-current',ROOT/'fuel_cost_chungcheong.xlsx',False),('skip-prior',TASK/'before.xlsx',False)]
 for name,fixture,verify in cases:
- sigs=[update(exe,fixture,verify,independent=True)[1] for exe in exes.values()];assert sigs[0]==sigs[1]
+ sigs=[update(exe,fixture,verify,independent=True)[1] for exe in exes.values()]
+ (OUT/'comparison-debug.json').write_text(json.dumps({'case':name,'release':sigs[0],'pgo':sigs[1]},indent=2))
+ assert sigs[0]==sigs[1],(name,[k for k in sigs[0][2] if sigs[0][2][k]!=sigs[1][2].get(k)],sigs[0][:2],sigs[1][:2])
  for exe in exes.values():update(exe,fixture,verify,loops=LOOPS)
  data={'raw':[]};report['cases'][name]=data
  for i in range(PAIRS):
