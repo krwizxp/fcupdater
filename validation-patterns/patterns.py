@@ -2,6 +2,9 @@
 from pathlib import Path
 import os, sys, subprocess, tempfile, shutil, time, threading, json, hashlib, gzip
 import random, statistics, re, zipfile, xml.etree.ElementTree as ET, email.utils
+import faulthandler
+faulthandler.enable()
+faulthandler.dump_traceback_later(60, repeat=True)
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 WIN = sys.platform == 'win32'
@@ -230,6 +233,7 @@ def interval(pairs):
 def pairs(sample,a,b,n):
     values=[]
     for i in range(n):
+        if i % 8 == 0: print("paired sample", a, b, i, n, flush=True)
         order=[a,b];RNG.shuffle(order);v={label:sample(label) for label in order}
         if v[a][1] is not None and v[b][1] is not None:assert v[a][1]==v[b][1],('behavior',a,b,v[a][1],v[b][1])
         values.append([v[a][0],v[b][0]])
@@ -321,6 +325,7 @@ def run_app(app,folder,llvm):
     # Selection is followed by fresh final randomized samples; never use selection samples as acceptance evidence.
     selected=min(data['selection'],key=lambda k:max(data['selection'][k]['vs_old']['summary']['median_change'],data['selection'][k].get('actions_vs_old',data['selection'][k]['vs_old'])['summary']['median_change']))
     data['selected']=selected;profile=work/(selected+'.profdata');data['binary_bytes']={k:exes[k].stat().st_size for k in ['normal','old',selected]}
+    shutil.copy2(profile, OUT/(app+'-'+TARGET+'.profdata'))
     cases=(['menu-bulk','actions-default','workflow-default','single','small','medium','integer','float','ladder','manual','time','help','version','invalid'] if app=='srg'
            else ['verify-current','verify-prior','skip-current','skip-prior','help','version','invalid','malformed'])
     for case in cases:
@@ -332,7 +337,7 @@ def run_app(app,folder,llvm):
             return srg_cli(exes[label],case,env,4 if case!='time' else 1)
         n=16 if case in ['manual','time'] else 64
         for a,b in [('old',selected),('normal',selected)]:
-            name=a+'-'+case;data['comparisons'][name]=pairs(sample,a,b,n)
+            name=a+'-'+case;print(app, 'BEGIN', name, flush=True);data['comparisons'][name]=pairs(sample,a,b,n)
             print(app,name,data['comparisons'][name]['summary'],flush=True);save()
     if app=='srg':
         for a in ['old','normal']:

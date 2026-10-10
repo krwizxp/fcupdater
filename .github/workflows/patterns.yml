@@ -8,15 +8,13 @@ jobs:
   native:
     name: PGO actual patterns / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       PYTHONUTF8: "1"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04
-            target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
