@@ -1342,18 +1342,22 @@ impl Worksheet {
             return Ok(None);
         }
         let magnitude = if round_away_from_zero {
-            whole.checked_add(1)
+            let Some(rounded) = whole.checked_add(1) else {
+                return Ok(None);
+            };
+            rounded
         } else {
-            Some(whole)
+            whole
         };
-        let signed = magnitude.and_then(|value| {
-            if negative {
-                value.checked_neg()
-            } else {
-                Some(value)
-            }
-        });
-        Ok(signed.and_then(|value| i32::try_from(value).ok()))
+        let signed = if negative {
+            let Some(negative_value) = magnitude.checked_neg() else {
+                return Ok(None);
+            };
+            negative_value
+        } else {
+            magnitude
+        };
+        Ok(i32::try_from(signed).ok())
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
         let row_index = row_index(row).unwrap_or_else(|| process::abort());

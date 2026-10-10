@@ -1,4 +1,4 @@
-name: Temporary i32 native validation
+name: Temporary Rust native validation
 on:
   push:
     branches:
@@ -44,7 +44,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: i32-native-${{ matrix.target }}
+          name: a1-native-${{ matrix.target }}
           path: validation-i32/evidence/${{ matrix.target }}
           if-no-files-found: error
           retention-days: 14

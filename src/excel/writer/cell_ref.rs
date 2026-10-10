@@ -20,10 +20,8 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         if index.strict_sub(col_start) >= MAX_A1_COLUMN_LETTERS {
             return None;
         }
-        let letter = u32::from(ch.to_ascii_uppercase())
-            .checked_sub(u32::from('A'))?
-            .checked_add(1)?;
-        col = col.checked_mul(26)?.checked_add(letter)?;
+        let letter = u32::from(ch.to_ascii_uppercase().strict_sub(b'A').strict_add(1));
+        col = col.strict_mul(26).strict_add(letter);
         index = index.strict_add(1);
     }
     if index == col_start {

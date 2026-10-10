@@ -9,7 +9,7 @@ OUT=TASK/'evidence'/TARGET; OUT.mkdir(parents=True,exist_ok=True)
 VERSION='1.99.0'; BASE_SHA='4a0df6f79f5ab812d699af99d8dd5dbe4a219900'
 BASE=Path(os.environ['RUNNER_TEMP'])/'fcupdater-i32-baseline'
 WIN=sys.platform=='win32'; MAC=sys.platform=='darwin'; EXT='.exe' if WIN else ''
-rng=random.Random(202610110015)
+rng=random.Random(202610110145)
 criteria={'pairs':192,'warmups':3,'CLI_launches':8,'bootstrap':10000,
           'each_wall_CPU_CI95_upper':.03,'executable_growth_bytes':0,
           'memory_growth':'baseline median + max(2MiB,5%)'}
@@ -102,9 +102,9 @@ def measure(name,functions):
                        'wall':summary(raw),'CPU':summary(cpuraw)}
  save();print(name,report['cases'][name]['wall'],report['cases'][name]['CPU'],flush=True)
 cmd(['git','worktree','add','--detach',BASE,BASE_SHA])
-assert digest(ROOT/'src/excel/writer.rs')=='acf63733987fbebef749acb7e553f53bc7c04ddea0bfa303f0df61ee0c1e5917'
+assert digest(ROOT/'src/excel/writer/cell_ref.rs')=='e20129d649ce64dae14e6234f4cb710a5e0d3a7e7a7552a80438866b42be5f7b'
 changed_paths=cmd(['git','diff','--name-only',BASE_SHA,'--']).stdout.decode().splitlines()
-assert all(p=='src/excel/writer.rs' or p=='.github/workflows/i32-native-validation.yml' or p.startswith('validation-i32/') for p in changed_paths),changed_paths
+assert all(p=='src/excel/writer/cell_ref.rs' or p=='.github/workflows/i32-native-validation.yml' or p.startswith('validation-i32/') for p in changed_paths),changed_paths
 
 rust=cmd(['rustc','+'+VERSION,'-Vv']).stdout.decode()
 assert 'commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4' in rust
@@ -148,7 +148,7 @@ for variant,folder in [('baseline',BASE),('candidate',ROOT)]:
  profile=OUT/('fresh-'+variant+'.profdata')
  cmd([llvm,'merge','-o',profile,*sorted(raw.glob('*.profraw'))]);fresh[variant]=(profile,records(profile))
 changed=sorted(k for k in original.keys()&fresh['candidate'][1].keys() if func_hash(original[k])!=func_hash(fresh['candidate'][1][k]))
-affected=sorted(k for k in original if '10get_i32_at' in k)
+affected=sorted(k for k in original if 'parse_ref_with_locks' in k)
 assert len(affected)==1 and set(changed)<=set(affected),changed
 report['changed_CFG_hashes']=changed
 assert not (fresh['candidate'][1].keys()-original.keys())
@@ -175,9 +175,9 @@ report['executable_bytes']={k:exe(k).stat().st_size for k in ['stock','pgo-basel
 assert report['executable_bytes']['pgo-candidate']<=min(report['executable_bytes']['stock'],report['executable_bytes']['pgo-baseline'])
 # Generate both diagnostic parsers from actual native source, retaining the independent oracle.
 for variant,folder in [('baseline',BASE),('candidate',ROOT)]:
- dst=TASK/('fc-'+variant)/'src/excel';dst.mkdir(parents=True)
- shutil.copy2(folder/'src/excel/writer.rs',dst/'writer.rs')
-cmd([sys.executable,TASK/'prepare_i32_probes.py'])
+ dst=TASK/('fc-'+variant)/'src/excel/writer';dst.mkdir(parents=True)
+ shutil.copy2(folder/'src/excel/writer/cell_ref.rs',dst/'cell_ref.rs')
+cmd([sys.executable,TASK/'prepare_a1_probes.py'])
 probes={}
 for variant in ['baseline','candidate']:
  path=TASK/('i32-'+variant+EXT);probes[variant]=path
@@ -251,7 +251,7 @@ for label in ['stock','pgo-baseline','pgo-candidate']:
    report['live']={'exit':r.returncode,'stderr':r.stderr.decode(),'independent_XLSX_reopen':True}
 assert report['packages']['pgo-candidate']['bytes']<=min(report['packages'][k]['bytes'] for k in ['stock','pgo-baseline'])
 assert all(digest(ROOT/p)==sha for p,sha in report['protected_inputs'].items())
-report['checks']=['two native strict lint/fmt/normal releases','11927 independent oracle cases per variant',
+report['checks']=['two native strict lint/fmt/normal releases','independent A1 oracle covers every16384 column and4 lock combinations per variant',
  'affected-only PGO refresh; other records exact','same192-pair wall+CPU performance gates',
  'all output archives independently CRC checked; final block signatures equal',
  'CLI/malformed errors equivalent without mutation','bounded sampled RSS comparison',
