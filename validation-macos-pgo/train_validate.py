@@ -49,10 +49,8 @@ def canonical(path):
   for name in sorted(z.namelist()):
    b=z.read(name)
    if name=='docProps/core.xml':
-    root=ET.fromstring(b)
-    for e in root.iter():
-     if e.tag.endswith('}modified'):e.text='NORMALIZED'
-    b=ET.tostring(root)
+    ET.fromstring(b)  # Validate XML without namespace reserialization side effects.
+    b=re.sub(rb'(<dcterms:modified\b[^>]*>)[^<]*(</dcterms:modified>)',rb'\1NORMALIZED\2',b)
    result[name]=digest_bytes(b)
   return result
 def digest_bytes(b):return hashlib.sha256(b).hexdigest()
