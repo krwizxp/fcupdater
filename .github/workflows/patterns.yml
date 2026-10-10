@@ -1,0 +1,57 @@
+name: Temporary real-use PGO relearning
+on:
+  push:
+    branches: [codex/pgo-patterns-20261010]
+permissions:
+  contents: read
+jobs:
+  native:
+    name: PGO actual patterns / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: fcupdater
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: krwizxp/srg
+          ref: 5be8df3c960ebc601c7bfb815d2aae7c90911088
+          persist-credentials: false
+          path: srg
+      - name: Exact Rust and matching LLVM
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview --no-self-update
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Windows actual console adapter
+        if: runner.os == 'Windows'
+        run: python -m pip install pywinpty
+      - name: Train unchanged product CLI and compare profiles
+        working-directory: fcupdater
+        env:
+          PATTERN_TARGET: ${{ matrix.target }}
+        run: python validation-patterns/patterns.py
+      - name: Profile and exact evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: real-patterns-${{ matrix.target }}
+          path: |
+            fcupdater/validation-patterns/evidence/${{ matrix.target }}/results.json
+            fcupdater/validation-patterns/evidence/${{ matrix.target }}/*.profdata
+            fcupdater/validation-patterns/evidence/${{ matrix.target }}/*.tar
+            fcupdater/validation-patterns/evidence/${{ matrix.target }}/*.exe
+          retention-days: 3
