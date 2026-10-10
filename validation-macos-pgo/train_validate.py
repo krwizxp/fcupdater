@@ -12,9 +12,10 @@ def cmd(args,cwd=ROOT,env=None,expected=0,timeout=300):
 def cargo(args,td,flags=None):
  e=dict(os.environ,CARGO_TARGET_DIR=str(td));e.pop('RUSTFLAGS',None);e.pop('CARGO_ENCODED_RUSTFLAGS',None)
  if flags:e['RUSTFLAGS']=flags
- p=cmd(['cargo','+'+VERSION,*args],env=e)
- text=p.stderr.decode('utf-8','replace');assert 'hash mismatch' not in text.lower() and 'no profile data available' not in text.lower(),text
+ p=cmd(['cargo','+'+VERSION,'--verbose',*args],env=e)
+ text=p.stderr.decode('utf-8','replace')
  with (OUT/'build.log').open('a') as f:f.write('cargo '+str(args)+'\n'+text+'\n')
+ assert 'hash mismatch' not in text.lower() and 'no profile data available' not in text.lower(),text
  return p
 report['environment']={'rust':cmd(['rustc','+'+VERSION,'-Vv']).stdout.decode(),'os':platform.platform(),'cpu':cmd(['sysctl','-n','machdep.cpu.brand_string'],expected=None).stdout.decode().strip(),'arch':platform.machine(),'runner_image':os.environ.get('ImageVersion')}
 assert cmd(['rustc','+'+VERSION,'-vV']).stdout.decode().split('release: ')[1].splitlines()[0]==VERSION
@@ -33,7 +34,7 @@ source=TASK/'source.xls';source.write_bytes(gzip.decompress((TASK/'source.xls.gz
 replay=TASK/'replay.dylib';cmd(['clang','-dynamiclib','-O2',TASK/'replay.c','-lcurl','-o',replay])
 env=dict(os.environ,PGO_XLS=str(source),DYLD_INSERT_LIBRARIES=str(replay),DYLD_FORCE_FLAT_NAMESPACE='1');env.pop('LLVM_PROFILE_FILE',None)
 trainenv=dict(env,LLVM_PROFILE_FILE=str(raw/'%p-%m.profraw'))
-cargo(['build','--release','--frozen','--bin','fcupdater','--target',TARGET],train_td,'-Cprofile-generate='+str(raw))
+cargo(['build-pgo'],train_td,'-Cprofile-generate='+str(raw))
 train=train_td/TARGET/'release/fcupdater'
 def canonical(path):
  with zipfile.ZipFile(path) as z:
@@ -75,6 +76,7 @@ report['training']={'verify_updates':32,'skip_updates':8,'cli_cases':4,'malforme
 sysroot=Path(cmd(['rustc','+'+VERSION,'--print','sysroot']).stdout.decode().strip());llvm=sysroot/'lib/rustlib'/TARGET/'bin/llvm-profdata'
 profile=ROOT/'pgo'/(TARGET+'.profdata');raws=list(raw.glob('*.profraw'));assert raws
 cmd([llvm,'merge','-o',profile,*raws]);shutil.copy2(profile,OUT/profile.name)
+(OUT/'profile-functions.txt').write_bytes(cmd([llvm,'show','--all-functions',profile]).stdout)
 report['profile']={'sha256':digest(profile),'bytes':profile.stat().st_size,'raw_files':len(raws)};save()
 cargo(['build-pgo'],pgo_td)
 pgo=pgo_td/TARGET/'release/fcupdater'
