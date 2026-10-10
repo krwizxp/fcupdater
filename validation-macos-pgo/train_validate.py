@@ -63,16 +63,22 @@ def update(exe,fixture,verify,e=env,loops=1,independent=False):
    rows=list(book['유류비'].iter_rows(values_only=True));assert len(rows)>500
    book.close()
   return elapsed/loops,sig
-for i in range(16):
- for fixture in [TASK/'before.xlsx',TASK/'valid.xlsx']:
-  update(train,fixture,True,trainenv)
-for i in range(4):
- for fixture in [TASK/'before.xlsx',TASK/'valid.xlsx']:update(train,fixture,False,trainenv)
-with tempfile.TemporaryDirectory(prefix='fcupdater-macos-training-errors-') as d:
- work=Path(d)
- for args,code in [(['--help'],0),(['--version'],0),(['--bad-option'],1),(['--verify','extra'],1)]:cmd([train,*args],work,trainenv,expected=code)
- (work/'fuel_cost_chungcheong.xlsx').write_bytes(b'not an xlsx');cmd([train,'--verify'],work,trainenv,expected=1)
-report['training']={'verify_updates':32,'skip_updates':8,'cli_cases':4,'malformed_workbook':1,'current_main_workbook_held_out':True,'instrumentation':'unchanged actual product CLI, fixed captured response via external DYLD interpose; adapter excluded from product/profdata'}
+def train_runs(binary):
+ for i in range(16):
+  for fixture in [TASK/'before.xlsx',TASK/'valid.xlsx']:
+   update(binary,fixture,True,trainenv)
+ for i in range(4):
+  for fixture in [TASK/'before.xlsx',TASK/'valid.xlsx']:update(binary,fixture,False,trainenv)
+ with tempfile.TemporaryDirectory(prefix='fcupdater-macos-training-errors-') as d:
+  work=Path(d)
+  for args,code in [(['--help'],0),(['--version'],0),(['--bad-option'],1),(['--verify','extra'],1)]:cmd([binary,*args],work,trainenv,expected=code)
+  (work/'fuel_cost_chungcheong.xlsx').write_bytes(b'not an xlsx');cmd([binary,'--verify'],work,trainenv,expected=1)
+train_runs(train)
+# Genuine supplemental native CLI profile: retain small functions otherwise removed before instrumentation.
+supp_td=TASK/'build-train-supplement'
+cargo(['build-pgo'],supp_td,'-Cprofile-generate='+str(raw)+' -Cllvm-args=-disable-preinline')
+train_runs(supp_td/TARGET/'release/fcupdater')
+report['training']={'verify_updates':32,'skip_updates':8,'cli_cases':4,'malformed_workbook':1,'current_main_workbook_held_out':True,'supplement':'same unchanged CLI and inputs; -disable-preinline instrumentation additionally retains small functions; final build retains normal preinline settings','instrumentation':'unchanged actual product CLI, fixed captured response via external DYLD interpose; adapter excluded from product/profdata'}
 sysroot=Path(cmd(['rustc','+'+VERSION,'--print','sysroot']).stdout.decode().strip());llvm=sysroot/'lib/rustlib'/TARGET/'bin/llvm-profdata'
 profile=ROOT/'pgo'/(TARGET+'.profdata');raws=list(raw.glob('*.profraw'));assert raws
 cmd([llvm,'merge','-o',profile,*raws]);shutil.copy2(profile,OUT/profile.name)
