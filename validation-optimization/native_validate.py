@@ -63,7 +63,7 @@ fresh=OUT/'full-fresh.profdata';shutil.copy2(prof,fresh)
 retained=TASK/'retained.profdata';crc_only=TASK/'crc-only.profdata';pattern='11zip_archive12crc32_update'
 cmd([llvm,'merge','--no-function='+pattern,ROOT/'pgo'/(TARGET+'.profdata'),'-o',retained]);cmd([llvm,'merge','--function='+pattern,fresh,'-o',crc_only]);cmd([llvm,'merge',retained,crc_only,'-o',prof])
 def profile_records(p):
- text=cmd([llvm,'show','--all-functions','--counts','--text',p]).stdout.decode().removeprefix(':ir\n').strip()
+ text=cmd([llvm,'show','--all-functions','--counts','--text',p]).stdout.decode().replace('\r\n','\n').removeprefix(':ir\n').strip()
  return {record.splitlines()[0]:record for record in text.split('\n\n')}
 old_records=profile_records(ROOT/'pgo'/(TARGET+'.profdata'));new_records=profile_records(prof);diff=[k for k in old_records.keys()|new_records.keys() if old_records.get(k)!=new_records.get(k)];assert len(diff)==1 and pattern in diff[0],diff
 report['profile_refresh']={'strategy':'refresh only changed CRC function from actual current native instrumentation; preserve all unchanged function records byte-for-byte','changed_records':diff,'unchanged_records':len(old_records)-1}
