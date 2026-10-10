@@ -4,23 +4,17 @@ on:
     branches: [codex/pgo-patterns-20261010]
 permissions:
   contents: read
+env:
+  PYTHONUTF8: "1"
+  PATTERN_TARGET: x86_64-pc-windows-msvc
 jobs:
-  native:
-    name: PGO actual patterns / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  train:
+    name: Windows SRG product training and selection
+    runs-on: windows-latest
     timeout-minutes: 120
-    env:
-      PYTHONUTF8: "1"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 0
           persist-credentials: false
           path: fcupdater
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -29,27 +23,87 @@ jobs:
           ref: 5be8df3c960ebc601c7bfb815d2aae7c90911088
           persist-credentials: false
           path: srg
-      - name: Exact Rust and matching LLVM
-        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview --no-self-update
-      - name: Linux native dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
-      - name: Windows actual console adapter
-        if: runner.os == 'Windows'
-        run: python -m pip install pywinpty
-      - name: Train unchanged product CLI and compare profiles
+      - run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview --no-self-update
+      - run: python -m pip install pywinpty
+      - name: Train exact product and choose among the same three profiles
         working-directory: fcupdater
         env:
-          PATTERN_TARGET: ${{ matrix.target }}
-        run: python validation-patterns/patterns.py
-      - name: Profile and exact evidence
+          PATTERN_PHASE: train
+        run: python validation-patterns/split_patterns.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: real-patterns-${{ matrix.target }}
+          name: windows-srg-prepared
           path: |
-            fcupdater/validation-patterns/evidence/${{ matrix.target }}/results.json
-            fcupdater/validation-patterns/evidence/${{ matrix.target }}/*.profdata
-            fcupdater/validation-patterns/evidence/${{ matrix.target }}/*.tar
-            fcupdater/validation-patterns/evidence/${{ matrix.target }}/*.exe
+            fcupdater/validation-patterns/prepared/
+          retention-days: 3
+  measure:
+    needs: train
+    name: Windows SRG paired comparison / ${{ matrix.group }}
+    runs-on: windows-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [features, menu, full-0, full-1, full-2, full-3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: fcupdater
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: windows-srg-prepared
+          path: fcupdater/validation-patterns/prepared
+      - run: python -m pip install pywinpty
+      - name: Measure unchanged release executables on paired native inputs
+        working-directory: fcupdater
+        env:
+          PATTERN_PHASE: measure
+          PATTERN_GROUP: ${{ matrix.group }}
+        run: python validation-patterns/split_patterns.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: windows-srg-part-${{ matrix.group }}
+          path: fcupdater/validation-patterns/evidence/x86_64-pc-windows-msvc/results.json
+          retention-days: 3
+  combine:
+    needs: measure
+    name: Windows SRG exact evidence and unchanged product package
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: fcupdater
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: krwizxp/srg
+          ref: 5be8df3c960ebc601c7bfb815d2aae7c90911088
+          persist-credentials: false
+          path: srg
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: windows-srg-prepared
+          path: fcupdater/validation-patterns/prepared
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          pattern: windows-srg-part-*
+          path: fcupdater/validation-patterns/parts
+      - run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview --no-self-update
+      - name: Verify fixed denominator and compute the original acceptance criteria
+        working-directory: fcupdater
+        env:
+          PATTERN_PHASE: combine
+        run: python validation-patterns/split_patterns.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: real-patterns-x86_64-pc-windows-msvc-srg
+          path: |
+            fcupdater/validation-patterns/evidence/x86_64-pc-windows-msvc/results.json
+            fcupdater/validation-patterns/evidence/x86_64-pc-windows-msvc/*.profdata
+            fcupdater/validation-patterns/evidence/x86_64-pc-windows-msvc/*.exe
           retention-days: 3

@@ -4,7 +4,7 @@ import os, sys, subprocess, tempfile, shutil, time, threading, json, hashlib, gz
 import random, statistics, re, zipfile, xml.etree.ElementTree as ET, email.utils
 import faulthandler
 faulthandler.enable()
-faulthandler.dump_traceback_later(60, repeat=True)
+faulthandler.dump_traceback_later(600, repeat=True)
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 WIN = sys.platform == 'win32'
@@ -326,6 +326,16 @@ def run_app(app,folder,llvm):
     selected=min(data['selection'],key=lambda k:max(data['selection'][k]['vs_old']['summary']['median_change'],data['selection'][k].get('actions_vs_old',data['selection'][k]['vs_old'])['summary']['median_change']))
     data['selected']=selected;profile=work/(selected+'.profdata');data['binary_bytes']={k:exes[k].stat().st_size for k in ['normal','old',selected]}
     shutil.copy2(profile, OUT/(app+'-'+TARGET+'.profdata'))
+    if os.environ.get('PATTERN_PREPARE_ONLY') == '1':
+        prepared = TASK/'prepared';prepared.mkdir(exist_ok=True)
+        payloads = {'normal'+EXT: exes['normal'], 'old'+EXT: exes['old'],
+                    'candidate'+EXT: exes[selected], 'wrapper'+EXT: wrapper,
+                    'candidate.profdata': profile}
+        data['prepared_sha256'] = {}
+        for name, path in payloads.items():
+            shutil.copy2(path, prepared/name)
+            data['prepared_sha256'][name] = hashlib.sha256((prepared/name).read_bytes()).hexdigest()
+        save();shutil.copy2(OUT/'results.json', prepared/'results.json');return
     cases=(['menu-bulk','actions-default','workflow-default','single','small','medium','integer','float','ladder','manual','time','help','version','invalid'] if app=='srg'
            else ['verify-current','verify-prior','skip-current','skip-prior','help','version','invalid','malformed'])
     for case in cases:
