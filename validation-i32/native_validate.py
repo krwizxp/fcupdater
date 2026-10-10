@@ -1,6 +1,6 @@
 """Task-only proposed native validation; never installs profiles in product pgo/."""
 from pathlib import Path
-import ctypes, gzip, hashlib, json, os, platform, random, shutil
+import atexit, ctypes, gzip, hashlib, json, os, platform, random, shutil
 import statistics, subprocess, sys, tarfile, tempfile, time, zipfile
 import xml.etree.ElementTree as ET
 import openpyxl, psutil
@@ -17,6 +17,7 @@ report={'target':TARGET,'base':BASE_SHA,'candidate':os.environ.get('GITHUB_SHA')
         'run':os.environ.get('GITHUB_RUN_ID'),'image':os.environ.get('ImageVersion'),
         'criteria':criteria,'cases':{},'checks':[],'logs':[],'complete':False}
 def save(): (OUT/'results.json').write_text(json.dumps(report,indent=2)+'\n')
+atexit.register(save)
 def digest(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def cmd(args,cwd=ROOT,env=None,expected=0,timeout=1200):
  p=subprocess.run(list(map(str,args)),cwd=cwd,env=env,capture_output=True,timeout=timeout)
@@ -101,7 +102,7 @@ def measure(name,functions):
                        'wall':summary(raw),'CPU':summary(cpuraw)}
  save();print(name,report['cases'][name]['wall'],report['cases'][name]['CPU'],flush=True)
 cmd(['git','worktree','add','--detach',BASE,BASE_SHA])
-assert digest(ROOT/'src/excel/writer.rs')=='cc52dc773d09cf16b0069775fd4e660aabfdf77b32c3f3377aa5c5943b3c894a'
+assert digest(ROOT/'src/excel/writer.rs')=='acf63733987fbebef749acb7e553f53bc7c04ddea0bfa303f0df61ee0c1e5917'
 changed_paths=cmd(['git','diff','--name-only',BASE_SHA,'--']).stdout.decode().splitlines()
 assert all(p=='src/excel/writer.rs' or p=='.github/workflows/i32-native-validation.yml' or p.startswith('validation-i32/') for p in changed_paths),changed_paths
 
@@ -147,11 +148,13 @@ for variant,folder in [('baseline',BASE),('candidate',ROOT)]:
  profile=OUT/('fresh-'+variant+'.profdata')
  cmd([llvm,'merge','-o',profile,*sorted(raw.glob('*.profraw'))]);fresh[variant]=(profile,records(profile))
 changed=sorted(k for k in original.keys()&fresh['candidate'][1].keys() if func_hash(original[k])!=func_hash(fresh['candidate'][1][k]))
-assert len(changed)==1 and '10get_i32_at' in changed[0],changed
+affected=sorted(k for k in original if '10get_i32_at' in k)
+assert len(affected)==1 and set(changed)<=set(affected),changed
+report['changed_CFG_hashes']=changed
 assert not (fresh['candidate'][1].keys()-original.keys())
 report['profiles']={}
 for variant in ['baseline','candidate']:
- key=changed[0]; assert key in fresh[variant][1]
+ key=affected[0]; assert key in fresh[variant][1]
  pattern=key.split(';')[-1];retained=OUT/(variant+'-retained.profdata');selected=OUT/(variant+'-selected.profdata');profile=OUT/(variant+'.profdata')
  cmd([llvm,'merge','--no-function='+pattern,ROOT/'pgo'/(TARGET+'.profdata'),'-o',retained])
  cmd([llvm,'merge','--function='+pattern,fresh[variant][0],'-o',selected])

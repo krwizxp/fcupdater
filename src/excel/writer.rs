@@ -1341,7 +1341,11 @@ impl Worksheet {
         if !saw_digit {
             return Ok(None);
         }
-        let magnitude = whole.checked_add(i64::from(round_away_from_zero));
+        let magnitude = if round_away_from_zero {
+            whole.checked_add(1)
+        } else {
+            Some(whole)
+        };
         let signed = magnitude.and_then(|value| {
             if negative {
                 value.checked_neg()
