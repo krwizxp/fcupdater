@@ -102,7 +102,7 @@ def measure(name,functions):
                        'wall':summary(raw),'CPU':summary(cpuraw)}
  save();print(name,report['cases'][name]['wall'],report['cases'][name]['CPU'],flush=True)
 cmd(['git','worktree','add','--detach',BASE,BASE_SHA])
-assert digest(ROOT/'src/excel/writer/cell_ref.rs')=='e20129d649ce64dae14e6234f4cb710a5e0d3a7e7a7552a80438866b42be5f7b'
+assert digest(ROOT/'src/excel/writer/cell_ref.rs')=='bf5794c07ce5cab43b0f250c1a5c04b1cdad566766526e373c9d6e3e3100a53f'
 changed_paths=cmd(['git','diff','--name-only',BASE_SHA,'--']).stdout.decode().splitlines()
 assert all(p=='src/excel/writer/cell_ref.rs' or p=='.github/workflows/i32-native-validation.yml' or p.startswith('validation-i32/') for p in changed_paths),changed_paths
 
