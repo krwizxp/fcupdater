@@ -1,4 +1,4 @@
-name: Temporary Rust native validation
+name: Temporary Windows validation environment repair
 on:
   push:
     branches:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 concurrency:
   group: i32-native-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   validate:
     runs-on: ${{ matrix.os }}
@@ -16,14 +16,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04
-            target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-26-intel
-            target: x86_64-apple-darwin
-          - os: macos-26
-            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

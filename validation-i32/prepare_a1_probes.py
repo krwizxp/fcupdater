@@ -33,7 +33,7 @@ kernel += [cases[65536+rng.randrange(len(cases)-65536)] for _ in range(256)]
 (ROOT/'kernel-input.bin').write_bytes(encoded(kernel))
 (ROOT/'corpus.json').write_text(json.dumps({'seed':202610110145,'oracle_cases':len(cases),'kernel_cases':1024,'kernel_passes':1024,
  'oracle':'independent ASCII regex grammar, openpyxl column index lookup, arbitrary precision Python row/lock fields',
- 'valid_column_coverage':16384,'lock_combinations':4,'edges':edges},ensure_ascii=False,indent=2)+'\n')
+ 'valid_column_coverage':16384,'lock_combinations':4,'edges':edges},ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 template=r'''
 use std::{io::Write,hint::black_box};
 const MAX_A1_COLUMN_LETTERS: usize = 3;
@@ -58,9 +58,9 @@ fn main() {
 }
 '''
 for label in ['baseline','candidate']:
- source=(ROOT/f'fc-{label}/src/excel/writer/cell_ref.rs').read_text()
+ source=(ROOT/f'fc-{label}/src/excel/writer/cell_ref.rs').read_text(encoding='utf-8')
  start=source.index('pub(super) fn parse_ref_with_locks')
  end=source.index('pub(super) fn with_unlocked_ref_parts',start)
  body=source[start:end].replace('pub(super) fn','fn',1)
- (ROOT/f'i32-{label}.rs').write_text(template.replace('BODY',body))
+ (ROOT/f'i32-{label}.rs').write_text(template.replace('BODY',body),encoding='utf-8')
 print('independent A1 oracle cases',len(cases))
