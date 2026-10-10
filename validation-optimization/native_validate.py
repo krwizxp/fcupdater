@@ -2,7 +2,7 @@ from pathlib import Path
 import os,sys,json,subprocess,shutil,gzip,tempfile,zipfile,hashlib,random,statistics,time,platform,xml.etree.ElementTree as ET
 import openpyxl,psutil,tarfile
 ROOT=Path.cwd();TASK=ROOT/'validation-optimization';TARGET=os.environ['OPT_TARGET'];WIN=sys.platform=='win32';MAC=sys.platform=='darwin';EXT='.exe' if WIN else '';VERSION='1.99.0';OUT=TASK/'evidence'/TARGET;OUT.mkdir(parents=True,exist_ok=True)
-BASE_SHA='4a0df6f79f5ab812d699af99d8dd5dbe4a219900';BASE=TASK/'baseline';rng=random.Random(2026101059)
+BASE_SHA='4a0df6f79f5ab812d699af99d8dd5dbe4a219900';BASE=Path(os.environ['RUNNER_TEMP'])/'fcupdater-opt-baseline';rng=random.Random(2026101059)
 report={'target':TARGET,'base_commit':BASE_SHA,'candidate_commit':os.environ.get('GITHUB_SHA'),'run':os.environ.get('GITHUB_RUN_ID'),'runner_image':os.environ.get('ImageVersion'),'criteria':{'pairs':48,'loops':3,'bootstrap':10000,'runtime_upper_bound':.03,'shipped_size_growth':0,'memory_upper_bound':'baseline median + max(2MiB,5%)'},'cases':{},'checks':[],'build_diagnostics':[]}
 def save():(OUT/'results.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 def digest(p):return hashlib.sha256(p.read_bytes()).hexdigest()
