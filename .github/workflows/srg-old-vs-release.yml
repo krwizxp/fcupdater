@@ -1,0 +1,69 @@
+name: Temporary SRG previous PGO vs normal release direct comparison
+on:
+  push:
+    branches: [codex/srg-old-pgo-vs-release-20261010]
+permissions:
+  contents: read
+  actions: read
+env:
+  PYTHONUTF8: '1'
+  PATTERN_TARGET: x86_64-pc-windows-msvc
+jobs:
+  compare:
+    name: Windows same-host paired SRG 8145060 / shard ${{ matrix.shard }}
+    runs-on: windows-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: fcupdater
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: windows-srg-prepared
+          run-id: 38015039181
+          github-token: ${{ github.token }}
+          path: fcupdater/validation-patterns/prepared
+      - run: python -m pip install pywinpty
+      - name: Compare old PGO directly with ordinary release (real SRG menu 4)
+        working-directory: fcupdater
+        env:
+          SRG_COMPARE_PHASE: measure
+          SRG_COMPARE_SHARD: ${{ matrix.shard }}
+        run: python validation-patterns/compare_old_release.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: srg-direct-old-vs-release-shard-${{ matrix.shard }}
+          path: fcupdater/validation-patterns/direct-results/shard-${{ matrix.shard }}/results.json
+          retention-days: 7
+  summarize:
+    needs: compare
+    name: Validate fixed denominator and summarize paired distributions
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: fcupdater
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          pattern: srg-direct-old-vs-release-shard-*
+          path: fcupdater/validation-patterns/direct-results
+          merge-multiple: false
+      - name: Collect same-code old PGO and release direct comparison
+        working-directory: fcupdater
+        env:
+          SRG_COMPARE_PHASE: combine
+        run: python validation-patterns/compare_old_release.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: srg-direct-old-pgo-vs-release-complete
+          path: fcupdater/validation-patterns/direct-results/final_results.json
+          retention-days: 7
