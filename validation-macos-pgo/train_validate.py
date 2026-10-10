@@ -3,6 +3,7 @@ import os,sys,json,subprocess,hashlib,gzip,shutil,tempfile,time,random,statistic
 ROOT=Path.cwd();TASK=ROOT/'validation-macos-pgo';TARGET=os.environ['MACOS_PGO_TARGET'];OUT=TASK/'evidence'/TARGET;OUT.mkdir(parents=True,exist_ok=True)
 SOURCE_COMMIT='cdd9b13c41502efaed4bfc6a6b868af1a7bc0ec0';VERSION='1.99.0';LOOPS=4;PAIRS=64
 report={'source_commit':SOURCE_COMMIT,'workflow_commit':os.environ.get('GITHUB_SHA'),'run':os.environ.get('GITHUB_RUN_ID'),'target':TARGET,'criteria':{'primary_paired_median_at_most':-.01,'primary_upper95_below':0,'workbook_non_regression_upper95':.03,'pairs':PAIRS,'invocations_per_sample':LOOPS,'bootstrap':10000,'seed':2026101014,'size':'record actual executable/package; no zero-growth requirement'},'cases':{},'checks':[]}
+prior_path=TASK/'resume'/TARGET/'results.json';prior=json.loads(prior_path.read_text()) if prior_path.exists() else None
 def save(): (OUT/'results.json').write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n')
 def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def cmd(args,cwd=ROOT,env=None,expected=0,timeout=300):
@@ -40,7 +41,7 @@ source=TASK/'source.xls';source.write_bytes(gzip.decompress((TASK/'source.xls.gz
 replay=TASK/'replay.dylib';cmd(['clang','-dynamiclib','-O2',TASK/'replay.c','-lcurl','-o',replay])
 env=dict(os.environ,PGO_XLS=str(source),DYLD_INSERT_LIBRARIES=str(replay),DYLD_FORCE_FLAT_NAMESPACE='1');env.pop('LLVM_PROFILE_FILE',None)
 trainenv=dict(env,LLVM_PROFILE_FILE=str(raw/'%p-%m.profraw'))
-cargo(['build-pgo'],train_td,'-Cprofile-generate='+str(raw))
+if not prior:cargo(['build-pgo'],train_td,'-Cprofile-generate='+str(raw))
 train=train_td/TARGET/'release/fcupdater'
 def canonical(path):
  with zipfile.ZipFile(path) as z:
@@ -78,13 +79,19 @@ def train_runs(binary):
   work=Path(d)
   for args,code in [(['--help'],0),(['--version'],0),(['--bad-option'],1),(['--verify','extra'],1)]:cmd([binary,*args],work,trainenv,expected=code)
   (work/'fuel_cost_chungcheong.xlsx').write_bytes(b'not an xlsx');cmd([binary,'--verify'],work,trainenv,expected=1)
-train_runs(train)
+if not prior:train_runs(train)
 report['training']={'verify_updates':32,'skip_updates':8,'cli_cases':4,'malformed_workbook':1,'current_main_workbook_held_out':True,'pipeline':'unchanged default release optimization pipeline; compiler missing-function diagnostics retained and audited','instrumentation':'unchanged actual product CLI, fixed captured response via external DYLD interpose; adapter excluded from product/profdata'}
-sysroot=Path(cmd(['rustc','+'+VERSION,'--print','sysroot']).stdout.decode().strip());llvm=sysroot/'lib/rustlib'/TARGET/'bin/llvm-profdata'
-profile=ROOT/'pgo'/(TARGET+'.profdata');raws=list(raw.glob('*.profraw'));assert raws
-cmd([llvm,'merge','-o',profile,*raws]);shutil.copy2(profile,OUT/profile.name)
-(OUT/'profile-functions.txt').write_bytes(cmd([llvm,'show','--all-functions',profile]).stdout)
-report['profile']={'sha256':digest(profile),'bytes':profile.stat().st_size,'raw_files':len(raws)};save()
+if not prior:
+ sysroot=Path(cmd(['rustc','+'+VERSION,'--print','sysroot']).stdout.decode().strip());llvm=sysroot/'lib/rustlib'/TARGET/'bin/llvm-profdata'
+ profile=ROOT/'pgo'/(TARGET+'.profdata');raws=list(raw.glob('*.profraw'));assert raws
+ cmd([llvm,'merge','-o',profile,*raws]);shutil.copy2(profile,OUT/profile.name)
+ (OUT/'profile-functions.txt').write_bytes(cmd([llvm,'show','--all-functions',profile]).stdout)
+ report['profile']={'sha256':digest(profile),'bytes':profile.stat().st_size,'raw_files':len(raws)};save()
+else:
+ profile=ROOT/'pgo'/(TARGET+'.profdata');assert digest(profile)==prior['profile']['sha256']
+ for key in ['sources','lock_sha256','fixtures']:assert report[key]==prior[key],key
+ report['profile']=prior['profile'];report['training']=prior['training'];shutil.copy2(profile,OUT/profile.name)
+ report['measurement_provenance']={'run':prior['run'],'workflow_commit':prior['workflow_commit']}
 cargo(['build-pgo'],pgo_td)
 pgo=pgo_td/TARGET/'release/fcupdater'
 cargo(['clippy','--release','--frozen','--bin','fcupdater','--config','.cargo/pgo.toml','--','-D','warnings'],pgo_td)
@@ -108,24 +115,30 @@ def interval(rows):
  boots=sorted(statistics.median(b.choices(ratios,k=len(ratios))) for _ in range(10000))
  return {'median_seconds':[statistics.median(r[k] for r in rows) for k in exes],'paired_median_change':statistics.median(ratios),'ci95':[boots[250],boots[9749]],'pairs':len(rows),'p95_seconds':[sorted(r[k] for r in rows)[int(.95*len(rows))] for k in exes]}
 cases=[('verify-current',ROOT/'fuel_cost_chungcheong.xlsx',True),('verify-prior',TASK/'before.xlsx',True),('skip-current',ROOT/'fuel_cost_chungcheong.xlsx',False),('skip-prior',TASK/'before.xlsx',False)]
-for name,fixture,verify in cases:
- sigs=[update(exe,fixture,verify,independent=True)[1] for exe in exes.values()]
- (OUT/'comparison-debug.json').write_text(json.dumps({'case':name,'release':sigs[0],'pgo':sigs[1]},indent=2))
- assert sigs[0]==sigs[1],(name,[k for k in sigs[0][2] if sigs[0][2][k]!=sigs[1][2].get(k)],sigs[0][:2],sigs[1][:2])
- for exe in exes.values():update(exe,fixture,verify,loops=LOOPS)
- data={'raw':[]};report['cases'][name]=data
- for i in range(PAIRS):
-  order=list(exes);rng.shuffle(order);values={k:update(exes[k],fixture,verify,loops=LOOPS) for k in order}
-  assert values['release'][1]==values['pgo'][1],(name,i,'output mismatch')
-  data['raw'].append({'order':order,'release':values['release'][0],'pgo':values['pgo'][0]});save()
-  if i%16==0:print(name,'pairs',i+1,'/',PAIRS,flush=True)
- data['summary']=interval(data['raw']);save();print(name,data['summary'],flush=True)
+reuse=bool(prior and report['binary']==prior['binary'] and report['environment']==prior['environment'])
+report['reused_identical_binary_measurements']=reuse
+if reuse:
+ report['cases']=prior['cases'];print('Reusing verified measurements of byte-identical binaries on identical runner image',flush=True)
+else:
+ for name,fixture,verify in cases:
+  sigs=[update(exe,fixture,verify,independent=True)[1] for exe in exes.values()]
+  (OUT/'comparison-debug.json').write_text(json.dumps({'case':name,'release':sigs[0],'pgo':sigs[1]},indent=2))
+  assert sigs[0]==sigs[1],(name,[k for k in sigs[0][2] if sigs[0][2][k]!=sigs[1][2].get(k)],sigs[0][:2],sigs[1][:2])
+  for exe in exes.values():update(exe,fixture,verify,loops=LOOPS)
+  data={'raw':[]};report['cases'][name]=data
+  for i in range(PAIRS):
+   order=list(exes);rng.shuffle(order);values={k:update(exes[k],fixture,verify,loops=LOOPS) for k in order}
+   assert values['release'][1]==values['pgo'][1],(name,i,'output mismatch')
+   data['raw'].append({'order':order,'release':values['release'][0],'pgo':values['pgo'][0]});save()
+   if i%16==0:print(name,'pairs',i+1,'/',PAIRS,flush=True)
+  data['summary']=interval(data['raw']);save();print(name,data['summary'],flush=True)
 # Per-process native peak RSS, separate from runtime pairs.
 report['memory_samples']={}
 for label,exe in exes.items():
  with tempfile.TemporaryDirectory(prefix='fcupdater-macos-memory-') as d:
   work=Path(d);shutil.copy2(ROOT/'fuel_cost_chungcheong.xlsx',work/'fuel_cost_chungcheong.xlsx')
-  p=cmd(['/usr/bin/time','-l',exe,'--verify'],work,env);text=p.stderr.decode();rss=re.search(r'(\d+)\s+maximum resident set size',text);assert rss,text
+  clean=dict(os.environ);clean.pop('DYLD_INSERT_LIBRARIES',None);clean.pop('DYLD_FORCE_FLAT_NAMESPACE',None)
+  p=cmd(['/usr/bin/time','-l','/usr/bin/env','DYLD_INSERT_LIBRARIES='+str(replay),'DYLD_FORCE_FLAT_NAMESPACE=1','PGO_XLS='+str(source),exe,'--verify'],work,clean);text=p.stderr.decode();rss=re.search(r'(\d+)\s+maximum resident set size',text);assert rss,text
   report['memory_samples'][label]={'maximum_resident_set_size_native':int(rss[1]),'raw_time_l':text}
 # Clean supported packaging, with no replay dylib or profdata in the archive.
 penv=dict(os.environ,CARGO_TARGET_DIR=str(pgo_td/TARGET));penv.pop('DYLD_INSERT_LIBRARIES',None);penv.pop('DYLD_FORCE_FLAT_NAMESPACE',None);penv.pop('LLVM_PROFILE_FILE',None)
