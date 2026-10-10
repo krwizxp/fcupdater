@@ -1,0 +1,39 @@
+name: Temporary native macOS PGO training and validation
+on:
+  push:
+    branches: [codex/fcupdater-macos-pgo-20261010-1413]
+permissions:
+  contents: read
+jobs:
+  native:
+    name: ${{ matrix.target }} PGO training and comparison
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+          - os: macos-26
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned latest stable Rust and LLVM tools
+        run: rustup toolchain install 1.99.0 --profile minimal --component llvm-tools-preview --component rustfmt --component clippy --no-self-update
+      - name: Install independent workbook reader
+        run: |
+          python3 -m venv "$RUNNER_TEMP/fcupdater-pgo-python"
+          "$RUNNER_TEMP/fcupdater-pgo-python/bin/pip" install openpyxl==3.1.5
+      - name: Train unchanged actual CLI and validate release versus PGO
+        env:
+          MACOS_PGO_TARGET: ${{ matrix.target }}
+        run: '"$RUNNER_TEMP/fcupdater-pgo-python/bin/python" validation-macos-pgo/train_validate.py'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: fcupdater-pgo-${{ matrix.target }}
+          path: validation-macos-pgo/evidence/${{ matrix.target }}
+          retention-days: 14
