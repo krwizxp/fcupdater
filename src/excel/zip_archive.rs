@@ -17,7 +17,7 @@ mod write;
 const CENTRAL_DIRECTORY_HEADER_LEN: usize = 46;
 const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const CODE_LENGTH_SYMBOLS: usize = 19;
-const CRC32_TABLES: [[u32; 256]; 16] = {
+const CRC32_TABLES: [[u32; 256]; 8] = {
     let mut previous = [0_u32; 256];
     let mut seeds: &mut [u32] = &mut previous;
     let mut seed = 0_u32;
@@ -26,7 +26,7 @@ const CRC32_TABLES: [[u32; 256]; 16] = {
         seeds = tail;
         seed = seed.strict_add(1);
     }
-    let mut tables = [[0_u32; 256]; 16];
+    let mut tables = [[0_u32; 256]; 8];
     let mut remaining: &mut [[u32; 256]] = &mut tables;
     while let Some((slot, tail)) = remaining.split_first_mut() {
         let mut values: &mut [u32] = &mut previous;
@@ -682,45 +682,7 @@ fn crc32_table_value(table_index: usize, byte: u8) -> u32 {
 pub(super) fn crc32_update(initial: u32, bytes: &[u8]) -> u32 {
     let mut crc = initial;
     let mut remaining = bytes;
-    while let Some((chunk, tail)) = remaining.split_first_chunk::<16>() {
-        let [
-            b0,
-            b1,
-            b2,
-            b3,
-            b4,
-            b5,
-            b6,
-            b7,
-            b8,
-            b9,
-            b10,
-            b11,
-            b12,
-            b13,
-            b14,
-            b15,
-        ] = *chunk;
-        let [c0, c1, c2, c3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
-        crc = crc32_table_value(15, c0)
-            ^ crc32_table_value(14, c1)
-            ^ crc32_table_value(13, c2)
-            ^ crc32_table_value(12, c3)
-            ^ crc32_table_value(11, b4)
-            ^ crc32_table_value(10, b5)
-            ^ crc32_table_value(9, b6)
-            ^ crc32_table_value(8, b7)
-            ^ crc32_table_value(7, b8)
-            ^ crc32_table_value(6, b9)
-            ^ crc32_table_value(5, b10)
-            ^ crc32_table_value(4, b11)
-            ^ crc32_table_value(3, b12)
-            ^ crc32_table_value(2, b13)
-            ^ crc32_table_value(1, b14)
-            ^ crc32_table_value(0, b15);
-        remaining = tail;
-    }
-    if let Some((chunk, tail)) = remaining.split_first_chunk::<8>() {
+    while let Some((chunk, tail)) = remaining.split_first_chunk::<8>() {
         let [b0, b1, b2, b3, b4, b5, b6, b7] = *chunk;
         let [c0, c1, c2, c3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
         crc = crc32_table_value(7, c0)

@@ -1,0 +1,45 @@
+name: Temporary native optimization validation
+on:
+  push:
+    branches: [codex/fcupdater-optimize-20261010]
+permissions:
+  contents: read
+jobs:
+  native:
+    name: ${{ matrix.target }} optimization comparison
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+          - os: macos-26
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install exact Rust compiler and checks
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy --component rustfmt --component llvm-tools-preview --no-self-update
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Install independent workbook reader and memory sampler
+        run: python3 -m pip install openpyxl==3.1.5 psutil==7.1.3
+      - name: Native builds, PGO training and protected-metric comparison
+        env:
+          OPT_TARGET: ${{ matrix.target }}
+        run: python3 validation-optimization/native_validate.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: fcupdater-optimization-${{ matrix.target }}
+          path: validation-optimization/evidence/${{ matrix.target }}
+          retention-days: 14
