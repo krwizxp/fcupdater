@@ -1,0 +1,95 @@
+# fcupdater
+
+`fuel_cost_chungcheong.xlsx`를 Opinet 전국 현재 판매가격 자료에 맞춰 현행화하는 명령행 도구입니다. Windows, Linux, macOS에서 같은 방식으로 사용할 수 있습니다.
+
+## 주요 기능
+
+- Opinet 주유소 판매가격 자료 다운로드
+- 주소 기준 주유소 정보와 유종별 가격 갱신
+- 신규·폐업 주유소 반영
+- 지역, 상호, 상표, 셀프 여부 변경 반영
+- 지역화폐와 스마트주유 할인 적용
+- `변경내역` 시트 갱신
+- 저장 결과 검증
+
+## 지원 환경
+
+- Rust 1.99.0 이상 (소스 빌드 및 개발)
+- Windows 10 22H2 이상 또는 Windows 11
+- Linux 및 macOS
+- Linux/macOS의 libcurl 7.85.0 이상
+
+Linux에서 직접 빌드할 때는 배포판의 libcurl 개발 패키지를 사용합니다. 현행화 날짜는 KST 기준으로 기록됩니다.
+
+## 빌드
+
+```bash
+rustup update stable
+cargo +stable build --release --frozen
+```
+
+빌드 결과는 다음 위치에 생성됩니다.
+
+- Windows x64: `target\release\fcupdater.exe`
+- Linux x64: `target/release/fcupdater`
+- macOS: `target/release/fcupdater`
+
+## 사용 방법
+
+실행 파일과 저장소에서 제공하는 `fuel_cost_chungcheong.xlsx`를 같은 폴더에 둔 뒤 실행합니다.
+
+```bash
+fcupdater
+```
+
+프로그램은 Opinet 자료를 내려받아 대상 지역의 주유소 정보를 갱신하고 같은 워크북에 저장합니다. 저장을 시작하기 전에 워크북 구성과 주요 데이터 형식을 확인하며, 원본 상태를 확인한 뒤 안전하게 교체합니다.
+
+### 옵션
+
+- `-h`, `--help`: 도움말 표시
+- `--verify`: 저장 결과를 다시 열어 확인한 뒤 워크북에 반영
+- `--version`: 버전 표시
+
+## 워크북
+
+저장소에서 제공하는 워크북은 다음 두 시트로 구성됩니다.
+
+- `유류비`: 현재 주유소 정보, 가격, 할인과 순위
+- `변경내역`: 가격과 주유소 정보의 변경 이력
+
+현행화 과정에서는 수식과 계산값, 서식, 변경 이력의 일관성을 함께 관리합니다. `--verify` 옵션은 생성된 워크북을 다시 열어 구조와 주요 내용을 한 번 더 확인합니다.
+Microsoft Excel 또는 LibreOffice Calc로 저장한 제공 워크북을 사용할 수 있으며, 현행화 결과는 Microsoft Excel 형식으로 일관되게 저장됩니다.
+
+정규 출력에는 참조 파일 크기를 맞추기 위한 ZIP padding, 합성 미리보기, Excel 버전·창 위치를 흉내 낸 메타데이터를 넣지 않습니다. 셀·수식·서식과 계산 의미를 보존하며 작성 프로그램은 `fcupdater`로 기록합니다.
+
+제목·작성자 등 선택적인 핵심 문서 속성과 편집 시간(`TotalTime`)이 생략된 워크북도 처리합니다. 생략된 속성은 합성하지 않으며, 편집 시간이 있으면 Excel에서 허용하는 0~2,147,483,647분 범위를 검증합니다.
+
+## 대상 지역
+
+- 대전광역시
+- 세종특별자치시
+- 충청북도 청주시
+- 충청남도 공주시
+- 충청남도 보령시
+- 충청남도 아산시
+- 충청남도 천안시
+
+## 변경내역
+
+`변경내역` 시트에는 다음 항목이 기록됩니다.
+
+- 가격변동
+- 지역정정
+- 상호변경
+- 상표변경
+- 셀프여부변경
+- 신규
+- 폐업
+
+휘발유, 고급휘발유, 경유의 이전 가격과 신규 가격, 변동액을 함께 확인할 수 있습니다.
+
+## GitHub Actions
+
+CI 워크플로는 `main` 브랜치와 태그에서 Windows, Linux, Intel Mac, Apple Silicon Mac용 release Artifact를 제공합니다.
+
+워크북 현행화 워크플로는 최신 Opinet 자료를 반영한 `fuel_cost_chungcheong.xlsx`를 Artifact로 제공합니다.
