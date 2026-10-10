@@ -82,11 +82,13 @@ class Terminal:
         self.send('0\n')
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
-            alive=self.p.isalive() if WIN else self.p.poll() is None
+            alive=self.p.pty.isalive() if WIN else self.p.poll() is None
             if not alive: break
             time.sleep(.01)
         if WIN:
-            status=self.p.exitstatus;self.p.close(force=True)
+            status=self.p.exitstatus;self.p.pty.cancel_io();self.p.close(force=True)
+            self.reader.join(timeout=5)
+            assert not self.reader.is_alive(), "Windows console reader did not terminate"
         else:
             if self.p.poll() is None:self.p.kill()
             status=self.p.wait();os.close(self.master)

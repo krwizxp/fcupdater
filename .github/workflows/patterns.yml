@@ -4,38 +4,26 @@ on:
     branches: [codex/pgo-patterns-20261010]
 permissions:
   contents: read
+  actions: read
 env:
   PYTHONUTF8: "1"
   PATTERN_TARGET: x86_64-pc-windows-msvc
 jobs:
   train:
-    name: Windows SRG product training and selection
+    name: Reuse byte-identical trained Windows SRG product
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          path: fcupdater
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: krwizxp/srg
-          ref: 5be8df3c960ebc601c7bfb815d2aae7c90911088
-          persist-credentials: false
-          path: srg
-      - run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview --no-self-update
-      - run: python -m pip install pywinpty
-      - name: Train exact product and choose among the same three profiles
-        working-directory: fcupdater
-        env:
-          PATTERN_PHASE: train
-        run: python validation-patterns/split_patterns.py
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           name: windows-srg-prepared
-          path: |
-            fcupdater/validation-patterns/prepared/
+          run-id: 38013902564
+          github-token: ${{ github.token }}
+          path: prepared
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-srg-prepared
+          path: prepared
           retention-days: 3
   measure:
     needs: train

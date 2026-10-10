@@ -1,5 +1,5 @@
 """Task-only Windows orchestration; all timed operations use patterns.py unchanged."""
-import os, json, shutil, hashlib
+import os, json, shutil, hashlib, platform
 from pathlib import Path
 import patterns as p
 
@@ -8,6 +8,8 @@ PREPARED = p.TASK/'prepared'
 
 def prepared():
     p.REPORT = json.loads((PREPARED/'results.json').read_text(encoding='utf-8'))
+    p.REPORT['training_run'] = p.REPORT['run']
+    p.REPORT['run'] = os.environ.get('GITHUB_RUN_ID')
     data = p.REPORT['apps']['srg']
     for name, digest in data['prepared_sha256'].items():
         assert hashlib.sha256((PREPARED/name).read_bytes()).hexdigest() == digest, name
@@ -28,6 +30,7 @@ def measure(group):
     p.RNG.seed(seed)
     p.REPORT['measurement_group'] = group
     p.REPORT['measurement_seed'] = seed
+    p.REPORT['environment'] = {'platform':platform.platform(), 'processor_identifier':os.environ.get('PROCESSOR_IDENTIFIER'), 'runner_image':os.environ.get('ImageVersion'), 'runner_arch':os.environ.get('RUNNER_ARCH')}
     if group.startswith('full-'):
         for a in ['old','normal']:
             labels = [a,selected];p.RNG.shuffle(labels);v={};checks=[]
@@ -64,7 +67,7 @@ def combine():
     for path in reports:
         report=json.loads(path.read_text(encoding='utf-8'));assert 'error' not in report,report.get('error')
         other=report['apps']['srg'];assert other['prepared_sha256']==data['prepared_sha256']
-        data['measurement_jobs'].append({'group':report['measurement_group'],'seed':report['measurement_seed']})
+        data['measurement_jobs'].append({'group':report['measurement_group'],'seed':report['measurement_seed'],'environment':report.get('environment')})
         for key,value in other['comparisons'].items():
             if key.endswith('-menu-8145060'):
                 dest=data['comparisons'].setdefault(key,{'raw':[],'records':[]})
