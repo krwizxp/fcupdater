@@ -34,7 +34,7 @@ source=TASK/'source.xls';source.write_bytes(gzip.decompress((TASK/'source.xls.gz
 replay=TASK/'replay.dylib';cmd(['clang','-dynamiclib','-O2',TASK/'replay.c','-lcurl','-o',replay])
 env=dict(os.environ,PGO_XLS=str(source),DYLD_INSERT_LIBRARIES=str(replay),DYLD_FORCE_FLAT_NAMESPACE='1');env.pop('LLVM_PROFILE_FILE',None)
 trainenv=dict(env,LLVM_PROFILE_FILE=str(raw/'%p-%m.profraw'))
-cargo(['build-pgo'],train_td,'-Cprofile-generate='+str(raw))
+cargo(['build-pgo'],train_td,'-Cprofile-generate='+str(raw)+' -Cllvm-args=-disable-preinline')
 train=train_td/TARGET/'release/fcupdater'
 def canonical(path):
  with zipfile.ZipFile(path) as z:
@@ -74,11 +74,7 @@ def train_runs(binary):
   for args,code in [(['--help'],0),(['--version'],0),(['--bad-option'],1),(['--verify','extra'],1)]:cmd([binary,*args],work,trainenv,expected=code)
   (work/'fuel_cost_chungcheong.xlsx').write_bytes(b'not an xlsx');cmd([binary,'--verify'],work,trainenv,expected=1)
 train_runs(train)
-# Genuine supplemental native CLI profile: retain small functions otherwise removed before instrumentation.
-supp_td=TASK/'build-train-supplement'
-cargo(['build-pgo'],supp_td,'-Cprofile-generate='+str(raw)+' -Cllvm-args=-disable-preinline')
-train_runs(supp_td/TARGET/'release/fcupdater')
-report['training']={'verify_updates':32,'skip_updates':8,'cli_cases':4,'malformed_workbook':1,'current_main_workbook_held_out':True,'supplement':'same unchanged CLI and inputs; -disable-preinline instrumentation additionally retains small functions; final build retains normal preinline settings','instrumentation':'unchanged actual product CLI, fixed captured response via external DYLD interpose; adapter excluded from product/profdata'}
+report['training']={'verify_updates':32,'skip_updates':8,'cli_cases':4,'malformed_workbook':1,'current_main_workbook_held_out':True,'pipeline':'-disable-preinline in BOTH instrumentation and final profile-use, avoiding early-inliner profile mismatches; regular release baseline retains defaults','instrumentation':'unchanged actual product CLI, fixed captured response via external DYLD interpose; adapter excluded from product/profdata'}
 sysroot=Path(cmd(['rustc','+'+VERSION,'--print','sysroot']).stdout.decode().strip());llvm=sysroot/'lib/rustlib'/TARGET/'bin/llvm-profdata'
 profile=ROOT/'pgo'/(TARGET+'.profdata');raws=list(raw.glob('*.profraw'));assert raws
 cmd([llvm,'merge','-o',profile,*raws]);shutil.copy2(profile,OUT/profile.name)

@@ -8,7 +8,7 @@ rustflags = ["-Cprofile-use=pgo/x86_64-unknown-linux-gnu.profdata", "-Cllvm-args
 rustflags = ["-Cprofile-use=pgo/x86_64-pc-windows-msvc.profdata", "-Cllvm-args=-pgo-warn-missing-function"]
 
 [target.x86_64-apple-darwin]
-rustflags = ["-Cprofile-use=pgo/x86_64-apple-darwin.profdata", "-Cllvm-args=-pgo-warn-missing-function"]
+rustflags = ["-Cprofile-use=pgo/x86_64-apple-darwin.profdata", "-Cllvm-args=-pgo-warn-missing-function", "-Cllvm-args=-disable-preinline"]
 
 [target.aarch64-apple-darwin]
-rustflags = ["-Cprofile-use=pgo/aarch64-apple-darwin.profdata", "-Cllvm-args=-pgo-warn-missing-function"]
+rustflags = ["-Cprofile-use=pgo/aarch64-apple-darwin.profdata", "-Cllvm-args=-pgo-warn-missing-function", "-Cllvm-args=-disable-preinline"]
