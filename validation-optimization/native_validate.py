@@ -113,7 +113,10 @@ save()
 # Independent workbook reader, true live HTTP, and original packaging with no replay DLL shipped.
 package=TASK/'package';exe=package/TARGET/'release'/('fcupdater'+EXT);exe.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(exes['candidate'],exe)
 with tempfile.TemporaryDirectory() as d:
- p=Path(d)/'fuel_cost_chungcheong.xlsx';shutil.copy2(fixtures['current'],p);r=cmd([exe,'--verify'],d,clean,timeout=180);(OUT/'live.stdout.txt').write_bytes(r.stdout);(OUT/'live.stderr.txt').write_bytes(r.stderr);assert zipfile.ZipFile(p).testzip() is None;book=openpyxl.load_workbook(p,data_only=False);assert book.sheetnames==['유류비','변경내역'];book.close();report['checks'].append('live native updater --verify + independent XLSX reopen')
+ p=Path(d)/'fuel_cost_chungcheong.xlsx';shutil.copy2(fixtures['current'],p);r=cmd([exe,'--verify'],d,clean,expected=None,timeout=180);
+ if r.returncode!=0:
+  clean_base=TASK/'clean-baseline';clean_base.mkdir(exist_ok=True);base_exe=clean_base/('fcupdater'+EXT);shutil.copy2(exes['baseline'],base_exe);baseline_live=cmd([base_exe,'--verify'],d,clean,expected=None,timeout=180);report['live_failure']={'candidate_returncode':r.returncode,'candidate_error':r.stderr.decode('utf-8','replace'),'baseline_returncode':baseline_live.returncode,'baseline_error':baseline_live.stderr.decode('utf-8','replace')};save();assert r.returncode==0,report['live_failure']
+ (OUT/'live.stdout.txt').write_bytes(r.stdout);(OUT/'live.stderr.txt').write_bytes(r.stderr);assert zipfile.ZipFile(p).testzip() is None;book=openpyxl.load_workbook(p,data_only=False);assert book.sheetnames==['유류비','변경내역'];book.close();report['checks'].append('live native updater --verify + independent XLSX reopen')
 for label in ('baseline','candidate'):
  td=TASK/('package-'+label);p=td/TARGET/'release'/('fcupdater'+EXT);p.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(exes[label],p);name='fcupdater-'+TARGET+'-'+label;penv=dict(clean,CARGO_TARGET_DIR=str(td/TARGET));cmd(['cargo','+'+VERSION,'run','--frozen','--example','package_artifact','--',name],ROOT,penv);artifact=next((ROOT/'artifacts').glob(name+'.*'));report['binary'][label]['package_bytes']=artifact.stat().st_size;shutil.copy2(artifact,OUT/artifact.name)
  if WIN:assert artifact.read_bytes()==p.read_bytes()

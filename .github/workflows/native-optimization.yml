@@ -25,6 +25,13 @@ jobs:
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Refresh Microsoft trusted roots for native HTTPS validation
+        if: runner.os == 'Windows'
+        run: |
+          certutil -generateSSTFromWU validation-optimization/roots.sst
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft trusted root download failed" }
+          certutil -user -addstore -f Root validation-optimization/roots.sst
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft trusted root import failed" }
       - name: Install independent workbook reader and memory sampler
         run: |
           python3 -m venv validation-optimization/.venv
