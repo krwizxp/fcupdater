@@ -26,7 +26,8 @@ class NativeValidation:
         self.repo, self.target, self.name = repo, target, name
         self.checkout = Path.cwd()
         self.tools = self.checkout / '.optimization-validation'
-        self.root = self.checkout / 'optimization-native-work'
+        # Sibling checkouts prevent Cargo from merging parent array-valued aliases.
+        self.root = self.checkout.parent / ('optimization-native-work-' + repo)
         self.out = self.checkout / 'optimization-native-results'
         self.root.mkdir(exist_ok=False)
         self.out.mkdir(exist_ok=False)
@@ -268,7 +269,9 @@ class NativeValidation:
         for mode in ['bench', 'parse-bench', 'intern-plain', 'intern-escaped']:
             for _ in range(3):
                 self.run([probe_binary, mode, workbook], env=probe_env, label=f'{variant}-probe-training')
-        self.run([probe_binary, 'save', workbook, self.root / f'{variant}-training.xlsx'],
+        training_output = self.root / f'{variant}-training.xlsx'
+        shutil.copyfile(workbook, training_output)
+        self.run([probe_binary, 'save', training_output, training_output],
                  env=probe_env, label=f'{variant}-save-training')
         raw_files = sorted(raw.glob('*.profraw'))
         assert len(raw_files) >= 7
@@ -312,7 +315,8 @@ class NativeValidation:
             cli[variant] = self.cli(self.binary(directory))
             workbook = checkout / 'fuel_cost_chungcheong.xlsx'
             saved = self.out / f'{variant}-fixed-output.xlsx'
-            self.run([probes[variant], 'save', workbook, saved], label=f'{variant}-fixed-save')
+            shutil.copyfile(workbook, saved)
+            self.run([probes[variant], 'save', saved, saved], label=f'{variant}-fixed-save')
             outputs[variant] = self.semantic_xlsx(saved)
             # Allocation instrumentation is kept in a separate diagnostic binary.
             alloc_checkout = self.root / (variant + '-alloc')
