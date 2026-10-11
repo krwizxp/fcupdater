@@ -282,7 +282,7 @@ class NativeValidation:
         self.run([profiler, 'show', '--all-functions', '--counts', profile], label=f'{variant}-profile-show')
         shutil.copyfile(profile, self.out / f'{variant}-{self.target}.profdata')
         self.result['variants'][variant]['profile'] = {'raw_count': len(raw_files),
-            'bytes': profile.stat().st_size(), 'sha256': hashlib.sha256(profile.read_bytes()).hexdigest(),
+            'bytes': profile.stat().st_size, 'sha256': hashlib.sha256(profile.read_bytes()).hexdigest(),
             'training': 'original CLI live --verify + fixed 864-station workbook + 5000 plain/escaped strings; 3 repetitions'}
         shutil.copyfile(profile, probe_checkout / 'pgo' / profile.name)
         profile_flags = f'-Cprofile-use={profile} -Cllvm-args=-pgo-warn-missing-function'

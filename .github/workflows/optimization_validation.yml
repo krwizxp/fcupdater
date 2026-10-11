@@ -40,6 +40,19 @@ jobs:
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Refresh native Windows trust and record TLS diagnostics
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $trustFile = Join-Path $env:RUNNER_TEMP 'optimization-roots.sst'
+          certutil.exe -generateSSTFromWU $trustFile
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft root update download failed' }
+          certutil.exe -addstore -f root $trustFile
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft root update import failed' }
+          curl.exe --version
+          curl.exe --verbose --head --max-time 30 https://www.opinet.co.kr/user/opdown/opDownload.do
+          curl.exe --verbose --head --max-time 30 https://nfl.opinet.co.kr/
+          exit 0
       - name: Native builds, behavior, profiles, and actual packages
         run: python .optimization-validation/native_validation.py --repo fcupdater --target "${{ matrix.target }}" --binary-name "${{ matrix.binary_name }}"
       - name: Upload reproducible native evidence
