@@ -50,6 +50,8 @@ jobs:
           certutil.exe -addstore -f root $trustFile
           if ($LASTEXITCODE -ne 0) { throw 'Microsoft root update import failed' }
           Get-TlsCipherSuite | ConvertTo-Json -Depth 4
+          Enable-TlsCipherSuite -Name 'TLS_RSA_WITH_AES_256_GCM_SHA384'
+          Enable-TlsCipherSuite -Name 'TLS_RSA_WITH_AES_128_GCM_SHA256'
           curl.exe --version
           curl.exe --verbose --head --max-time 30 https://www.opinet.co.kr/user/opdown/opDownload.do
           curl.exe --verbose --tls-max 1.2 --head --max-time 30 https://nfl.opinet.co.kr/

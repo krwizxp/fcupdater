@@ -321,7 +321,8 @@ class NativeValidation:
             release = self.run(['cargo', f'+{VERSION}', 'build-pgo'], cwd=checkout, env=env,
                                label=f'{variant}-release')
             diagnostics = release.stderr.decode(errors='replace')
-            warnings = [line for line in diagnostics.splitlines() if line.startswith('warning:')]
+            warnings = [line for line in diagnostics.splitlines()
+                        if line.startswith('warning:') and not re.search(r'generated \d+ warnings?$', line)]
             assert all('no profile data available' in line and 'up to 0 count discarded' in line for line in warnings), diagnostics
             assert all('RankSortRefresher' not in line and 'SharedStringTable' not in line for line in warnings), diagnostics
             assert 'function control flow change detected' not in diagnostics and 'hash mismatch' not in diagnostics
