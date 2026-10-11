@@ -134,6 +134,12 @@ class NativeValidation:
                                       'COUNT_ALLOC.store(false, Ordering::Relaxed);\n'
                                       '        println!("{} {} {} {}", start.elapsed().as_nanos(), bytes, '
                                       'ALLOC_CALLS.load(Ordering::Relaxed), ALLOC_BYTES.load(Ordering::Relaxed));')
+            harness = harness.replace('let result = master_sheet::MasterSheetUpdater { source_index: std::hint::black_box(&source) }.update(&mut book)?;',
+                                      'COUNT_ALLOC.store(true, Ordering::Relaxed);\n'
+                                      '        let result = master_sheet::MasterSheetUpdater { source_index: std::hint::black_box(&source) }.update(&mut book)?;\n'
+                                      '        COUNT_ALLOC.store(false, Ordering::Relaxed);')
+            harness = harness.replace('println!("{nanos} {total}");',
+                                      'println!("{} {} {} {}", nanos, total, ALLOC_CALLS.load(Ordering::Relaxed), ALLOC_BYTES.load(Ordering::Relaxed));')
         main.write_text(original + '\n' + harness, encoding='utf-8')
         if self.repo == 'fcupdater':
             excel = checkout / 'src/excel.rs'
@@ -315,9 +321,17 @@ class NativeValidation:
             release = self.run(['cargo', f'+{VERSION}', 'build-pgo'], cwd=checkout, env=env,
                                label=f'{variant}-release')
             diagnostics = release.stderr.decode(errors='replace')
-            assert 'warning:' not in diagnostics, diagnostics
+            warnings = [line for line in diagnostics.splitlines() if line.startswith('warning:')]
+            assert all('no profile data available' in line and 'up to 0 count discarded' in line for line in warnings), diagnostics
+            assert all('RankSortRefresher' not in line and 'SharedStringTable' not in line for line in warnings), diagnostics
+            assert 'function control flow change detected' not in diagnostics and 'hash mismatch' not in diagnostics
+            normalized = sorted(re.search(r'function (.+)', line).group(1) for line in warnings)
+            if variant != 'baseline':
+                assert normalized == self.result['variants']['baseline']['release_pgo_zero_count_helpers'], diagnostics
             self.result['variants'][variant].update(self.package(variant, checkout, directory))
-            self.result['variants'][variant]['release_pgo_warnings'] = 0
+            self.result['variants'][variant]['release_pgo_zero_count_helpers'] = normalized
+            self.result['variants'][variant]['release_pgo_warnings'] = len(warnings)
+            self.result['variants'][variant]['release_pgo_cfg_mismatches'] = 0
             cli[variant] = self.cli(self.binary(directory))
             workbook = checkout / 'fuel_cost_chungcheong.xlsx'
             saved = self.out / f'{variant}-fixed-output.xlsx'
@@ -330,7 +344,7 @@ class NativeValidation:
             self.make_probe(alloc_checkout, allocation=True)
             allocator, _ = self.build_probe(variant + '-alloc', alloc_checkout)
             allocation = {}
-            for mode in ['intern-plain', 'intern-escaped']:
+            for mode in ['intern-plain', 'intern-escaped', 'bench']:
                 r = self.run([allocator, mode, workbook], label=f'{variant}-{mode}-alloc')
                 nanos, byte_count, calls, requested = map(int, r.stdout.split())
                 allocation[mode] = {'calls': calls, 'requested_bytes': requested, 'xml_bytes': byte_count}
