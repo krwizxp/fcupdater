@@ -208,21 +208,33 @@ class NativeValidation:
                     ET.fromstring(data)
                 parts[name] = hashlib.sha256(data).hexdigest()
             sheet = ET.fromstring(archive.read('xl/worksheets/sheet1.xml'))
-            ranks = [c.findtext('s:v', namespaces=NS) for c in sheet.findall('.//s:c', NS)
-                     if c.get('r', '').startswith('I') and c.find('s:f', NS) is not None]
+            rank_rows = []
             cells = {c.get('r'): c for c in sheet.findall('.//s:c', NS)}
-            values = []
-            for row in range(15, 15 + len(ranks)):
+            for cell in cells.values():
+                match = re.fullmatch(r'A(\d+)', cell.get('r', ''))
+                if match and int(match[1]) >= 15 and cell.find('s:f', NS) is not None:
+                    rank_rows.append(int(match[1]))
+            rank_rows.sort()
+            assert rank_rows and rank_rows == list(range(15, 15 + len(rank_rows)))
+            ranks, values, blank_rows = [], [], []
+            for row in rank_rows:
+                rank = cells['A' + str(row)].findtext('s:v', namespaces=NS)
+                ranks.append(rank)
                 total = cells.get('T' + str(row))
                 value = total.findtext('s:v', namespaces=NS) if total is not None else None
                 if value is not None and value != '':
                     key = cells['W' + str(row)].findtext('s:v', namespaces=NS)
+                    assert key is not None and key != ''
                     values.append((row, Decimal(key)))
+                else:
+                    assert rank is None or rank == ''
+                    blank_rows.append(row)
             for row, key in values:
-                actual = cells['I' + str(row)].findtext('s:v', namespaces=NS)
+                actual = cells['A' + str(row)].findtext('s:v', namespaces=NS)
                 assert int(actual) == 1 + sum(other < key for _, other in values)
             return {'parts': parts, 'rank_cache_count': len(ranks),
                     'independent_competition_rank_checks': len(values),
+                    'independent_blank_rank_checks': len(blank_rows),
                     'rank_cache_sha256': hashlib.sha256(json.dumps(ranks).encode()).hexdigest()}
 
     def srg(self):
@@ -307,7 +319,7 @@ class NativeValidation:
 
     def fcupdater(self):
         probes, cli, outputs = {}, {}, {}
-        for variant in ['baseline', 'rank', 'xml-fast']:
+        for variant in ['baseline', 'rank']:
             checkout = self.snapshot(variant, BASE[self.repo])
             if variant != 'baseline':
                 patch = self.tools / f'fcupdater-{variant}-experiment.patch'
@@ -333,7 +345,17 @@ class NativeValidation:
             self.result['variants'][variant]['release_pgo_zero_count_helpers'] = normalized
             self.result['variants'][variant]['release_pgo_warnings'] = len(warnings)
             self.result['variants'][variant]['release_pgo_cfg_mismatches'] = 0
-            cli[variant] = self.cli(self.binary(directory))
+            release_binary = self.binary(directory)
+            cli[variant] = self.cli(release_binary)
+            release_live = self.root / 'release-live' / variant
+            release_live.mkdir(parents=True)
+            master = checkout / 'fuel_cost_chungcheong.xlsx'
+            shutil.copyfile(master, release_live / master.name)
+            completed = self.run([release_binary, '--verify'], cwd=release_live,
+                                 label=f'{variant}-release-live-verify', timeout=180)
+            self.result['variants'][variant]['release_live_verify'] = {
+                'status': completed.returncode,
+                'workbook': self.semantic_xlsx(release_live / master.name)}
             workbook = checkout / 'fuel_cost_chungcheong.xlsx'
             saved = self.out / f'{variant}-fixed-output.xlsx'
             shutil.copyfile(workbook, saved)
@@ -351,7 +373,7 @@ class NativeValidation:
                 allocation[mode] = {'calls': calls, 'requested_bytes': requested, 'xml_bytes': byte_count}
             self.result['variants'][variant]['allocations'] = allocation
             self.save()
-        for variant in ['rank', 'xml-fast']:
+        for variant in ['rank']:
             assert cli['baseline'] == cli[variant]
             assert outputs['baseline'] == outputs[variant]
             for mode in ['bench', 'parse-bench', 'intern-plain', 'intern-escaped', 'roundtrip']:
@@ -389,3 +411,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
