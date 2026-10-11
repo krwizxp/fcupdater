@@ -1,0 +1,32 @@
+diff --git a/src/excel/writer.rs b/src/excel/writer.rs
+index 985409e..925f7e7 100644
+--- a/src/excel/writer.rs
++++ b/src/excel/writer.rs
+@@ -235,7 +235,8 @@ impl SharedStringTable {
+         }
+         let index = self.entries.len();
+         let stored_value = Rc::<str>::from(value);
+-        let escaped = try_xml_escape_text(value, XmlEscapeContext::Text, "shared string XML")?;
++        let escaped_len =
++            validated_xml_escaped_len(value, XmlEscapeContext::Text, "shared string XML")?;
+         let preserve = value.chars().next().is_some_and(char::is_whitespace)
+             || value.chars().next_back().is_some_and(char::is_whitespace);
+         let opening = if preserve {
+@@ -245,11 +246,15 @@ impl SharedStringTable {
+         };
+         let capacity = opening
+             .len()
+-            .strict_add(escaped.len())
++            .strict_add(escaped_len)
+             .strict_add("</t></si>".len());
+         let mut entry = try_string_with_capacity(capacity, "shared string XML 메모리 확보 실패")?;
+         entry.push_str(opening);
+-        entry.push_str(&escaped);
++        if escaped_len == value.len() {
++            entry.push_str(value);
++        } else {
++            append_xml_escaped(&mut entry, value, XmlEscapeContext::Text);
++        }
+         entry.push_str("</t></si>");
+         self.entries.push(SharedStringEntry {
+             text: Rc::clone(&stored_value),
