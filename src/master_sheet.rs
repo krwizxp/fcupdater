@@ -47,7 +47,6 @@ const COL_UNIT_PRICE_WITH_CURRENCY: u32 = 21;
 const COL_UNIT_PRICE_WITHOUT_CURRENCY: u32 = 22;
 const COL_SORT_KEY: u32 = 23;
 const MASTER_FORMULA_BUFFER_CAPACITY: usize = 512;
-const USIZE_DECIMAL_TEXT_MAX_LEN: usize = 20;
 const SMART_DISCOUNT_BRAND_KEYWORD: &str = "현대오일뱅크";
 const SMART_DISCOUNT_DIRECT_KEYWORD: &str = "직영";
 const SMART_DISCOUNT_INPUT_COL: u32 = 2;
@@ -552,22 +551,18 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 "마스터 수식 메모리 확보 실패",
             )?,
         };
-        let mut rank_text = try_string_with_capacity(
-            USIZE_DECIMAL_TEXT_MAX_LEN,
-            "지역화폐 순위 문자열 메모리 확보 실패",
-        )?;
         let mut rank_buffer = NumBuffer::new();
         let mut ranked_count = 0_usize;
+        let mut current_rank = 0_usize;
         let mut previous_total = None;
         for (row, plan) in (MASTER_DATA_START_ROW..=self.data_last_row).zip(&row_plans) {
             let rank_cache = plan.rank_total.map(|current| {
                 ranked_count = ranked_count.strict_add(1);
                 if previous_total != Some(current) {
-                    rank_text.clear();
-                    rank_text.push_str(ranked_count.format_into(&mut rank_buffer));
+                    current_rank = ranked_count;
                     previous_total = Some(current);
                 }
-                rank_text.as_str()
+                current_rank.format_into(&mut rank_buffer)
             });
             self.apply_row_formulas_and_caches(row, plan, &sort_context, rank_cache, &mut buffers)?;
         }
