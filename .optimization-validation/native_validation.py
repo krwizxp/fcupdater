@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import statistics
 import subprocess
@@ -289,8 +290,13 @@ class NativeValidation:
         probe_binary, diagnostic = self.build_probe(variant + '-pgo', probe_checkout, profile_flags)
         pgo_diagnostics = diagnostic.stderr.decode(errors='replace')
         assert 'function control flow change detected' not in pgo_diagnostics
-        assert 'no profile data available' not in pgo_diagnostics
         assert 'hash mismatch' not in pgo_diagnostics
+        missing = [line for line in pgo_diagnostics.splitlines() if 'no profile data available' in line]
+        # Profiling changes LLVM inlining and can expose fresh compiler-generated helpers.
+        # Retain those diagnostic warnings; never accept a lost nonzero count or affected function.
+        assert all('up to 0 count discarded' in line for line in missing)
+        assert all('RankSortRefresher' not in line and 'SharedStringTable' not in line for line in missing)
+        self.result['variants'][variant]['diagnostic_probe_missing_profiles'] = missing
         return probe_binary, profile
 
     def fcupdater(self):

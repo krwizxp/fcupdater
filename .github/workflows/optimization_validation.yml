@@ -49,8 +49,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Microsoft root update download failed' }
           certutil.exe -addstore -f root $trustFile
           if ($LASTEXITCODE -ne 0) { throw 'Microsoft root update import failed' }
+          Get-TlsCipherSuite | Select-Object -ExpandProperty Name
           curl.exe --version
           curl.exe --verbose --head --max-time 30 https://www.opinet.co.kr/user/opdown/opDownload.do
+          curl.exe --verbose --tls-max 1.2 --head --max-time 30 https://nfl.opinet.co.kr/
           curl.exe --verbose --head --max-time 30 https://nfl.opinet.co.kr/
           exit 0
       - name: Native builds, behavior, profiles, and actual packages
