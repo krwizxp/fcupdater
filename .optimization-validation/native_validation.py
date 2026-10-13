@@ -258,7 +258,11 @@ class NativeValidation:
         live.mkdir(parents=True)
         master = checkout / 'fuel_cost_chungcheong.xlsx'
         shutil.copyfile(master, live / master.name)
-        r = self.run([binary, '--verify'], cwd=live, env=env, label=f'{variant}-live-training', timeout=180)
+        r = self.run([binary, '--verify'], cwd=live, env=env, expected=(0,1), label=f'{variant}-live-training', timeout=180)
+        if r.returncode != 0 and os.name == 'nt' and b'12175' in r.stderr:
+            self.run(['python', self.tools/'windows_tls_diagnostic.py'], label='windows-tls-diagnostic')
+            r = self.run([binary, '--verify'], cwd=live, env=env, label=f'{variant}-live-training-bounded-retry', timeout=180)
+        assert r.returncode == 0, r.stderr
         self.result['variants'][variant]['live_verify'] = {'status': r.returncode,
             'workbook': self.semantic_xlsx(live / master.name)}
         probe_checkout = self.root / (variant + '-probe')
@@ -419,7 +423,7 @@ class NativeValidation:
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 try:
-                    observed = self.run([binary, 'time-observe', f'127.0.0.1:{server.server_port}', '1'], label=f'{variant}-http-{case}')
+                    observed = self.run([binary, 'time-observe', f'http://127.0.0.1:{server.server_port}', '1'], label=f'{variant}-http-{case}')
                     stdout = observed.stdout.decode()
                     assert Handler.calls > 0
                     if case == 'fresh': assert '샘플 수집 실패' not in stdout
@@ -496,8 +500,8 @@ class NativeValidation:
             allocation = self.run([alloc_binary,'bench',workbook],label=f'{variant}-allocation').stdout.decode().split()
             assert len(allocation) == 4, allocation
             self.result['variants'][variant]['allocations'] = {'count':int(allocation[2]),'allocated_bytes':int(allocation[3]),'workload':'eight master-sheet updates excluding parse'}
-            fresh[variant],profile = self.train_fc(variant,checkout)
             if configured:
+                fresh[variant],profile = self.train_fc(variant,checkout)
                 binary,package,diagnostics = self.release(variant+'-refreshed',checkout,True)
                 assert 'function control flow change detected' not in diagnostics
                 assert 'hash mismatch' not in diagnostics
@@ -505,11 +509,19 @@ class NativeValidation:
                 assert all('up to 0 count discarded' in line for line in missing), missing
                 self.result['variants'][variant]['refreshed_profile_release'] = package
                 self.result['variants'][variant]['refreshed_profile_diagnostics'] = diagnostics
+            else:
+                live = self.root/'live'/variant
+                live.mkdir(parents=True)
+                shutil.copyfile(workbook,live/workbook.name)
+                completed = self.run([binary,'--verify'],cwd=live,label=f'{variant}-live-unprofiled',timeout=180)
+                self.result['variants'][variant]['live_verify'] = {'status':completed.returncode,'workbook':self.semantic_xlsx(live/workbook.name)}
+                self.result['variants'][variant]['profile_not_trained'] = 'target has no profile-use flags in existing shipping configuration'
             self.result['variants'][variant]['profile_used_by_shipping_configuration'] = configured
         assert self.result['variants']['baseline']['cli'] == self.result['variants']['candidate']['cli']
         self.fc_contracts(stored['baseline'],stored['candidate'],workbooks['baseline'])
         self.paired('source-only-unprofiled',stored['baseline'],stored['candidate'],'roundtrip',workbooks['baseline'])
-        self.paired('source-only-fresh-profile-both',fresh['baseline'],fresh['candidate'],'roundtrip',workbooks['baseline'])
+        if configured:
+            self.paired('source-only-fresh-profile-both',fresh['baseline'],fresh['candidate'],'roundtrip',workbooks['baseline'])
         self.result['profiles_are_diagnostic_until_measured'] = True
         self.save()
 
