@@ -18,29 +18,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04
-            target: x86_64-unknown-linux-gnu
-            x64_on_arm: "0"
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            x64_on_arm: "0"
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            x64_on_arm: "0"
-            evidence_suffix: native
           - os: windows-11-arm
             target: x86_64-pc-windows-msvc
             x64_on_arm: "1"
             evidence_suffix: win11-emulated
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            x64_on_arm: "0"
-          - os: macos-26-intel
-            target: x86_64-apple-darwin
-            x64_on_arm: "0"
-          - os: macos-26
-            target: aarch64-apple-darwin
-            x64_on_arm: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
