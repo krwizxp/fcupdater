@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 
 def environment():
@@ -11,8 +12,10 @@ def environment():
     assert vcvars.is_file(),vcvars
     failures = []
     for architecture in ['arm64_amd64','amd64','x64']:
-        command = 'call "'+str(vcvars)+'" '+architecture+' >nul && set'
-        prepared = subprocess.run(['cmd.exe','/s','/c',command],capture_output=True,text=True)
+        with tempfile.TemporaryDirectory(prefix='optimization-vcvars-',dir=os.environ.get('RUNNER_TEMP')) as directory:
+            batch = Path(directory)/'prepare.cmd'
+            batch.write_bytes(('@echo off\r\ncall "'+str(vcvars)+'" '+architecture+' >nul\r\nif errorlevel 1 exit /b 1\r\nset\r\n').encode())
+            prepared = subprocess.run(['cmd.exe','/d','/c',str(batch)],capture_output=True,text=True)
         if prepared.returncode:
             failures.append(architecture+': '+prepared.stderr+' '+prepared.stdout)
             continue
