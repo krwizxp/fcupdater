@@ -12,11 +12,13 @@ jobs:
     name: Native / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      OPTIMIZATION_X64_ON_ARM: "1"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-2022
+          - os: windows-11-arm
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -51,8 +53,9 @@ jobs:
       - name: Record enabled cipher suites and curl diagnostics
         shell: pwsh
         run: |
-          Get-TlsCipherSuite | Select-Object -ExpandProperty Name | Out-File optimization-native-results/cipher-suites.txt
+          $ErrorActionPreference = "Continue"
           curl.exe --verbose --head --max-time 30 https://nfl.opinet.co.kr/ 2>&1 | Out-File optimization-native-results/curl-tls.txt
+          Get-TlsCipherSuite | ConvertTo-Json -Depth 3 | Out-File optimization-native-results/cipher-suites.txt
           exit 0
       - name: Upload transport evidence
         if: always()

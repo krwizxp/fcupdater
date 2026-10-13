@@ -6,6 +6,7 @@ import http.server
 import threading
 import json
 import os
+import platform
 from pathlib import Path
 import random
 import re
@@ -39,7 +40,11 @@ class NativeValidation:
                        'validation_sha': os.environ.get('GITHUB_SHA'),
                        'compiler': '', 'commands': [], 'variants': {}, 'timings': []}
         self.serial = 0
+        self.result['execution_environment'] = {'os':sys.platform,'python_machine':platform.machine(),'x64_on_arm':os.environ.get('OPTIMIZATION_X64_ON_ARM')=='1'}
         self.base_env = dict(os.environ)
+        if os.environ.get('OPTIMIZATION_X64_ON_ARM') == '1':
+            from prepare_msvc import environment
+            self.base_env.update(environment())
         self.base_env.pop('RUSTFLAGS', None)
         self.base_env.pop('CARGO_ENCODED_RUSTFLAGS', None)
         self.base_env['CARGO_INCREMENTAL'] = '0'
