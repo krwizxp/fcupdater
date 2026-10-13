@@ -741,47 +741,61 @@ impl<'source> MasterSheetUpdater<'source> {
             || (1_i64, trimmed.strip_prefix('+').unwrap_or(trimmed)),
             |rest| (-1_i64, rest),
         );
-        let mut whole = 0_i64;
-        let mut fraction = 0_i64;
-        let mut fraction_digit_count = 0_u8;
-        let mut has_whole_digit = false;
+        let (mantissa, exponent) = if let Some((mantissa, exponent)) = digits.split_once(['e', 'E'])
+        {
+            (
+                mantissa,
+                exponent.parse::<i64>().ok().ok_or_else(invalid_value)?,
+            )
+        } else {
+            (digits, 0_i64)
+        };
+        let mut coefficient = 0_i64;
+        let mut trailing_zeros = 0_u32;
+        let mut fractional_digits = 0_i64;
+        let mut has_digit = false;
         let mut parsing_fraction = false;
-        for digit_byte in digits.bytes() {
-            if digit_byte == b',' {
+        for byte in mantissa.bytes() {
+            if byte == b',' {
                 continue;
             }
-            if digit_byte == b'.' {
+            if byte == b'.' {
                 (!parsing_fraction).ok_or_else(invalid_value)?;
                 parsing_fraction = true;
                 continue;
             }
-            digit_byte.is_ascii_digit().ok_or_else(invalid_value)?;
-            let digit_raw = digit_byte.strict_sub(b'0');
-            let digit = i64::from(digit_raw);
-            if parsing_fraction {
-                if fraction_digit_count >= 6 {
-                    (digit == 0).ok_or_else(invalid_value)?;
-                    continue;
-                }
-                fraction = fraction.strict_mul(10).strict_add(digit);
-                fraction_digit_count = fraction_digit_count.strict_add(1);
-            } else {
-                has_whole_digit = true;
-                let next_whole = whole
-                    .checked_mul(10)
-                    .and_then(|value| value.checked_add(digit))
-                    .ok_or_else(invalid_value)?;
-                whole = next_whole;
+            byte.is_ascii_digit().ok_or_else(invalid_value)?;
+            has_digit = true;
+            fractional_digits = fractional_digits.strict_add(i64::from(parsing_fraction));
+            let digit = i64::from(byte.strict_sub(b'0'));
+            if digit == 0 {
+                trailing_zeros = trailing_zeros.strict_add(1);
+                continue;
             }
+            coefficient = if coefficient == 0 {
+                digit
+            } else {
+                10_i64
+                    .checked_pow(trailing_zeros.strict_add(1))
+                    .and_then(|scale| coefficient.checked_mul(scale))
+                    .and_then(|value| value.checked_add(digit))
+                    .ok_or_else(invalid_value)?
+            };
+            trailing_zeros = 0;
         }
-        has_whole_digit.ok_or_else(invalid_value)?;
-        while fraction_digit_count < 6 {
-            fraction = fraction.strict_mul(10);
-            fraction_digit_count = fraction_digit_count.strict_add(1);
+        has_digit.ok_or_else(invalid_value)?;
+        if coefficient == 0 {
+            return Ok(Some(ScaledDecimal::ZERO));
         }
-        whole
-            .checked_mul(DECIMAL_SCALE.as_i64())
-            .and_then(|scaled| scaled.checked_add(fraction))
+        let power = exponent
+            .checked_add(6)
+            .and_then(|value| value.checked_sub(fractional_digits))
+            .and_then(|value| value.checked_add(i64::from(trailing_zeros)))
+            .ok_or_else(invalid_value)?;
+        let unsigned_power = u32::try_from(power).ok().ok_or_else(invalid_value)?;
+        10_i64
+            .checked_pow(unsigned_power)
+            .and_then(|scale| coefficient.checked_mul(scale))
             .and_then(|combined| combined.checked_mul(sign))
             .map(ScaledDecimal)
             .map(Some)
