@@ -339,6 +339,20 @@ class NativeValidation:
         assert self.numbers(new, 'integers', workbook, ['1500','1.5e3']) == ['1500','1500']
         assert self.numbers(old, 'numbers', workbook, ['1E-6']) == ['ERROR']
         assert self.numbers(new, 'numbers', workbook, ['1E-6']) == ['1']
+        rounding = ['1.4999999999999999','-1.4999999999999999','2147483647.4999999999999999','-2147483648.4999999999999999']
+        assert self.numbers(old,'integers',workbook,rounding) == ['1','-1','2147483647','-2147483648']
+        assert self.numbers(new,'integers',workbook,[value+'e0' for value in rounding]) == ['1','-1','2147483647','-2147483648']
+        price_rng = random.Random(426014)
+        price_micro = [price_rng.randrange(-2147483649000000000,2147483649000000000) for _ in range(1000)]
+        price_plain = [('-' if n < 0 else '')+str(abs(n)//10**9)+'.'+str(abs(n)%10**9).zfill(9) for n in price_micro]
+        price_expected = []
+        for n in price_micro:
+            rounded = (abs(n)+500000000)//10**9 * (-1 if n < 0 else 1)
+            price_expected.append(str(rounded) if -2147483648 <= rounded <= 2147483647 else 'NONE')
+        assert self.numbers(old,'integers',workbook,price_plain) == price_expected
+        assert self.numbers(new,'integers',workbook,price_plain) == price_expected
+        assert self.numbers(new,'integers',workbook,[str(n)+'e-9' for n in price_micro]) == price_expected
+        assert self.numbers(new,'integers',workbook,['150000000000000000000e-17']) == ['1500']
         raw = workbook.read_bytes()
         for i in range(16):
             bad = bytearray(raw)
@@ -372,7 +386,7 @@ class NativeValidation:
         scientific_output = self.semantic_xlsx(path)
         assert hashlib.sha256(workbook.read_bytes()).hexdigest() == original_hash
         self.result['behavior'] = {'numeric_plain_cases':len(plain), 'numeric_scientific_cases':len(micro),
-            'numeric_edge_cases':len(extra), 'scientific_integer_cases':len(ints), 'corrupt_zip_rejections':16,
+            'numeric_edge_cases':len(extra), 'scientific_integer_cases':len(ints), 'price_equivalence_cases':len(price_micro), 'rounding_boundary_cases':len(rounding), 'corrupt_zip_rejections':16,
             'ordinary_roundtrip':outputs, 'scientific_roundtrip':scientific_output,
             'original_workbook_sha256':original_hash, 'original_workbook_unchanged':True}
         self.save()

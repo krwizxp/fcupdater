@@ -17,6 +17,7 @@ use alloc::{
     rc::Rc,
 };
 use core::{
+    cmp::Ordering,
     fmt::NumBuffer,
     mem,
     num::IntErrorKind,
@@ -1307,12 +1308,35 @@ impl Worksheet {
         if digits.is_empty() {
             return Ok(None);
         }
+        let (mantissa, exponent) =
+            if let Some((mantissa, exponent_text)) = digits.split_once(['e', 'E']) {
+                if mantissa.contains(',') {
+                    return Ok(None);
+                }
+                let Ok(exponent) = exponent_text.parse::<i64>() else {
+                    return Ok(None);
+                };
+                (mantissa, exponent)
+            } else {
+                (digits, 0_i64)
+            };
+        let integer_digits = mantissa
+            .bytes()
+            .take_while(|&byte| byte != b'.')
+            .filter(u8::is_ascii_digit)
+            .count();
+        let Some(decimal_position) = i64::try_from(integer_digits)
+            .ok()
+            .and_then(|position| position.checked_add(exponent))
+        else {
+            return Ok(None);
+        };
         let mut whole = 0_i64;
+        let mut position = 0_i64;
         let mut round_away_from_zero = false;
         let mut saw_digit = false;
-        let mut saw_fraction_digit = false;
         let mut seen_decimal = false;
-        for byte in digits.bytes() {
+        for byte in mantissa.bytes() {
             match byte {
                 b',' if !seen_decimal => {}
                 b'.' if !seen_decimal => {
@@ -1321,29 +1345,35 @@ impl Worksheet {
                 b'0'..=b'9' => {
                     saw_digit = true;
                     let digit = i64::from(byte.strict_sub(b'0'));
-                    if seen_decimal {
-                        if !saw_fraction_digit {
-                            round_away_from_zero = digit >= 5_i64;
-                            saw_fraction_digit = true;
+                    match position.cmp(&decimal_position) {
+                        Ordering::Less => {
+                            let Some(next) = whole
+                                .checked_mul(10)
+                                .and_then(|scaled| scaled.checked_add(digit))
+                            else {
+                                return Ok(None);
+                            };
+                            whole = next;
                         }
-                    } else {
-                        let Some(next) = whole
-                            .checked_mul(10)
-                            .and_then(|scaled| scaled.checked_add(digit))
-                        else {
-                            return Ok(None);
-                        };
-                        whole = next;
+                        Ordering::Equal => round_away_from_zero = digit >= 5_i64,
+                        Ordering::Greater => {}
                     }
+                    position = position.strict_add(1);
                 }
-                _ => {
-                    return Ok(trimmed
-                        .parse::<f64>()
-                        .ok()
-                        .filter(|value| value.is_finite())
-                        .and_then(|value| format!("{:.0}", value.round()).parse::<i32>().ok()));
-                }
+                _ => return Ok(None),
             }
+        }
+        if whole != 0 && decimal_position > position {
+            let Ok(power) = u32::try_from(decimal_position.strict_sub(position)) else {
+                return Ok(None);
+            };
+            let Some(scaled) = 10_i64
+                .checked_pow(power)
+                .and_then(|scale| whole.checked_mul(scale))
+            else {
+                return Ok(None);
+            };
+            whole = scaled;
         }
         if !saw_digit {
             return Ok(None);

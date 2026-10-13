@@ -13,13 +13,29 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
-      OPTIMIZATION_X64_ON_ARM: "1"
+      OPTIMIZATION_X64_ON_ARM: ${{ matrix.x64_on_arm }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+            x64_on_arm: "0"
+          - os: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
+            x64_on_arm: "0"
           - os: windows-11-arm
             target: x86_64-pc-windows-msvc
+            x64_on_arm: "1"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            x64_on_arm: "0"
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+            x64_on_arm: "0"
+          - os: macos-26
+            target: aarch64-apple-darwin
+            x64_on_arm: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -39,29 +55,4 @@ jobs:
           name: native-fcupdater-${{ matrix.target }}
           path: optimization-native-results/
           if-no-files-found: warn
-          retention-days: 14
-  tls-diagnostic:
-    name: Observe Server 2025 TLS failure
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Observe strict TLS negotiation
-        run: python .optimization-validation/windows_tls_diagnostic.py
-      - name: Record enabled cipher suites and curl diagnostics
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          curl.exe --verbose --head --max-time 30 https://nfl.opinet.co.kr/ 2>&1 | Out-File optimization-native-results/curl-tls.txt
-          Get-TlsCipherSuite | ConvertTo-Json -Depth 3 | Out-File optimization-native-results/cipher-suites.txt
-          exit 0
-      - name: Upload transport evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: windows-server-2025-tls
-          path: optimization-native-results/
-          if-no-files-found: error
           retention-days: 14
