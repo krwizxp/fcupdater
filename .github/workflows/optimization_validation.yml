@@ -26,7 +26,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install pinned native Rust
-        run: rustup toolchain install 1.99.0-${{ matrix.target }} --profile minimal --component rustfmt --component clippy --component llvm-tools-preview --no-self-update
+        run: rustup toolchain install 1.99.0-${{ matrix.target }} --profile minimal --component rustfmt --component clippy --component llvm-tools-preview --no-self-update --force-non-host
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
