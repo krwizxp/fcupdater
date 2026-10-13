@@ -457,16 +457,17 @@ impl Workbook {
         let mut input = [0_i128; 6];
         for (slot, row) in input.iter_mut().zip(4_u32..=9_u32) {
             let required_value = || err(format!("유류비 고정 입력값이 비어 있습니다: B{row}"));
-            let integer = self
-                .master_sheet
-                .get_i32_at(2, row, strings)?
-                .ok_or_else(required_value)?;
             *slot = if row <= 6 {
                 MasterSheetUpdater::get_f64_at(&self.master_sheet, 2, row, strings)?
                     .ok_or_else(required_value)?
                     .as_i128()
             } else {
-                i128::from(integer).strict_mul(DECIMAL_SCALE.as_i128())
+                i128::from(
+                    self.master_sheet
+                        .get_i32_at(2, row, strings)?
+                        .ok_or_else(required_value)?,
+                )
+                .strict_mul(DECIMAL_SCALE.as_i128())
             };
         }
         let [
@@ -1335,7 +1336,13 @@ impl Worksheet {
                         whole = next;
                     }
                 }
-                _ => return Ok(None),
+                _ => {
+                    return Ok(trimmed
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|value| value.is_finite())
+                        .and_then(|value| format!("{:.0}", value.round()).parse::<i32>().ok()));
+                }
             }
         }
         if !saw_digit {
