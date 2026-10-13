@@ -318,7 +318,7 @@ class NativeValidation:
 
     def numbers(self, binary, mode, workbook, values):
         completed = subprocess.run([str(binary), mode, str(workbook)], input='\n'.join(values)+'\n',
-                                   text=True, capture_output=True, timeout=60, env=self.base_env)
+                                   text=True, encoding='utf-8', capture_output=True, timeout=60, env=self.base_env)
         assert completed.returncode == 0, completed.stderr
         return completed.stdout.splitlines()
 
