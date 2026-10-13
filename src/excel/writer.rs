@@ -1656,12 +1656,7 @@ impl Worksheet {
             if element.opening.self_closing {
                 return Ok(());
             }
-            let prefix = trimmed_open_tag
-                .strip_suffix('>')
-                .unwrap_or_else(|| process::abort());
-            let mut replacement = copy_text(prefix)?;
-            replacement.push_str("/>");
-            xml.replace_range(element.span, &replacement);
+            xml.replace_range(element.opening.end..element.span.end, "/>");
         } else if element.opening.self_closing {
             let prefix = trimmed_open_tag
                 .strip_suffix("/>")
