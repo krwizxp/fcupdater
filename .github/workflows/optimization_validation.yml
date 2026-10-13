@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   native:
-    name: Native / ${{ matrix.target }}
+    name: Final / ${{ matrix.target }} / ${{ matrix.evidence_suffix }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
@@ -18,14 +18,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04-arm
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+            x64_on_arm: "0"
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             x64_on_arm: "0"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            x64_on_arm: "0"
+            evidence_suffix: native
           - os: windows-11-arm
             target: x86_64-pc-windows-msvc
             x64_on_arm: "1"
+            evidence_suffix: win11-emulated
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+            x64_on_arm: "0"
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+            x64_on_arm: "0"
+          - os: macos-26
+            target: aarch64-apple-darwin
             x64_on_arm: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -38,12 +52,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
       - name: Compare immutable baseline and candidate
-        run: python .optimization-validation/native_validation.py --repo fcupdater --target "${{ matrix.target }}" --name "fcupdater-${{ matrix.target }}"
+        run: python .optimization-validation/final_validation.py --target "${{ matrix.target }}"
       - name: Upload measurement evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: native-fcupdater-${{ matrix.target }}
+          name: final-fcupdater-${{ matrix.target }}-${{ matrix.evidence_suffix }}
           path: optimization-native-results/
           if-no-files-found: warn
           retention-days: 14
