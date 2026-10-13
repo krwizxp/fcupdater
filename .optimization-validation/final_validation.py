@@ -62,6 +62,13 @@ def main():
         assert v.result['variants']['baseline']['cli']==v.result['variants']['candidate']['cli']
         v.fc_contracts(probes['baseline'],probes['candidate'],workbooks['baseline'])
         v.paired('final-source-and-profile-vs-original-cycle',probes['baseline'],probes['candidate'],'roundtrip',workbooks['baseline'])
+        memory_samples={'baseline':[],'candidate':[]}
+        for sample in range(8):
+            order=['baseline','candidate'] if sample%2 else ['candidate','baseline']
+            for variant in order:
+                v.peak_memory(variant,probes[variant],workbooks['baseline'])
+                memory_samples[variant].append(dict(v.result['variants'][variant]['memory']))
+        v.result['paired_peak_memory_samples']=memory_samples
         v.result['default_host_live_blockers']=blocked
         v.result['status']='passed' if not blocked and all(t['protected_runtime_pass'] for t in v.result['timings']) else 'passed-offline-live-path-blocked' if blocked and all(t['protected_runtime_pass'] for t in v.result['timings']) else 'runtime-bound-unresolved'
         v.save()
