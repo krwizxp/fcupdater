@@ -16,10 +16,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -39,4 +37,28 @@ jobs:
           name: native-fcupdater-${{ matrix.target }}
           path: optimization-native-results/
           if-no-files-found: warn
+          retention-days: 14
+  tls-diagnostic:
+    name: Observe Server 2025 TLS failure
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Observe strict TLS negotiation
+        run: python .optimization-validation/windows_tls_diagnostic.py
+      - name: Record enabled cipher suites and curl diagnostics
+        shell: pwsh
+        run: |
+          Get-TlsCipherSuite | Select-Object -ExpandProperty Name | Out-File optimization-native-results/cipher-suites.txt
+          curl.exe --verbose --head --max-time 30 https://nfl.opinet.co.kr/ 2>&1 | Out-File optimization-native-results/curl-tls.txt
+          exit 0
+      - name: Upload transport evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-server-2025-tls
+          path: optimization-native-results/
+          if-no-files-found: error
           retention-days: 14

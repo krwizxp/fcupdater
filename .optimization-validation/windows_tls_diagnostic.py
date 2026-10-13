@@ -32,7 +32,7 @@ failure = constant('WINHTTP_CALLBACK_STATUS_SECURE_FAILURE')
 flag_names = ['CERT_REV_FAILED','INVALID_CERT','CERT_REVOKED','INVALID_CA','CERT_CN_INVALID','CERT_DATE_INVALID','SECURITY_CHANNEL_ERROR']
 flags = {name:constant('WINHTTP_CALLBACK_STATUS_FLAG_'+name) for name in flag_names}
 records = []
-for host in ['nfl.opinet.co.kr','www.opinet.co.kr']:
+for host,protocol_mask in [(host,mask) for host in ['nfl.opinet.co.kr','www.opinet.co.kr'] for mask in [0x2800,0x800,0x2000]]:
     events = []
     callback_type=ctypes.WINFUNCTYPE(None,P,ctypes.c_size_t,W.DWORD,P,W.DWORD)
     @callback_type
@@ -44,7 +44,7 @@ for host in ['nfl.opinet.co.kr','www.opinet.co.kr']:
     try:
         session=api.WinHttpOpen('optimization-validation',4,None,None,0);assert session;handles.append(session)
         assert api.WinHttpSetTimeouts(session,30000,30000,30000,30000)
-        protocols=W.DWORD(0x800|0x2000)
+        protocols=W.DWORD(protocol_mask)
         assert api.WinHttpSetOption(session,84,ctypes.byref(protocols),ctypes.sizeof(protocols))
         connection=api.WinHttpConnect(session,host,443,0);assert connection;handles.append(connection)
         request=api.WinHttpOpenRequest(connection,'HEAD','/',None,None,None,0x800000);assert request;handles.append(request)
@@ -56,7 +56,7 @@ for host in ['nfl.opinet.co.kr','www.opinet.co.kr']:
         error=ctypes.get_last_error() if not sent else 0
         received=api.WinHttpReceiveResponse(request,None) if sent else False
         if sent and not received:error=ctypes.get_last_error()
-        records.append({'host':host,'sent':bool(sent),'received':bool(received),'error':error,'secure_failure_events':events})
+        records.append({'host':host,'protocol_mask':protocol_mask,'sent':bool(sent),'received':bool(received),'error':error,'secure_failure_events':events})
     finally:
         for handle in reversed(handles):api.WinHttpCloseHandle(handle)
 output=Path('optimization-native-results');output.mkdir(exist_ok=True)
