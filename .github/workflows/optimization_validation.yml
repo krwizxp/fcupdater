@@ -1,0 +1,58 @@
+name: Optimization validation 20261013
+on:
+  push:
+    branches: [codex/optimization-validation-20261013]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  native:
+    name: Native / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      OPTIMIZATION_X64_ON_ARM: ${{ matrix.x64_on_arm }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+            x64_on_arm: "0"
+          - os: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
+            x64_on_arm: "0"
+          - os: windows-11-arm
+            target: x86_64-pc-windows-msvc
+            x64_on_arm: "1"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            x64_on_arm: "0"
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+            x64_on_arm: "0"
+          - os: macos-26
+            target: aarch64-apple-darwin
+            x64_on_arm: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned native Rust
+        run: rustup toolchain install 1.99.0-${{ matrix.target }} --profile minimal --component rustfmt --component clippy --component llvm-tools-preview --no-self-update --force-non-host
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Compare immutable baseline and candidate
+        run: python .optimization-validation/native_validation.py --repo fcupdater --target "${{ matrix.target }}" --name "fcupdater-${{ matrix.target }}"
+      - name: Upload measurement evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-fcupdater-${{ matrix.target }}
+          path: optimization-native-results/
+          if-no-files-found: warn
+          retention-days: 14

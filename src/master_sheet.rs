@@ -745,9 +745,7 @@ impl<'source> MasterSheetUpdater<'source> {
         {
             (
                 mantissa,
-                exponent
-                    .parse::<i64>()
-                    .map_err(|source| err_with_source(invalid_value().to_string(), source))?,
+                exponent.parse::<i64>().ok().ok_or_else(invalid_value)?,
             )
         } else {
             (digits, 0_i64)
@@ -794,8 +792,7 @@ impl<'source> MasterSheetUpdater<'source> {
             .and_then(|value| value.checked_sub(fractional_digits))
             .and_then(|value| value.checked_add(i64::from(trailing_zeros)))
             .ok_or_else(invalid_value)?;
-        let unsigned_power = u32::try_from(power)
-            .map_err(|source| err_with_source(invalid_value().to_string(), source))?;
+        let unsigned_power = u32::try_from(power).ok().ok_or_else(invalid_value)?;
         10_i64
             .checked_pow(unsigned_power)
             .and_then(|scale| coefficient.checked_mul(scale))
