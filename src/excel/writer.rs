@@ -110,7 +110,7 @@ const MASTER_FORMULA_LAYOUT: FormulaLayout = FormulaLayout {
     fixed_formulas: &[
         (2, 10, "B4+B5+B6"),
         (2, 11, r#"IF(B4+B5=0,"",(B4*B7+B5*B8)/(B4+B5))"#),
-        (2, 12, r#"IF(B5+B6=0,"",(B4*B7+B5*B9)/(B4+B5))"#),
+        (2, 12, r#"IF(B4+B5=0,"",(B4*B7+B5*B9)/(B4+B5))"#),
     ],
     optional_zero_col: Some(11),
     required_cols: &[1, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, MASTER_LAST_COL],
@@ -423,7 +423,7 @@ impl Workbook {
             index.entry(Rc::clone(&entry.text)).or_insert(value_index);
         }
         let shared_strings = SharedStringTable { entries, index };
-        let master_sheet = WorksheetParser {
+        let mut master_sheet = WorksheetParser {
             cell_count: 0,
             input_styles: &input_styles,
             shared_formula_heads: BTreeMap::new(),
@@ -431,6 +431,17 @@ impl Workbook {
             xml: &master_xml,
         }
         .scan_worksheet()?;
+        if master_sheet.try_get_formula_at(2, 12)?.as_deref()
+            == Some(r#"IF(B5+B6=0,"",(B4*B7+B5*B9)/(B4+B5))"#)
+        {
+            master_sheet.set_formula_at_with_cache(
+                2,
+                12,
+                r#"IF(B4+B5=0,"",(B4*B7+B5*B9)/(B4+B5))"#,
+                None,
+                true,
+            )?;
+        }
         master_sheet.validate_fixed_header(ExcelSheetKind::Master, &shared_strings)?;
         let change_log_sheet = WorksheetParser {
             cell_count: 0,
@@ -500,10 +511,9 @@ impl Workbook {
         };
         self.master_sheet
             .set_formula_cached_value_at(2, 11, premium_cache, false)?;
-        let diesel_cache = if premium_qty.strict_add(diesel_qty) == 0 {
+        let ultra_octane_cache = if fuel_denominator == 0 {
             None
         } else {
-            (fuel_denominator != 0).ok_or(err("유류비 경유 평균 단가 분모가 0입니다."))?;
             let numerator = gasoline_qty
                 .strict_mul(gasoline_weight)
                 .strict_add(premium_qty.strict_mul(diesel_weight));
@@ -515,7 +525,7 @@ impl Workbook {
             Some(cache.as_str())
         };
         self.master_sheet
-            .set_formula_cached_value_at(2, 12, diesel_cache, false)
+            .set_formula_cached_value_at(2, 12, ultra_octane_cache, false)
     }
     pub(crate) fn save(
         mut self,
@@ -1258,21 +1268,7 @@ impl Worksheet {
         let src = row_index(source_row)
             .and_then(|index| self.rows.get(index))
             .ok_or_else(|| err(format!("worksheet style 원본 row가 없습니다: {source_row}")))?;
-        let cell_count = src.cells.partition_point(|cell| cell.col <= max_col);
-        let mut cells =
-            try_vec_with_capacity(cell_count, "row style cell 목록 복사 메모리 확보 실패")?;
-        for cell in src.cells.iter().take(cell_count) {
-            cells.push(Cell {
-                col: cell.col,
-                inner_xml: String::new(),
-                style: cell.style,
-                value_type: CellValueType::General,
-            });
-        }
-        let copied = Row {
-            attrs_xml: copy_text(&src.attrs_xml)?,
-            cells,
-        };
+        let copied = src.try_copy_style(max_col)?;
         let target_index = row_index(target_row).unwrap_or_else(|| process::abort());
         let required_len = target_index.strict_add(1);
         if self.rows.len() < required_len {
@@ -1982,15 +1978,16 @@ impl Row {
             .ok()?;
         self.cells.get(index)
     }
-    pub(crate) fn try_copy(&self) -> Result<Self> {
+    pub(crate) fn try_copy_style(&self, max_col: u32) -> Result<Self> {
+        let cell_count = self.cells.partition_point(|cell| cell.col <= max_col);
         let mut cells =
-            try_vec_with_capacity(self.cells.len(), "row cell 목록 복사 메모리 확보 실패")?;
-        for cell in &self.cells {
+            try_vec_with_capacity(cell_count, "row style cell 목록 복사 메모리 확보 실패")?;
+        for cell in self.cells.iter().take(cell_count) {
             cells.push(Cell {
                 col: cell.col,
-                inner_xml: copy_text(&cell.inner_xml)?,
+                inner_xml: String::new(),
                 style: cell.style,
-                value_type: cell.value_type,
+                value_type: CellValueType::General,
             });
         }
         Ok(Self {

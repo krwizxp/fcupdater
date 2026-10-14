@@ -215,7 +215,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             row_num,
             COL_RANK,
             format_args!(
-                r#"IF($T{row_text}="","",1+COUNTIF($W${data_start}:$W${data_last},"<"&W{row_text}))"#
+                r#"IF($T{row_text}="","",RANK(T{row_text},$T${data_start}:$T${data_last},1))"#
             ),
             rank_cache,
             false,
@@ -834,7 +834,7 @@ impl<'source> MasterSheetUpdater<'source> {
                     "유류비 신규행 template이 없습니다: row={template_row_num}"
                 ))
             })?;
-            Some(template_row.try_copy()?)
+            Some(template_row.try_copy_style(COL_SORT_KEY)?)
         };
         let data_start_index = MASTER_HEADER_ROW as usize;
         let trailing_start_index = last_old_row.unwrap_or(MASTER_HEADER_ROW) as usize;
@@ -862,7 +862,7 @@ impl<'source> MasterSheetUpdater<'source> {
         }
         if let Some(template_row) = added_template_row {
             for _ in 1..added.len() {
-                original_rows.push(template_row.try_copy()?);
+                original_rows.push(template_row.try_copy_style(COL_SORT_KEY)?);
             }
             original_rows.push(template_row);
         }
@@ -878,7 +878,6 @@ impl<'source> MasterSheetUpdater<'source> {
             let offset = kept_count.strict_add(i);
             let new_row = add_row_offset(MASTER_DATA_START_ROW, offset, "유류비 신규행 추가")?;
             Self::write_master_row_from_source(ws, shared_strings, new_row, source)?;
-            ws.set_i32_at(COL_SMART_DISCOUNT, new_row, None)?;
         }
         let last_data_row = MASTER_DATA_START_ROW.strict_add(final_count_u32.strict_sub(1));
         RankSortRefresher {
