@@ -469,18 +469,9 @@ impl Workbook {
         let mut input = [0_i128; 6];
         for (slot, row) in input.iter_mut().zip(4_u32..=9_u32) {
             let required_value = || err(format!("유류비 고정 입력값이 비어 있습니다: B{row}"));
-            *slot = if row <= 6 {
-                MasterSheetUpdater::get_f64_at(&self.master_sheet, 2, row, strings)?
-                    .ok_or_else(required_value)?
-                    .as_i128()
-            } else {
-                i128::from(
-                    self.master_sheet
-                        .get_i32_at(2, row, strings)?
-                        .ok_or_else(required_value)?,
-                )
-                .strict_mul(DECIMAL_SCALE.as_i128())
-            };
+            *slot = MasterSheetUpdater::get_f64_at(&self.master_sheet, 2, row, strings)?
+                .ok_or_else(required_value)?
+                .as_i128();
         }
         let [
             gasoline_qty,
@@ -500,8 +491,12 @@ impl Workbook {
             None
         } else {
             let numerator = gasoline_qty
-                .strict_mul(gasoline_weight)
-                .strict_add(premium_qty.strict_mul(premium_weight));
+                .checked_mul(gasoline_weight)
+                .and_then(|value| {
+                    let premium = premium_qty.checked_mul(premium_weight)?;
+                    value.checked_add(premium)
+                })
+                .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?;
             format_excel_ratio_into(
                 &mut cache,
                 numerator,
@@ -515,8 +510,12 @@ impl Workbook {
             None
         } else {
             let numerator = gasoline_qty
-                .strict_mul(gasoline_weight)
-                .strict_add(premium_qty.strict_mul(diesel_weight));
+                .checked_mul(gasoline_weight)
+                .and_then(|value| {
+                    let premium = premium_qty.checked_mul(diesel_weight)?;
+                    value.checked_add(premium)
+                })
+                .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?;
             format_excel_ratio_into(
                 &mut cache,
                 numerator,
