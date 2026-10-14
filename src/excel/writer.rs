@@ -1550,7 +1550,8 @@ impl Worksheet {
                 if first_layout_issue.is_none()
                     && let Some(col) = layout.optional_zero_col
                     && !optional_formula
-                    && self.get_i32_at(col, row_num, shared_strings)? != Some(0_i32)
+                    && MasterSheetUpdater::get_f64_at(self, col, row_num, shared_strings)?
+                        .is_none_or(|value| value.as_i128() != 0)
                 {
                     first_layout_issue =
                         Some((row_num, col, "선택 formula 위치는 수동 0이어야 합니다"));

@@ -259,19 +259,15 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             true,
             &mut buffers.formula,
         )?;
-        format_scaled_value_into(
-            &mut buffers.cache,
-            plan.smart_discount.as_i128(),
-            DECIMAL_SCALE.as_i128(),
-        );
         if plan.smart_discount_excluded {
-            self.ws.set_formula_cached_value_at(
-                COL_SMART_DISCOUNT,
-                row_num,
-                Some(buffers.cache.as_str()),
-                false,
-            )?;
+            self.ws
+                .set_i32_at(COL_SMART_DISCOUNT, row_num, Some(0_i32))?;
         } else {
+            format_scaled_value_into(
+                &mut buffers.cache,
+                plan.smart_discount.as_i128(),
+                DECIMAL_SCALE.as_i128(),
+            );
             let smart_discount_cache = buffers.cache.as_str();
             self.apply_formula_cache(
                 row_num,
@@ -812,17 +808,31 @@ impl<'source> MasterSheetUpdater<'source> {
         let mut fractional_digits = 0_i64;
         let mut has_digit = false;
         let mut parsing_fraction = false;
+        let mut integer_group_len = 0_u32;
+        let mut has_group = false;
         for byte in mantissa.bytes() {
             if byte == b',' {
+                (!parsing_fraction
+                    && integer_group_len != 0
+                    && if has_group {
+                        integer_group_len == 3
+                    } else {
+                        integer_group_len <= 3
+                    })
+                .ok_or_else(invalid_value)?;
+                has_group = true;
+                integer_group_len = 0;
                 continue;
             }
             if byte == b'.' {
-                (!parsing_fraction).ok_or_else(invalid_value)?;
+                (!parsing_fraction && (!has_group || integer_group_len == 3))
+                    .ok_or_else(invalid_value)?;
                 parsing_fraction = true;
                 continue;
             }
             byte.is_ascii_digit().ok_or_else(invalid_value)?;
             has_digit = true;
+            integer_group_len = integer_group_len.strict_add(u32::from(!parsing_fraction));
             fractional_digits = fractional_digits.strict_add(i64::from(parsing_fraction));
             let digit = i64::from(byte.strict_sub(b'0'));
             if digit == 0 {
@@ -841,6 +851,7 @@ impl<'source> MasterSheetUpdater<'source> {
             trailing_zeros = 0;
         }
         has_digit.ok_or_else(invalid_value)?;
+        (!has_group || integer_group_len == 3).ok_or_else(invalid_value)?;
         if coefficient == 0 {
             return Ok(Some(ScaledDecimal::ZERO));
         }
