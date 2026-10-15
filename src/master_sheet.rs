@@ -999,8 +999,13 @@ fn append_fuel_total_text(
     let Some(total) = quantity.as_i128().checked_mul(price_value.as_i128()) else {
         return Ok(false);
     };
+    // Negative ties need one scaled unit of correction before floor division.
+    let rounding_offset = DECIMAL_SCALE_SQUARED
+        .as_i128()
+        .div_euclid(2)
+        .strict_sub(i128::from(total < 0));
     let rounded = ScaledSortKey(total)
-        .checked_add(ScaledSortKey(DECIMAL_SCALE_SQUARED.as_i128().div_euclid(2)))
+        .checked_add(ScaledSortKey(rounding_offset))
         .ok_or_else(|| err("연료비 반올림 계산 중 overflow가 발생했습니다."))?
         .as_i128()
         .div_euclid(DECIMAL_SCALE_SQUARED.as_i128());
