@@ -392,22 +392,15 @@ impl SstChunkReader<'_, '_> {
     }
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.ensure_available()?;
-        let chunk = self
+        let bytes = self
             .chunks
             .get(self.chunk_index)
-            .ok_or_else(|| err("SST chunk 접근 범위 오류"))?;
-        if let Some(bytes) = chunk
-            .get(self.offset_in_chunk..)
+            .and_then(|chunk| chunk.get(self.offset_in_chunk..))
             .and_then(|remaining| remaining.first_chunk::<N>())
-        {
-            self.offset_in_chunk = self.offset_in_chunk.strict_add(N);
-            return Ok(*bytes);
-        }
-        let mut out = [0_u8; N];
-        for byte in &mut out {
-            *byte = self.read_u8()?;
-        }
-        Ok(out)
+            .copied()
+            .ok_or_else(|| err("SST 숫자 필드가 record 경계를 넘습니다."))?;
+        self.offset_in_chunk = self.offset_in_chunk.strict_add(N);
+        Ok(bytes)
     }
     fn read_u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.read_array::<2>()?))
@@ -416,13 +409,7 @@ impl SstChunkReader<'_, '_> {
         Ok(u32::from_le_bytes(self.read_array::<4>()?))
     }
     fn read_u8(&mut self) -> Result<u8> {
-        self.ensure_available()?;
-        let value = *self
-            .chunks
-            .get(self.chunk_index)
-            .and_then(|chunk| chunk.get(self.offset_in_chunk))
-            .ok_or_else(|| err("SST byte 접근 범위 오류"))?;
-        self.offset_in_chunk = self.offset_in_chunk.strict_add(1);
+        let [value] = self.read_array::<1>()?;
         Ok(value)
     }
     fn read_xl_unicode_chars(
@@ -433,10 +420,11 @@ impl SstChunkReader<'_, '_> {
     ) -> Result<Range<usize>> {
         let value_start = out.len();
         let mut remaining = char_count;
-        let mut continuation = false;
+        let mut pending_surrogate = None;
         while remaining > 0 {
+            let previous_chunk = self.chunk_index;
             self.ensure_available()?;
-            if continuation && self.offset_in_chunk == 0 {
+            if self.chunk_index != previous_chunk {
                 let option = self.read_u8()?;
                 validate_sst_option(
                     option,
@@ -444,7 +432,6 @@ impl SstChunkReader<'_, '_> {
                     "SST Continue 문자열 option",
                 )?;
                 high_byte = (option & 0x01) != 0;
-                self.ensure_available()?;
             }
             let chunk = *self
                 .chunks
@@ -454,12 +441,11 @@ impl SstChunkReader<'_, '_> {
             let bytes_per_char = if high_byte { 2 } else { 1 };
             let available_chars = available_bytes.div_euclid(bytes_per_char);
             let chars_here = available_chars.min(remaining);
-            if chars_here == 0 {
-                self.chunk_index = self.chunk_index.strict_add(1);
-                self.offset_in_chunk = 0;
-                continuation = true;
+            if available_bytes == 0 {
                 continue;
             }
+            (chars_here != 0)
+                .ok_or_else(|| err("SST UTF-16 code unit이 record 경계에서 나뉘어져 있습니다."))?;
             let byte_len = chars_here.strict_mul(bytes_per_char);
             let start = self.offset_in_chunk;
             let end = start.strict_add(byte_len);
@@ -475,27 +461,37 @@ impl SstChunkReader<'_, '_> {
             out.try_reserve(additional_capacity)
                 .map_err(|source| err_with_source("SST 문자열 메모리 확보 실패", source))?;
             if high_byte {
-                let (chunks, &[]) = bytes.as_chunks::<2>() else {
+                let (mut chunks, &[]) = bytes.as_chunks::<2>() else {
                     return Err(err("SST UTF-16 문자열 길이가 홀수입니다."));
                 };
-                for decoded in
-                    char::decode_utf16(chunks.iter().map(|unit| u16::from_le_bytes(*unit)))
+                let previous_surrogate = pending_surrogate.take();
+                if let Some((last, rest)) = chunks.split_last()
+                    && matches!(u16::from_le_bytes(*last), 0xd800..=0xdbff)
                 {
+                    pending_surrogate = Some(u16::from_le_bytes(*last));
+                    chunks = rest;
+                }
+                for decoded in char::decode_utf16(
+                    previous_surrogate
+                        .into_iter()
+                        .chain(chunks.iter().map(|unit| u16::from_le_bytes(*unit))),
+                ) {
                     out.push(decoded.map_err(|source| {
                         err_with_source("SST UTF-16 문자열 해석 실패", source)
                     })?);
                 }
             } else {
+                pending_surrogate
+                    .is_none()
+                    .ok_or_else(|| err("SST UTF-16 서로게이트 쌍이 올바르지 않습니다."))?;
                 out.extend(bytes.iter().copied().map(char::from));
             }
             self.offset_in_chunk = end;
             remaining = remaining.strict_sub(chars_here);
-            continuation = remaining > 0 && self.offset_in_chunk >= chunk.len();
-            if continuation {
-                self.chunk_index = self.chunk_index.strict_add(1);
-                self.offset_in_chunk = 0;
-            }
         }
+        pending_surrogate
+            .is_none()
+            .ok_or_else(|| err("SST UTF-16 서로게이트 쌍이 올바르지 않습니다."))?;
         Ok(Range {
             start: value_start,
             end: out.len(),
@@ -659,7 +655,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
     ) -> Result<(BiffSharedStrings, usize)> {
         let (chunks, next_offset, total_chunk_bytes) =
             self.collect_sst_chunks(first_chunk, first_chunk_end)?;
-        (total_chunk_bytes >= 8).ok_or(err("SST 데이터가 비정상적으로 짧습니다."))?;
+        (first_chunk.len() >= 8).ok_or(err("SST 데이터가 비정상적으로 짧습니다."))?;
         let mut reader = SstChunkReader {
             chunk_index: 0,
             chunks: &chunks,
@@ -692,6 +688,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         let mut ranges = try_vec_with_capacity(unique_count, "SST 문자열 테이블 메모리 확보 실패")?;
         let mut text = try_string_with_capacity(total_chunk_bytes, "SST 문자열 메모리 확보 실패")?;
         for _ in 0..unique_count {
+            reader.ensure_available()?;
+            let header_chunk = reader.chunk_index;
             let char_count = usize::from(reader.read_u16()?);
             let flags = reader.read_u8()?;
             validate_sst_option(flags, BIFF_SST_STRING_FLAGS_MASK, "SST 문자열 option")?;
@@ -705,6 +703,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             } else {
                 0_usize
             };
+            (reader.chunk_index == header_chunk)
+                .ok_or_else(|| err("SST 문자열 header가 record 경계를 넘습니다."))?;
             let value = reader.read_xl_unicode_chars(char_count, flags & 0x01 != 0, &mut text)?;
             reader.skip_bytes(rich_run_count.strict_mul(4))?;
             reader.skip_bytes(ext_len)?;
@@ -1165,3 +1165,6 @@ fn display_limit_message(
 ) -> String {
     format!("{prefix}{value} ({limit_label}{limit})")
 }
+
+#[cfg(test)]
+mod tests;

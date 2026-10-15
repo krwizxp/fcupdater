@@ -54,10 +54,10 @@ static FIXED_DECODE_TREES: LazyLock<DynamicTrees> = LazyLock::new(|| {
         _ => 0,
     });
     let distance_lengths = [5_u8; FIXED_DISTANCE_SYMBOLS];
-    let literal = DecodeHuffman::from_lengths(&literal_lengths)
+    let literal = DecodeHuffman::from_lengths(&literal_lengths, false)
         .unwrap_or_else(|_| process::abort())
         .unwrap_or_else(|| process::abort());
-    let distance = DecodeHuffman::from_lengths(&distance_lengths)
+    let distance = DecodeHuffman::from_lengths(&distance_lengths, false)
         .unwrap_or_else(|_| process::abort())
         .unwrap_or_else(|| process::abort());
     DynamicTrees {
@@ -302,7 +302,7 @@ impl DecodeHuffman {
         }
         Err(zip_static("deflate Huffman code를 해석하지 못했습니다."))
     }
-    fn from_lengths(lengths: &[u8]) -> ZipResult<Option<Self>> {
+    fn from_lengths(lengths: &[u8], allow_single_code: bool) -> ZipResult<Option<Self>> {
         (lengths.len() <= DECODE_MAX_SYMBOLS)
             .ok_or(zip_static("deflate decode symbol 수가 너무 많습니다."))?;
         let mut counts = [0_u16; DEFLATE_MAX_BITS + 1];
@@ -316,6 +316,14 @@ impl DecodeHuffman {
             symbol_count = symbol_count.strict_add(count);
             first_symbol
         });
+        let code_end = u32::from(huffman_get(&first_codes, DEFLATE_MAX_BITS))
+            .strict_add(u32::from(huffman_get(&counts, DEFLATE_MAX_BITS)));
+        let code_limit = 1_u32.strict_shl(u32::from(DEFLATE_MAX_BITS_U8));
+        (code_end <= code_limit).ok_or(zip_static("Oversubscribed deflate Huffman tree"))?;
+        // RFC 1951 permits a single one-bit literal/distance code, not an incomplete code-length tree.
+        (code_end == code_limit
+            || (allow_single_code && symbol_count == 1 && huffman_get(&counts, 1) == 1))
+            .ok_or(zip_static("Incomplete deflate Huffman tree"))?;
         let mut root = [DecodeEntry::EMPTY; DECODE_ROOT_SIZE];
         let mut symbols = [0_u16; DECODE_MAX_SYMBOLS];
         for (symbol_u16, &bit_len) in zip(0_u16.., lengths) {
@@ -324,9 +332,6 @@ impl DecodeHuffman {
             }
             let bit_index = usize::from(bit_len);
             let assigned = huffman_get(&next_codes, bit_index);
-            let code_limit = 1_u16.strict_shl(u32::from(bit_len));
-            (assigned < code_limit)
-                .ok_or(zip_static("deflate Huffman code가 과포화되었습니다."))?;
             huffman_set(&mut next_codes, bit_index, assigned.strict_add(1));
             let symbol_index = usize::from(
                 huffman_get(&first_symbols, bit_index)
@@ -448,7 +453,7 @@ impl InflateState<'_> {
             let [length, _] = self.reader.read_bits(3)?.to_le_bytes();
             *slot = length;
         }
-        let code_tree = DecodeHuffman::from_lengths(&code_lengths)?
+        let code_tree = DecodeHuffman::from_lengths(&code_lengths, false)?
             .ok_or_else(|| zip_static("deflate code length tree가 비어 있습니다."))?;
         let total = literal_count
             .checked_add(distance_count)
@@ -487,9 +492,9 @@ impl InflateState<'_> {
         else {
             return Err(zip_static("deflate literal/distance length 범위 오류"));
         };
-        let literal = DecodeHuffman::from_lengths(literal_lengths)?
+        let literal = DecodeHuffman::from_lengths(literal_lengths, true)?
             .ok_or_else(|| zip_static("deflate literal Huffman tree가 비어 있습니다."))?;
-        let distance = DecodeHuffman::from_lengths(distance_lengths)?;
+        let distance = DecodeHuffman::from_lengths(distance_lengths, true)?;
         Ok(DynamicTrees { distance, literal })
     }
     fn inflate_compressed_block(
@@ -1202,7 +1207,6 @@ impl DeflateWriter<'_, '_> {
         let head = &mut workspace.head;
         let previous = &mut workspace.previous;
         let work_budget = &mut workspace.work_budget;
-        let mut skip_next_hash_insert = true;
         let mut position = 0_usize;
         while position < bytes.len() {
             let mut best_len = 0_usize;
@@ -1276,11 +1280,7 @@ impl DeflateWriter<'_, '_> {
                     chain_len = chain_len.strict_add(1);
                 }
             }
-            if skip_next_hash_insert {
-                skip_next_hash_insert = false;
-            } else {
-                Self::insert_position(position, position_hash, head, previous);
-            }
+            Self::insert_position(position, position_hash, head, previous);
             if best_len >= MIN_MATCH {
                 push_deflate_token(
                     &mut tokens,
@@ -1418,3 +1418,6 @@ fn write_fixed_symbol(writer: &mut BitWriter<'_>, symbol: u16) -> ZipResult<()> 
     };
     writer.write_bits(reverse_low_bits(code, bit_count), bit_count)
 }
+
+#[cfg(test)]
+mod tests;
