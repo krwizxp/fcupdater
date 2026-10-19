@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -177,9 +178,22 @@ release_env = BASE_ENV | {"CARGO_TARGET_DIR": str(TMP / "pgo-release-target")}
 release = run(["cargo", "+" + VERSION, "build-pgo"], env=release_env, timeout=1200)
 diagnostics = release.stderr.lower()
 for diagnostic in ("function control flow change detected",
-                   "hash mismatch", "no profile data available",
-                   "profile data may be out of date"):
+                   "hash mismatch", "profile data may be out of date"):
     assert diagnostic not in diagnostics, "PGO mismatch: " + diagnostic
+
+# LLVM can emit warnings for compiler-generated, never-executed helper
+# functions with exactly zero counters discarded. Do not ignore any other
+# diagnostics or silently drop useful application profile information.
+warnings = [line for line in release.stderr.splitlines()
+            if line.startswith("warning:") and not re.search(r"generated \d+ warnings?$", line)]
+zero_count_helpers = [line for line in warnings
+                      if "no profile data available for function" in line
+                      and "up to 0 count discarded" in line]
+assert len(warnings) == len(zero_count_helpers), "Unexpected PGO warning: " + repr(warnings)
+assert len(zero_count_helpers) <= 32, "Unusually many profile-absent functions"
+assert all("RankSortRefresher" not in line and "SharedStringTable" not in line
+           for line in zero_count_helpers), "Hot application functions lack PGO counters"
+print("Zero-count LLVM helper warnings:", len(zero_count_helpers))
 release_binary = TMP / "pgo-release-target" / TARGET / "release" / EXE
 assert release_binary.is_file(), "PGO release binary missing"
 run([release_binary, "--help"], env=BASE_ENV, timeout=30)
@@ -192,6 +206,7 @@ result = {
     "bytes": ROOT_PROFILE.stat().st_size, "raw_count": len(raw),
     "live_verify_exit": live_result.returncode,
     "offline_workbook_valid": True, "release_pgo_build": "success",
+    "zero_count_pgo_helpers": len(zero_count_helpers),
     "source_workbook_sha256": original_sha,
     "updated_workbook_sha256": sha256(OUT / WORKBOOK.name) if TARGET == "x86_64-unknown-linux-gnu" else None,
 }
@@ -201,5 +216,6 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
     summary.write(f"- Compiler: {result['rust']}\n")
     summary.write(f"- PGO SHA-256: {profile_sha}\n")
     summary.write(f"- Samples: {len(raw)}; profile bytes: {ROOT_PROFILE.stat().st_size}\n")
+    summary.write(f"- Zero-count LLVM helper warnings: {len(zero_count_helpers)}\n")
     summary.write(f"- Real CLI --verify exit: {live_result.returncode} (offline probe also executed)\n")
     summary.write("- Instrumented workload, XLSX CRC, PGO release build and CLI: passed\n")
