@@ -8,6 +8,11 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
+
+# Keep native Windows runner output encoding independent from the console code page.
+sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 VERSION = "1.99.1"
 ROOT = Path.cwd().resolve()
@@ -44,9 +49,21 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 def check_xlsx(path):
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     with zipfile.ZipFile(path) as archive:
         assert archive.testzip() is None, "XLSX ZIP CRC failure"
-        assert "xl/workbook.xml" in archive.namelist(), "Missing workbook.xml"
+        required = ("xl/workbook.xml", "xl/styles.xml", "xl/sharedStrings.xml",
+                    "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml")
+        assert all(name in archive.namelist() for name in required), "Missing XLSX parts"
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        sheets = [node.attrib["name"] for node in workbook.iter(ns + "sheet")]
+        assert sheets == ["유류비", "변경내역"], "Unexpected workbook sheet structure"
+        sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        assert sum(1 for _ in sheet.iter(ns + "row")) >= 800, "Master rows missing"
+        assert any(True for _ in sheet.iter(ns + "f")), "Workbook formulas missing"
+        ET.fromstring(archive.read("xl/worksheets/sheet2.xml"))
+        ET.fromstring(archive.read("xl/sharedStrings.xml"))
+        ET.fromstring(archive.read("xl/styles.xml"))
 
 version = run(["rustc", "+" + VERSION, "-Vv"]).stdout
 assert version.startswith("rustc 1.99.1 "), version
@@ -91,6 +108,13 @@ print("Live stdout:", live_result.stdout[-1200:])
 print("Live stderr:", live_result.stderr[-1200:])
 if live_result.returncode == 0:
     check_xlsx(live_book)
+if TARGET == "x86_64-unknown-linux-gnu":
+    assert live_result.returncode == 0, "Authoritative Opinet update failed on Linux"
+    assert live_result.stdout.count("Opinet 소스 데이터 준비 완료") == 1
+    assert sha256(live_book) != original_sha, "Refreshed workbook unexpectedly identical"
+    shutil.copyfile(live_book, OUT / WORKBOOK.name)
+    assert sha256(OUT / WORKBOOK.name) == sha256(live_book)
+    print("Refreshed workbook SHA-256:", sha256(live_book))
 assert sha256(WORKBOOK) == original_sha, "Tracked workbook changed"
 
 # Train the substantial workbook computation without external I/O using the
@@ -127,7 +151,10 @@ for name in ("bench", "parse-bench", "intern-plain", "intern-escaped"):
     for _ in range(3):
         run([probe, name, WORKBOOK], cwd=probe_src, env=probe_env, timeout=120)
 saved = TMP / "offline-trained.xlsx"
-run([probe, "save", WORKBOOK, saved], cwd=probe_src, env=probe_env, timeout=180)
+# The workbook writer intentionally protects the input file identity. A
+# disposable workbook must exist first, then be updated in place.
+shutil.copyfile(WORKBOOK, saved)
+run([probe, "save", saved, saved], cwd=probe_src, env=probe_env, timeout=180)
 check_xlsx(saved)
 raw = sorted(RAW.glob("*.profraw"))
 assert len(raw) >= 7, "Insufficient nonempty training samples"
@@ -166,6 +193,7 @@ result = {
     "live_verify_exit": live_result.returncode,
     "offline_workbook_valid": True, "release_pgo_build": "success",
     "source_workbook_sha256": original_sha,
+    "updated_workbook_sha256": sha256(OUT / WORKBOOK.name) if TARGET == "x86_64-unknown-linux-gnu" else None,
 }
 print("PGO RESULT:", json.dumps(result, sort_keys=True))
 with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
