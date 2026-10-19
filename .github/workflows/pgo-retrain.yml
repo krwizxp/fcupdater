@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/pgo-retrain.yml"
+      - ".pgo-retrain/train.py"
 permissions:
   contents: read
 jobs:
