@@ -29,7 +29,33 @@ jobs:
           curl --silent --show-error --location --connect-timeout 10 --max-time 30 --output /dev/null --write-out "Opinet HTTPS status %{http_code}\n" https://www.opinet.co.kr/user/opdown/opDownload.do
       - name: Build production PGO release
         run: cargo +stable build-pgo
-      - name: Exercise CLI, independent formula cache, valid, malformed and refusal paths
+      - name: Prepare isolated edge-case and rejected-input fixtures
+        run: |
+          python3 - <<'PY'
+          import runpy
+          import shutil
+          from pathlib import Path
+          module = runpy.run_path(".validation/fcupdater-regressions.py")
+          source = Path("fuel_cost_chungcheong.xlsx")
+          dest = Path(".validation/fixtures")
+          dest.mkdir(parents=True,exist_ok=True)
+          shutil.copyfile(source,dest/"default.xlsx")
+          for filename,controls in [
+              ("premium.xlsx",{"B4":0}),
+              ("gasoline.xlsx",{"B5":0}),
+              ("zero.xlsx",{"B4":0,"B5":0}),
+              ("large.xlsx",{"B4":2147483647,"B5":2147483647}),
+          ]:
+              module["change_controls"](source,dest/filename,controls)
+          module["change_controls"](source,dest/"badformula.xlsx",invalid_formula=True)
+          (dest/"badzip.xlsx").write_bytes(b"not a valid ZIP")
+          (dest/"symlink.xlsx").symlink_to("default.xlsx")
+          with Path("src/excel/writer.rs").open("a") as stream:
+              stream.write('\\ninclude!("../../.validation/octane-regressions.rs");\\n')
+          PY
+      - name: Run independent deterministic octane, malformed container and symlink regressions
+        run: cargo +stable test --all-targets --frozen -- --nocapture
+      - name: Exercise CLI and one real authoritative Opinet verified refresh
         env:
           FCUPDATER_RELEASE_BINARY: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release/fcupdater
         run: python3 .validation/fcupdater-regressions.py
