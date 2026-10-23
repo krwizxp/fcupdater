@@ -187,7 +187,7 @@ impl CellValueType {
     }
 }
 struct XmlAttr<'text> {
-    name: Cow<'text, str>,
+    name: &'text str,
     value: Cow<'text, str>,
 }
 struct WorksheetParser<'xml, 'styles> {
@@ -367,7 +367,7 @@ impl Workbook {
                             err_with_source("XML 속성 목록 추가 메모리 확보 실패", source)
                         })?;
                         attrs.push(XmlAttr {
-                            name: Cow::Borrowed("xml:space"),
+                            name: "xml:space",
                             value: Cow::Borrowed("preserve"),
                         });
                     }
@@ -2166,10 +2166,7 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr<'_>>> {
             .ok_or(err("XML 태그에 중복 속성이 있습니다."))?;
         out.try_reserve(1)
             .map_err(|source| err_with_source("XML 속성 목록 추가 메모리 확보 실패", source))?;
-        out.push(XmlAttr {
-            name: Cow::Borrowed(name),
-            value,
-        });
+        out.push(XmlAttr { name, value });
     }
     Ok(out)
 }
@@ -2258,7 +2255,7 @@ fn build_tag(name: &str, attrs: &[XmlAttr<'_>], self_closing: bool) -> Result<St
     let mut out = try_string_with_capacity(capacity, "XML 태그 메모리 확보 실패")?;
     out.extend(["<", name]);
     for attr in attrs {
-        out.extend([" ", attr.name.as_ref(), "=\""]);
+        out.extend([" ", attr.name, "=\""]);
         append_xml_escaped(&mut out, &attr.value, XmlEscapeContext::Attribute);
         out.push('"');
     }
