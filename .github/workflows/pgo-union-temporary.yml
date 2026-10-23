@@ -1,0 +1,90 @@
+name: Temporary measured PGO profile coverage union
+on:
+  pull_request:
+    branches:
+      - main
+permissions:
+  contents: read
+concurrency:
+  group: temporary-pgo-union-${{ github.head_ref }}
+  cancel-in-progress: true
+jobs:
+  merge-and-measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+          - os: macos-26
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve current stable Rust and LLVM profile tools
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview --no-self-update
+          rustc +stable -Vv
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Merge valid preexisting and newly trained PGO instrumentation
+        shell: bash
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          git show "6d267214b1feae5cb4cd53b4d539291766293753:pgo/$TARGET_TRIPLE.profdata" > "$RUNNER_TEMP/pgo-original.profdata"
+          cp "pgo/$TARGET_TRIPLE.profdata" "$RUNNER_TEMP/pgo-trained.profdata"
+          SYSROOT="$(rustc +stable --print sysroot)"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            LLVM_PROFDATA="$(cygpath -u "$SYSROOT")/lib/rustlib/$TARGET_TRIPLE/bin/llvm-profdata.exe"
+          else
+            LLVM_PROFDATA="$SYSROOT/lib/rustlib/$TARGET_TRIPLE/bin/llvm-profdata"
+          fi
+          test -x "$LLVM_PROFDATA"
+          "$LLVM_PROFDATA" show "$RUNNER_TEMP/pgo-original.profdata" | head -18
+          "$LLVM_PROFDATA" show "$RUNNER_TEMP/pgo-trained.profdata" | head -18
+          "$LLVM_PROFDATA" merge -sparse "$RUNNER_TEMP/pgo-original.profdata" "$RUNNER_TEMP/pgo-trained.profdata" -o "$RUNNER_TEMP/pgo-combined.profdata"
+          "$LLVM_PROFDATA" show "$RUNNER_TEMP/pgo-combined.profdata" | head -18
+          test -s "$RUNNER_TEMP/pgo-combined.profdata"
+          for type in original combined; do
+            if [ "$type" = original ]; then
+              cp "$RUNNER_TEMP/pgo-original.profdata" "pgo/$TARGET_TRIPLE.profdata"
+            else
+              cp "$RUNNER_TEMP/pgo-combined.profdata" "pgo/$TARGET_TRIPLE.profdata"
+            fi
+            export CARGO_TARGET_DIR="$RUNNER_TEMP/target-$type"
+            if ! cargo +stable build-pgo > "$RUNNER_TEMP/build-$type.log" 2>&1; then
+              tail -100 "$RUNNER_TEMP/build-$type.log"
+              exit 1
+            fi
+            missing="$(grep -c 'no profile data available' "$RUNNER_TEMP/build-$type.log" || true)"
+            mismatch="$(grep -c 'control flow change detected' "$RUNNER_TEMP/build-$type.log" || true)"
+            echo "$type: missing=$missing mismatch=$mismatch"
+            printf '%s %s\n' "$missing" "$mismatch" > "$RUNNER_TEMP/profile-$type.count"
+            grep -E 'warning: .*generated|Finished .release' "$RUNNER_TEMP/build-$type.log" | tail -5 || true
+          done
+          read -r old_missing old_hash < "$RUNNER_TEMP/profile-original.count"
+          read -r new_missing new_hash < "$RUNNER_TEMP/profile-combined.count"
+          if [ "$new_missing" -gt "$old_missing" ] || [ "$new_hash" -gt "$old_hash" ]; then
+            echo "The PGO profile union degraded coverage; refusing promotion."
+            exit 1
+          fi
+          echo "PGO coverage union nonregressive for $TARGET_TRIPLE"
+          cp "$RUNNER_TEMP/pgo-combined.profdata" "$TARGET_TRIPLE.profdata"
+          sha256sum "$TARGET_TRIPLE.profdata"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: union-${{ matrix.target }}
+          path: ${{ matrix.target }}.profdata
+          if-no-files-found: error
+          retention-days: 7
