@@ -423,7 +423,7 @@ impl Workbook {
             index.entry(Rc::clone(&entry.text)).or_insert(value_index);
         }
         let shared_strings = SharedStringTable { entries, index };
-        let mut master_sheet = WorksheetParser {
+        let master_sheet = WorksheetParser {
             cell_count: 0,
             input_styles: &input_styles,
             shared_formula_heads: BTreeMap::new(),
@@ -486,10 +486,10 @@ impl Workbook {
             )
         };
         for (column, weight) in [(11, premium_weight), (12, diesel_weight)] {
-            let cached = if let Some(gasoline_contribution) = gasoline_contribution {
+            let cached = if let Some(gasoline_term) = gasoline_contribution {
                 let numerator = premium_qty
                     .checked_mul(weight)
-                    .and_then(|premium| gasoline_contribution.checked_add(premium))
+                    .and_then(|premium| gasoline_term.checked_add(premium))
                     .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?;
                 format_excel_ratio_into(
                     &mut cache,

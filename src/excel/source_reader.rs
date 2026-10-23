@@ -1165,4 +1165,3 @@ fn display_limit_message(
 ) -> String {
     format!("{prefix}{value} ({limit_label}{limit})")
 }
-
