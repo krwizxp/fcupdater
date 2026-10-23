@@ -25,7 +25,9 @@ jobs:
           set -euo pipefail
           BASE="$RUNNER_TEMP/fcupdater-baseline"
           CURRENT="$GITHUB_WORKSPACE"
-          git worktree add --detach "$BASE" 6d267214b1feae5cb4cd53b4d539291766293753
+          git worktree add --detach "$BASE" 68b774e838693f4a7226d272859fdea773b8814d
+          MAIN="$RUNNER_TEMP/fcupdater-main"
+          git worktree add --detach "$MAIN" 6d267214b1feae5cb4cd53b4d539291766293753
           cat > "$RUNNER_TEMP/bench.rs" <<'RS'
           #[cfg(test)]
           mod octane_perf_metrics {
@@ -37,26 +39,26 @@ jobs:
                   let file = crate::temp_entry::open_regular(path, false)?;
                   let container = XlsxContainer::from_validated_file(file, path)?;
                   let mut workbook = Workbook::from_container(container)?;
-                  for _ in 0..2000 {
+                  for _ in 0..3000 {
                       workbook.request_recalculation_caches()?;
                   }
                   let mut durations = Vec::new();
-                  for _ in 0..7 {
+                  for _ in 0..9 {
                       let start = Instant::now();
-                      for _ in 0..4000 {
+                      for _ in 0..20000 {
                           std::hint::black_box(workbook.request_recalculation_caches()?);
                       }
-                      durations.push(start.elapsed().as_nanos() as f64 / 4000.0);
+                      durations.push(start.elapsed().as_nanos() as f64 / 20000.0);
                   }
                   durations.sort_unstable_by(f64::total_cmp);
-                  println!("OCTANE_NS_MEDIAN_PER_RUN {:.3}", durations[3]);
-                  println!("OCTANE_NS_MAX_OF_7 {:.3}", durations[6]);
+                  println!("OCTANE_NS_MEDIAN_PER_RUN {:.3}", durations[4]);
+                  println!("OCTANE_NS_MAX_OF_7 {:.3}", durations[8]);
                   Ok(())
               }
           }
           RS
-          for label in baseline candidate; do
-            if [ "$label" = baseline ]; then DIR="$BASE"; else DIR="$CURRENT"; fi
+          for label in baseline main candidate; do
+            if [ "$label" = baseline ]; then DIR="$BASE"; elif [ "$label" = main ]; then DIR="$MAIN"; else DIR="$CURRENT"; fi
             echo "==== MEASUREMENT $label ===="
             (cd "$DIR" && git rev-parse HEAD)
             (cd "$DIR" && cargo +stable build-pgo) > "$RUNNER_TEMP/$label-build.log" 2>&1
@@ -80,7 +82,7 @@ jobs:
           import os,re,pathlib,statistics
           root=pathlib.Path(os.environ['RUNNER_TEMP'])
           info={}
-          for name in ('baseline','candidate'):
+          for name in ('baseline','main','candidate'):
               s=(root/f'{name}-perf.log').read_text()
               measures={k:float(v) for k,v in re.findall(r'(OCTANE_NS_MEDIAN_PER_RUN|OCTANE_NS_MAX_OF_7) ([\d.]+)',s)}
               rss=re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)',s)
@@ -89,6 +91,7 @@ jobs:
                           'max_ns':measures['OCTANE_NS_MAX_OF_7'],
                           'peak_kib':int(rss.group(1))}
           delta=100*(info['candidate']['median_ns']-info['baseline']['median_ns'])/info['baseline']['median_ns']
-          print('COMPARABLE_METRICS',info,'median_pct_change',round(delta,2))
+          main_delta=100*(info['main']['median_ns']-info['baseline']['median_ns'])/info['baseline']['median_ns']
+          print('COMPARABLE_METRICS',info,'main_vs_68b_pct',round(main_delta,2),'candidate_vs_68b_pct',round(delta,2))
           assert delta < 25, 'Candidate octane cache computation regressed more than 25%'
           PY
