@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod octane_regression_validation {
     use super::*;
-    use std::{fs::File, path::Path};
+    use std::path::Path;
 
     fn cached_value(book: &Workbook, row_index: usize) -> Result<Option<f64>> {
         let row = book
@@ -38,7 +38,7 @@ mod octane_regression_validation {
         ];
         for (filename, avg, ultra) in fixtures {
             let path = Path::new(".validation/fixtures").join(filename);
-            let input = File::open(&path)?;
+            let input = crate::temp_entry::open_regular(&path, false)?;
             let container = XlsxContainer::from_validated_file(input, &path)?;
             let mut workbook = Workbook::from_container(container)?;
             workbook.request_recalculation_caches()?;
@@ -63,7 +63,7 @@ mod octane_regression_validation {
     #[test]
     fn invalid_fixed_header_formula_is_rejected() -> Result<()> {
         let path = Path::new(".validation/fixtures/badformula.xlsx");
-        let input = File::open(path)?;
+        let input = crate::temp_entry::open_regular(path, false)?;
         let container = XlsxContainer::from_validated_file(input, path)?;
         if Workbook::from_container(container).is_ok() {
             return Err(err("Unsupported fixed-header formula was accepted"));
@@ -74,7 +74,7 @@ mod octane_regression_validation {
     #[test]
     fn malformed_zip_is_rejected() -> Result<()> {
         let path = Path::new(".validation/fixtures/badzip.xlsx");
-        let input = File::open(path)?;
+        let input = crate::temp_entry::open_regular(path, false)?;
         if XlsxContainer::from_validated_file(input, path).is_ok() {
             return Err(err("Malformed XLSX container was accepted"));
         }
