@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/pgo-training-cycle-temporary.yml"
       - "src/**"
+      - ".validation/windows-pgo-live.ps1"
       - "fuel_cost_chungcheong.xlsx"
 concurrency:
   group: temporary-pgo-training-${{ github.head_ref }}
