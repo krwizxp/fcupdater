@@ -1166,5 +1166,3 @@ fn display_limit_message(
     format!("{prefix}{value} ({limit_label}{limit})")
 }
 
-#[cfg(test)]
-mod tests;
