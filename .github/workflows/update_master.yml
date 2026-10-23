@@ -29,8 +29,9 @@ jobs:
           ./target/x86_64-unknown-linux-gnu/release/fcupdater --verify
       - name: Mark newly added Daejeon Hansol station as local currency eligible
         run: |
-          python3 -m pip install --user openpyxl
-          python3 - <<'PY'
+          python3 -m venv /tmp/fcupdater-verify-venv
+          /tmp/fcupdater-verify-venv/bin/pip install openpyxl
+          /tmp/fcupdater-verify-venv/bin/python - <<'PY'
           from zipfile import ZipFile
           from pathlib import Path
           import openpyxl
