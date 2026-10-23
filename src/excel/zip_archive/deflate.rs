@@ -1418,4 +1418,3 @@ fn write_fixed_symbol(writer: &mut BitWriter<'_>, symbol: u16) -> ZipResult<()> 
     };
     writer.write_bits(reverse_low_bits(code, bit_count), bit_count)
 }
-
