@@ -1,0 +1,45 @@
+name: Temporary full Rust validation
+on:
+  pull_request:
+    branches:
+      - main
+permissions:
+  contents: read
+concurrency:
+  group: temporary-full-rust-${{ github.head_ref }}
+  cancel-in-progress: true
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+          - os: macos-26
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Resolve and install current stable Rust components
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Log exact Rust compiler
+        run: rustc +stable -Vv
+      - name: Install native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Check Rust formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Strict Clippy all targets
+        run: cargo +stable clippy --all-targets --frozen -- -D warnings
+      - name: Cargo regression tests
+        run: cargo +stable test --all-targets --frozen
+      - name: Release build
+        run: cargo +stable build-pgo
