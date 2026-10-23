@@ -18,12 +18,14 @@ function IsSame($a,$b) {
     return $a.path -eq $b.path -and $a.kind -eq $b.kind -and ((ConvertTo-Json -InputObject $a.value -Compress) -ceq (ConvertTo-Json -InputObject $b.value -Compress))
 }
 function ProbeApp {
-    Push-Location $WorkDir
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
     try {
-        $output = (& $Binary --verify 2>&1 | Out-String)
-        return @{code=$LASTEXITCODE;output=$output}
+        $proc = Start-Process -FilePath $Binary -ArgumentList @("--verify") -WorkingDirectory $WorkDir -RedirectStandardOutput $outFile -RedirectStandardError $errFile -Wait -PassThru
+        $output = (Get-Content $outFile -Raw) + (Get-Content $errFile -Raw)
+        return @{code=$proc.ExitCode;output=$output}
     } finally {
-        Pop-Location
+        Remove-Item $outFile,$errFile -Force -ErrorAction SilentlyContinue
     }
 }
 $policyBefore = Snapshot $policyPath
