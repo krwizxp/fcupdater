@@ -53,7 +53,7 @@ jobs:
           test -x "$LLVM_PROFDATA"
           "$LLVM_PROFDATA" show "$RUNNER_TEMP/pgo-original.profdata" | head -18
           "$LLVM_PROFDATA" show "$RUNNER_TEMP/pgo-trained.profdata" | head -18
-          "$LLVM_PROFDATA" merge -sparse "$RUNNER_TEMP/pgo-original.profdata" "$RUNNER_TEMP/pgo-trained.profdata" -o "$RUNNER_TEMP/pgo-combined.profdata"
+          "$LLVM_PROFDATA" merge "$RUNNER_TEMP/pgo-original.profdata" "$RUNNER_TEMP/pgo-trained.profdata" -o "$RUNNER_TEMP/pgo-combined.profdata"
           "$LLVM_PROFDATA" show "$RUNNER_TEMP/pgo-combined.profdata" | head -18
           test -s "$RUNNER_TEMP/pgo-combined.profdata"
           for type in original combined; do
