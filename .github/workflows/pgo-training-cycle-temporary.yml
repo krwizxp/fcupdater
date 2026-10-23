@@ -7,6 +7,9 @@ on:
       - ".github/workflows/pgo-training-cycle-temporary.yml"
       - "src/**"
       - "fuel_cost_chungcheong.xlsx"
+concurrency:
+  group: temporary-pgo-training-${{ github.head_ref }}
+  cancel-in-progress: true
 permissions:
   contents: write
 jobs:
@@ -51,7 +54,13 @@ jobs:
           TARGET_TRIPLE: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          mkdir -p pgo-raw "$RUNNER_TEMP/fcupdater-trained"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            WORK_ROOT="$(cygpath -u "$RUNNER_TEMP")"
+          else
+            WORK_ROOT="$RUNNER_TEMP"
+          fi
+          REPO_ROOT="$PWD"
+          mkdir -p pgo-raw "$WORK_ROOT/fcupdater-trained"
           if [ "$RUNNER_OS" = "Windows" ]; then
             PROFILE_PATH="$(cygpath -m "$PWD/pgo-raw")"
           else
@@ -62,16 +71,20 @@ jobs:
           cargo +stable build --release --frozen --bin fcupdater --target "$TARGET_TRIPLE"
           BINARY="$PWD/target-profile-training/$TARGET_TRIPLE/release/fcupdater"
           if [ "$RUNNER_OS" = "Windows" ]; then BINARY="$BINARY.exe"; fi
-          "$BINARY" --help > "$RUNNER_TEMP/fcupdater-trained/help.txt"
-          "$BINARY" --version > "$RUNNER_TEMP/fcupdater-trained/version.txt"
-          if "$BINARY" --unknown-option > "$RUNNER_TEMP/fcupdater-trained/rejected.txt" 2>&1; then
+          "$BINARY" --help > "$WORK_ROOT/fcupdater-trained/help.txt"
+          "$BINARY" --version > "$WORK_ROOT/fcupdater-trained/version.txt"
+          if "$BINARY" --unknown-option > "$WORK_ROOT/fcupdater-trained/rejected.txt" 2>&1; then
             echo "Invalid CLI option unexpectedly succeeded"
             exit 1
           fi
-          cp fuel_cost_chungcheong.xlsx "$RUNNER_TEMP/fcupdater-trained/"
-          cd "$RUNNER_TEMP/fcupdater-trained"
-          "$BINARY" --verify
-          cd "$GITHUB_WORKSPACE"
+          cp fuel_cost_chungcheong.xlsx "$WORK_ROOT/fcupdater-trained/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$REPO_ROOT/.validation/windows-pgo-live.ps1")" -Binary "$(cygpath -w "$BINARY")" -WorkDir "$(cygpath -w "$WORK_ROOT/fcupdater-trained")"
+          else
+            cd "$WORK_ROOT/fcupdater-trained"
+            "$BINARY" --verify
+            cd "$REPO_ROOT"
+          fi
           python - <<'PY'
           from pathlib import Path
           from zipfile import ZipFile
