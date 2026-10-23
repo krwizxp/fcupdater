@@ -51,7 +51,7 @@ jobs:
           (dest/"badzip.xlsx").write_bytes(b"not a valid ZIP")
           (dest/"symlink.xlsx").symlink_to("default.xlsx")
           with Path("src/excel/writer.rs").open("a") as stream:
-              stream.write('\\ninclude!("../../.validation/octane-regressions.rs");\\n')
+              stream.write('\ninclude!("../../.validation/octane-regressions.rs");\n')
           PY
       - name: Run independent deterministic octane, malformed container and symlink regressions
         run: cargo +stable test --all-targets --frozen -- --nocapture
