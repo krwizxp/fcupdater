@@ -111,7 +111,7 @@ jobs:
               assert len(found)==1 and found[0][1]=='Y',found
               assert any(c.find(ns+'f') is not None for c in root.findall('.//'+ns+'c'))
               assert 'xl/worksheets/sheet2.xml' in z.namelist()
-              print('Validated shared-string flag and ZIP/worksheet CRC:',found, p.stat().st_size)
+              print('Validated shared-string flag and ZIP/worksheet CRC:',len(found),found[0][1],p.stat().st_size)
           PY
           SYSROOT="$(rustc +stable --print sysroot)"
           if [ "$RUNNER_OS" = "Windows" ]; then
