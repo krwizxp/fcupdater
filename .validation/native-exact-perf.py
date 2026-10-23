@@ -20,7 +20,7 @@ EXE = ".exe" if sys.platform == "win32" else ""
 SOURCE = ROOT / "fuel_cost_chungcheong.xlsx"
 PERFORMANCE_SOURCE = ROOT / ".validation/native-baseline-performance.rs"
 VARIANTS = ("baseline", "main", "candidate")
-N = 8
+N = 24
 MARGIN_MEDIAN = 0.05
 MARGIN_TAIL = 0.10
 MARGIN_PACKAGE = 0.03
