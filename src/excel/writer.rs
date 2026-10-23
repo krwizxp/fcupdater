@@ -476,44 +476,34 @@ impl Workbook {
         self.master_sheet
             .set_formula_cached_value_at(2, 10, Some(&cache), false)?;
         let fuel_denominator = gasoline_qty.strict_add(premium_qty);
-        let premium_cache = if fuel_denominator == 0 {
+        let gasoline_contribution = if fuel_denominator == 0 {
             None
         } else {
-            let numerator = gasoline_qty
-                .checked_mul(gasoline_weight)
-                .and_then(|value| {
-                    let premium = premium_qty.checked_mul(premium_weight)?;
-                    value.checked_add(premium)
-                })
-                .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?;
-            format_excel_ratio_into(
-                &mut cache,
-                numerator,
-                fuel_denominator.strict_mul(DECIMAL_SCALE.as_i128()),
-            );
-            Some(cache.as_str())
+            Some(
+                gasoline_qty
+                    .checked_mul(gasoline_weight)
+                    .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?,
+            )
         };
-        self.master_sheet
-            .set_formula_cached_value_at(2, 11, premium_cache, false)?;
-        let ultra_octane_cache = if fuel_denominator == 0 {
-            None
-        } else {
-            let numerator = gasoline_qty
-                .checked_mul(gasoline_weight)
-                .and_then(|value| {
-                    let premium = premium_qty.checked_mul(diesel_weight)?;
-                    value.checked_add(premium)
-                })
-                .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?;
-            format_excel_ratio_into(
-                &mut cache,
-                numerator,
-                fuel_denominator.strict_mul(DECIMAL_SCALE.as_i128()),
-            );
-            Some(cache.as_str())
-        };
-        self.master_sheet
-            .set_formula_cached_value_at(2, 12, ultra_octane_cache, false)
+        for (column, weight) in [(11, premium_weight), (12, diesel_weight)] {
+            let cached = if let Some(gasoline_contribution) = gasoline_contribution {
+                let numerator = premium_qty
+                    .checked_mul(weight)
+                    .and_then(|premium| gasoline_contribution.checked_add(premium))
+                    .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?;
+                format_excel_ratio_into(
+                    &mut cache,
+                    numerator,
+                    fuel_denominator.strict_mul(DECIMAL_SCALE.as_i128()),
+                );
+                Some(cache.as_str())
+            } else {
+                None
+            };
+            self.master_sheet
+                .set_formula_cached_value_at(2, column, cached, false)?;
+        }
+        Ok(())
     }
     pub(crate) fn save(
         mut self,
