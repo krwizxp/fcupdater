@@ -423,7 +423,7 @@ impl Workbook {
             index.entry(Rc::clone(&entry.text)).or_insert(value_index);
         }
         let shared_strings = SharedStringTable { entries, index };
-        let mut master_sheet = WorksheetParser {
+        let master_sheet = WorksheetParser {
             cell_count: 0,
             input_styles: &input_styles,
             shared_formula_heads: BTreeMap::new(),
