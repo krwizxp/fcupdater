@@ -1,0 +1,94 @@
+name: Temporary baseline candidate metric comparison
+on:
+  pull_request:
+    branches:
+      - main
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install latest stable Rust and Linux build support
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustc +stable -Vv
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Compare pinned baseline and candidate with identical release settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="$RUNNER_TEMP/fcupdater-baseline"
+          CURRENT="$GITHUB_WORKSPACE"
+          git worktree add --detach "$BASE" 6d267214b1feae5cb4cd53b4d539291766293753
+          cat > "$RUNNER_TEMP/bench.rs" <<'RS'
+          #[cfg(test)]
+          mod octane_perf_metrics {
+              use super::*;
+              use std::{path::Path, time::Instant};
+              #[test]
+              fn cached_octane_recalculation() -> Result<()> {
+                  let path = Path::new(".validation/fixtures/default.xlsx");
+                  let file = crate::temp_entry::open_regular(path, false)?;
+                  let container = XlsxContainer::from_validated_file(file, path)?;
+                  let mut workbook = Workbook::from_container(container)?;
+                  for _ in 0..2000 {
+                      workbook.request_recalculation_caches()?;
+                  }
+                  let mut durations = Vec::new();
+                  for _ in 0..7 {
+                      let start = Instant::now();
+                      for _ in 0..4000 {
+                          std::hint::black_box(workbook.request_recalculation_caches()?);
+                      }
+                      durations.push(start.elapsed().as_nanos() as f64 / 4000.0);
+                  }
+                  durations.sort_unstable_by(f64::total_cmp);
+                  println!("OCTANE_NS_MEDIAN_PER_RUN {:.3}", durations[3]);
+                  println!("OCTANE_NS_MAX_OF_7 {:.3}", durations[6]);
+                  Ok(())
+              }
+          }
+          RS
+          for label in baseline candidate; do
+            if [ "$label" = baseline ]; then DIR="$BASE"; else DIR="$CURRENT"; fi
+            echo "==== MEASUREMENT $label ===="
+            (cd "$DIR" && git rev-parse HEAD)
+            (cd "$DIR" && cargo +stable build-pgo) > "$RUNNER_TEMP/$label-build.log" 2>&1
+            BIN="$DIR/target/x86_64-unknown-linux-gnu/release/fcupdater"
+            test -x "$BIN"
+            stat -c "SHIPPED_BINARY_BYTES %s" "$BIN"
+            (cd "$DIR" && CARGO_TARGET_DIR=target/x86_64-unknown-linux-gnu cargo +stable run --frozen --example package_artifact -- fcupdater-linux-x64) > "$RUNNER_TEMP/$label-package.log" 2>&1
+            find "$DIR/artifacts" -maxdepth 1 -name 'fcupdater-linux-x64*' -printf "SHIPPED_ARTIFACT_BYTES %s %f\n"
+            mkdir -p "$DIR/.validation/fixtures"
+            cp "$CURRENT/fuel_cost_chungcheong.xlsx" "$DIR/.validation/fixtures/default.xlsx"
+            cp "$RUNNER_TEMP/bench.rs" "$DIR/.validation/perf.rs"
+            printf '\ninclude!("../../.validation/perf.rs");\n' >> "$DIR/src/excel/writer.rs"
+            (cd "$DIR" && CARGO_TARGET_DIR="$RUNNER_TEMP/test-$label" cargo +stable test --release --frozen --no-run) > "$RUNNER_TEMP/$label-test-build.log" 2>&1
+            TEST_BIN="$(find "$RUNNER_TEMP/test-$label/release/deps" -maxdepth 1 -type f -name 'fcupdater-*' -perm /111 | head -1)"
+            test -n "$TEST_BIN"
+            (cd "$DIR" && /usr/bin/time -v "$TEST_BIN" octane_perf_metrics::cached_octane_recalculation --exact --nocapture) > "$RUNNER_TEMP/$label-perf.log" 2>&1
+            grep -E 'OCTANE_NS_|Maximum resident set size|Elapsed \(wall clock\) time|test result:' "$RUNNER_TEMP/$label-perf.log"
+            echo "==== END $label ===="
+          done
+          python3 - <<'PY'
+          import os,re,pathlib,statistics
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])
+          info={}
+          for name in ('baseline','candidate'):
+              s=(root/f'{name}-perf.log').read_text()
+              measures={k:float(v) for k,v in re.findall(r'(OCTANE_NS_MEDIAN_PER_RUN|OCTANE_NS_MAX_OF_7) ([\d.]+)',s)}
+              rss=re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)',s)
+              assert rss and len(measures)==2,(name,s[-1500:])
+              info[name]={'median_ns':measures['OCTANE_NS_MEDIAN_PER_RUN'],
+                          'max_ns':measures['OCTANE_NS_MAX_OF_7'],
+                          'peak_kib':int(rss.group(1))}
+          delta=100*(info['candidate']['median_ns']-info['baseline']['median_ns'])/info['baseline']['median_ns']
+          print('COMPARABLE_METRICS',info,'median_pct_change',round(delta,2))
+          assert delta < 25, 'Candidate octane cache computation regressed more than 25%'
+          PY
