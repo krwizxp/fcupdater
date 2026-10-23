@@ -72,7 +72,7 @@ jobs:
             (cd "$DIR" && CARGO_TARGET_DIR="$RUNNER_TEMP/test-$label" cargo +stable test --release --frozen --no-run) > "$RUNNER_TEMP/$label-test-build.log" 2>&1
             TEST_BIN="$(find "$RUNNER_TEMP/test-$label/release/deps" -maxdepth 1 -type f -name 'fcupdater-*' -perm /111 | head -1)"
             test -n "$TEST_BIN"
-            (cd "$DIR" && /usr/bin/time -v "$TEST_BIN" octane_perf_metrics::cached_octane_recalculation --exact --nocapture) > "$RUNNER_TEMP/$label-perf.log" 2>&1
+            (cd "$DIR" && /usr/bin/time -v "$TEST_BIN" octane_perf_metrics::cached_octane_recalculation --nocapture) > "$RUNNER_TEMP/$label-perf.log" 2>&1
             grep -E 'OCTANE_NS_|Maximum resident set size|Elapsed \(wall clock\) time|test result:' "$RUNNER_TEMP/$label-perf.log"
             echo "==== END $label ===="
           done
