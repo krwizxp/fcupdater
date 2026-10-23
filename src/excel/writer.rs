@@ -431,17 +431,6 @@ impl Workbook {
             xml: &master_xml,
         }
         .scan_worksheet()?;
-        if master_sheet.try_get_formula_at(2, 12)?.as_deref()
-            == Some(r#"IF(B5+B6=0,"",(B4*B7+B5*B9)/(B4+B5))"#)
-        {
-            master_sheet.set_formula_at_with_cache(
-                2,
-                12,
-                r#"IF(B4+B5=0,"",(B4*B7+B5*B9)/(B4+B5))"#,
-                None,
-                true,
-            )?;
-        }
         master_sheet.validate_fixed_header(ExcelSheetKind::Master, &shared_strings)?;
         let change_log_sheet = WorksheetParser {
             cell_count: 0,
