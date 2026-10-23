@@ -1602,10 +1602,12 @@ impl Worksheet {
         value: Option<&str>,
         string_value: bool,
     ) -> Result<()> {
-        let formula_text =
-            try_xml_escape_text(formula, XmlEscapeContext::Text, "formula XML escape")?;
-        let value_text = value
-            .map(|raw| try_xml_escape_text(raw, XmlEscapeContext::Text, "formula cache XML escape"))
+        let formula_len =
+            validated_xml_escaped_len(formula, XmlEscapeContext::Text, "formula XML escape")?;
+        let value_len = value
+            .map(|raw| {
+                validated_xml_escaped_len(raw, XmlEscapeContext::Text, "formula cache XML escape")
+            })
             .transpose()?;
         let cell = Self::get_or_create_cell_mut(&mut self.rows, col, row)?;
         cell.value_type = if string_value || value.is_none() {
@@ -1613,21 +1615,33 @@ impl Worksheet {
         } else {
             CellValueType::General
         };
-        let cached = value_text.as_deref().unwrap_or("");
+        let cached = value.unwrap_or("");
         let inner = &mut cell.inner_xml;
         inner.clear();
         inner
             .try_reserve_exact(sum_lengths(&[
                 "<f></f><v></v>".len(),
-                formula_text.len(),
-                cached.len(),
+                formula_len,
+                value_len.unwrap_or(0),
             ]))
             .map_err(|source| err_with_source("formula/cache XML 메모리 확보 실패", source))?;
-        inner.extend(["<f>", formula_text.as_ref(), "</f>"]);
+        inner.push_str("<f>");
+        if formula_len == formula.len() {
+            inner.push_str(formula);
+        } else {
+            append_xml_escaped(inner, formula, XmlEscapeContext::Text);
+        }
+        inner.push_str("</f>");
         if cached.is_empty() {
             inner.push_str("<v/>");
         } else {
-            inner.extend(["<v>", cached, "</v>"]);
+            inner.push_str("<v>");
+            if value_len == Some(cached.len()) {
+                inner.push_str(cached);
+            } else {
+                append_xml_escaped(inner, cached, XmlEscapeContext::Text);
+            }
+            inner.push_str("</v>");
         }
         Ok(())
     }
