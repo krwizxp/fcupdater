@@ -14,6 +14,8 @@ jobs:
   integration:
     runs-on: ubuntu-26.04
     timeout-minutes: 40
+    env:
+      FCUPDATER_RELEASE_BINARY: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release/fcupdater
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
