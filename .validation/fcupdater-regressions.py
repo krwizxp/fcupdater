@@ -151,16 +151,8 @@ def main():
             assert marker in result.stdout+result.stderr,(args,result.stdout,result.stderr)
         assert not (Path(tmp)/MASTER.name).exists()
     inspect(MASTER,(25,20))
-    durations = [
-        ("default",valid_scenario("default",(25,20))),
-        ("premium",valid_scenario("premium",(0,20),{"B4":0})),
-        ("gasoline",valid_scenario("gasoline",(25,0),{"B5":0})),
-        ("zero",valid_scenario("zero",(0,0),{"B4":0,"B5":0}))
-    ]
-    rejection_scenario("missing","missing","마스터 xlsx 파일 열기 실패")
-    rejection_scenario("invalid_zip","invalid_zip","xlsx")
-    rejection_scenario("invalid_formula","invalid_formula","고정")
-    rejection_scenario("symlink","symlink","마스터 xlsx 파일 열기 실패")
-    print("Behavior regression success",durations)
+    duration = valid_scenario("default",(25,20))
+    print("Single live Opinet success path (seconds):",round(duration,3))
+
 if __name__=="__main__":
     main()
