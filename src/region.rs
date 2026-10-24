@@ -34,9 +34,16 @@ pub(super) enum TargetRegionPolicy {
 }
 impl TargetRegion {
     pub(super) fn from_label(label: &str) -> Option<Self> {
-        TARGET_REGIONS
-            .into_iter()
-            .find(|region| region.label() == label)
+        match label {
+            "대전" => Some(Self::Daejeon),
+            "세종" => Some(Self::Sejong),
+            "청주" => Some(Self::Cheongju),
+            "공주" => Some(Self::Gongju),
+            "보령" => Some(Self::Boryeong),
+            "아산" => Some(Self::Asan),
+            "천안" => Some(Self::Cheonan),
+            _ => None,
+        }
     }
     const fn index(self) -> usize {
         match self {
@@ -75,7 +82,7 @@ impl TargetRegion {
 pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     let trimmed = addr.trim();
     out.clear();
-    out.try_reserve_exact(trimmed.len())
+    out.try_reserve(trimmed.len())
         .map_err(|source| err_with_source("주소 key 정규화 메모리 확보 실패", source))?;
     for ch in trimmed.chars() {
         if ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.') {
@@ -102,25 +109,6 @@ pub(super) fn target_region(
     policy: TargetRegionPolicy,
 ) -> Result<Option<TargetRegion>> {
     if matches!(policy, TargetRegionPolicy::StrictSource) {
-        normalize_address_key_into(region, scratch)?;
-        let normalized_region = scratch.as_str();
-        let parsed_region = if normalized_region == "대전"
-            || normalized_region
-                .strip_prefix("대전")
-                .is_some_and(|district| DAEJEON_DISTRICT_KEYS.contains(&district))
-        {
-            Some(TargetRegion::Daejeon)
-        } else {
-            match normalized_region {
-                "세종시" => Some(TargetRegion::Sejong),
-                "충북청주시" => Some(TargetRegion::Cheongju),
-                "충남공주시" => Some(TargetRegion::Gongju),
-                "충남보령시" => Some(TargetRegion::Boryeong),
-                "충남아산시" => Some(TargetRegion::Asan),
-                "충남천안시" => Some(TargetRegion::Cheonan),
-                _ => None,
-            }
-        };
         let mut tokens = address.split_whitespace();
         let address_region = match tokens.next() {
             Some("대전") => match tokens.next() {
@@ -142,6 +130,35 @@ pub(super) fn target_region(
             },
             Some(_) | None => None,
         };
+        if address_region.is_none()
+            && !region
+                .trim_start_matches(|ch: char| {
+                    ch.is_whitespace()
+                        || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.')
+                })
+                .starts_with(['대', '세', '충'])
+        {
+            return Ok(None);
+        }
+        normalize_address_key_into(region, scratch)?;
+        let normalized_region = scratch.as_str();
+        let parsed_region = if normalized_region == "대전"
+            || normalized_region
+                .strip_prefix("대전")
+                .is_some_and(|district| DAEJEON_DISTRICT_KEYS.contains(&district))
+        {
+            Some(TargetRegion::Daejeon)
+        } else {
+            match normalized_region {
+                "세종시" => Some(TargetRegion::Sejong),
+                "충북청주시" => Some(TargetRegion::Cheongju),
+                "충남공주시" => Some(TargetRegion::Gongju),
+                "충남보령시" => Some(TargetRegion::Boryeong),
+                "충남아산시" => Some(TargetRegion::Asan),
+                "충남천안시" => Some(TargetRegion::Cheonan),
+                _ => None,
+            }
+        };
         return match (parsed_region, address_region) {
             (Some(region_match), Some(address_match)) if region_match == address_match => {
                 Ok(Some(address_match))
@@ -158,12 +175,20 @@ pub(super) fn target_region(
             (None, None) => Ok(None),
         };
     }
-    normalize_address_key_into(region, scratch)?;
-    let region_is_daejeon = scratch.as_str() == "대전";
-    let region_match = if region_is_daejeon {
-        None
-    } else {
-        target_region_from_normalized(scratch.as_str())
+    let trimmed_region = region.trim();
+    let (region_is_daejeon, region_match) = match TargetRegion::from_label(trimmed_region) {
+        Some(TargetRegion::Daejeon) => (true, None),
+        Some(target) => (false, Some(target)),
+        None => {
+            normalize_address_key_into(trimmed_region, scratch)?;
+            let is_daejeon = scratch.as_str() == "대전";
+            let matched = if is_daejeon {
+                None
+            } else {
+                target_region_from_normalized(scratch.as_str())
+            };
+            (is_daejeon, matched)
+        }
     };
     normalize_address_key_into(address, scratch)?;
     if let Some(target) = region_match.or_else(|| target_region_from_normalized(scratch.as_str())) {

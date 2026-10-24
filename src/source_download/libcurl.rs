@@ -74,6 +74,12 @@ struct CurlSlist {
     _marker: PhantomData<(*mut u8, PhantomPinned)>,
 }
 struct EasyHandle(NonNull<Curl>);
+struct TransferOptions<'handle>(&'handle EasyHandle);
+impl Drop for TransferOptions<'_> {
+    fn drop(&mut self) {
+        self.0.reset();
+    }
+}
 struct HeaderList(Option<NonNull<CurlSlist>>);
 struct ResponseBody {
     bytes: Vec<u8>,
@@ -246,48 +252,56 @@ impl Client {
                     empty.insert(EasyHandle(raw_handle))
                 }
             };
-            handle.reset();
-            handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
-            handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
-            handle.setopt_ptr(CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
-            handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
-            handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
-            for (option, value) in [
-                (CURLOPT_CONNECTTIMEOUT_MS, 30_000),
-                (CURLOPT_TIMEOUT_MS, 60_000),
-                (CURLOPT_FOLLOWLOCATION, 0),
-                (CURLOPT_NOSIGNAL, 1),
-                (
-                    CURLOPT_SSLVERSION,
-                    CURL_SSLVERSION_TLSV1_2 | CURL_SSLVERSION_MAX_DEFAULT,
-                ),
-            ] {
-                handle.setopt_long(option, value)?;
-            }
-            handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
-            let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES)
-                .map_err(|source| download_error_with_source("HTTP 본문 한도 변환 실패", source))?;
-            handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;
-            if let Some(body_bytes) = request_body {
-                handle.setopt_long(CURLOPT_POST, 1)?;
-                let body_len = c_long::try_from(body_bytes.len()).map_err(|source| {
-                    download_error_with_source("요청 본문 길이 변환 실패", source)
-                })?;
-                handle.setopt_long(CURLOPT_POSTFIELDSIZE, body_len)?;
-                if !body_bytes.is_empty() {
-                    handle.setopt_ptr(CURLOPT_POSTFIELDS, body_bytes.as_ptr().cast::<c_char>())?;
-                }
-            } else {
-                handle.setopt_long(CURLOPT_HTTPGET, 1)?;
-            }
-            let perform_code = {
+            let (perform_code, response_info) = {
                 let mut body_target = CurlWriteTarget::Body(&mut body_buffer);
                 let mut header_target = CurlWriteTarget::Header(&mut header_capture);
+                let _options = TransferOptions(handle);
+                handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
+                handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
+                handle.setopt_ptr(CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
+                handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
+                handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
+                for (option, value) in [
+                    (CURLOPT_CONNECTTIMEOUT_MS, 30_000),
+                    (CURLOPT_TIMEOUT_MS, 60_000),
+                    (CURLOPT_FOLLOWLOCATION, 0),
+                    (CURLOPT_NOSIGNAL, 1),
+                    (
+                        CURLOPT_SSLVERSION,
+                        CURL_SSLVERSION_TLSV1_2 | CURL_SSLVERSION_MAX_DEFAULT,
+                    ),
+                ] {
+                    handle.setopt_long(option, value)?;
+                }
+                handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
+                let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES).map_err(|source| {
+                    download_error_with_source("HTTP 본문 한도 변환 실패", source)
+                })?;
+                handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;
+                if let Some(body_bytes) = request_body {
+                    handle.setopt_long(CURLOPT_POST, 1)?;
+                    let body_len = c_long::try_from(body_bytes.len()).map_err(|source| {
+                        download_error_with_source("요청 본문 길이 변환 실패", source)
+                    })?;
+                    handle.setopt_long(CURLOPT_POSTFIELDSIZE, body_len)?;
+                    if !body_bytes.is_empty() {
+                        handle
+                            .setopt_ptr(CURLOPT_POSTFIELDS, body_bytes.as_ptr().cast::<c_char>())?;
+                    }
+                } else {
+                    handle.setopt_long(CURLOPT_HTTPGET, 1)?;
+                }
+
                 let body_data = (&raw mut body_target).cast::<c_void>();
                 let header_data = (&raw mut header_target).cast::<c_void>();
                 handle.setopt_ptr(CURLOPT_WRITEDATA, body_data)?;
                 handle.setopt_ptr(CURLOPT_HEADERDATA, header_data)?;
-                handle.perform()
+                let code = handle.perform();
+                let response_info = (code == CURLE_OK).then(|| {
+                    handle.ensure_https_scheme()?;
+                    handle.response_code()
+                });
+                (code, response_info)
             };
             if let Some(callback_error) = body_buffer
                 .error
@@ -310,8 +324,7 @@ impl Client {
                 self.easy_handle = None;
                 return Err(perform_error.into());
             }
-            handle.ensure_https_scheme()?;
-            let raw_status = handle.response_code()?;
+            let raw_status = response_info.unwrap_or_else(|| process::abort())?;
             u32::try_from(raw_status)
                 .map_err(|source| download_error_with_source("HTTP 상태 코드 변환 실패", source))
         })();
