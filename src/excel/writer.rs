@@ -352,7 +352,7 @@ impl Workbook {
                 xml.push_str(prefix);
                 let mut attrs = parse_tag_attrs(element.opening.raw)?;
                 if element.opening.self_closing {
-                    xml.push_str(&build_tag("t", &attrs, true)?);
+                    append_text_tag(&mut xml, &attrs, true)?;
                     source_cursor = element.span.end;
                     continue;
                 }
@@ -374,13 +374,13 @@ impl Workbook {
                 } else {
                     attrs.retain(|attr| attr.name != "xml:space");
                 }
-                let opening = build_tag("t", &attrs, false)?;
+                append_text_tag(&mut xml, &attrs, false)?;
                 let escaped = try_xml_escape_text(
                     decoded.as_ref(),
                     XmlEscapeContext::Text,
                     "shared string XML",
                 )?;
-                xml.extend([opening.as_str(), escaped.as_ref(), "</t>"]);
+                xml.extend([escaped.as_ref(), "</t>"]);
                 if !decoded.is_empty() {
                     if let Some(out_text) = text_out.as_mut() {
                         out_text
@@ -2260,21 +2260,22 @@ const fn xml_escape_replacement(ch: char, context: XmlEscapeContext) -> Option<&
         _ => None,
     }
 }
-fn build_tag(name: &str, attrs: &[XmlAttr<'_>], self_closing: bool) -> Result<String> {
+fn append_text_tag(out: &mut String, attrs: &[XmlAttr<'_>], self_closing: bool) -> Result<()> {
     let suffix = if self_closing { "/>" } else { ">" };
-    let mut capacity = sum_lengths(&["<".len(), name.len(), suffix.len()]);
+    let mut capacity = "<t".len().strict_add(suffix.len());
     for attr in attrs {
         capacity = sum_lengths(&[capacity, " =\"\"".len(), attr.name.len(), attr.value.len()]);
     }
-    let mut out = try_string_with_capacity(capacity, "XML 태그 메모리 확보 실패")?;
-    out.extend(["<", name]);
+    out.try_reserve(capacity)
+        .map_err(|source| err_with_source("XML 태그 메모리 확보 실패", source))?;
+    out.push_str("<t");
     for attr in attrs {
         out.extend([" ", attr.name, "=\""]);
-        append_xml_escaped(&mut out, &attr.value, XmlEscapeContext::Attribute);
+        append_xml_escaped(out, &attr.value, XmlEscapeContext::Attribute);
         out.push('"');
     }
     out.push_str(suffix);
-    Ok(out)
+    Ok(())
 }
 fn build_ref_range(
     start_col_text: &str,
