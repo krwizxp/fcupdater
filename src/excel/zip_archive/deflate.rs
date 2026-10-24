@@ -458,37 +458,49 @@ impl InflateState<'_> {
         let total = literal_count
             .checked_add(distance_count)
             .ok_or_else(|| zip_static("deflate code length 총합 계산 실패"))?;
-        let mut lengths = try_vec_with_capacity(total, "deflate code length 메모리 확보 실패")?;
-        while lengths.len() < total {
+        let mut lengths = [0_u8; LITERAL_LENGTH_SYMBOLS + FIXED_DISTANCE_SYMBOLS];
+        let mut length_count = 0_usize;
+        while length_count < total {
             let symbol = code_tree.decode(&mut self.reader)?;
-            match symbol {
+            let (value, repeat) = match symbol {
                 0..=15 => {
                     let [length, _] = symbol.to_le_bytes();
-                    lengths.push(length);
+                    (length, 1)
                 }
                 16 => {
-                    let Some(&previous) = lengths.last() else {
-                        return Err(zip_static("deflate repeat code에 이전 길이가 없습니다."));
-                    };
-                    let repeat = usize::from(self.reader.read_bits(2)?).strict_add(3);
-                    push_repeated(&mut lengths, previous, repeat, total)?;
+                    let previous = length_count
+                        .checked_sub(1)
+                        .and_then(|index| lengths.get(index))
+                        .copied()
+                        .ok_or_else(|| zip_static("deflate repeat code에 이전 길이가 없습니다."))?;
+                    (
+                        previous,
+                        usize::from(self.reader.read_bits(2)?).strict_add(3),
+                    )
                 }
-                17 => {
-                    let repeat = usize::from(self.reader.read_bits(3)?).strict_add(3);
-                    push_repeated(&mut lengths, 0, repeat, total)?;
-                }
-                18 => {
-                    let repeat = usize::from(self.reader.read_bits(7)?).strict_add(11);
-                    push_repeated(&mut lengths, 0, repeat, total)?;
-                }
+                17 => (0, usize::from(self.reader.read_bits(3)?).strict_add(3)),
+                18 => (0, usize::from(self.reader.read_bits(7)?).strict_add(11)),
                 _ => {
                     return Err(zip_static(
                         "deflate code length symbol이 올바르지 않습니다.",
                     ));
                 }
-            }
+            };
+            let next_len = length_count
+                .checked_add(repeat)
+                .ok_or_else(|| zip_static("deflate repeat 길이 계산 실패"))?;
+            (next_len <= total).ok_or(zip_static(
+                "deflate repeat 길이가 code length 총합을 초과합니다.",
+            ))?;
+            lengths
+                .get_mut(length_count..next_len)
+                .unwrap_or_else(|| process::abort())
+                .fill(value);
+            length_count = next_len;
         }
-        let Some((literal_lengths, distance_lengths)) = lengths.split_at_checked(literal_count)
+        let Some((literal_lengths, distance_lengths)) = lengths
+            .get(..total)
+            .and_then(|all| all.split_at_checked(literal_count))
         else {
             return Err(zip_static("deflate literal/distance length 범위 오류"));
         };
@@ -1390,17 +1402,6 @@ fn push_deflate_token(tokens: &mut Vec<DeflateToken>, token: DeflateToken) -> Zi
             .map_err(|source| zip_with_source("deflate token 메모리 확장 실패", source))?;
     }
     tokens.push(token);
-    Ok(())
-}
-fn push_repeated(lengths: &mut Vec<u8>, value: u8, repeat: usize, total: usize) -> ZipResult<()> {
-    let next_len = lengths
-        .len()
-        .checked_add(repeat)
-        .ok_or_else(|| zip_static("deflate repeat 길이 계산 실패"))?;
-    (next_len <= total).ok_or(zip_static(
-        "deflate repeat 길이가 code length 총합을 초과합니다.",
-    ))?;
-    lengths.extend(repeat_n(value, repeat));
     Ok(())
 }
 fn reverse_low_bits(value: u16, count: u8) -> u16 {
