@@ -125,6 +125,7 @@ const EXCEL_CONTENT_TYPES_XML: &str = include_str!("excel_content_types.xml");
 const EXCEL_ROOT_RELS_XML: &str = include_str!("excel_root_rels.xml");
 const EXCEL_WORKBOOK_RELS_XML: &str = include_str!("excel_workbook_rels.xml");
 const LIBREOFFICE_CELL_XFS_XML: &str = include_str!("libreoffice_cell_xfs.xml");
+const EXCEL_CANONICAL_STYLE_COUNT: u32 = 27;
 const LIBREOFFICE_UNMAPPED_STYLE_INDEX: usize = 7;
 const LIBREOFFICE_STYLE_MAP: [u32; 26] = [
     0, 3, 4, 24, 2, 1, 22, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 23, 18, 19, 20, 21,
@@ -673,7 +674,6 @@ impl XlsxContainer {
     }
     pub(super) fn package_prepare_excel_output(&mut self) -> Result<CanonicalStyleMap> {
         let source_styles = self.text("xl/styles.xml")?;
-        let excel_xfs = style_entries(EXCEL_STYLES_XML, "cellXfs", "xf")?;
         let static_styles = EXCEL_STYLES_XML
             .strip_suffix('\n')
             .unwrap_or(EXCEL_STYLES_XML);
@@ -687,13 +687,14 @@ impl XlsxContainer {
                         == Some(style_sheet)
                 });
         let input_styles = if canonical_styles {
-            let count = u32::try_from(excel_xfs.len())
-                .map_err(|error| err_with_source("Excel style 수 변환 실패", error))?;
-            let mut mapping =
-                try_vec_with_capacity(excel_xfs.len(), "입력 style mapping 메모리 확보 실패")?;
-            mapping.extend((0..count).map(Some));
+            let mut mapping = try_vec_with_capacity(
+                EXCEL_CANONICAL_STYLE_COUNT as usize,
+                "입력 style mapping 메모리 확보 실패",
+            )?;
+            mapping.extend((0..EXCEL_CANONICAL_STYLE_COUNT).map(Some));
             mapping
         } else {
+            let excel_xfs = style_entries(EXCEL_STYLES_XML, "cellXfs", "xf")?;
             let source_xfs = style_entries(source_styles, "cellXfs", "xf")?;
             let source_fonts = style_entries(source_styles, "fonts", "font")?;
             let source_borders = style_entries(source_styles, "borders", "border")?;
@@ -824,7 +825,7 @@ impl XlsxContainer {
                 "[Content_Types].xml" => excel_static_xml(EXCEL_CONTENT_TYPES_XML),
                 "_rels/.rels" => excel_static_xml(EXCEL_ROOT_RELS_XML),
                 "xl/_rels/workbook.xml.rels" => excel_static_xml(EXCEL_WORKBOOK_RELS_XML),
-                "xl/styles.xml" => excel_static_xml(EXCEL_STYLES_XML),
+                "xl/styles.xml" if !canonical_styles => excel_static_xml(EXCEL_STYLES_XML),
                 "xl/theme/theme1.xml" => excel_static_xml(EXCEL_THEME_XML),
                 _ => slot.take().unwrap_or_else(|| process::abort()),
             };

@@ -383,7 +383,7 @@ impl Client {
                 (header_bytes.is_multiple_of(2)).ok_or("Set-Cookie UTF-16 길이가 2바이트 단위가 아닙니다.")?;
                 let units = header_bytes.div_euclid(2);
                 self.header_buffer.clear();
-                self.header_buffer.try_reserve_exact(units).map_err(|source| {
+                self.header_buffer.try_reserve(units).map_err(|source| {
                     download_error_with_source("Set-Cookie 메모리 확보 실패", source)
                 })?;
                 self.header_buffer.resize(units, 0_u16);

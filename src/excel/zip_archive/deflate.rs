@@ -89,8 +89,7 @@ struct DecodeHuffman {
 #[derive(Clone, Copy)]
 struct DecodeEntry(u16);
 struct WriteHuffman {
-    codes: Vec<u16>,
-    lengths: Vec<u8>,
+    codes: Vec<[u8; 3]>,
 }
 #[derive(Clone, Copy)]
 enum DeflateToken {
@@ -154,8 +153,8 @@ struct DeflateSymbol {
     extra_bits: u8,
     symbol: u16,
 }
-struct HuffmanLengthBuilder<'frequencies> {
-    frequencies: &'frequencies [u32],
+struct HuffmanLengthBuilder<'frequencies, const N: usize> {
+    frequencies: &'frequencies [u32; N],
     max_bits: u8,
 }
 struct HuffmanBuildState {
@@ -367,32 +366,35 @@ impl DecodeHuffman {
     }
 }
 impl WriteHuffman {
-    fn from_lengths(lengths: Vec<u8>) -> ZipResult<Self> {
+    fn from_lengths<const N: usize>(lengths: [u8; N]) -> ZipResult<Self> {
         let mut length_counts = [0_u16; DEFLATE_MAX_BITS + 1];
         let mut next_code =
             canonical_next_codes(&lengths, &mut length_counts)?.unwrap_or_else(|| process::abort());
         let mut codes =
             try_vec_with_capacity(lengths.len(), "deflate 출력 Huffman code 메모리 확보 실패")?;
-        codes.resize(lengths.len(), 0_u16);
-        for (code_slot, &len) in codes.iter_mut().zip(&lengths) {
-            if len == 0 {
-                continue;
-            }
-            let next_slot = next_code
-                .get_mut(usize::from(len))
-                .unwrap_or_else(|| process::abort());
-            *code_slot = reverse_low_bits(*next_slot, len);
-            *next_slot = next_slot.strict_add(1);
+        for len in lengths {
+            let code = if len == 0 {
+                0
+            } else {
+                let next_slot = next_code
+                    .get_mut(usize::from(len))
+                    .unwrap_or_else(|| process::abort());
+                let code = reverse_low_bits(*next_slot, len);
+                *next_slot = next_slot.strict_add(1);
+                code
+            };
+            let [low, high] = code.to_le_bytes();
+            codes.push([low, high, len]);
         }
-        Ok(Self { codes, lengths })
+        Ok(Self { codes })
     }
     fn write_symbol(&self, writer: &mut BitWriter<'_>, symbol: u16) -> ZipResult<()> {
         let index = usize::from(symbol);
-        let len = huffman_get(&self.lengths, index);
+        let [low, high, len] = huffman_get(&self.codes, index);
         if len == 0 {
             process::abort();
         }
-        let code = huffman_get(&self.codes, index);
+        let code = u16::from_le_bytes([low, high]);
         writer.write_bits(code, len)
     }
 }
@@ -640,16 +642,15 @@ impl DynamicFrequencies {
         let mut bit_len = 17_usize.strict_add(plan.code_length_count.strict_mul(3));
         for token in &plan.code_length_tokens {
             bit_len = bit_len
-                .strict_add(usize::from(huffman_get(
-                    &plan.code_huffman.lengths,
-                    usize::from(token.symbol),
-                )))
+                .strict_add(usize::from(
+                    huffman_get(&plan.code_huffman.codes, usize::from(token.symbol))[2],
+                ))
                 .strict_add(usize::from(token.extra_bits));
         }
-        for (symbol, (&frequency, &code_len)) in self
+        for (symbol, (&frequency, code)) in self
             .literal
             .iter()
-            .zip(&plan.literal_huffman.lengths)
+            .zip(&plan.literal_huffman.codes)
             .enumerate()
         {
             let extra_bits = symbol
@@ -657,16 +658,16 @@ impl DynamicFrequencies {
                 .and_then(|index| LENGTH_EXTRA_BITS.get(index))
                 .copied()
                 .unwrap_or(0);
-            let symbol_bits = usize::from(code_len).strict_add(usize::from(extra_bits));
+            let symbol_bits = usize::from(code[2]).strict_add(usize::from(extra_bits));
             bit_len = bit_len.strict_add((frequency as usize).strict_mul(symbol_bits));
         }
-        for ((&frequency, &code_len), &extra_bits) in self
+        for ((&frequency, code), &extra_bits) in self
             .distance
             .iter()
-            .zip(&plan.distance_huffman.lengths)
+            .zip(&plan.distance_huffman.codes)
             .zip(&DISTANCE_EXTRA_BITS)
         {
-            let symbol_bits = usize::from(code_len).strict_add(usize::from(extra_bits));
+            let symbol_bits = usize::from(code[2]).strict_add(usize::from(extra_bits));
             bit_len = bit_len.strict_add((frequency as usize).strict_mul(symbol_bits));
         }
         bit_len
@@ -676,12 +677,12 @@ impl DynamicFrequencies {
             frequencies: &self.literal,
             max_bits: DEFLATE_MAX_BITS_U8,
         })
-        .build()?;
+        .build();
         let distance_lengths = (HuffmanLengthBuilder {
             frequencies: &self.distance,
             max_bits: DEFLATE_MAX_BITS_U8,
         })
-        .build()?;
+        .build();
         let literal_count = literal_lengths
             .iter()
             .rposition(|&len| len != 0)
@@ -775,7 +776,7 @@ impl DynamicFrequencies {
             frequencies: &code_length_freq,
             max_bits: 7,
         })
-        .build()?;
+        .build();
         let code_length_count = CODE_LENGTH_ORDER
             .iter()
             .rposition(|&symbol| huffman_get(&code_lengths, symbol) != 0)
@@ -812,7 +813,7 @@ impl DynamicDeflatePlan {
             4,
         )?;
         for &symbol in CODE_LENGTH_ORDER.iter().take(self.code_length_count) {
-            let len = huffman_get(&self.code_huffman.lengths, symbol);
+            let len = huffman_get(&self.code_huffman.codes, symbol)[2];
             writer.write_bits(u16::from(len), 3)?;
         }
         for &token in &self.code_length_tokens {
@@ -838,8 +839,8 @@ impl DynamicDeflatePlan {
         self.literal_huffman.write_symbol(writer, 256)
     }
 }
-impl HuffmanLengthBuilder<'_> {
-    fn build(&self) -> ZipResult<Vec<u8>> {
+impl<const N: usize> HuffmanLengthBuilder<'_, N> {
+    fn build(&self) -> [u8; N] {
         let symbol_count = self.frequencies.len();
         let node_capacity = symbol_count.strict_mul(2).strict_add(1);
         let mut state = HuffmanBuildState {
@@ -932,11 +933,7 @@ impl HuffmanLengthBuilder<'_> {
             }
         }
         if overflow == 0 {
-            let mut lengths = try_vec_filled(
-                symbol_count,
-                0_u8,
-                "deflate Huffman length 메모리 확보 실패",
-            )?;
+            let mut lengths = [0_u8; N];
             lengths
                 .get_mut(..symbol_count)
                 .unwrap_or_else(|| process::abort())
@@ -945,7 +942,7 @@ impl HuffmanLengthBuilder<'_> {
                         .get(..symbol_count)
                         .unwrap_or_else(|| process::abort()),
                 );
-            return Ok(lengths);
+            return lengths;
         }
         while overflow != 0 {
             let shorter_bits = (1..maximum_length)
@@ -961,11 +958,7 @@ impl HuffmanLengthBuilder<'_> {
             huffman_set(&mut length_counts, maximum_length, maximum);
             overflow = overflow.strict_sub(2);
         }
-        let mut lengths = try_vec_filled(
-            symbol_count,
-            0_u8,
-            "deflate Huffman length 메모리 확보 실패",
-        )?;
+        let mut lengths = [0_u8; N];
         let mut ordered_index = node_capacity;
         for bits in (1..=maximum_length).rev() {
             let mut remaining = huffman_get(&length_counts, bits);
@@ -982,7 +975,7 @@ impl HuffmanLengthBuilder<'_> {
                 remaining = remaining.strict_sub(1);
             }
         }
-        Ok(lengths)
+        lengths
     }
 }
 impl HuffmanBuildState {
@@ -1240,39 +1233,44 @@ impl DeflateWriter<'_, '_> {
                         workspace.tokens = tokens;
                         return Ok(None);
                     }
-                    let mut len = 0_usize;
-                    let mut mismatch_found = false;
-                    while max_len.strict_sub(len) >= MATCH_CHUNK_BYTES
-                        && work_budget.remaining >= MATCH_CHUNK_BYTES
+                    if best_len < MIN_MATCH
+                        || bytes.get(candidate.strict_add(best_len))
+                            == bytes.get(position.strict_add(best_len))
                     {
-                        let left = bytes.as_ptr().wrapping_add(candidate.strict_add(len));
-                        let right = bytes.as_ptr().wrapping_add(position.strict_add(len));
-                        let prefix = matching_prefix_16!(left, right);
-                        let compared = prefix.saturating_add(1).min(MATCH_CHUNK_BYTES);
-                        work_budget.remaining = work_budget.remaining.strict_sub(compared);
-                        len = len.strict_add(prefix);
-                        if prefix < MATCH_CHUNK_BYTES {
-                            mismatch_found = true;
-                            break;
-                        }
-                    }
-                    while !mismatch_found && len < max_len {
-                        if !work_budget.consume() {
-                            workspace.tokens = tokens;
-                            return Ok(None);
-                        }
-                        if bytes.get(candidate.strict_add(len))
-                            != bytes.get(position.strict_add(len))
+                        let mut len = 0_usize;
+                        let mut mismatch_found = false;
+                        while max_len.strict_sub(len) >= MATCH_CHUNK_BYTES
+                            && work_budget.remaining >= MATCH_CHUNK_BYTES
                         {
-                            break;
+                            let left = bytes.as_ptr().wrapping_add(candidate.strict_add(len));
+                            let right = bytes.as_ptr().wrapping_add(position.strict_add(len));
+                            let prefix = matching_prefix_16!(left, right);
+                            let compared = prefix.saturating_add(1).min(MATCH_CHUNK_BYTES);
+                            work_budget.remaining = work_budget.remaining.strict_sub(compared);
+                            len = len.strict_add(prefix);
+                            if prefix < MATCH_CHUNK_BYTES {
+                                mismatch_found = true;
+                                break;
+                            }
                         }
-                        len = len.strict_add(1);
-                    }
-                    if len > best_len && len >= MIN_MATCH {
-                        best_len = len;
-                        best_distance = position.strict_sub(candidate);
-                        if len >= XML_NICE_MATCH_LEN {
-                            break;
+                        while !mismatch_found && len < max_len {
+                            if !work_budget.consume() {
+                                workspace.tokens = tokens;
+                                return Ok(None);
+                            }
+                            if bytes.get(candidate.strict_add(len))
+                                != bytes.get(position.strict_add(len))
+                            {
+                                break;
+                            }
+                            len = len.strict_add(1);
+                        }
+                        if len > best_len && len >= MIN_MATCH {
+                            best_len = len;
+                            best_distance = position.strict_sub(candidate);
+                            if len >= XML_NICE_MATCH_LEN {
+                                break;
+                            }
                         }
                     }
                     let Some(&previous_distance) =
@@ -1337,14 +1335,6 @@ where
 }
 fn huffman_set<T>(values: &mut [T], index: usize, value: T) {
     *values.get_mut(index).unwrap_or_else(|| process::abort()) = value;
-}
-fn try_vec_filled<T>(len: usize, value: T, context: &'static str) -> ZipResult<Vec<T>>
-where
-    T: Clone,
-{
-    let mut values = try_vec_with_capacity(len, context)?;
-    values.resize(len, value);
-    Ok(values)
 }
 fn canonical_next_codes(
     lengths: &[u8],

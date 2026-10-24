@@ -127,7 +127,7 @@ pub(crate) struct SharedStringTable {
 }
 struct SharedStringEntry {
     text: Rc<str>,
-    xml: String,
+    xml: Option<String>,
 }
 pub(crate) struct Worksheet {
     rows: Vec<Row>,
@@ -236,25 +236,10 @@ impl SharedStringTable {
         }
         let index = self.entries.len();
         let stored_value = Rc::<str>::from(value);
-        let escaped = try_xml_escape_text(value, XmlEscapeContext::Text, "shared string XML")?;
-        let preserve = value.chars().next().is_some_and(char::is_whitespace)
-            || value.chars().next_back().is_some_and(char::is_whitespace);
-        let opening = if preserve {
-            "<si><t xml:space=\"preserve\">"
-        } else {
-            "<si><t>"
-        };
-        let capacity = opening
-            .len()
-            .strict_add(escaped.len())
-            .strict_add("</t></si>".len());
-        let mut entry = try_string_with_capacity(capacity, "shared string XML 메모리 확보 실패")?;
-        entry.push_str(opening);
-        entry.push_str(&escaped);
-        entry.push_str("</t></si>");
+        validated_xml_escaped_len(value, XmlEscapeContext::Text, "shared string XML")?;
         self.entries.push(SharedStringEntry {
             text: Rc::clone(&stored_value),
-            xml: entry,
+            xml: None,
         });
         self.index.insert(stored_value, index);
         Ok(index)
@@ -273,10 +258,24 @@ impl SharedStringTable {
         Ok(())
     }
     fn to_xml(&self, reference_count: usize) -> Result<String> {
-        let additional_capacity = self
-            .entries
-            .iter()
-            .fold("</sst>".len(), |sum, entry| sum.strict_add(entry.xml.len()));
+        let additional_capacity =
+            self.entries
+                .iter()
+                .try_fold("</sst>".len(), |sum, entry| -> Result<usize> {
+                    let len = if let Some(xml) = entry.xml.as_ref() {
+                        xml.len()
+                    } else {
+                        shared_string_opening(&entry.text)
+                            .len()
+                            .strict_add(validated_xml_escaped_len(
+                                &entry.text,
+                                XmlEscapeContext::Text,
+                                "shared string XML",
+                            )?)
+                            .strict_add("</t></si>".len())
+                    };
+                    Ok(sum.strict_add(len))
+                })?;
         let mut xml = try_string_with_capacity(
             additional_capacity.strict_add(256),
             "sharedStrings XML 메모리 확보 실패",
@@ -289,7 +288,13 @@ impl SharedStringTable {
             ),
         );
         for entry in &self.entries {
-            xml.push_str(&entry.xml);
+            if let Some(original) = entry.xml.as_ref() {
+                xml.push_str(original);
+            } else {
+                xml.push_str(shared_string_opening(&entry.text));
+                append_xml_escaped(&mut xml, &entry.text, XmlEscapeContext::Text);
+                xml.push_str("</t></si>");
+            }
         }
         xml.push_str("</sst>");
         Ok(xml)
@@ -316,6 +321,7 @@ impl Workbook {
             "shared string entry 메모리 확보 실패",
         )?;
         let sst_closing = (!sst.self_closing).then_some(sst.name);
+        let mut attrs = Vec::new();
         while let Some(closing_name) = sst_closing
             && let Some(si) = shared_strings_scanner.next_direct_element_named_until(
                 "si",
@@ -350,7 +356,7 @@ impl Workbook {
                     .get(source_cursor..element.span.start)
                     .unwrap_or_else(|| process::abort());
                 xml.push_str(prefix);
-                let mut attrs = parse_tag_attrs(element.opening.raw)?;
+                parse_tag_attrs_into(element.opening.raw, &mut attrs)?;
                 if element.opening.self_closing {
                     append_text_tag(&mut xml, &attrs, true)?;
                     source_cursor = element.span.end;
@@ -412,7 +418,7 @@ impl Workbook {
                 .unwrap_or(Cow::Borrowed(""));
             entries.push(SharedStringEntry {
                 text: Rc::<str>::from(value.as_ref()),
-                xml,
+                xml: Some(xml),
             });
         }
         let mut index = HashMap::new();
@@ -947,12 +953,13 @@ impl WorksheetParser<'_, '_> {
         let mut last_col_buffer = NumBuffer::new();
         let last_col_text = last_col.format_into(&mut last_col_buffer);
         let mut style_buffer = NumBuffer::new();
+        let mut row_attrs = Vec::new();
         while let Some(row_info) = scanner.next_direct_opening_named_until(
             "row",
             sheet_data_name,
             "worksheet sheetData",
         )? {
-            let row_attrs = parse_tag_attrs(row_info.raw)?;
+            parse_tag_attrs_into(row_info.raw, &mut row_attrs)?;
             let row_num_text = get_attr(&row_attrs, "r")
                 .ok_or_else(|| err("고정 workbook의 worksheet row에 r 속성이 없습니다."))?;
             let row_num = parse_u32_decimal(
@@ -2170,8 +2177,8 @@ fn worksheet_row_count(len: usize) -> u32 {
 fn sum_lengths(parts: &[usize]) -> usize {
     parts.iter().copied().fold(0_usize, usize::strict_add)
 }
-fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr<'_>>> {
-    let mut out: Vec<XmlAttr<'_>> = Vec::new();
+fn parse_tag_attrs_into<'tag>(tag: &'tag str, out: &mut Vec<XmlAttr<'tag>>) -> Result<()> {
+    out.clear();
     let mut scanner = XmlAttrScanner::new(tag)?;
     while let Some((name, value)) = scanner.next()? {
         (out.len() < MAX_XML_ATTRIBUTE_COUNT)
@@ -2182,7 +2189,7 @@ fn parse_tag_attrs(tag: &str) -> Result<Vec<XmlAttr<'_>>> {
             .map_err(|source| err_with_source("XML 속성 목록 추가 메모리 확보 실패", source))?;
         out.push(XmlAttr { name, value });
     }
-    Ok(out)
+    Ok(())
 }
 fn get_attr<'attrs>(attrs: &'attrs [XmlAttr<'_>], name: &str) -> Option<&'attrs str> {
     attrs
@@ -2260,11 +2267,25 @@ const fn xml_escape_replacement(ch: char, context: XmlEscapeContext) -> Option<&
         _ => None,
     }
 }
+fn shared_string_opening(value: &str) -> &'static str {
+    if value.chars().next().is_some_and(char::is_whitespace)
+        || value.chars().next_back().is_some_and(char::is_whitespace)
+    {
+        "<si><t xml:space=\"preserve\">"
+    } else {
+        "<si><t>"
+    }
+}
 fn append_text_tag(out: &mut String, attrs: &[XmlAttr<'_>], self_closing: bool) -> Result<()> {
     let suffix = if self_closing { "/>" } else { ">" };
     let mut capacity = "<t".len().strict_add(suffix.len());
     for attr in attrs {
-        capacity = sum_lengths(&[capacity, " =\"\"".len(), attr.name.len(), attr.value.len()]);
+        capacity = sum_lengths(&[
+            capacity,
+            " =\"\"".len(),
+            attr.name.len(),
+            validated_xml_escaped_len(&attr.value, XmlEscapeContext::Attribute, "XML 태그")?,
+        ]);
     }
     out.try_reserve(capacity)
         .map_err(|source| err_with_source("XML 태그 메모리 확보 실패", source))?;
