@@ -66,7 +66,7 @@ static FIXED_DECODE_TREES: LazyLock<DynamicTrees> = LazyLock::new(|| {
     }
 });
 struct BitReader<'bytes> {
-    bit_buffer: u32,
+    bit_buffer: u64,
     bit_count: u8,
     bytes: &'bytes [u8],
     cursor: usize,
@@ -212,15 +212,25 @@ impl BitReader<'_> {
         Ok(bytes)
     }
     fn try_peek_bits(&mut self, count: u8) -> Option<u16> {
+        if self.bit_count < count
+            && let Some(&chunk) = self
+                .bytes
+                .get(self.cursor..)
+                .and_then(|tail| tail.first_chunk::<4>())
+        {
+            self.bit_buffer |= u64::from(u32::from_le_bytes(chunk)) << u32::from(self.bit_count);
+            self.cursor = self.cursor.strict_add(4);
+            self.bit_count = self.bit_count.strict_add(32);
+        }
         while self.bit_count < count {
             let &byte = self.bytes.get(self.cursor)?;
-            self.bit_buffer |= u32::from(byte) << u32::from(self.bit_count);
+            self.bit_buffer |= u64::from(byte) << u32::from(self.bit_count);
             self.cursor = self.cursor.strict_add(1);
             self.bit_count = self.bit_count.strict_add(8);
         }
-        let mask = 1_u32.strict_shl(u32::from(count)).strict_sub(1);
+        let mask = 1_u64.strict_shl(u32::from(count)).strict_sub(1);
         let value = self.bit_buffer & mask;
-        let [low, high, _, _] = value.to_le_bytes();
+        let [low, high, ..] = value.to_le_bytes();
         Some(u16::from_le_bytes([low, high]))
     }
 }

@@ -352,11 +352,6 @@ impl Workbook {
                 .filter(|body| !body.contains('<'))
             {
                 let plain_text = decode_xml_entities(plain_body)?;
-                validated_xml_escaped_len(
-                    plain_text.as_ref(),
-                    XmlEscapeContext::Text,
-                    "shared string XML",
-                )?;
                 entries.push(SharedStringEntry {
                     text: Rc::<str>::from(plain_text.as_ref()),
                     xml: None,
@@ -1396,23 +1391,15 @@ impl Worksheet {
         if !saw_digit {
             return Ok(None);
         }
-        let magnitude = if round_away_from_zero {
-            let Some(rounded) = whole.checked_add(1) else {
-                return Ok(None);
-            };
-            rounded
-        } else {
-            whole
+        let Some(magnitude) = whole.checked_add(i64::from(round_away_from_zero)) else {
+            return Ok(None);
         };
         let signed = if negative {
-            let Some(negative_value) = magnitude.checked_neg() else {
-                return Ok(None);
-            };
-            negative_value
+            magnitude.checked_neg()
         } else {
-            magnitude
+            Some(magnitude)
         };
-        Ok(i32::try_from(signed).ok())
+        Ok(signed.and_then(|value| i32::try_from(value).ok()))
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
         let row_index = row_index(row).unwrap_or_else(|| process::abort());
@@ -2349,13 +2336,21 @@ fn validated_xml_escaped_len(
     })
 }
 fn append_xml_escaped(out: &mut String, text: &str, context: XmlEscapeContext) {
-    for ch in text.chars() {
+    let mut unescaped_start = 0_usize;
+    for (index, ch) in text.char_indices() {
         if let Some(replacement) = xml_escape_replacement(ch, context) {
+            let prefix = text
+                .get(unescaped_start..index)
+                .unwrap_or_else(|| process::abort());
+            out.push_str(prefix);
             out.push_str(replacement);
-        } else {
-            out.push(ch);
+            unescaped_start = index.strict_add(ch.len_utf8());
         }
     }
+    let tail = text
+        .get(unescaped_start..)
+        .unwrap_or_else(|| process::abort());
+    out.push_str(tail);
 }
 const fn xml_escape_replacement(ch: char, context: XmlEscapeContext) -> Option<&'static str> {
     match ch {
