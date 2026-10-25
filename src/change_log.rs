@@ -51,6 +51,7 @@ impl ChangeLogRowValues<'_> {
         worksheet: &mut Worksheet,
         shared_strings: &mut SharedStringTable,
         row: u32,
+        is_shared_follower: bool,
         formula_buffer: &mut String,
     ) -> Result<()> {
         for (col, value) in [
@@ -81,6 +82,19 @@ impl ChangeLogRowValues<'_> {
                 (self.old_fuels.diesel, self.new_fuels.diesel),
             ])
         {
+            let cached_value = old_value
+                .zip(new_value)
+                .map(|(old, new)| new.strict_sub(old));
+            let cached_text = cached_value.map(|value| value.format_into(&mut cache_buffer));
+            if is_shared_follower {
+                worksheet.set_shared_formula_follower_cache_at(
+                    target_col,
+                    row,
+                    cached_text,
+                    false,
+                )?;
+                continue;
+            }
             formula_buffer.clear();
             append_fmt(
                 formula_buffer,
@@ -88,10 +102,6 @@ impl ChangeLogRowValues<'_> {
                     "IF(OR({old_col}{row_text}=\"\",{new_col}{row_text}=\"\"),\"\",{new_col}{row_text}-{old_col}{row_text})"
                 ),
             );
-            let cached_value = old_value
-                .zip(new_value)
-                .map(|(old, new)| new.strict_sub(old));
-            let cached_text = cached_value.map(|value| value.format_into(&mut cache_buffer));
             worksheet.set_formula_at_with_cache(
                 target_col,
                 row,
@@ -175,10 +185,15 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
                 CHANGELOG_COL_DELTA_DIESEL,
                 26,
             )?;
+            let group_offset = index.rem_euclid(64);
+            let group_start = index.strict_sub(group_offset);
+            let is_shared_follower =
+                group_offset != 0 && entry_count.strict_sub(group_start).min(64) >= 6;
             values.write_to(
                 worksheet,
                 self.shared_string_table,
                 row,
+                is_shared_follower,
                 &mut formula_buffer,
             )?;
         }
