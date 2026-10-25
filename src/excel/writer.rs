@@ -19,6 +19,7 @@ use alloc::{
 use core::{
     cmp::Ordering,
     fmt::NumBuffer,
+    iter::repeat_n,
     mem,
     num::IntErrorKind,
     range::{Range, RangeInclusive},
@@ -344,6 +345,24 @@ impl Workbook {
             let si_xml = shared_strings_xml_text
                 .get(si.span)
                 .unwrap_or_else(|| process::abort());
+            if let Some(plain_body) = si_xml
+                .strip_prefix("<si><t>")
+                .or_else(|| si_xml.strip_prefix("<si><t xml:space=\"preserve\">"))
+                .and_then(|tail| tail.strip_suffix("</t></si>"))
+                .filter(|body| !body.contains('<'))
+            {
+                let plain_text = decode_xml_entities(plain_body)?;
+                validated_xml_escaped_len(
+                    plain_text.as_ref(),
+                    XmlEscapeContext::Text,
+                    "shared string XML",
+                )?;
+                entries.push(SharedStringEntry {
+                    text: Rc::<str>::from(plain_text.as_ref()),
+                    xml: None,
+                });
+                continue;
+            }
             let mut xml =
                 try_string_with_capacity(si_xml.len(), "shared string XML 메모리 확보 실패")?;
             let mut text_scanner = XmlScanner::new(si_xml);
@@ -364,20 +383,15 @@ impl Workbook {
                 let decoded = decode_xml_entities(element.body)?;
                 let preserve = decoded.chars().next().is_some_and(char::is_whitespace)
                     || decoded.chars().next_back().is_some_and(char::is_whitespace);
+                attrs.retain(|attr| attr.name != "xml:space");
                 if preserve {
-                    if let Some(attr) = attrs.iter_mut().find(|attr| attr.name == "xml:space") {
-                        attr.value = Cow::Borrowed("preserve");
-                    } else {
-                        attrs.try_reserve(1).map_err(|source| {
-                            err_with_source("XML 속성 목록 추가 메모리 확보 실패", source)
-                        })?;
-                        attrs.push(XmlAttr {
-                            name: "xml:space",
-                            value: Cow::Borrowed("preserve"),
-                        });
-                    }
-                } else {
-                    attrs.retain(|attr| attr.name != "xml:space");
+                    attrs.try_reserve(1).map_err(|source| {
+                        err_with_source("XML 속성 목록 추가 메모리 확보 실패", source)
+                    })?;
+                    attrs.push(XmlAttr {
+                        name: "xml:space",
+                        value: Cow::Borrowed("preserve"),
+                    });
                 }
                 append_text_tag(&mut xml, &attrs, false)?;
                 let escaped = try_xml_escape_text(
@@ -2121,6 +2135,8 @@ fn xml_bool_attr(attrs: &[XmlAttr<'_>], name: &str) -> Result<bool> {
     }
 }
 pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denominator: i128) {
+    const POW5_16: u64 = 152_587_890_625;
+    const RATIO_SCALE: u64 = 1_000_000_000;
     let negative = numerator != 0 && numerator.is_negative() != denominator.is_negative();
     let denominator_abs = denominator.unsigned_abs();
     let numerator_abs = numerator.unsigned_abs();
@@ -2131,7 +2147,39 @@ pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denomin
         out.push('-');
     }
     push_decimal_text!(out, whole);
-    if remainder != 0 {
+    if remainder == 0 {
+        return;
+    }
+    let fast_value = u64::try_from(numerator_abs)
+        .ok()
+        .zip(u64::try_from(denominator_abs).ok())
+        .filter(|&(num_u64, den_u64)| {
+            num_u64 >= den_u64
+                && num_u64.is_multiple_of(RATIO_SCALE)
+                && den_u64.is_multiple_of(RATIO_SCALE)
+        })
+        .and_then(|(num_u64, den_u64)| {
+            let scaled_num = num_u64.div_euclid(RATIO_SCALE);
+            let scaled_den = den_u64.div_euclid(RATIO_SCALE);
+            let scaled_rem = scaled_num.rem_euclid(scaled_den);
+            let odd_den = scaled_den >> scaled_den.trailing_zeros();
+            (!u128::from(scaled_rem)
+                .strict_mul(u128::from(POW5_16))
+                .is_multiple_of(u128::from(odd_den)))
+            .then(|| {
+                u32::try_from(scaled_num)
+                    .ok()
+                    .zip(u32::try_from(scaled_den).ok())
+            })
+            .flatten()
+        })
+        .map(|(num_u32, den_u32)| {
+            let ratio = f64::from(num_u32) / f64::from(den_u32);
+            f64::from_bits(ratio.to_bits() ^ (u64::from(negative) << 63_u32))
+        });
+    let value = if let Some(resolved) = fast_value {
+        resolved
+    } else {
         out.push('.');
         for _ in 0_u32..32_u32 {
             remainder = remainder.strict_mul(10);
@@ -2139,14 +2187,11 @@ pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denomin
             out.push(char::from(b'0'.strict_add(digit)));
             remainder = remainder.rem_euclid(denominator_abs);
             if remainder == 0 {
-                break;
+                return;
             }
         }
-    }
-    if remainder == 0 {
-        return;
-    }
-    let value = out.parse::<f64>().unwrap_or_else(|_| process::abort());
+        out.parse::<f64>().unwrap_or_else(|_| process::abort())
+    };
     out.clear();
     append_fmt(out, format_args!("{value:.16e}"));
     let exponent_marker = out.rfind('e').unwrap_or_else(|| process::abort());
@@ -2174,19 +2219,14 @@ pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denomin
         }
     } else {
         let position = usize::try_from(decimal_position).unwrap_or_else(|_| process::abort());
-        if position >= digit_count {
-            for _ in digit_count..position {
-                out.push('0');
-            }
+        if let Some(pad_zeros) = position.checked_sub(digit_count) {
+            out.extend(repeat_n('0', pad_zeros));
         } else {
             out.insert(sign_len.strict_add(position), '.');
         }
     }
     if out.contains('.') {
-        out.truncate(out.trim_end_matches('0').len());
-        if out.ends_with('.') {
-            out.pop();
-        }
+        out.truncate(out.trim_end_matches('0').trim_end_matches('.').len());
     }
 }
 fn replace_formula_tag_at(

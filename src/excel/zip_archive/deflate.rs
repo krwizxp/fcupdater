@@ -366,13 +366,13 @@ impl DecodeHuffman {
     }
 }
 impl WriteHuffman {
-    fn from_lengths<const N: usize>(lengths: [u8; N]) -> ZipResult<Self> {
+    fn from_lengths(lengths: &[u8]) -> ZipResult<Self> {
         let mut length_counts = [0_u16; DEFLATE_MAX_BITS + 1];
         let mut next_code =
-            canonical_next_codes(&lengths, &mut length_counts)?.unwrap_or_else(|| process::abort());
+            canonical_next_codes(lengths, &mut length_counts)?.unwrap_or_else(|| process::abort());
         let mut codes =
             try_vec_with_capacity(lengths.len(), "deflate 출력 Huffman code 메모리 확보 실패")?;
-        for len in lengths {
+        for &len in lengths {
             let code = if len == 0 {
                 0
             } else {
@@ -781,9 +781,9 @@ impl DynamicFrequencies {
             .iter()
             .rposition(|&symbol| huffman_get(&code_lengths, symbol) != 0)
             .map_or(4, |index| index.strict_add(1).max(4));
-        let literal_huffman = WriteHuffman::from_lengths(literal_lengths)?;
-        let distance_huffman = WriteHuffman::from_lengths(distance_lengths)?;
-        let code_huffman = WriteHuffman::from_lengths(code_lengths)?;
+        let literal_huffman = WriteHuffman::from_lengths(&literal_lengths)?;
+        let distance_huffman = WriteHuffman::from_lengths(&distance_lengths)?;
+        let code_huffman = WriteHuffman::from_lengths(&code_lengths)?;
         Ok(DynamicDeflatePlan {
             code_huffman,
             code_length_count,
