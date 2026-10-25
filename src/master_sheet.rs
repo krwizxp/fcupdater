@@ -163,13 +163,18 @@ struct MasterRowEvaluation<'source> {
 impl<'strings> RankSortRefresher<'_, 'strings> {
     fn apply_formula_cache(
         &mut self,
-        row: u32,
-        col: u32,
+        (row, col): (u32, u32),
+        is_shared_follower: bool,
         formula_args: Arguments<'_>,
         value: Option<&str>,
         string_value: bool,
         formula: &mut String,
     ) -> Result<()> {
+        if is_shared_follower {
+            return self
+                .ws
+                .set_shared_formula_follower_cache_at(col, row, value, string_value);
+        }
         formula.clear();
         append_fmt(formula, formula_args);
         self.ws
@@ -177,8 +182,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
     }
     fn apply_numeric_formula_cache(
         &mut self,
-        row: u32,
-        col: u32,
+        (row, col): (u32, u32),
+        is_shared_follower: bool,
         formula_args: Arguments<'_>,
         value: Option<i128>,
         scale: i128,
@@ -188,7 +193,14 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             format_scaled_value_into(&mut buffers.cache, scaled, scale);
             buffers.cache.as_str()
         });
-        self.apply_formula_cache(row, col, formula_args, cached, false, &mut buffers.formula)
+        self.apply_formula_cache(
+            (row, col),
+            is_shared_follower,
+            formula_args,
+            cached,
+            false,
+            &mut buffers.formula,
+        )
     }
     fn apply_row_formulas_and_caches(
         &mut self,
@@ -218,9 +230,15 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let rank_total = plan.rank_total;
         let data_start = MASTER_DATA_START_ROW;
         let data_last = self.data_last_row;
+        let row_offset = row_num.strict_sub(data_start);
+        let group_start_row =
+            data_start.strict_add(row_offset.strict_sub(row_offset.rem_euclid(64)));
+        let group_last_row = group_start_row.strict_add(63).min(data_last);
+        let is_shared_follower = row_num > group_start_row
+            && group_last_row.strict_sub(group_start_row).strict_add(1) >= 6;
         self.apply_formula_cache(
-            row_num,
-            COL_RANK,
+            (row_num, COL_RANK),
+            is_shared_follower,
             format_args!(
                 r#"IF($T{row_text}="","",RANK(T{row_text},$T${data_start}:$T${data_last},1))"#
             ),
@@ -250,8 +268,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             )?;
         let fuel_total_cache = has_fuel_total_text.then_some(buffers.cache.as_str());
         self.apply_formula_cache(
-            row_num,
-            COL_FUEL_TOTAL_TEXT,
+            (row_num, COL_FUEL_TOTAL_TEXT),
+            is_shared_follower,
             format_args!(
                 r##"IF($B$10=0,"",IFERROR(IF($B$4>0,"휘발유 "&TEXT(IF($L{row_text}="",1/0,$L{row_text}*$B$4),"#,##0")&"원","")&IF($B$5>0,IF($B$4>0," / ","")&"고급유 "&TEXT(IF($M{row_text}="",1/0,$M{row_text}*$B$5),"#,##0")&"원","")&IF($B$6>0,IF(OR($B$4>0,$B$5>0)," / ","")&"경유 "&TEXT(IF($N{row_text}="",1/0,$N{row_text}*$B$6),"#,##0")&"원",""),""))"##
             ),
@@ -270,8 +288,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             );
             let smart_discount_cache = buffers.cache.as_str();
             self.apply_formula_cache(
-                row_num,
-                COL_SMART_DISCOUNT,
+                (row_num, COL_SMART_DISCOUNT),
+                false,
                 format_args!(
                     r#"IF(AND(IFERROR(SEARCH("{SMART_DISCOUNT_BRAND_KEYWORD}",$C{row_text}),0)>0,IFERROR(SEARCH("{SMART_DISCOUNT_DIRECT_KEYWORD}",$C{row_text}),0)>0),$B${SMART_DISCOUNT_INPUT_ROW},0)"#
                 ),
@@ -286,8 +304,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             (COL_ADJUSTED_DIESEL, "J", prices.diesel),
         ] {
             self.apply_numeric_formula_cache(
-                row_num,
-                col,
+                (row_num, col),
+                is_shared_follower,
                 format_args!(
                     r#"IF(${source_col}{row_text}="","",${source_col}{row_text}+$K{row_text})"#
                 ),
@@ -297,8 +315,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             )?;
         }
         self.apply_numeric_formula_cache(
-            row_num,
-            COL_TOTAL_PRICE,
+            (row_num, COL_TOTAL_PRICE),
+            is_shared_follower,
             format_args!(
                 r#"IF($B$10=0,"",IFERROR(IF($B$4>0,IF($L{row_text}="",1/0,$L{row_text}*$B$4),0)+IF($B$5>0,IF($M{row_text}="",1/0,$M{row_text}*$B$5),0)+IF($B$6>0,IF($N{row_text}="",1/0,$N{row_text}*$B$6),0),""))"#
             ),
@@ -307,8 +325,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             buffers,
         )?;
         self.apply_numeric_formula_cache(
-            row_num,
-            COL_REGION_RATE,
+            (row_num, COL_REGION_RATE),
+            is_shared_follower,
             format_args!(
                 r#"IF($P{row_text}="","",IF($Q{row_text}="Y",IFERROR(VLOOKUP($B{row_text},$C$4:$D$13,2,FALSE()),0),0))"#
             ),
@@ -317,16 +335,16 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             buffers,
         )?;
         self.apply_numeric_formula_cache(
-            row_num,
-            COL_REGION_DISCOUNT,
+            (row_num, COL_REGION_DISCOUNT),
+            is_shared_follower,
             format_args!(r#"IF($P{row_text}="","",ROUNDDOWN($P{row_text}*$R{row_text},0))"#),
             regional_discount.map(ScaledSortKey::as_i128),
             DECIMAL_SCALE_SQUARED.as_i128(),
             buffers,
         )?;
         self.apply_numeric_formula_cache(
-            row_num,
-            COL_REGIONAL_TOTAL,
+            (row_num, COL_REGIONAL_TOTAL),
+            is_shared_follower,
             format_args!(r#"IF($P{row_text}="","",$P{row_text}-$S{row_text})"#),
             rank_total.map(ScaledSortKey::as_i128),
             DECIMAL_SCALE_SQUARED.as_i128(),
@@ -338,8 +356,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         }
         let sort_key_cache = buffers.cache.as_str();
         self.apply_formula_cache(
-            row_num,
-            COL_SORT_KEY,
+            (row_num, COL_SORT_KEY),
+            is_shared_follower,
             format_args!(r#"IF($T{row_text}="",1000000000000000,$T{row_text})"#),
             Some(sort_key_cache),
             false,
@@ -361,8 +379,8 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 false
             };
             self.apply_formula_cache(
-                row_num,
-                col,
+                (row_num, col),
+                is_shared_follower,
                 format_args!(
                     r#"IF(${total_col}{row_text}="","",IF($B$10=0,"",${total_col}{row_text}/$B$10))"#
                 ),

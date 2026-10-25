@@ -152,7 +152,6 @@ struct SharedFormulaHead {
 #[derive(Clone, Copy)]
 enum FormulaTag<'text> {
     PlainEscaped(&'text str),
-    SharedFollower(&'text str),
     SharedRoot {
         formula: &'text str,
         reference: &'text str,
@@ -1172,7 +1171,9 @@ impl Worksheet {
                     let Some(candidate_cell) = self.cell_at(col, candidate_row) else {
                         break;
                     };
-                    if extract_first_tag_text(&candidate_cell.inner_xml, "f")?.is_none() {
+                    if !candidate_cell.inner_xml.starts_with("<f/>")
+                        && extract_first_tag_text(&candidate_cell.inner_xml, "f")?.is_none()
+                    {
                         break;
                     }
                     last_row = candidate_row;
@@ -1193,24 +1194,46 @@ impl Worksheet {
                 })?;
                 let mut si_buffer = NumBuffer::new();
                 let si_text = next_si.format_into(&mut si_buffer);
+                let mut follower_xml = try_string_with_capacity(
+                    "<f t=\"shared\" si=\"\"/>".len().strict_add(si_text.len()),
+                    "shared formula follower 태그 메모리 확보 실패",
+                )?;
+                follower_xml.extend(["<f t=\"shared\" si=\"", si_text, "\"/>"]);
                 for shared_row in row..=last_row {
                     let cell = Self::get_or_create_cell_mut(&mut self.rows, col, shared_row)?;
-                    let inner = &cell.inner_xml;
-                    (!inner.is_empty()).ok_or(err("shared formula 대상 cell 본문이 없습니다."))?;
-                    let tag = if shared_row == row {
-                        FormulaTag::SharedRoot {
-                            formula: &owned_anchor,
-                            reference: &reference,
-                            si: si_text,
-                        }
+                    (!cell.inner_xml.is_empty())
+                        .ok_or(err("shared formula 대상 cell 본문이 없습니다."))?;
+                    if shared_row == row {
+                        let inner = &cell.inner_xml;
+                        let formula_span = XmlScanner::new(inner)
+                            .next_element_named("f")?
+                            .map(|formula| formula.span)
+                            .ok_or_else(|| err("cell formula 태그를 찾지 못했습니다."))?;
+                        cell.inner_xml = replace_formula_tag_at(
+                            inner,
+                            formula_span,
+                            FormulaTag::SharedRoot {
+                                formula: &owned_anchor,
+                                reference: &reference,
+                                si: si_text,
+                            },
+                        )?;
                     } else {
-                        FormulaTag::SharedFollower(si_text)
-                    };
-                    let formula_span = XmlScanner::new(inner)
-                        .next_element_named("f")?
-                        .map(|formula| formula.span)
-                        .ok_or_else(|| err("cell formula 태그를 찾지 못했습니다."))?;
-                    cell.inner_xml = replace_formula_tag_at(inner, formula_span, tag)?;
+                        let formula_span = if cell.inner_xml.starts_with("<f/>") {
+                            (0..4).into()
+                        } else {
+                            XmlScanner::new(&cell.inner_xml)
+                                .next_element_named("f")?
+                                .map(|formula| formula.span)
+                                .ok_or_else(|| err("cell formula 태그를 찾지 못했습니다."))?
+                        };
+                        let span_len = formula_span.end.strict_sub(formula_span.start);
+                        let additional = follower_xml.len().saturating_sub(span_len);
+                        cell.inner_xml.try_reserve(additional).map_err(|source| {
+                            err_with_source("shared formula follower XML 메모리 확보 실패", source)
+                        })?;
+                        cell.inner_xml.replace_range(formula_span, &follower_xml);
+                    }
                 }
                 next_si = next_si.strict_add(1);
             }
@@ -1718,6 +1741,47 @@ impl Worksheet {
         }
         Ok(())
     }
+    pub(crate) fn set_shared_formula_follower_cache_at(
+        &mut self,
+        col: u32,
+        row: u32,
+        value: Option<&str>,
+        string_value: bool,
+    ) -> Result<()> {
+        let value_len = value
+            .map(|raw| {
+                validated_xml_escaped_len(raw, XmlEscapeContext::Text, "formula cache XML escape")
+            })
+            .transpose()?;
+        let cell = Self::get_or_create_cell_mut(&mut self.rows, col, row)?;
+        cell.value_type = if string_value || value.is_none() {
+            CellValueType::String
+        } else {
+            CellValueType::General
+        };
+        let cached = value.unwrap_or("");
+        let inner = &mut cell.inner_xml;
+        inner.clear();
+        inner
+            .try_reserve_exact(sum_lengths(&[
+                "<f t=\"shared\" si=\"99999\"/><v></v>".len(),
+                value_len.unwrap_or(0),
+            ]))
+            .map_err(|source| err_with_source("formula/cache XML 메모리 확보 실패", source))?;
+        inner.push_str("<f/>");
+        if cached.is_empty() {
+            inner.push_str("<v/>");
+        } else {
+            inner.push_str("<v>");
+            if value_len == Some(cached.len()) {
+                inner.push_str(cached);
+            } else {
+                append_xml_escaped(inner, cached, XmlEscapeContext::Text);
+            }
+            inner.push_str("</v>");
+        }
+        Ok(())
+    }
     pub(crate) fn take_rows(&mut self) -> Vec<Row> {
         mem::take(&mut self.rows)
     }
@@ -2139,7 +2203,6 @@ fn replace_formula_tag_at(
     let shared_escaped;
     let parts: &[&str] = match tag {
         FormulaTag::PlainEscaped(escaped) => &[prefix, "<f>", escaped, "</f>", suffix],
-        FormulaTag::SharedFollower(si) => &[prefix, "<f t=\"shared\" si=\"", si, "\"/>", suffix],
         FormulaTag::SharedRoot {
             formula,
             reference,
