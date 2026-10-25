@@ -35,6 +35,15 @@ impl<'xml> XmlScanner<'xml> {
         opening: XmlTag<'xml>,
         ancestor_depth: usize,
     ) -> Result<XmlElement<'xml>> {
+        let root_name = opening.name;
+        self.element_from_opening_with_root(opening, ancestor_depth, root_name)
+    }
+    fn element_from_opening_with_root(
+        &mut self,
+        opening: XmlTag<'xml>,
+        ancestor_depth: usize,
+        root_name: &str,
+    ) -> Result<XmlElement<'xml>> {
         (ancestor_depth < MAX_XML_NESTING_DEPTH).ok_or(err("XML 중첩 깊이가 너무 큽니다."))?;
         let tag_name = opening.name;
         let body_start = opening.end.strict_add(1);
@@ -45,23 +54,28 @@ impl<'xml> XmlScanner<'xml> {
                 cursor: body_start,
                 xml: self.xml,
             };
-            let mut ancestors = [tag_name; MAX_XML_NESTING_DEPTH];
+            let mut shallow = [tag_name; 4];
             let mut depth = 1_usize;
             let closing = loop {
                 let tag = scanner.next_tag().ok_or_else(|| {
-                    err(format!("XML </{tag_name}> 종료 태그를 찾지 못했습니다."))
+                    err(format!("XML </{root_name}> 종료 태그를 찾지 못했습니다."))
                 })?;
                 if tag.is_start {
                     if !tag.self_closing {
-                        (ancestor_depth.strict_add(depth) < MAX_XML_NESTING_DEPTH)
+                        let next_depth = ancestor_depth.strict_add(depth);
+                        (next_depth < MAX_XML_NESTING_DEPTH)
                             .ok_or(err("XML 중첩 깊이가 너무 큽니다."))?;
-                        *ancestors.get_mut(depth).unwrap_or_else(|| process::abort()) = tag.name;
-                        depth = depth.strict_add(1);
+                        if let Some(slot) = shallow.get_mut(depth) {
+                            *slot = tag.name;
+                            depth = depth.strict_add(1);
+                        } else {
+                            scanner.element_from_opening_with_root(tag, next_depth, root_name)?;
+                        }
                     }
                     continue;
                 }
                 depth = depth.strict_sub(1);
-                let open = ancestors
+                let open = shallow
                     .get(depth)
                     .copied()
                     .unwrap_or_else(|| process::abort());
