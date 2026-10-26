@@ -1368,11 +1368,15 @@ fn find_equivalent_xf(
     Ok(None)
 }
 fn excel_static_xml(source: &str) -> Vec<u8> {
-    source
-        .strip_suffix('\n')
-        .unwrap_or(source)
-        .replacen('\n', "\r\n", 1)
-        .into_bytes()
+    let trimmed = source.strip_suffix('\n').unwrap_or(source);
+    let Some((first_line, remainder)) = trimmed.split_once('\n') else {
+        return trimmed.as_bytes().to_vec();
+    };
+    let mut output = Vec::with_capacity(trimmed.len().strict_add(1));
+    output.extend_from_slice(first_line.as_bytes());
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(remainder.as_bytes());
+    output
 }
 fn parse_attrs<'tag, const N: usize>(
     tag: &'tag str,

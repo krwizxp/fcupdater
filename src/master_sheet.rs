@@ -107,21 +107,6 @@ impl ScaledSortKey {
     fn checked_add(self, rhs: Self) -> Option<Self> {
         self.0.checked_add(rhs.0).map(Self)
     }
-    fn checked_div(self, rhs: Self) -> Option<Self> {
-        self.0.checked_div(rhs.0).map(Self)
-    }
-    fn checked_mul(self, rhs: Self) -> Option<Self> {
-        self.0.checked_mul(rhs.0).map(Self)
-    }
-    fn checked_sub(self, rhs: Self) -> Option<Self> {
-        self.0.checked_sub(rhs.0).map(Self)
-    }
-    fn regional_discount(self, region_rate: ScaledDecimal) -> Result<Self> {
-        self.checked_mul(Self(region_rate.as_i128()))
-            .and_then(|value| value.checked_div(DECIMAL_SCALE_CUBED))
-            .and_then(|value| value.checked_mul(DECIMAL_SCALE_SQUARED))
-            .ok_or_else(|| err("지역화폐 할인 계산 중 overflow가 발생했습니다."))
-    }
 }
 struct SortableRankRow<'text> {
     address: &'text str,
@@ -145,7 +130,7 @@ struct RankSortContext {
     quantities: FuelValues<ScaledDecimal>,
     region_rates: [Option<ScaledDecimal>; TARGET_REGION_COUNT],
     smart_discount: ScaledDecimal,
-    total_qty: Option<ScaledDecimal>,
+    unit_price_denominator: Option<i128>,
 }
 struct FormulaBuffers {
     cache: String,
@@ -212,9 +197,9 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
     ) -> Result<()> {
         let mut row_buffer = NumBuffer::new();
         let row_text = row_num.format_into(&mut row_buffer);
-        let total_qty = sort_context.total_qty;
+        let unit_price_denominator = sort_context.unit_price_denominator;
         let prices = plan.adjusted_prices;
-        let total_price = total_qty
+        let total_price = unit_price_denominator
             .map(|_| MasterSheetUpdater::compute_total_price(sort_context, prices))
             .transpose()?
             .flatten();
@@ -224,10 +209,10 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         } else {
             ScaledDecimal::ZERO
         };
-        let regional_discount = total_price
-            .map(|value| value.regional_discount(region_rate))
-            .transpose()?;
         let rank_total = plan.rank_total;
+        let regional_discount = total_price
+            .zip(rank_total)
+            .map(|(price, ranked)| ScaledSortKey(price.as_i128().strict_sub(ranked.as_i128())));
         let data_start = MASTER_DATA_START_ROW;
         let data_last = self.data_last_row;
         let row_offset = row_num.strict_sub(data_start);
@@ -247,7 +232,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             &mut buffers.formula,
         )?;
         buffers.cache.clear();
-        let has_fuel_total_text = total_qty.is_some()
+        let has_fuel_total_text = unit_price_denominator.is_some()
             && append_fuel_total_text(
                 &mut buffers.cache,
                 sort_context.quantities.gasoline,
@@ -368,11 +353,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             (COL_UNIT_PRICE_WITHOUT_CURRENCY, "P", total_price),
         ] {
             buffers.cache.clear();
-            let has_value = if let Some((total, qty)) = value.zip(total_qty) {
-                let denominator = qty
-                    .as_i128()
-                    .checked_mul(DECIMAL_SCALE.as_i128())
-                    .ok_or_else(|| err("단가 분모 계산 중 overflow가 발생했습니다."))?;
+            let has_value = if let Some((total, denominator)) = value.zip(unit_price_denominator) {
                 format_excel_ratio_into(&mut buffers.cache, total.as_i128(), denominator);
                 true
             } else {
@@ -465,15 +446,22 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 .map(ScaledSortKey)
         });
         let total_price = sort_context
-            .total_qty
+            .unit_price_denominator
             .map(|_| MasterSheetUpdater::compute_total_price(sort_context, adjusted_prices))
             .transpose()?
             .flatten();
         let rank_total = total_price
             .map(|price| {
-                let discount = price.regional_discount(region_rate)?;
+                let discount = price
+                    .as_i128()
+                    .checked_mul(region_rate.as_i128())
+                    .and_then(|value| value.checked_div(DECIMAL_SCALE_CUBED.as_i128()))
+                    .and_then(|value| value.checked_mul(DECIMAL_SCALE_SQUARED.as_i128()))
+                    .ok_or_else(|| err("지역화폐 할인 계산 중 overflow가 발생했습니다."))?;
                 price
+                    .as_i128()
                     .checked_sub(discount)
+                    .map(ScaledSortKey)
                     .ok_or_else(|| err("지역화폐 적용 금액 계산 중 overflow가 발생했습니다."))
             })
             .transpose()?;
@@ -541,10 +529,17 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             .checked_add(quantities.premium)
             .and_then(|total| total.checked_add(quantities.diesel))
             .ok_or_else(|| err("유류비 고정 입력값 합계가 허용 범위를 초과했습니다."))?;
-        let total_qty = (derived_total_qty != ScaledDecimal::ZERO).then_some(derived_total_qty);
+        let unit_price_denominator = (derived_total_qty != ScaledDecimal::ZERO)
+            .then(|| {
+                derived_total_qty
+                    .as_i128()
+                    .checked_mul(DECIMAL_SCALE.as_i128())
+                    .ok_or_else(|| err("단가 분모 계산 중 overflow가 발생했습니다."))
+            })
+            .transpose()?;
         let sort_context = RankSortContext {
             quantities,
-            total_qty,
+            region_rates,
             smart_discount: MasterSheetUpdater::get_f64_at(
                 self.ws,
                 SMART_DISCOUNT_INPUT_COL,
@@ -552,7 +547,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 self.shared_strings,
             )?
             .unwrap_or(ScaledDecimal::ZERO),
-            region_rates,
+            unit_price_denominator,
         };
         let row_count = self
             .data_last_row

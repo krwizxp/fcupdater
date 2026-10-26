@@ -219,7 +219,7 @@ impl Client {
         };
         let mut url_buffer = mem::take(&mut self.url_buffer);
         let mut header_build_buffer = mem::take(&mut self.header_build_buffer);
-        let mut error_buffer = [c_char::default(); CURL_ERROR_SIZE];
+        let mut error_buffer = [0_u8; CURL_ERROR_SIZE];
         let result = (|| {
             let mut header_list = HeaderList(None);
             for (name, value) in request_headers.iter() {
@@ -258,7 +258,10 @@ impl Client {
                 let _options = TransferOptions(handle);
                 handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
                 handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
-                handle.setopt_ptr(CURLOPT_ERRORBUFFER, error_buffer.as_mut_ptr())?;
+                handle.setopt_ptr(
+                    CURLOPT_ERRORBUFFER,
+                    error_buffer.as_mut_ptr().cast::<c_char>(),
+                )?;
                 handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
                 handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
                 for (option, value) in [
@@ -312,8 +315,8 @@ impl Client {
                 return Err(callback_error);
             }
             if perform_code != CURLE_OK {
-                let bytes = error_buffer.map(|ch| ch.to_le_bytes()[0]);
-                let perform_error = if let Ok(message_cstr) = CStr::from_bytes_until_nul(&bytes)
+                let perform_error = if let Ok(message_cstr) =
+                    CStr::from_bytes_until_nul(&error_buffer)
                     && !message_cstr.is_empty()
                 {
                     let message = message_cstr.to_string_lossy();

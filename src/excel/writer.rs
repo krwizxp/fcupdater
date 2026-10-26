@@ -936,11 +936,13 @@ impl WorksheetParser<'_, '_> {
                         XmlEscapeContext::Text,
                         "cell formula XML escape",
                     )?;
-                    cell.inner_xml = replace_formula_tag_at(
-                        inner_xml,
-                        formula_span,
-                        FormulaTag::PlainEscaped(escaped.as_ref()),
-                    )?;
+                    if formula.opening.raw != "<f>" || escaped.as_ref() != formula.body {
+                        cell.inner_xml = replace_formula_tag_at(
+                            inner_xml,
+                            formula_span,
+                            FormulaTag::PlainEscaped(escaped.as_ref()),
+                        )?;
+                    }
                 }
             }
         }
@@ -1132,6 +1134,7 @@ impl Worksheet {
             .chain(layout.optional_zero_col)
             .fold(0_u32, |mask, col| mask | 1_u32.strict_shl(col));
         let mut column_state = [None; MASTER_HEADERS.len().strict_add(1)];
+        let mut follower_xml = String::new();
         let mut reference = String::new();
         let row_count = worksheet_row_count(self.rows.len());
         let row_start_index = layout.data_start_row.strict_sub(1) as usize;
@@ -1203,10 +1206,11 @@ impl Worksheet {
                 })?;
                 let mut si_buffer = NumBuffer::new();
                 let si_text = next_si.format_into(&mut si_buffer);
-                let mut follower_xml = try_string_with_capacity(
-                    "<f t=\"shared\" si=\"\"/>".len().strict_add(si_text.len()),
-                    "shared formula follower 태그 메모리 확보 실패",
-                )?;
+                follower_xml.clear();
+                let follower_len = "<f t=\"shared\" si=\"\"/>".len().strict_add(si_text.len());
+                follower_xml.try_reserve(follower_len).map_err(|source| {
+                    err_with_source("shared formula follower 태그 메모리 확보 실패", source)
+                })?;
                 follower_xml.extend(["<f t=\"shared\" si=\"", si_text, "\"/>"]);
                 for shared_row in row..=last_row {
                     let cell = Self::get_or_create_cell_mut(&mut self.rows, col, shared_row)?;
@@ -2063,10 +2067,12 @@ impl Row {
 }
 fn canonical_excel_fragment(source: &str) -> Result<String> {
     let trimmed = source.strip_suffix('\n').unwrap_or(source);
-    let mut output = copy_text(trimmed)?;
-    if let Some(line_break) = output.find('\n') {
-        output.replace_range(line_break..=line_break, "\r\n");
-    }
+    let Some((first_line, remainder)) = trimmed.split_once('\n') else {
+        return copy_text(trimmed);
+    };
+    let mut output =
+        try_string_with_capacity(trimmed.len().strict_add(1), "텍스트 복사 메모리 확보 실패")?;
+    output.extend([first_line, "\r\n", remainder]);
     Ok(output)
 }
 fn replace_canonical_text(xml: &mut String, old: &str, new: &str, context: &str) -> Result<()> {

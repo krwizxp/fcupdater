@@ -89,7 +89,7 @@ struct DecodeHuffman {
 #[derive(Clone, Copy)]
 struct DecodeEntry(u16);
 struct WriteHuffman {
-    codes: Vec<[u8; 3]>,
+    codes: [[u8; 3]; LITERAL_LENGTH_SYMBOLS],
 }
 #[derive(Clone, Copy)]
 enum DeflateToken {
@@ -380,9 +380,8 @@ impl WriteHuffman {
         let mut length_counts = [0_u16; DEFLATE_MAX_BITS + 1];
         let mut next_code =
             canonical_next_codes(lengths, &mut length_counts)?.unwrap_or_else(|| process::abort());
-        let mut codes =
-            try_vec_with_capacity(lengths.len(), "deflate 출력 Huffman code 메모리 확보 실패")?;
-        for &len in lengths {
+        let mut codes = [[0_u8; 3]; LITERAL_LENGTH_SYMBOLS];
+        for (slot, &len) in codes.iter_mut().zip(lengths) {
             let code = if len == 0 {
                 0
             } else {
@@ -394,7 +393,7 @@ impl WriteHuffman {
                 code
             };
             let [low, high] = code.to_le_bytes();
-            codes.push([low, high, len]);
+            *slot = [low, high, len];
         }
         Ok(Self { codes })
     }
@@ -1098,16 +1097,24 @@ impl DeflateWorkspace {
         self.tokens
             .try_reserve_exact(initial_token_capacity)
             .map_err(|source| zip_with_source("deflate token 메모리 확보 실패", source))?;
-        self.head.clear();
-        self.head
-            .try_reserve_exact(HASH_SIZE)
-            .map_err(|source| zip_with_source("deflate hash head 메모리 확보 실패", source))?;
-        self.head.resize(HASH_SIZE, usize::MAX);
-        self.previous.clear();
-        self.previous
-            .try_reserve_exact(DEFLATE_WINDOW_LEN)
-            .map_err(|source| zip_with_source("deflate hash previous 메모리 확보 실패", source))?;
-        self.previous.resize(DEFLATE_WINDOW_LEN, 0);
+        if self.head.len() == HASH_SIZE {
+            self.head.fill(usize::MAX);
+        } else {
+            self.head.clear();
+            self.head
+                .try_reserve_exact(HASH_SIZE)
+                .map_err(|source| zip_with_source("deflate hash head 메모리 확보 실패", source))?;
+            self.head.resize(HASH_SIZE, usize::MAX);
+        }
+        let previous_len = input_len.min(DEFLATE_WINDOW_LEN);
+        if self.previous.len() < previous_len {
+            self.previous
+                .try_reserve_exact(previous_len.strict_sub(self.previous.len()))
+                .map_err(|source| {
+                    zip_with_source("deflate hash previous 메모리 확보 실패", source)
+                })?;
+            self.previous.resize(previous_len, 0);
+        }
         Ok(())
     }
     pub(super) fn recycle(&mut self, plan: DeflatePlan) {
