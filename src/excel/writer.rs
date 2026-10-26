@@ -2135,12 +2135,12 @@ pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denomin
     let numerator_abs = numerator.unsigned_abs();
     let whole = numerator_abs.div_euclid(denominator_abs);
     let mut remainder = numerator_abs.rem_euclid(denominator_abs);
-    out.clear();
-    if negative {
-        out.push('-');
-    }
-    push_decimal_text!(out, whole);
     if remainder == 0 {
+        out.clear();
+        if negative {
+            out.push('-');
+        }
+        push_decimal_text!(out, whole);
         return;
     }
     let fast_value = u64::try_from(numerator_abs)
@@ -2173,6 +2173,11 @@ pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denomin
     let value = if let Some(resolved) = fast_value {
         resolved
     } else {
+        out.clear();
+        if negative {
+            out.push('-');
+        }
+        push_decimal_text!(out, whole);
         out.push('.');
         for _ in 0_u32..32_u32 {
             remainder = remainder.strict_mul(10);
