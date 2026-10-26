@@ -1,0 +1,132 @@
+name: Remove non-main branches and their Actions history
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/cleanup-non-main-20261026.yml]
+permissions:
+  contents: write
+  actions: write
+jobs:
+  cleanup:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_PRODUCT_TREE: a377f1c664a286c7f19d06762354585973b89234
+    steps:
+      - name: Remove only non-main branch resources and restore the original workflow set
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json,os,time,urllib.request,urllib.error,urllib.parse
+          from pathlib import Path
+          repo=os.environ['GITHUB_REPOSITORY']
+          assert repo in {'krwizxp/srg','krwizxp/fcupdater'}
+          assert os.environ['GITHUB_REF']=='refs/heads/main'
+          token=os.environ['GH_TOKEN']
+          prefix='/repos/'+repo
+          own_path='.github/workflows/cleanup-non-main-20261026.yml'
+          receipt={'repository':repo,'run_id':int(os.environ['GITHUB_RUN_ID']),'deleted_branches':[],'deleted_runs':[],'deleted_orphan_artifacts':[],'main_runs_preserved':False,'nonmain_branches_remaining':None,'nonmain_runs_remaining':None,'nonmain_artifacts_remaining':None,'workflow_file_removed':False,'success':False}
+          def api(method,path,data=None):
+              assert path.startswith(prefix+'/')
+              raw=None if data is None else json.dumps(data).encode()
+              request=urllib.request.Request('https://api.github.com'+path,data=raw,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'authorized-repository-cleanup'})
+              try:
+                  with urllib.request.urlopen(request,timeout=60) as response:
+                      body=response.read()
+                      return json.loads(body) if body else None
+              except urllib.error.HTTPError as error:
+                  if method=='DELETE' and error.code==404:return None
+                  raise
+          def pages(path,key=None):
+              items=[]
+              for page in range(1,101):
+                  data=api('GET',path+('?' if '?' not in path else '&')+'per_page=100&page='+str(page))
+                  chunk=data[key] if key else data
+                  items.extend(chunk)
+                  if len(chunk)<100:return items
+              raise RuntimeError('Pagination exceeded its explicit bound')
+          def save():
+              Path('cleanup-result.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
+          try:
+              current=api('GET',prefix+'/actions/runs/'+os.environ['GITHUB_RUN_ID'])
+              assert current['head_branch']=='main'
+              definition=api('GET',prefix+'/contents/'+own_path+'?ref='+os.environ['GITHUB_SHA'])
+              original_main=api('GET',prefix+'/git/ref/heads/main')['object']['sha']
+              receipt['main_before_cleanup']=original_main
+              branches=pages(prefix+'/branches')
+              tags={x['name'] for x in pages(prefix+'/tags')}
+              protected_names={'main'}|tags
+              runs=pages(prefix+'/actions/runs','workflow_runs')
+              main_ids={r['id'] for r in runs if r.get('head_branch')=='main'}
+              targets=[r for r in runs if r.get('head_branch') not in protected_names]
+              target_ids={r['id'] for r in targets}
+              receipt['main_runs_before']=len(main_ids)
+              receipt['tag_runs_preserved']=sum(r.get('head_branch') in tags for r in runs)
+              receipt['nonmain_runs_before']=len(targets)
+              artifacts=pages(prefix+'/actions/artifacts','artifacts')
+              def related_artifact(a):
+                  w=a.get('workflow_run') or {}
+                  branch=w.get('head_branch')
+                  return (bool(branch) and branch not in protected_names) or w.get('id') in target_ids
+              receipt['related_artifacts_before']=sum(related_artifact(a) for a in artifacts)
+              for branch in branches:
+                  name=branch['name']
+                  if name=='main':continue
+                  assert name not in {'main','refs/heads/main'}
+                  ref='/git/refs/heads/'+urllib.parse.quote(name,safe='/')
+                  api('DELETE',prefix+ref)
+                  receipt['deleted_branches'].append({'name':name,'sha':branch['commit']['sha']})
+                  print('Removed branch',name,flush=True)
+              for index,run in enumerate(targets):
+                  run_id=run['id']
+                  fresh=api('GET',prefix+'/actions/runs/'+str(run_id))
+                  assert fresh.get('head_branch')!='main' and fresh.get('head_branch') not in tags
+                  if fresh['status']!='completed':
+                      api('POST',prefix+'/actions/runs/'+str(run_id)+'/cancel')
+                      for _ in range(60):
+                          time.sleep(2)
+                          fresh=api('GET',prefix+'/actions/runs/'+str(run_id))
+                          if fresh['status']=='completed':break
+                      assert fresh['status']=='completed','Non-main run did not finish cancellation'
+                  api('DELETE',prefix+'/actions/runs/'+str(run_id))
+                  receipt['deleted_runs'].append({'id':run_id,'branch':run.get('head_branch'),'workflow':run.get('name')})
+                  if (index+1)%20==0:print('Removed non-main runs',index+1,'/',len(targets),flush=True)
+              for artifact in pages(prefix+'/actions/artifacts','artifacts'):
+                  if related_artifact(artifact):
+                      api('DELETE',prefix+'/actions/artifacts/'+str(artifact['id']))
+                      receipt['deleted_orphan_artifacts'].append(artifact['id'])
+              final_branches=pages(prefix+'/branches')
+              final_runs=pages(prefix+'/actions/runs','workflow_runs')
+              final_artifacts=pages(prefix+'/actions/artifacts','artifacts')
+              receipt['nonmain_branches_remaining']=sum(b['name']!='main' for b in final_branches)
+              receipt['nonmain_runs_remaining']=sum(r.get('head_branch') not in protected_names for r in final_runs)
+              receipt['nonmain_artifacts_remaining']=sum(related_artifact(a) for a in final_artifacts)
+              receipt['main_runs_preserved']=main_ids.issubset({r['id'] for r in final_runs if r.get('head_branch')=='main'})
+              receipt['main_runs_after']=sum(r.get('head_branch')=='main' for r in final_runs)
+              assert receipt['nonmain_branches_remaining']==receipt['nonmain_runs_remaining']==receipt['nonmain_artifacts_remaining']==0
+              assert receipt['main_runs_preserved']
+              latest=api('GET',prefix+'/contents/'+own_path+'?ref=main')
+              assert latest['sha']==definition['sha'],'Temporary workflow changed concurrently'
+              removed=api('DELETE',prefix+'/contents/'+own_path,{'message':'ops: remove completed non-main cleanup workflow [skip ci]','branch':'main','sha':latest['sha']})
+              receipt['workflow_file_removed']=True
+              receipt['main_after_cleanup']=removed['commit']['sha']
+              tree=api('GET',prefix+'/git/commits/'+removed['commit']['sha'])['tree']['sha']
+              receipt['final_tree']=tree
+              assert tree==os.environ['EXPECTED_PRODUCT_TREE'],'Final product tree changed concurrently'
+              receipt['success']=True
+              print(json.dumps({k:v for k,v in receipt.items() if k not in ['deleted_runs','deleted_branches','deleted_orphan_artifacts']},indent=2),flush=True)
+          except Exception as error:
+              receipt['error']=str(error)
+              raise
+          finally:save()
+          PY
+      - name: Preserve cleanup receipt on the protected main run
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: non-main-cleanup-receipt
+          path: cleanup-result.json
+          if-no-files-found: error
+          retention-days: 14
