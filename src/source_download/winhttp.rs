@@ -11,7 +11,7 @@ use core::{
     result::Result as CoreResult,
     time::Duration,
 };
-use std::{ffi::OsStr, os::windows::ffi::OsStrExt as WindowsOsStrExt, process, time::Instant};
+use std::{process, time::Instant};
 mod sys;
 const DWORD_BYTE_SIZE: u32 = 4;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -531,7 +531,7 @@ impl Client {
 fn wide(value: &str) -> DownloadResult<Vec<u16>> {
     let capacity = value.len().strict_add(1);
     let mut out = try_vec_with_capacity(capacity, "wide 문자열 메모리 확보 실패")?;
-    out.extend(<OsStr as WindowsOsStrExt>::encode_wide(OsStr::new(value)));
+    out.extend(value.encode_utf16());
     out.push(0);
     Ok(out)
 }

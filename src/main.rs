@@ -4,7 +4,6 @@ use diagnostic::{Result, err, err_with_source};
 use excel::SaveVerification;
 use std::{
     env,
-    ffi::OsStr,
     fs::{File, TryLockError},
     io::{self, Write, stdout},
     path::Path,
@@ -58,9 +57,9 @@ fn main() -> Result<()> {
     let save_verification = match raw_args.next() {
         None => SaveVerification::Skip,
         Some(token) => {
-            let is_help = token == OsStr::new("-h") || token == OsStr::new("--help");
-            let is_version = token == OsStr::new("--version");
-            if !(is_help || token == OsStr::new("--verify") || is_version) {
+            let is_help = token == "-h" || token == "--help";
+            let is_version = token == "--version";
+            if !(is_help || token == "--verify" || is_version) {
                 return Err(err(format!(
                     "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
                     token.display()
