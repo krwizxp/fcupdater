@@ -1,0 +1,25 @@
+name: Temporary default Clippy threshold audit
+on:
+  push:
+    branches: [validation/full-audit-20261031-gpt6]
+permissions:
+  contents: read
+jobs:
+  default-threshold:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Latest stable
+        run: rustup toolchain install 1.99.1 --profile minimal --component clippy --no-self-update
+      - name: Native dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Default 100-line Clippy threshold
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/strict-clippy"
+          sed 's/^too-many-lines-threshold = 200$/too-many-lines-threshold = 100/' clippy.toml > "$RUNNER_TEMP/strict-clippy/clippy.toml"
+          cat "$RUNNER_TEMP/strict-clippy/clippy.toml"
+          CLIPPY_CONF_DIR="$RUNNER_TEMP/strict-clippy" cargo +1.99.1 clippy --frozen --all-targets -- -D warnings
