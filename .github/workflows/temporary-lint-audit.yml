@@ -1,0 +1,37 @@
+name: Temporary lint and bypass audit
+on:
+  push:
+    branches: [validation/full-audit-20261031-gpt6]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Resolve pinned stable toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --component clippy --component rustfmt --no-self-update
+      - name: Toolchain
+        run: rustc +1.99.1 -Vv
+      - name: Check lint bypasses
+        shell: bash
+        run: |
+          echo 'LINT_AUDIT_BEGIN'
+          git grep -n -E '#[[:space:]]*\[[[:space:]]*(allow|expect|cfg_attr)|cap-lints|rustfmt::skip|clippy::[^ =]*[[:space:]]*=[[:space:]]*"(allow|expect)"|(^|[[:space:]])-[AW][[:space:]]*(clippy|warnings)' -- '*.rs' '*.toml' '*.yml' '*.yaml' '*.sh' '*.json' || true
+          echo 'LINT_AUDIT_END'
+          echo 'CONFIG_BEGIN'
+          cat clippy.toml .cargo/config.toml .cargo/pgo.toml 2>/dev/null || true
+          echo 'CONFIG_END'
+      - name: Dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+      - name: Rust format
+        run: cargo +1.99.1 fmt --all -- --check
+      - name: Strict Clippy
+        run: cargo +1.99.1 clippy --frozen --all-targets -- -D warnings
+      - name: Tests
+        if: always()
+        run: cargo +1.99.1 test --frozen
