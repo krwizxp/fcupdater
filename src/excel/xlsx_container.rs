@@ -674,9 +674,7 @@ impl XlsxContainer {
     }
     pub(super) fn package_prepare_excel_output(&mut self) -> Result<CanonicalStyleMap> {
         let source_styles = self.text("xl/styles.xml")?;
-        let static_styles = EXCEL_STYLES_XML
-            .strip_suffix('\n')
-            .unwrap_or(EXCEL_STYLES_XML);
+        let static_styles = EXCEL_STYLES_XML.trim_suffix('\n');
         let canonical_styles =
             static_styles
                 .split_once('\n')
@@ -1368,7 +1366,7 @@ fn find_equivalent_xf(
     Ok(None)
 }
 fn excel_static_xml(source: &str) -> Vec<u8> {
-    let trimmed = source.strip_suffix('\n').unwrap_or(source);
+    let trimmed = source.trim_suffix('\n');
     let Some((first_line, remainder)) = trimmed.split_once('\n') else {
         return trimmed.as_bytes().to_vec();
     };

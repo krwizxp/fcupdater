@@ -960,7 +960,7 @@ fn row_fuel_price(
     let mut comma_seen = false;
     let mut decimal_seen = false;
     let mut round_up = false;
-    for byte in text.strip_prefix('+').unwrap_or(text).bytes() {
+    for byte in text.trim_prefix('+').bytes() {
         match byte {
             b'0'..=b'9' => {
                 let digit = i64::from(byte.strict_sub(b'0'));

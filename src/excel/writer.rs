@@ -1319,7 +1319,7 @@ impl Worksheet {
             return Ok(None);
         }
         let (negative, digits) = trimmed.strip_prefix('-').map_or_else(
-            || (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+            || (false, trimmed.trim_prefix('+')),
             |unsigned| (true, unsigned),
         );
         if digits.is_empty() {
@@ -2066,7 +2066,7 @@ impl Row {
     }
 }
 fn canonical_excel_fragment(source: &str) -> Result<String> {
-    let trimmed = source.strip_suffix('\n').unwrap_or(source);
+    let trimmed = source.trim_suffix('\n');
     let Some((first_line, remainder)) = trimmed.split_once('\n') else {
         return copy_text(trimmed);
     };

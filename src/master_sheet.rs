@@ -803,10 +803,9 @@ impl<'source> MasterSheetUpdater<'source> {
                 "유류비 숫자 셀 값이 올바르지 않습니다: row={row}, col={col}, value={trimmed}"
             ))
         };
-        let (sign, digits) = trimmed.strip_prefix('-').map_or_else(
-            || (1_i64, trimmed.strip_prefix('+').unwrap_or(trimmed)),
-            |rest| (-1_i64, rest),
-        );
+        let (sign, digits) = trimmed
+            .strip_prefix('-')
+            .map_or_else(|| (1_i64, trimmed.trim_prefix('+')), |rest| (-1_i64, rest));
         let (mantissa, exponent) = if let Some((mantissa, exponent)) = digits.split_once(['e', 'E'])
         {
             (

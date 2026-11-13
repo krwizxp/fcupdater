@@ -7,7 +7,7 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{
     ffi::{CStr, c_char, c_long, c_uint, c_void},
     marker::{PhantomData, PhantomPinned},
-    mem,
+    mem::{self, DropGuard},
     ptr::{NonNull, null_mut},
     slice, str,
 };
@@ -74,12 +74,6 @@ struct CurlSlist {
     _marker: PhantomData<(*mut u8, PhantomPinned)>,
 }
 struct EasyHandle(NonNull<Curl>);
-struct TransferOptions<'handle>(&'handle EasyHandle);
-impl Drop for TransferOptions<'_> {
-    fn drop(&mut self) {
-        self.0.reset();
-    }
-}
 struct HeaderList(Option<NonNull<CurlSlist>>);
 struct ResponseBody {
     bytes: Vec<u8>,
@@ -145,12 +139,6 @@ impl EasyHandle {
     fn perform(&self) -> CurlCode {
         // SAFETY: self.0 is a configured easy handle and callback data live until this call returns.
         unsafe { sys::curl_easy_perform(self.as_ptr()) }
-    }
-    fn reset(&self) {
-        // SAFETY: self.0 is a valid easy handle; reset only clears options and keeps connection cache.
-        unsafe {
-            sys::curl_easy_reset(self.as_ptr());
-        }
     }
     fn response_code(&self) -> DownloadResult<c_long> {
         let mut raw_status = c_long::default();
@@ -255,7 +243,12 @@ impl Client {
             let (perform_code, response_info) = {
                 let mut body_target = CurlWriteTarget::Body(&mut body_buffer);
                 let mut header_target = CurlWriteTarget::Header(&mut header_capture);
-                let _options = TransferOptions(handle);
+                let _options = DropGuard::new(&*handle, |reset_handle| {
+                    // SAFETY: reset_handle is valid; reset clears options while keeping connection cache.
+                    unsafe {
+                        sys::curl_easy_reset(reset_handle.as_ptr());
+                    }
+                });
                 handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
                 handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
                 handle.setopt_ptr(
@@ -399,7 +392,7 @@ impl CurlHeaderCapture {
         true
     }
     fn capture_line(&mut self, bytes: &[u8]) {
-        let line = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        let line = bytes.trim_suffix(b"\r");
         if line.starts_with(b"HTTP/") {
             self.current_block = Some(CapturedHeaderBlock::default());
             return;
