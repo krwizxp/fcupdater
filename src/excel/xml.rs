@@ -424,8 +424,8 @@ fn find_delimited_markup_end(
     )
 }
 pub(super) fn xml_misc_only(mut xml: &str, allow_bom: bool) -> bool {
-    if allow_bom && let Some(without_bom) = xml.strip_prefix('\u{feff}') {
-        xml = without_bom;
+    if allow_bom {
+        xml = xml.trim_prefix('\u{feff}');
     }
     loop {
         xml = xml.trim_start_matches([' ', '\t', '\n', '\r']);
