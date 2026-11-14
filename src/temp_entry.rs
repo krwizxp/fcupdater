@@ -111,12 +111,12 @@ pub(crate) fn validate_regular_file(file: &File) -> io::Result<(Metadata, FileId
             "리파스 포인트는 허용되지 않습니다.",
         ));
     }
-    if !metadata.is_file() {
-        return Err(io::Error::new(
+    metadata.is_file().ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             "경로는 일반 파일이어야 합니다.",
-        ));
-    }
+        )
+    })?;
     let (link_count, identity) = cfg_select! {
         target_os = "windows" => {{
             let mut information = ByHandleFileInformation::default();
@@ -148,11 +148,11 @@ pub(crate) fn validate_regular_file(file: &File) -> io::Result<(Metadata, FileId
             compile_error!("File identity supports only Windows, Linux, and macOS.")
         }
     };
-    if link_count != 1 {
-        return Err(io::Error::new(
+    (link_count == 1).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             "파일의 하드 링크 수는 1이어야 합니다.",
-        ));
-    }
+        )
+    })?;
     Ok((metadata, identity))
 }

@@ -366,13 +366,9 @@ impl Client {
                 if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
                     break;
                 }
-                if code != ERROR_INSUFFICIENT_BUFFER {
-                    return Err(Self::windows_error_message(
-                        "WinHttpQueryHeaders Set-Cookie 크기",
-                        code,
-                    )
-                    .into());
-                }
+                (code == ERROR_INSUFFICIENT_BUFFER).ok_or_else(|| {
+                    Self::windows_error_message("WinHttpQueryHeaders Set-Cookie 크기", code)
+                })?;
                 let header_bytes = bytes as usize;
                 header_bytes_seen = checked_http_buffer_len(
                     "헤더",
