@@ -1154,7 +1154,7 @@ impl Worksheet {
                     .and_then(|row_obj| row_obj.cells.get(cell_index))
                     .unwrap_or_else(|| process::abort());
                 let col = current_cell.col;
-                if col >= u32::BITS || formula_col_mask & 1_u32.strict_shl(col) == 0 {
+                if formula_col_mask & 1_u32.unbounded_shl(col) == 0 {
                     continue;
                 }
                 let state = column_state
@@ -2224,7 +2224,7 @@ pub(crate) fn format_excel_ratio_into(out: &mut String, numerator: i128, denomin
         }
     }
     if out.contains('.') {
-        out.truncate(out.trim_end_matches('0').trim_end_matches('.').len());
+        out.truncate(out.trim_end_matches('0').trim_suffix('.').len());
     }
 }
 fn replace_formula_tag_at(

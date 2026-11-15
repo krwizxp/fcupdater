@@ -142,20 +142,20 @@ cfg_select! {
                         "Windows UNC path is invalid",
                     ));
                 };
-                if unit == 0 {
-                    return Err(io::Error::new(
+                (unit != 0).ok_or_else(|| {
+                    io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "Windows file path contains a NUL character",
-                    ));
-                }
+                    )
+                })?;
             }
             for unit in path_wide {
-                if unit == 0 {
-                    return Err(io::Error::new(
+                (unit != 0).ok_or_else(|| {
+                    io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "Windows file path contains a NUL character",
-                    ));
-                }
+                    )
+                })?;
                 wide.push(unit);
             }
             wide.push(0);
