@@ -607,7 +607,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                         )));
                     }
                     (sheet_offset.replace(offset).is_none())
-                        .ok_or(err("Opinet 고정 소스와 다른 worksheet 개수입니다."))?;
+                        .ok_or_else(|| err("Opinet 고정 소스와 다른 worksheet 개수입니다."))?;
                 }
                 0x0042 => {
                     let parsed_code_page = read_u16_le(data, 0)?;
@@ -623,7 +623,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                 BIFF_RECORD_SST => {
                     shared_strings
                         .is_none()
-                        .ok_or(err("xls SST record가 중복 선언되었습니다."))?;
+                        .ok_or_else(|| err("xls SST record가 중복 선언되었습니다."))?;
                     code_page_seen.ok_or_else(|| {
                         err("BIFF CodePage record보다 SST가 먼저 선언되었습니다.")
                     })?;
@@ -645,7 +645,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         let parsed_shared_strings =
             shared_strings.ok_or_else(|| err("Opinet 고정 소스에서 SST를 찾지 못했습니다."))?;
         (!parsed_shared_strings.ranges.is_empty())
-            .ok_or(err("Opinet 고정 소스의 SST가 비어 있습니다."))?;
+            .ok_or_else(|| err("Opinet 고정 소스의 SST가 비어 있습니다."))?;
         Ok((parsed_sheet_offset, parsed_shared_strings))
     }
     fn read_sst(
@@ -655,7 +655,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
     ) -> Result<(BiffSharedStrings, usize)> {
         let (chunks, next_offset, total_chunk_bytes) =
             self.collect_sst_chunks(first_chunk, first_chunk_end)?;
-        (first_chunk.len() >= 8).ok_or(err("SST 데이터가 비정상적으로 짧습니다."))?;
+        (first_chunk.len() >= 8).ok_or_else(|| err("SST 데이터가 비정상적으로 짧습니다."))?;
         let mut reader = SstChunkReader {
             chunk_index: 0,
             chunks: &chunks,

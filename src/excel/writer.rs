@@ -704,9 +704,7 @@ impl WorksheetParser<'_, '_> {
             let has_attrs =
                 style.is_some() || value_type != CellValueType::General || shared_string;
             if cell_info.self_closing {
-                if shared_string {
-                    return Err(err("shared string cell 본문이 없습니다."));
-                }
+                (!shared_string).ok_or_else(|| err("shared string cell 본문이 없습니다."))?;
                 if has_attrs {
                     self.retain_cell(
                         row_num,
@@ -838,9 +836,8 @@ impl WorksheetParser<'_, '_> {
                             )));
                         }
                     };
-                    if slot.replace(value).is_some() {
-                        return Err(err("XML 태그에 중복 속성이 있습니다."));
-                    }
+                    (slot.replace(value).is_none())
+                        .ok_or_else(|| err("XML 태그에 중복 속성이 있습니다."))?;
                 }
                 let shared = formula_type.as_deref() == Some("shared");
                 if !shared
@@ -859,9 +856,8 @@ impl WorksheetParser<'_, '_> {
                     )));
                 }
                 if shared {
-                    if aca.is_some() {
-                        return Err(err("shared formula에 지원하지 않는 속성이 있습니다."));
-                    }
+                    aca.is_none()
+                        .ok_or_else(|| err("shared formula에 지원하지 않는 속성이 있습니다."))?;
                     let si_text = shared_index
                         .as_deref()
                         .ok_or_else(|| err("shared formula에 si 속성이 없습니다."))?;
@@ -915,9 +911,9 @@ impl WorksheetParser<'_, '_> {
                             }
                         }
                     } else {
-                        if range.is_some() {
-                            return Err(err("shared formula follower에 ref 범위가 있습니다."));
-                        }
+                        range
+                            .is_none()
+                            .ok_or_else(|| err("shared formula follower에 ref 범위가 있습니다."))?;
                         self.shared_formula_heads.get_mut(&si).ok_or_else(|| {
                             err(format!("shared formula anchor를 찾지 못했습니다: si={si}"))
                         })?
@@ -1132,7 +1128,7 @@ impl Worksheet {
             .iter()
             .copied()
             .chain(layout.optional_zero_col)
-            .fold(0_u32, |mask, col| mask | 1_u32.strict_shl(col));
+            .fold(0_u32, |mask, col| mask | 1_u32.unbounded_shl(col));
         let mut column_state = [None; MASTER_HEADERS.len().strict_add(1)];
         let mut follower_xml = String::new();
         let mut reference = String::new();
@@ -1480,7 +1476,7 @@ impl Worksheet {
         let required_col_mask = layout
             .required_cols
             .iter()
-            .fold(0_u32, |mask, &col| mask | 1_u32.strict_shl(col));
+            .fold(0_u32, |mask, &col| mask | 1_u32.unbounded_shl(col));
         let mut last_data_row = None;
         let mut last_master_address_row = None;
         let mut first_layout_issue = None;
