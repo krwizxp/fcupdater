@@ -2,6 +2,10 @@ use super::CellReference;
 use crate::diagnostic::{Result, err};
 use std::process;
 const MAX_A1_COLUMN_LETTERS: usize = 3;
+const SINGLE_LETTER_COLUMNS: [&str; 26] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "V", "W", "X", "Y", "Z",
+];
 pub(super) const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
 pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
@@ -61,6 +65,12 @@ pub(super) fn with_unlocked_ref_parts<R>(
     (1..=MAX_A1_COL)
         .contains(&col)
         .ok_or_else(|| err(format!("Excel column 범위를 벗어났습니다: {col}")))?;
+    (1..=MAX_A1_ROW)
+        .contains(&row)
+        .ok_or_else(|| err(format!("Excel row 범위를 벗어났습니다: {row}")))?;
+    if let Some(&single) = SINGLE_LETTER_COLUMNS.get((col.strict_sub(1)) as usize) {
+        return Ok(use_parts(single, row));
+    }
     let mut col_buffer = [0_u8; MAX_A1_COLUMN_LETTERS];
     let mut index = col_buffer.len();
     while col > 0 {
@@ -74,8 +84,5 @@ pub(super) fn with_unlocked_ref_parts<R>(
     }
     let col_name = str::from_utf8(col_buffer.get(index..).unwrap_or_else(|| process::abort()))
         .unwrap_or_else(|_| process::abort());
-    (1..=MAX_A1_ROW)
-        .contains(&row)
-        .ok_or_else(|| err(format!("Excel row 범위를 벗어났습니다: {row}")))?;
     Ok(use_parts(col_name, row))
 }

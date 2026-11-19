@@ -45,6 +45,34 @@ const DEFLATE_MAX_DISTANCE: usize = DEFLATE_WINDOW_LEN - MAX_MATCH - MIN_MATCH -
 const TOKEN_BLOCK_LIMIT: usize = 8191;
 const MATCH_CHUNK_BYTES: usize = 16;
 const XML_MAX_INSERT_MATCH_LEN: usize = 4;
+const LENGTH_SYMBOL_TABLE: [DeflateSymbol; 256] = {
+    let mut table = [DeflateSymbol {
+        extra: 0,
+        extra_bits: 0,
+        symbol: 285,
+    }; 256];
+    let mut slots: &mut [DeflateSymbol] = &mut table;
+    let mut value = 0_u16;
+    while let Some((slot, tail)) = slots.split_first_mut() {
+        if value < 255 {
+            let [extra_bits, _, _, _] = value.bit_width().saturating_sub(3).to_le_bytes();
+            let extra_u16 = extra_bits as u16;
+            let code_idx = if extra_bits == 0 {
+                value
+            } else {
+                extra_u16.strict_add(1).strict_mul(4) | ((value >> extra_bits) & 3)
+            };
+            *slot = DeflateSymbol {
+                extra: value & 1_u16.strict_shl(extra_bits as u32).strict_sub(1),
+                extra_bits,
+                symbol: 257_u16.strict_add(code_idx),
+            };
+        }
+        value = value.strict_add(1);
+        slots = tail;
+    }
+    table
+};
 const XML_NICE_MATCH_LEN: usize = 128;
 static FIXED_DECODE_TREES: LazyLock<DynamicTrees> = LazyLock::new(|| {
     let literal_lengths: [u8; FIXED_LITERAL_SYMBOLS] = from_fn(|symbol| match symbol {
@@ -266,10 +294,20 @@ impl BitWriter<'_> {
         let mask = u16::MAX.unbounded_shr(u16::BITS.strict_sub(u32::from(count)));
         self.bit_buffer |= u64::from(value & mask) << self.bit_count;
         self.bit_count = self.bit_count.strict_add(count);
-        while self.bit_count >= 8 {
-            self.write_byte(self.bit_buffer.to_le_bytes()[0])?;
-            self.bit_buffer >>= 8_u8;
-            self.bit_count = self.bit_count.strict_sub(8);
+        if self.bit_count >= 32 {
+            if self.buffer.len().strict_sub(self.buffered_len) < 4 {
+                self.flush_buffer()?;
+            }
+            let [b0, b1, b2, b3, ..] = self.bit_buffer.to_le_bytes();
+            let dst = self
+                .buffer
+                .get_mut(self.buffered_len..self.buffered_len.strict_add(4))
+                .unwrap_or_else(|| process::abort());
+            dst.copy_from_slice(&[b0, b1, b2, b3]);
+            self.buffered_len = self.buffered_len.strict_add(4);
+            self.len = self.len.strict_add(4);
+            self.bit_buffer >>= 32_u8;
+            self.bit_count = self.bit_count.strict_sub(32);
         }
         Ok(())
     }
@@ -1081,6 +1119,11 @@ impl DeflatePlan {
             writer,
         };
         self.write(&mut bit_writer)?;
+        while bit_writer.bit_count >= 8 {
+            bit_writer.write_byte(bit_writer.bit_buffer.to_le_bytes()[0])?;
+            bit_writer.bit_buffer >>= 8_u8;
+            bit_writer.bit_count = bit_writer.bit_count.strict_sub(8);
+        }
         if bit_writer.bit_count > 0 {
             bit_writer.write_byte(bit_writer.bit_buffer.to_le_bytes()[0])?;
         }
@@ -1178,25 +1221,7 @@ impl DeflateWriter<'_, '_> {
         *head_slot = u32::try_from(position).unwrap_or(u32::MAX);
     }
     fn length_symbol(length: u16) -> DeflateSymbol {
-        if length == 258 {
-            return DeflateSymbol {
-                extra: 0,
-                extra_bits: 0,
-                symbol: 285,
-            };
-        }
-        let value = length.strict_sub(3);
-        let [extra_bits, _, _, _] = value.bit_width().saturating_sub(3).to_le_bytes();
-        let index = if extra_bits == 0 {
-            value
-        } else {
-            u16::from(extra_bits).strict_add(1).strict_mul(4) | ((value >> extra_bits) & 3)
-        };
-        DeflateSymbol {
-            extra: value & 1_u16.strict_shl(u32::from(extra_bits)).strict_sub(1),
-            extra_bits,
-            symbol: 257_u16.strict_add(index),
-        }
+        huffman_get(&LENGTH_SYMBOL_TABLE, usize::from(length.strict_sub(3)))
     }
     pub(super) fn plan(&mut self) -> ZipResult<Option<DeflatePlan>> {
         let Some((tokens, crc32)) = self.tokens()? else {
