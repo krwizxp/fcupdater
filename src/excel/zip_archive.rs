@@ -419,11 +419,12 @@ impl ZipPackageReader<'_> {
             return Err(zip_static("분할 ZIP archive는 지원하지 않습니다."));
         }
         let entry_count = usize::from(entries_total);
-        if entry_count > XLSX_PARTS.len() {
+        let mut slots = [const { None }; XLSX_PARTS.len()];
+        let Some(entries) = slots.get_mut(..entry_count) else {
             return Err(err(format!(
                 "ZIP entry 수가 지원 상한을 초과했습니다: {entry_count}"
             )));
-        }
+        };
         let central_dir_size = read_u32(eocd, 12)? as usize;
         let central_dir_offset = read_u32(eocd, 16)? as usize;
         let central_dir_end = central_dir_offset
@@ -447,8 +448,7 @@ impl ZipPackageReader<'_> {
         };
         let mut total_uncompressed = 0_usize;
         let mut seen = [false; XLSX_PARTS.len()];
-        let mut entries = try_vec_with_capacity(entry_count, "ZIP entry 목록 메모리 확보 실패")?;
-        for _ in 0..entry_count {
+        for slot in entries.iter_mut() {
             let entry = central_directory.next_entry()?;
             let Some((part_index, (part_name, _, _))) = XLSX_PARTS
                 .iter()
@@ -476,7 +476,7 @@ impl ZipPackageReader<'_> {
                 ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES,
                 entry.name,
             )?;
-            entries.push((entry, part_index, expected_len));
+            *slot = Some((entry, part_index, expected_len));
         }
         if central_directory.cursor != central_directory.end {
             return Err(zip_static(ZIP_CENTRAL_DIRECTORY_SIZE_MISMATCH_MESSAGE));
@@ -486,13 +486,13 @@ impl ZipPackageReader<'_> {
                 return Err(err(format!("ZIP 필수 entry가 없습니다: {name}")));
             }
         }
-        entries.sort_unstable_by_key(|item| item.0.local_header_offset);
+        entries.sort_unstable_by_key(|slot| slot.as_ref().map(|item| item.0.local_header_offset));
         let mut expected_local_offset = 0_usize;
         let mut parts =
             try_vec_with_capacity(entry_count, "ZIP package part 목록 메모리 확보 실패")?;
         let mut record_bytes = Vec::new();
         let mut archive_crc = u32::MAX;
-        let mut entry_iter = entries.into_iter().peekable();
+        let mut entry_iter = entries.iter_mut().filter_map(Option::take).peekable();
         while let Some((entry, part_index, expected_len)) = entry_iter.next() {
             let local_offset = entry.local_header_offset as usize;
             let next_offset = entry_iter.peek().map_or(central_dir_offset, |item| {
