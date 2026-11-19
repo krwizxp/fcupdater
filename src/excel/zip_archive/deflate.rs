@@ -92,7 +92,20 @@ struct WriteHuffman {
     codes: [[u8; 3]; LITERAL_LENGTH_SYMBOLS],
 }
 #[derive(Clone, Copy)]
-enum DeflateToken {
+struct DeflateToken(u32);
+impl DeflateToken {
+    const fn into_kind(self) -> DeflateTokenKind {
+        if self.0 & 0x8000_0000 == 0 {
+            DeflateTokenKind::Literal((self.0 & 0xFF) as u16)
+        } else {
+            let length = (((self.0 >> 16_u32) & 0xFF) as u16).strict_add(3);
+            let distance = ((self.0 & 0x7FFF) as u16).strict_add(1);
+            DeflateTokenKind::Match { distance, length }
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum DeflateTokenKind {
     Literal(u16),
     Match { distance: u16, length: u16 },
 }
@@ -111,7 +124,7 @@ pub(super) struct DeflateInflater<'bytes> {
 }
 #[derive(Default)]
 pub(super) struct DeflateWorkspace {
-    head: Vec<usize>,
+    head: Vec<u32>,
     previous: Vec<u16>,
     tokens: Vec<DeflateToken>,
     work_budget: DeflateWorkBudget,
@@ -610,8 +623,8 @@ impl DynamicFrequencies {
         let mut fixed_bit_len = 3_usize;
         let mut has_distance = false;
         for &token in tokens {
-            match token {
-                DeflateToken::Literal(byte) => {
+            match token.into_kind() {
+                DeflateTokenKind::Literal(byte) => {
                     let freq = self
                         .literal
                         .get_mut(usize::from(byte))
@@ -619,7 +632,7 @@ impl DynamicFrequencies {
                     *freq = freq.strict_add(1);
                     fixed_bit_len = fixed_bit_len.strict_add(if byte <= 143 { 8 } else { 9 });
                 }
-                DeflateToken::Match { distance, length } => {
+                DeflateTokenKind::Match { distance, length } => {
                     let length_code = DeflateWriter::length_symbol(length);
                     let length_freq = self
                         .literal
@@ -831,9 +844,11 @@ impl DynamicDeflatePlan {
             writer.write_bits(token.extra, token.extra_bits)?;
         }
         for &token in tokens {
-            match token {
-                DeflateToken::Literal(byte) => self.literal_huffman.write_symbol(writer, byte)?,
-                DeflateToken::Match { distance, length } => {
+            match token.into_kind() {
+                DeflateTokenKind::Literal(byte) => {
+                    self.literal_huffman.write_symbol(writer, byte)?;
+                }
+                DeflateTokenKind::Match { distance, length } => {
                     let length_code = DeflateWriter::length_symbol(length);
                     self.literal_huffman
                         .write_symbol(writer, length_code.symbol)?;
@@ -1037,9 +1052,9 @@ impl DeflatePlan {
                 writer.write_bits(0, 1)?;
                 writer.write_bits(1, 2)?;
                 for &token in tokens {
-                    match token {
-                        DeflateToken::Literal(byte) => write_fixed_symbol(writer, byte)?,
-                        DeflateToken::Match { distance, length } => {
+                    match token.into_kind() {
+                        DeflateTokenKind::Literal(byte) => write_fixed_symbol(writer, byte)?,
+                        DeflateTokenKind::Match { distance, length } => {
                             let length_code = DeflateWriter::length_symbol(length);
                             write_fixed_symbol(writer, length_code.symbol)?;
                             writer.write_bits(length_code.extra, length_code.extra_bits)?;
@@ -1098,13 +1113,13 @@ impl DeflateWorkspace {
             .try_reserve_exact(initial_token_capacity)
             .map_err(|source| zip_with_source("deflate token 메모리 확보 실패", source))?;
         if self.head.len() == HASH_SIZE {
-            self.head.fill(usize::MAX);
+            self.head.fill(u32::MAX);
         } else {
             self.head.clear();
             self.head
                 .try_reserve_exact(HASH_SIZE)
                 .map_err(|source| zip_with_source("deflate hash head 메모리 확보 실패", source))?;
-            self.head.resize(HASH_SIZE, usize::MAX);
+            self.head.resize(HASH_SIZE, u32::MAX);
         }
         let previous_len = input_len.min(DEFLATE_WINDOW_LEN);
         if self.previous.len() < previous_len {
@@ -1139,23 +1154,28 @@ impl DeflateWriter<'_, '_> {
     fn insert_position(
         position: usize,
         hash_index: Option<usize>,
-        head: &mut [usize],
+        head: &mut [u32],
         previous: &mut [u16],
     ) {
         let Some(hash) = hash_index else {
             return;
         };
         let head_slot = head.get_mut(hash).unwrap_or_else(|| process::abort());
-        let previous_distance = position
-            .checked_sub(*head_slot)
-            .and_then(|distance| u16::try_from(distance).ok())
-            .filter(|distance| usize::from(*distance) <= DEFLATE_WINDOW_LEN)
-            .unwrap_or(0);
+        let head_pos = *head_slot;
+        let previous_distance = if head_pos == u32::MAX {
+            0
+        } else {
+            position
+                .checked_sub(head_pos as usize)
+                .and_then(|distance| u16::try_from(distance).ok())
+                .filter(|distance| usize::from(*distance) <= DEFLATE_WINDOW_LEN)
+                .unwrap_or(0)
+        };
         let slot = previous
             .get_mut(position.rem_euclid(DEFLATE_WINDOW_LEN))
             .unwrap_or_else(|| process::abort());
         *slot = previous_distance;
-        *head_slot = position;
+        *head_slot = u32::try_from(position).unwrap_or(u32::MAX);
     }
     fn length_symbol(length: u16) -> DeflateSymbol {
         if length == 258 {
@@ -1237,7 +1257,11 @@ impl DeflateWriter<'_, '_> {
             if let Some(hash) = position_hash
                 && let Some(&head_candidate) = head.get(hash)
             {
-                let mut candidate = head_candidate;
+                let mut candidate = if head_candidate == u32::MAX {
+                    usize::MAX
+                } else {
+                    head_candidate as usize
+                };
                 let min_candidate = position.saturating_sub(DEFLATE_MAX_DISTANCE);
                 let max_len = bytes.len().strict_sub(position).min(MAX_MATCH);
                 let mut chain_len = 0_usize;
@@ -1309,12 +1333,15 @@ impl DeflateWriter<'_, '_> {
             }
             Self::insert_position(position, position_hash, head, previous);
             if best_len >= MIN_MATCH {
+                let dist_bits = u32::from(
+                    deflate_u16(best_distance, "deflate match distance 변환 실패")?.strict_sub(1),
+                ) & 0x7FFF;
+                let len_bits = u32::from(
+                    deflate_u16(best_len, "deflate match length 변환 실패")?.strict_sub(3),
+                ) & 0xFF;
                 push_deflate_token(
                     &mut tokens,
-                    DeflateToken::Match {
-                        distance: deflate_u16(best_distance, "deflate match distance 변환 실패")?,
-                        length: deflate_u16(best_len, "deflate match length 변환 실패")?,
-                    },
+                    DeflateToken(0x8000_0000 | (len_bits << 16_u32) | dist_bits),
                 )?;
                 let next_position = position
                     .checked_add(best_len)
@@ -1334,7 +1361,7 @@ impl DeflateWriter<'_, '_> {
                 let Some(&byte) = bytes.get(position) else {
                     return Err(zip_static("deflate literal 범위 오류"));
                 };
-                push_deflate_token(&mut tokens, DeflateToken::Literal(u16::from(byte)))?;
+                push_deflate_token(&mut tokens, DeflateToken(u32::from(byte)))?;
                 position = position.strict_add(1);
             }
         }
