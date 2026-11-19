@@ -721,26 +721,37 @@ impl WorksheetParser<'_, '_> {
                 continue;
             }
             let retained_cell = if shared_string {
-                let mut value_scanner = XmlScanner::new(inner_xml_text);
-                let value = value_scanner
-                    .next_element_named("v")?
-                    .filter(|element| element.opening.name == "v" && !element.opening.self_closing)
-                    .ok_or_else(|| err("shared string cell에 v 태그가 없습니다."))?;
-                let mut value_attrs = XmlAttrScanner::new(value.opening.raw)?;
-                (value_attrs.next()?.is_none())
-                    .ok_or(err("shared string v 태그에 속성이 있습니다."))?;
-                (value_scanner.next_tag().is_none()
-                    && inner_xml_text
-                        .get(..value.span.start)
-                        .is_some_and(|text| text.trim().is_empty())
-                    && inner_xml_text
-                        .get(value.span.end..)
-                        .is_some_and(|text| text.trim().is_empty()))
-                .ok_or(err("shared string cell 본문 형식이 올바르지 않습니다."))?;
-                (!value.body.starts_with('+')).ok_or(err(
+                let value_body = if let Some(body) = inner_xml_text
+                    .strip_prefix("<v>")
+                    .and_then(|rest| rest.strip_suffix("</v>"))
+                    && !body.as_bytes().contains(&b'<')
+                {
+                    body
+                } else {
+                    let mut value_scanner = XmlScanner::new(inner_xml_text);
+                    let value = value_scanner
+                        .next_element_named("v")?
+                        .filter(|element| {
+                            element.opening.name == "v" && !element.opening.self_closing
+                        })
+                        .ok_or_else(|| err("shared string cell에 v 태그가 없습니다."))?;
+                    let mut value_attrs = XmlAttrScanner::new(value.opening.raw)?;
+                    (value_attrs.next()?.is_none())
+                        .ok_or(err("shared string v 태그에 속성이 있습니다."))?;
+                    (value_scanner.next_tag().is_none()
+                        && inner_xml_text
+                            .get(..value.span.start)
+                            .is_some_and(|text| text.trim().is_empty())
+                        && inner_xml_text
+                            .get(value.span.end..)
+                            .is_some_and(|text| text.trim().is_empty()))
+                    .ok_or(err("shared string cell 본문 형식이 올바르지 않습니다."))?;
+                    value.body
+                };
+                (!value_body.starts_with('+')).ok_or(err(
                     "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.",
                 ))?;
-                let index = value.body.parse::<usize>().map_err(|source| {
+                let index = value_body.parse::<usize>().map_err(|source| {
                     if matches!(
                         source.kind(),
                         IntErrorKind::Empty | IntErrorKind::InvalidDigit
@@ -780,7 +791,12 @@ impl WorksheetParser<'_, '_> {
                 "worksheet cell 개수가 허용 한도({MAX_WORKSHEET_CELL_COUNT})를 초과했습니다."
             )));
         }
-        if !cell.inner_xml.is_empty() {
+        let skip_simple_value = cell
+            .inner_xml
+            .strip_prefix("<v>")
+            .and_then(|rest| rest.strip_suffix("</v>"))
+            .is_some_and(|body| !body.as_bytes().contains(&b'<'));
+        if !cell.inner_xml.is_empty() && !skip_simple_value {
             let inner_xml = cell.inner_xml.as_str();
             let mut formula_scanner = XmlScanner::new(inner_xml);
             let mut formula_element = None;
