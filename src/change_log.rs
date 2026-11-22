@@ -55,20 +55,19 @@ impl ChangeLogRowValues<'_> {
         ] {
             shared_strings.set_cell(worksheet, col, row, value)?;
         }
-        let fuels = FUEL_COLUMNS.iter().zip(
-            self.old_fuels
-                .into_array()
-                .into_iter()
-                .zip(self.new_fuels.into_array()),
-        );
-        for (&(old_col_num, new_col_num, ..), (old_value, new_value)) in fuels.clone() {
-            worksheet.set_i32_at(old_col_num, row, old_value)?;
-            worksheet.set_i32_at(new_col_num, row, new_value)?;
-        }
         let mut row_buffer = NumBuffer::new();
         let row_text = row.format_into(&mut row_buffer);
         let mut cache_buffer = NumBuffer::new();
-        for (&(_, _, target_col, old_col, new_col), (old_value, new_value)) in fuels {
+        for (&(old_col_num, new_col_num, target_col, old_col, new_col), (old_value, new_value)) in
+            FUEL_COLUMNS.iter().zip(
+                self.old_fuels
+                    .into_array()
+                    .into_iter()
+                    .zip(self.new_fuels.into_array()),
+            )
+        {
+            worksheet.set_i32_at(old_col_num, row, old_value)?;
+            worksheet.set_i32_at(new_col_num, row, new_value)?;
             let cached_value = old_value
                 .zip(new_value)
                 .map(|(old, new)| new.strict_sub(old));

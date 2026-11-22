@@ -30,6 +30,22 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 mod atomic_replace;
+macro_rules! rel_spec {
+    ($target:expr, $type_:expr) => {
+        RelationshipSpec {
+            optional_part: None,
+            target: $target,
+            type_: $type_,
+        }
+    };
+    ($optional_part:expr, $target:expr, $type_:expr) => {
+        RelationshipSpec {
+            optional_part: Some($optional_part),
+            target: $target,
+            type_: $type_,
+        }
+    };
+}
 const CONTENT_TYPES_NAMESPACE: &str =
     "http://schemas.openxmlformats.org/package/2006/content-types";
 const OFFICE_DOCUMENT_REL_NAMESPACE: &str =
@@ -56,69 +72,51 @@ const CONTENT_TYPE_DEFAULTS: [(&str, &str, PartRole); 6] = [
     ("png", "image/png", PartRole::InputOnly),
 ];
 const ROOT_RELATIONSHIPS: [RelationshipSpec; 5] = [
-    RelationshipSpec {
-        optional_part: None,
-        target: "docProps/core.xml",
-        type_: "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
-    },
-    RelationshipSpec {
-        optional_part: Some("docProps/thumbnail.emf"),
-        target: "docProps/thumbnail.emf",
-        type_: "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail",
-    },
-    RelationshipSpec {
-        optional_part: None,
-        target: WORKBOOK_REL_TARGET,
-        type_: OFFICE_DOCUMENT_REL_TYPE,
-    },
-    RelationshipSpec {
-        optional_part: None,
-        target: "docProps/app.xml",
-        type_: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
-    },
-    RelationshipSpec {
-        optional_part: Some("docProps/custom.xml"),
-        target: "docProps/custom.xml",
-        type_: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties",
-    },
+    rel_spec!(
+        "docProps/core.xml",
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties"
+    ),
+    rel_spec!(
+        "docProps/thumbnail.emf",
+        "docProps/thumbnail.emf",
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"
+    ),
+    rel_spec!(WORKBOOK_REL_TARGET, OFFICE_DOCUMENT_REL_TYPE),
+    rel_spec!(
+        "docProps/app.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties"
+    ),
+    rel_spec!(
+        "docProps/custom.xml",
+        "docProps/custom.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties"
+    ),
 ];
 const WORKBOOK_RELATIONSHIPS: [RelationshipSpec; 6] = [
-    RelationshipSpec {
-        optional_part: None,
-        target: "theme/theme1.xml",
-        type_: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
-    },
-    RelationshipSpec {
-        optional_part: None,
-        target: "worksheets/sheet2.xml",
-        type_: WORKSHEET_REL_TYPE,
-    },
-    RelationshipSpec {
-        optional_part: None,
-        target: "worksheets/sheet1.xml",
-        type_: WORKSHEET_REL_TYPE,
-    },
-    RelationshipSpec {
-        optional_part: None,
-        target: "sharedStrings.xml",
-        type_: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
-    },
-    RelationshipSpec {
-        optional_part: None,
-        target: "styles.xml",
-        type_: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
-    },
-    RelationshipSpec {
-        optional_part: Some(CALC_CHAIN_PATH),
-        target: "calcChain.xml",
-        type_: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain",
-    },
+    rel_spec!(
+        "theme/theme1.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"
+    ),
+    rel_spec!("worksheets/sheet2.xml", WORKSHEET_REL_TYPE),
+    rel_spec!("worksheets/sheet1.xml", WORKSHEET_REL_TYPE),
+    rel_spec!(
+        "sharedStrings.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"
+    ),
+    rel_spec!(
+        "styles.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
+    ),
+    rel_spec!(
+        CALC_CHAIN_PATH,
+        "calcChain.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain"
+    ),
 ];
-const SHEET_RELATIONSHIPS: [RelationshipSpec; 1] = [RelationshipSpec {
-    optional_part: None,
-    target: "../drawings/drawing1.xml",
-    type_: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
-}];
+const SHEET_RELATIONSHIPS: [RelationshipSpec; 1] = [rel_spec!(
+    "../drawings/drawing1.xml",
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
+)];
 const EXCEL_STYLES_XML: &str = include_str!("excel_styles.xml");
 const EXCEL_THEME_XML: &str = include_str!("excel_theme.xml");
 const EXCEL_CONTENT_TYPES_XML: &str = include_str!("excel_content_types.xml");
@@ -284,26 +282,16 @@ impl TempArchivePromotion<'_> {
         context: &str,
         source: atomic_replace::ReplaceFailure,
     ) -> Result<()> {
-        let message = cfg_select! {
-            target_os = "windows" => {
-                format!(
-                    "{context}; 자동 복구 실패 후 수동 복구를 위해 현재 경로 상태를 보존했습니다: target={}, replacement={}, backup={}",
-                    self.target_xlsx.display(),
-                    self.temp_archive.path().display(),
-                    self.backup_archive.path().display(),
-                )
-            }
-            any(target_os = "linux", target_os = "macos") => {
-                format!(
-                    "{context}; 자동 복구 실패 후 수동 복구를 위해 현재 경로 상태를 보존했습니다: target={}, replacement={}",
-                    self.target_xlsx.display(),
-                    self.temp_archive.path().display(),
-                )
-            }
-            _ => {
-                compile_error!("fcupdater archive promotion supports only Windows, Linux, and macOS.")
-            }
+        let backup_suffix = cfg_select! {
+            target_os = "windows" => format!(", backup={}", self.backup_archive.path().display()),
+            any(target_os = "linux", target_os = "macos") => "",
+            _ => compile_error!("fcupdater archive promotion supports only Windows, Linux, and macOS."),
         };
+        let message = format!(
+            "{context}; 자동 복구 실패 후 수동 복구를 위해 현재 경로 상태를 보존했습니다: target={}, replacement={}{backup_suffix}",
+            self.target_xlsx.display(),
+            self.temp_archive.path().display(),
+        );
         self.temp_archive.disable_drop_cleanup();
         #[cfg(target_os = "windows")]
         self.backup_archive.disable_drop_cleanup();
@@ -339,38 +327,29 @@ impl TempArchivePromotion<'_> {
             #[cfg(target_os = "windows")]
             false,
         );
-        match replace_result {
-            Ok(()) => {}
-            Err(atomic_replace::ReplaceFilesError::Failed(source)) => {
-                return Err(err_with_source(
-                    format!(
-                        "xlsx 저장 실패: {} -> {}",
-                        self.temp_archive.path().display(),
-                        self.target_xlsx.display(),
-                    ),
-                    source,
-                ));
-            }
-            #[cfg(target_os = "windows")]
-            Err(atomic_replace::ReplaceFilesError::Restored(source)) => {
-                return Err(err_with_source(
-                    format!(
-                        "xlsx 저장 실패 후 원본 대상 파일 자동 복원 완료: {} -> {}",
-                        self.temp_archive.path().display(),
-                        self.target_xlsx.display(),
-                    ),
-                    source,
-                ));
-            }
-            #[cfg(target_os = "windows")]
-            Err(atomic_replace::ReplaceFilesError::RecoveryRequired(source)) => {
-                let context = format!(
-                    "xlsx 저장 중 원본 대상 파일 자동 복구 실패: {} -> {}",
+        if let Err(replace_error) = replace_result {
+            let format_context = |label: &str| {
+                format!(
+                    "{label}: {} -> {}",
                     self.temp_archive.path().display(),
                     self.target_xlsx.display(),
-                );
-                return self.preserve_recovery_archives(&context, source);
-            }
+                )
+            };
+            return match replace_error {
+                atomic_replace::ReplaceFilesError::Failed(source) => {
+                    Err(err_with_source(format_context("xlsx 저장 실패"), source))
+                }
+                #[cfg(target_os = "windows")]
+                atomic_replace::ReplaceFilesError::Restored(source) => Err(err_with_source(
+                    format_context("xlsx 저장 실패 후 원본 대상 파일 자동 복원 완료"),
+                    source,
+                )),
+                #[cfg(target_os = "windows")]
+                atomic_replace::ReplaceFilesError::RecoveryRequired(source) => {
+                    let context = format_context("xlsx 저장 중 원본 대상 파일 자동 복구 실패");
+                    self.preserve_recovery_archives(&context, source)
+                }
+            };
         }
         if let Err(validation_error) = self.validate_displaced_original() {
             return self.rollback_after_validation_failure(validation_error);
@@ -783,12 +762,6 @@ impl XlsxContainer {
         }
         Ok(input_styles)
     }
-    fn part(&self, name: &str) -> &[u8] {
-        self.parts
-            .get(part_index(name))
-            .and_then(Option::as_deref)
-            .unwrap_or_else(|| process::abort())
-    }
     fn part_mut(&mut self, name: &str) -> &mut Vec<u8> {
         self.parts
             .get_mut(part_index(name))
@@ -880,24 +853,21 @@ impl XlsxContainer {
             }
             .promote()
         })();
-        match result {
-            Ok(()) => Ok(()),
-            Err(source) => {
-                if !tmp_archive.remove_on_drop {
-                    return Err(source);
-                }
-                match tmp_archive.remove_owned() {
-                    Ok(()) => Err(source),
-                    Err(error) => Err(err_with_source(
-                        format!(
-                            "xlsx 임시 저장 파일 삭제 실패: {} ({error})",
-                            tmp_archive.path().display(),
-                        ),
-                        source,
-                    )),
-                }
-            }
+        let Err(source) = result else {
+            return Ok(());
+        };
+        if tmp_archive.remove_on_drop
+            && let Err(error) = tmp_archive.remove_owned()
+        {
+            return Err(err_with_source(
+                format!(
+                    "xlsx 임시 저장 파일 삭제 실패: {} ({error})",
+                    tmp_archive.path().display(),
+                ),
+                source,
+            ));
         }
+        Err(source)
     }
     pub(super) fn take_shared_strings_text(&mut self) -> Result<String> {
         let xml = self.take_text("xl/sharedStrings.xml")?;
@@ -1031,7 +1001,12 @@ impl XlsxContainer {
         Ok(xml)
     }
     fn text(&self, name: &str) -> Result<&str> {
-        str::from_utf8(self.part(name))
+        let bytes = self
+            .parts
+            .get(part_index(name))
+            .and_then(Option::as_deref)
+            .unwrap_or_else(|| process::abort());
+        str::from_utf8(bytes)
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
     }
     fn validate_content_types(&self) -> Result<()> {
@@ -1160,15 +1135,15 @@ fn style_entries<'text>(
                 entry.opening.name
             )));
         }
-        entries
-            .try_reserve(1)
-            .map_err(|source| err_with_source("styles.xml 항목 목록 메모리 확보 실패", source))?;
-        entries.push(
+        try_push_vec(
+            &mut entries,
             element
                 .body
                 .get(entry.span)
                 .unwrap_or_else(|| process::abort()),
-        );
+            1,
+            "styles.xml 항목 목록 메모리 확보 실패",
+        )?;
     }
     if scanner.next_start_named(group_name).is_some() {
         return Err(err(format!(

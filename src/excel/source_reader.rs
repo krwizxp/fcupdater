@@ -135,24 +135,6 @@ struct SstChunkReader<'chunks, 'chunk> {
     offset_in_chunk: usize,
 }
 impl SourceReader {
-    fn build_fat_table(&self, fat_sector_ids: &[u32]) -> Result<Vec<u32>> {
-        let entries_per_sector = CFB_SECTOR_SIZE.div_euclid(4);
-        let total_entries = fat_sector_ids.len().strict_mul(entries_per_sector);
-        let mut fat = try_vec_with_capacity(total_entries, "CFB FAT 메모리 확보 실패")?;
-        for &sid in fat_sector_ids {
-            let sector = get_sector_slice(&self.0, sid)?;
-            let (chunks, _) = sector.as_chunks::<4>();
-            fat.extend(chunks.iter().map(|chunk| u32::from_le_bytes(*chunk)));
-        }
-        Ok(fat)
-    }
-    fn header_difat_entries(&self) -> Result<&[[u8; 4]]> {
-        let header_difat = self
-            .0
-            .get(0x4C..512)
-            .ok_or_else(|| err("CFB DIFAT 헤더 범위가 손상되었습니다."))?;
-        Ok(header_difat.as_chunks::<4>().0)
-    }
     fn parse_cfb_header(&self) -> Result<CfbHeader> {
         let data = self
             .0
@@ -312,7 +294,12 @@ impl SourceReader {
                 "CFB FAT sector 개수가 비정상적으로 큽니다: {declared_fat_sectors} (최대 {max_sector_count})"
             )));
         }
-        let difat_chunks = self.header_difat_entries()?;
+        let difat_chunks = self
+            .0
+            .get(0x4C..512)
+            .ok_or_else(|| err("CFB DIFAT 헤더 범위가 손상되었습니다."))?
+            .as_chunks::<4>()
+            .0;
         if declared_fat_sectors > difat_chunks.len() {
             return Err(err(format!(
                 "CFB FAT 엔트리 개수가 header DIFAT 용량을 초과했습니다: {declared_fat_sectors}"
@@ -340,7 +327,22 @@ impl SourceReader {
                 difat_entries.len()
             )));
         }
-        let fat = self.build_fat_table(&difat_entries)?;
+        let mut fat = try_vec_with_capacity(
+            difat_entries
+                .len()
+                .strict_mul(CFB_SECTOR_SIZE.div_euclid(4)),
+            "CFB FAT 메모리 확보 실패",
+        )?;
+        for &sid in &difat_entries {
+            let sector = get_sector_slice(&self.0, sid)?;
+            fat.extend(
+                sector
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_le_bytes(*chunk)),
+            );
+        }
         let mini_fat_last_sector = if header.num_mini_fat_sectors == 0 {
             if header.first_mini_fat_sector != CFB_END_OF_CHAIN {
                 return Err(err(format!(

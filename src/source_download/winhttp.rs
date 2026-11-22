@@ -11,7 +11,7 @@ use core::{
     result::Result as CoreResult,
     time::Duration,
 };
-use std::{process, time::Instant};
+use std::time::Instant;
 mod sys;
 const DWORD_BYTE_SIZE: u32 = 4;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -252,13 +252,13 @@ impl Client {
                 session,
             })
         };
-        let mut empty_slot = None;
-        for (index, slot) in cache.connects.iter().enumerate() {
-            match slot.as_ref() {
-                Some(entry) if entry.host == host => return Ok(entry.handle.0),
-                None if empty_slot.is_none() => empty_slot = Some(index),
-                Some(_) | None => {}
-            }
+        if let Some(entry) = cache
+            .connects
+            .iter()
+            .flatten()
+            .find(|entry| entry.host == host)
+        {
+            return Ok(entry.handle.0);
         }
         let host_wide = wide(host)?;
         // SAFETY: host_wide is NUL-terminated and cache.session is a valid session handle.
@@ -273,16 +273,14 @@ impl Client {
         let handle = Self::non_null_handle(raw_connect, "WinHttpConnect")?;
         let connect = handle.0;
         let entry = CachedConnect { handle, host };
-        if let Some(index) = empty_slot {
-            let slot = cache
-                .connects
-                .get_mut(index)
-                .unwrap_or_else(|| process::abort());
-            *slot = Some(entry);
+        let [first, second] = cache.connects.each_mut();
+        if first.is_none() {
+            *first = Some(entry);
         } else {
-            cache.connects.rotate_left(1);
-            let [_, slot] = cache.connects.each_mut();
-            *slot = Some(entry);
+            if second.is_some() {
+                *first = second.take();
+            }
+            *second = Some(entry);
         }
         Ok(connect)
     }

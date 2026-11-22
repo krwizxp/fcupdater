@@ -6,7 +6,6 @@ use crate::diagnostic::AppError as DownloadError;
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{
     ffi::{CStr, c_char, c_long, c_uint, c_void},
-    marker::{PhantomData, PhantomPinned},
     mem::{self, DropGuard},
     ptr::{NonNull, null_mut},
     slice, str,
@@ -54,11 +53,7 @@ static CURL_INIT: LazyLock<CurlCode> = LazyLock::new(|| {
     // SAFETY: LazyLock runs this initializer once before any easy handles are used.
     unsafe { sys::curl_global_init(CURL_GLOBAL_DEFAULT) }
 });
-#[repr(C)]
-struct Curl {
-    _data: (),
-    _marker: PhantomData<(*mut u8, PhantomPinned)>,
-}
+enum Curl {}
 type CurlCode = c_uint;
 type CurlInfo = c_uint;
 type CurlOffT = i64;
@@ -69,11 +64,7 @@ pub(super) struct Client {
     header_build_buffer: Vec<u8>,
     url_buffer: Vec<u8>,
 }
-#[repr(C)]
-struct CurlSlist {
-    _data: (),
-    _marker: PhantomData<(*mut u8, PhantomPinned)>,
-}
+enum CurlSlist {}
 struct EasyHandle(NonNull<Curl>);
 struct HeaderList(Option<NonNull<CurlSlist>>);
 struct ResponseBody {
