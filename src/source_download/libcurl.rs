@@ -38,6 +38,7 @@ const CURLOPT_POST: CurlOption = 47;
 const CURLOPT_POSTFIELDS: CurlOption = 10_015;
 const CURLOPT_POSTFIELDSIZE: CurlOption = 60;
 const CURLOPT_PROTOCOLS_STR: CurlOption = 10_318;
+const HTTP_MAX_BODY_BYTES_OFF_T: CurlOffT = 32 * 1024 * 1024;
 const CURLOPT_SSLVERSION: CurlOption = 32;
 const CURLOPT_TIMEOUT_MS: CurlOption = 155;
 const CURLOPT_URL: CurlOption = 10_002;
@@ -191,7 +192,7 @@ impl Client {
     pub(super) fn request(
         &mut self,
         request_body: Option<&[u8]>,
-        host: &str,
+        host: &'static str,
         path: &str,
         request_headers: RequestHeaders<'_>,
     ) -> DownloadResult<HttpResponse> {
@@ -270,10 +271,7 @@ impl Client {
                     handle.setopt_long(option, value)?;
                 }
                 handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
-                let max_file_size = CurlOffT::try_from(HTTP_MAX_BODY_BYTES).map_err(|source| {
-                    download_error_with_source("HTTP 본문 한도 변환 실패", source)
-                })?;
-                handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, max_file_size)?;
+                handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, HTTP_MAX_BODY_BYTES_OFF_T)?;
                 if let Some(body_bytes) = request_body {
                     handle.setopt_long(CURLOPT_POST, 1)?;
                     let body_len = c_long::try_from(body_bytes.len()).map_err(|source| {
@@ -333,19 +331,9 @@ impl Client {
         if let Some(header_error) = final_block.error {
             return Err(header_error);
         }
-        let headers = final_block.headers;
-        if let Some(expected_len) = headers.content_length
-            && body_buffer.bytes.len() != expected_len
-        {
-            return Err(format!(
-                "HTTP 응답 본문 길이가 Content-Length와 다릅니다: expected={expected_len}, actual={}",
-                body_buffer.bytes.len()
-            )
-            .into());
-        }
         Ok(HttpResponse {
             body: body_buffer.bytes,
-            headers,
+            headers: final_block.headers,
             status,
         })
     }

@@ -155,8 +155,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
                 "ZIP deflate 출력 크기가 계획과 다릅니다: expected={compressed_size}, actual={actual_written}"
             )));
         }
-        self.bytes_written =
-            self.ensure_output_limit(compressed_size, "ZIP 압축 데이터 출력 크기 계산")?;
+        self.bytes_written = self.bytes_written.strict_add(compressed_size);
         self.deflate_workspace.recycle(plan);
         Ok(WriteEntry {
             compressed_size: compressed_size_u32,

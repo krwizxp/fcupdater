@@ -6,7 +6,7 @@ const SINGLE_LETTER_COLUMNS: [&str; 26] = [
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
     "T", "U", "V", "W", "X", "Y", "Z",
 ];
-pub(super) const MAX_A1_COL: u32 = 0x4000;
+const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
 pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
     let bytes = reference.as_bytes();

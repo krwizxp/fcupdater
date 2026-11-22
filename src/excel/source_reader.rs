@@ -461,9 +461,7 @@ impl SstChunkReader<'_, '_> {
             out.try_reserve(additional_capacity)
                 .map_err(|source| err_with_source("SST 문자열 메모리 확보 실패", source))?;
             if high_byte {
-                let (mut chunks, &[]) = bytes.as_chunks::<2>() else {
-                    return Err(err("SST UTF-16 문자열 길이가 홀수입니다."));
-                };
+                let (mut chunks, _) = bytes.as_chunks::<2>();
                 let previous_surrogate = pending_surrogate.take();
                 if let Some((last, rest)) = chunks.split_last()
                     && matches!(u16::from_le_bytes(*last), 0xd800..=0xdbff)
@@ -870,12 +868,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     })?;
                     if row >= SOURCE_HEADER_ROW
                         && let Some(cell) = current_row.get_mut(col)
-                        && cell.replace(value).is_some()
                     {
-                        return Err(err(format!(
-                            "Opinet 고정 소스 셀이 중복 선언되었습니다: row={row}, col={}",
-                            col.strict_add(1)
-                        )));
+                        *cell = Some(value);
                     }
                 }
                 0x0203 | 0x027E | 0x00BD | 0x0204 => {

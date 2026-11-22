@@ -6,7 +6,7 @@ use super::{
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
     download_error_with_source, try_string_with_capacity,
 };
-use core::{fmt::NumBuffer, mem, num::IntErrorKind, time::Duration};
+use core::{fmt::NumBuffer, mem, num::IntErrorKind, range::Range, time::Duration};
 use std::{
     process,
     thread::sleep,
@@ -147,6 +147,15 @@ impl SourceDownload {
             headers,
             status,
         } = response;
+        if let Some(expected_len) = headers.content_length
+            && body.len() != expected_len
+        {
+            return Err(format!(
+                "HTTP 응답 본문 길이가 Content-Length와 다릅니다: expected={expected_len}, actual={}",
+                body.len()
+            )
+            .into());
+        }
         for value in &headers.set_cookies {
             let (cookie_name, cookie_value) = split_head_or_all(value, ';')
                 .split_once('=')
@@ -301,9 +310,11 @@ impl SourceDownload {
                 PostHeaderProfile::Standard,
             )?;
             if !response.starts_with(&OLE2_SIGNATURE) {
-                let preview_len = response.len().min(HTTP_ERROR_PREVIEW_BYTES);
-                let (preview_bytes, _) = response.split_at(preview_len);
-                let preview = String::from_utf8_lossy(preview_bytes);
+                let preview = String::from_utf8_lossy(
+                    response
+                        .get(..HTTP_ERROR_PREVIEW_BYTES)
+                        .unwrap_or(&response),
+                );
                 let error_text =
                     format!("다운로드 응답이 예상한 OLE2 .xls 파일이 아닙니다: {preview}");
                 return Err(error_text.into());
@@ -414,14 +425,20 @@ impl SourceDownload {
             .and_then(|(_, tail)| tail.split_once('\''))
             .ok_or_else(|| format!("NetFunnel result 파싱 실패: {text}"))?;
         let value_range = text.substr_range(value).unwrap_or_else(|| process::abort());
-        text.truncate(value_range.end);
-        text.replace_range(..value_range.start, "");
+        retain_substr(&mut text, value_range);
         Ok(text)
     }
 }
 const fn hex_digit(nibble: u8) -> u8 {
     b'0'.strict_add(nibble)
         .strict_add(nibble.strict_add(6).wrapping_shr(4).strict_mul(7))
+}
+fn retain_substr(text: &mut String, range: Range<usize>) {
+    text.truncate(range.end);
+    text.replace_range(..range.start, "");
+}
+fn split_head_or_all(value: &str, separator: char) -> &str {
+    value.split_once(separator).map_or(value, |(head, _)| head)
 }
 fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     let (_, value_tail) = result
@@ -432,12 +449,8 @@ fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     let value_range = result
         .substr_range(value)
         .unwrap_or_else(|| process::abort());
-    result.truncate(value_range.end);
-    result.replace_range(..value_range.start, "");
+    retain_substr(&mut result, value_range);
     Ok(result)
-}
-fn split_head_or_all(value: &str, separator: char) -> &str {
-    value.split_once(separator).map_or(value, |(head, _)| head)
 }
 fn parse_netfunnel_u32(value: &str, context: &'static str) -> DownloadResult<u32> {
     if value.starts_with('+') {

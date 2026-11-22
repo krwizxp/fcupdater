@@ -1,7 +1,7 @@
 use super::{
     ArchiveFingerprint, CALC_CHAIN_PATH, CHANGE_LOG_SHEET_NAME, CanonicalStyleMap,
     MASTER_SHEET_NAME, PackagePart, PartRole, SPREADSHEETML_NAMESPACE, SaveVerification,
-    XLSX_PARTS, ZipArchiveBuilder, ZipPackageReader,
+    XLSX_PARTS, ZipArchiveBuilder, ZipPackageReader, canonical_excel_fragment,
     xml::{
         MAX_XML_NESTING_DEPTH, XmlAttrScanner, XmlScanner, XmlTag, decode_xml_entities,
         xml_misc_only,
@@ -497,7 +497,7 @@ impl TempArchivePromotion<'_> {
         }
         let archive_len = archive_file_len(&captured_file.file, captured_original)?;
         let mut limited = (&captured_file.file).take((archive_len as u64).strict_add(1));
-        let mut buffer = vec![0_u8; ZIP_FINGERPRINT_BUFFER_BYTES].into_boxed_slice();
+        let mut buffer = vec![0_u8; ZIP_FINGERPRINT_BUFFER_BYTES];
         let mut crc = u32::MAX;
         let mut bytes_read = 0_usize;
         loop {
@@ -546,12 +546,11 @@ impl XlsxContainer {
             == OFFICE_DOCUMENT_REL_NAMESPACE)
             .ok_or(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."))?;
         let workbook_xml = workbook_text.as_str();
-        let (mut scanner, workbook_root) = scan_xml_root(workbook_xml, "workbook", "workbook.xml")?;
+        let mut scanner = XmlScanner::new(workbook_xml);
+        scanner.skip_to(root.end.strict_add(1));
         let mut forbidden = None;
         let mut empty_protection_seen = false;
-        while let Some(element) =
-            scanner.next_direct_element_until(&workbook_root, "workbook.xml")?
-        {
+        while let Some(element) = scanner.next_direct_element_until(&root, "workbook.xml")? {
             let tag = element.opening;
             let candidate = match tag.local_name {
                 "fileRecoveryPr" => (
@@ -820,11 +819,17 @@ impl XlsxContainer {
                 continue;
             }
             let bytes = match name {
-                "[Content_Types].xml" => excel_static_xml(EXCEL_CONTENT_TYPES_XML),
-                "_rels/.rels" => excel_static_xml(EXCEL_ROOT_RELS_XML),
-                "xl/_rels/workbook.xml.rels" => excel_static_xml(EXCEL_WORKBOOK_RELS_XML),
-                "xl/styles.xml" if !canonical_styles => excel_static_xml(EXCEL_STYLES_XML),
-                "xl/theme/theme1.xml" => excel_static_xml(EXCEL_THEME_XML),
+                "[Content_Types].xml" => {
+                    canonical_excel_fragment(EXCEL_CONTENT_TYPES_XML)?.into_bytes()
+                }
+                "_rels/.rels" => canonical_excel_fragment(EXCEL_ROOT_RELS_XML)?.into_bytes(),
+                "xl/_rels/workbook.xml.rels" => {
+                    canonical_excel_fragment(EXCEL_WORKBOOK_RELS_XML)?.into_bytes()
+                }
+                "xl/styles.xml" if !canonical_styles => {
+                    canonical_excel_fragment(EXCEL_STYLES_XML)?.into_bytes()
+                }
+                "xl/theme/theme1.xml" => canonical_excel_fragment(EXCEL_THEME_XML)?.into_bytes(),
                 _ => slot.take().unwrap_or_else(|| process::abort()),
             };
             *slot = Some(bytes);
@@ -858,10 +863,9 @@ impl XlsxContainer {
             .parent()
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let target_file_name = crate::MASTER_PATH;
-        let temp_archive_prefix = format!(".{target_file_name}.tmp_");
+        let temp_archive_prefix = format!(".{}.tmp_", crate::MASTER_PATH);
         #[cfg(target_os = "windows")]
-        let backup_archive_prefix = format!(".{target_file_name}.backup_");
+        let backup_archive_prefix = format!(".{}.backup_", crate::MASTER_PATH);
         let reserve_archive = |prefix: &str| -> io::Result<ReservedTempArchive> {
             const ATTEMPTS: u32 = 1024;
             let pid = process::id();
@@ -959,7 +963,7 @@ impl XlsxContainer {
         validate_spreadsheet_xml_document(&xml, "sst", "sharedStrings.xml", false, None)?;
         Ok(xml)
     }
-    pub(super) fn take_text(&mut self, name: &str) -> Result<String> {
+    fn take_text(&mut self, name: &str) -> Result<String> {
         let bytes = mem::take(self.part_mut(name));
         String::from_utf8(bytes)
             .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
@@ -1336,8 +1340,6 @@ fn find_equivalent_xf(
                         .is_some_and(|(source_resource, candidate_resource)| {
                             source_resource == candidate_resource
                         })
-                } else if name == "fontId" || name == "borderId" {
-                    source_value.as_ref() == candidate_value.as_ref()
                 } else if BOOLEAN_ATTRS.contains(&name) {
                     matches!(
                         (source_value.as_ref(), candidate_value.as_ref()),
@@ -1364,17 +1366,6 @@ fn find_equivalent_xf(
         }
     }
     Ok(None)
-}
-fn excel_static_xml(source: &str) -> Vec<u8> {
-    let trimmed = source.trim_suffix('\n');
-    let Some((first_line, remainder)) = trimmed.split_once('\n') else {
-        return trimmed.as_bytes().to_vec();
-    };
-    let mut output = Vec::with_capacity(trimmed.len().strict_add(1));
-    output.extend_from_slice(first_line.as_bytes());
-    output.extend_from_slice(b"\r\n");
-    output.extend_from_slice(remainder.as_bytes());
-    output
 }
 fn parse_attrs<'tag, const N: usize>(
     tag: &'tag str,
@@ -1585,10 +1576,9 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
                 return Err(err(format!("{context}에 sheetData가 없습니다.")));
             }
             let document_end = tag.end.strict_add(1);
-            if scanner.next_tag().is_some()
-                || !xml
-                    .get(document_end..)
-                    .is_some_and(|trailing| xml_misc_only(trailing, false))
+            if !xml
+                .get(document_end..)
+                .is_some_and(|trailing| xml_misc_only(trailing, false))
             {
                 return Err(err(format!(
                     "{context}의 XML root 뒤 내용이 올바르지 않습니다."
@@ -1632,7 +1622,7 @@ fn visit_direct_xml_children<'xml>(
     expected_namespace: &str,
     context: &str,
     mut visit: impl FnMut(&'xml str, &'xml str) -> Result<()>,
-) -> Result<usize> {
+) -> Result<()> {
     let (mut scanner, root) = scan_xml_root(xml, root_local_name, context)?;
     if root.self_closing {
         return Err(err(format!("{context}의 XML root 태그가 비어 있습니다.")));
@@ -1642,7 +1632,6 @@ fn visit_direct_xml_children<'xml>(
         &[("xmlns", expected_namespace)],
         &format!("{context} root"),
     )?;
-    let mut child_count = 0_usize;
     while let Some(child) = scanner.next_direct_element_until(&root, context)? {
         let tag = child.opening;
         if tag.name != tag.local_name {
@@ -1657,7 +1646,6 @@ fn visit_direct_xml_children<'xml>(
             )));
         }
         visit(tag.local_name, tag.raw)?;
-        child_count = child_count.strict_add(1);
     }
-    Ok(child_count)
+    Ok(())
 }

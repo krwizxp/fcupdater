@@ -1,16 +1,15 @@
 extern crate alloc;
-use core::fmt::Arguments;
 use diagnostic::{Result, err, err_with_source};
 use excel::SaveVerification;
 use std::{
     env,
     fs::{File, TryLockError},
-    io::{self, Write, stdout},
+    io::{Write as _, stdout},
     path::Path,
 };
 cfg_select! {
     target_os = "windows" => {
-        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::{fs::Metadata, os::windows::fs::OpenOptionsExt as _};
     }
     any(target_os = "linux", target_os = "macos") => {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -105,20 +104,14 @@ fn main() -> Result<()> {
     let run_lock = lock_options
         .open(Path::new(RUN_LOCK_PATH))
         .map_err(|source| err_with_source("실행 잠금 파일 열기 실패", source))?;
-    cfg_select! {
-        target_os = "windows" => {
-            validate_regular_file(&run_lock)
-                .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
-        }
-        any(target_os = "linux", target_os = "macos") => {
-            let (lock_metadata, _) = validate_regular_file(&run_lock)
-                .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
-            (lock_metadata.mode() & 0o022 == 0).ok_or(err(
-                "실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.",
-            ))?;
-        }
-        _ => {}
-    }
+    let (lock_metadata, _) = validate_regular_file(&run_lock)
+        .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    (lock_metadata.mode() & 0o022 == 0).ok_or(err(
+        "실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.",
+    ))?;
+    #[cfg(target_os = "windows")]
+    let _: Metadata = lock_metadata;
     match run_lock.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Err(err("다른 fcupdater 실행이 진행 중입니다.")),
@@ -132,8 +125,4 @@ fn main() -> Result<()> {
         save_verification,
     }
     .run()
-}
-fn write_line(output: &mut dyn Write, args: Arguments<'_>) -> io::Result<()> {
-    output.write_fmt(args)?;
-    output.write_all(b"\n")
 }

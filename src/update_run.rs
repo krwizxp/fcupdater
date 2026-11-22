@@ -10,9 +10,8 @@ use crate::{
     },
     source_download::SourceDownload,
     temp_entry::open_regular,
-    write_line,
 };
-use core::{mem, time::Duration};
+use core::time::Duration;
 use std::{
     collections::{HashMap, hash_map::Entry},
     io::Write,
@@ -80,7 +79,6 @@ impl UpdateRun<'_> {
             index: HashMap::new(),
             region_counts: [0; TARGET_REGION_COUNT],
         };
-        let mut address_key_scratch = String::new();
         let mut target_region_scratch = String::new();
         SourceReader::from(source_data).visit_rows(|borrowed_record| {
             if let Some(region) = target_region(
@@ -89,8 +87,8 @@ impl UpdateRun<'_> {
                 &mut target_region_scratch,
                 TargetRegionPolicy::StrictSource,
             )? {
-                normalize_address_key_into(borrowed_record.address, &mut address_key_scratch)?;
-                let key = mem::take(&mut address_key_scratch);
+                let mut key = String::new();
+                normalize_address_key_into(borrowed_record.address, &mut key)?;
                 if loaded_source.index.len() == loaded_source.index.capacity() {
                     loaded_source
                         .index
@@ -180,23 +178,18 @@ impl UpdateRun<'_> {
         if row_count == 0 {
             return Ok(());
         }
-        write_line(self.out, format_args!("\n{title}"))?;
+        writeln!(self.out, "\n{title}")?;
         for (display_index, (region, name, address)) in (1_usize..=20).zip(rows) {
-            write_line(
+            writeln!(
                 self.out,
-                format_args!(
-                    "  {display_index}. {region} / {name} / {address}",
-                    region = terminal_safe(region),
-                    name = terminal_safe(name),
-                    address = terminal_safe(address)
-                ),
+                "  {display_index}. {region} / {name} / {address}",
+                region = terminal_safe(region),
+                name = terminal_safe(name),
+                address = terminal_safe(address)
             )?;
         }
         if row_count > 20 {
-            write_line(
-                self.out,
-                format_args!("  ... ({row_count}개 중 20개만 표시)"),
-            )?;
+            writeln!(self.out, "  ... ({row_count}개 중 20개만 표시)")?;
         }
         Ok(())
     }

@@ -91,6 +91,16 @@ struct ZipPackageReader<'path> {
     archive_file: File,
     archive_path: &'path Path,
 }
+fn canonical_excel_fragment(source: &str) -> Result<String> {
+    let trimmed = source.trim_suffix('\n');
+    let Some((first_line, remainder)) = trimmed.split_once('\n') else {
+        return copy_text(trimmed);
+    };
+    let mut output =
+        try_string_with_capacity(trimmed.len().strict_add(1), "텍스트 복사 메모리 확보 실패")?;
+    output.extend([first_line, "\r\n", remainder]);
+    Ok(output)
+}
 fn copy_text(text: &str) -> Result<String> {
     let mut out = try_string_with_capacity(text.len(), "텍스트 복사 메모리 확보 실패")?;
     out.push_str(text);

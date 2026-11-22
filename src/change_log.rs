@@ -2,7 +2,7 @@ use crate::{
     diagnostic::{Result, append_fmt, err, try_string_with_capacity},
     excel::{
         FuelValues, SourceRecord,
-        writer::{SharedStringTable, Worksheet},
+        writer::{SharedStringTable, Worksheet, is_shared_formula_follower},
     },
     master_sheet::{ChangeRow, StoreRow},
     sheet_util::add_row_offset,
@@ -86,29 +86,17 @@ impl ChangeLogRowValues<'_> {
                 .zip(new_value)
                 .map(|(old, new)| new.strict_sub(old));
             let cached_text = cached_value.map(|value| value.format_into(&mut cache_buffer));
-            if is_shared_follower {
-                worksheet.set_shared_formula_follower_cache_at(
-                    target_col,
-                    row,
-                    cached_text,
-                    false,
-                )?;
-                continue;
-            }
-            formula_buffer.clear();
-            append_fmt(
-                formula_buffer,
-                format_args!(
-                    "IF(OR({old_col}{row_text}=\"\",{new_col}{row_text}=\"\"),\"\",{new_col}{row_text}-{old_col}{row_text})"
-                ),
-            );
-            worksheet.set_formula_at_with_cache(
-                target_col,
-                row,
-                formula_buffer,
-                cached_text,
-                false,
-            )?;
+            let formula = (!is_shared_follower).then(|| {
+                formula_buffer.clear();
+                append_fmt(
+                    formula_buffer,
+                    format_args!(
+                        "IF(OR({old_col}{row_text}=\"\",{new_col}{row_text}=\"\"),\"\",{new_col}{row_text}-{old_col}{row_text})"
+                    ),
+                );
+                formula_buffer.as_str()
+            });
+            worksheet.set_formula_at_with_cache(target_col, row, formula, cached_text, false)?;
         }
         Ok(())
     }
@@ -130,14 +118,14 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             last_data_row,
             CHANGELOG_COL_DELTA_DIESEL,
         );
-        let style_template_row = CHANGELOG_STYLE_TEMPLATE_ROW;
         let entry_count = self
             .changes
             .len()
             .strict_add(self.added.len())
             .strict_add(self.deleted.len());
         if entry_count == 0 {
-            self.worksheet.truncate_rows_after(style_template_row);
+            self.worksheet
+                .truncate_rows_after(CHANGELOG_STYLE_TEMPLATE_ROW);
             return Ok(CHANGELOG_DATA_START_ROW);
         }
         let change_entries = self.changes.iter().map(|change| ChangeLogRowValues {
@@ -169,28 +157,28 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             .strict_add("IF(OR(E=\"\",F=\"\"),\"\",F-E)".len());
         let mut formula_buffer =
             try_string_with_capacity(formula_capacity, "변경내역 delta formula 메모리 확보 실패")?;
-        let worksheet = &mut *self.worksheet;
         for (index, values) in change_entries
             .chain(added_entries)
             .chain(deleted_entries)
             .enumerate()
         {
             let row = add_row_offset(CHANGELOG_DATA_START_ROW, index, "변경내역 데이터 쓰기")?;
-            if row > style_template_row {
-                worksheet.copy_row_style(style_template_row, row, CHANGELOG_COL_DELTA_DIESEL)?;
+            if row > CHANGELOG_STYLE_TEMPLATE_ROW {
+                self.worksheet.copy_row_style(
+                    CHANGELOG_STYLE_TEMPLATE_ROW,
+                    row,
+                    CHANGELOG_COL_DELTA_DIESEL,
+                )?;
             }
-            worksheet.set_existing_cell_style_in_range(
+            self.worksheet.set_existing_cell_style_in_range(
                 row,
                 CHANGELOG_COL_OLD_GAS,
                 CHANGELOG_COL_DELTA_DIESEL,
                 26,
             )?;
-            let group_offset = index.rem_euclid(64);
-            let group_start = index.strict_sub(group_offset);
-            let is_shared_follower =
-                group_offset != 0 && entry_count.strict_sub(group_start).min(64) >= 6;
+            let is_shared_follower = is_shared_formula_follower(index, entry_count);
             values.write_to(
-                worksheet,
+                self.worksheet,
                 self.shared_string_table,
                 row,
                 is_shared_follower,
@@ -203,7 +191,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             "변경내역 마지막 행 계산",
         )?;
         self.worksheet
-            .truncate_rows_after(last_change_row.max(style_template_row));
+            .truncate_rows_after(last_change_row.max(CHANGELOG_STYLE_TEMPLATE_ROW));
         Ok(last_change_row)
     }
 }

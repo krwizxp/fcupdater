@@ -1,10 +1,12 @@
-use self::format::format_scaled_value_into;
 use crate::{
     diagnostic::{
         Result, append_fmt, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
     },
     excel,
-    excel::writer::{SharedStringTable, Workbook as StdWorkbook, format_excel_ratio_into},
+    excel::writer::{
+        SharedStringTable, Workbook as StdWorkbook, format_excel_ratio_into,
+        is_shared_formula_follower,
+    },
     excel::{FuelValues, SourceRecord},
     region::{
         TARGET_REGION_COUNT, TargetRegion, TargetRegionPolicy, increment_target_region_count,
@@ -22,7 +24,6 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     process,
 };
-mod format;
 const MASTER_HEADER_ROW: u32 = 14;
 const MASTER_DATA_START_ROW: u32 = 15;
 const COL_RANK: u32 = 1;
@@ -104,9 +105,6 @@ impl ScaledSortKey {
     const fn as_i128(self) -> i128 {
         self.0
     }
-    fn checked_add(self, rhs: Self) -> Option<Self> {
-        self.0.checked_add(rhs.0).map(Self)
-    }
 }
 struct SortableRankRow<'text> {
     address: &'text str,
@@ -120,6 +118,7 @@ struct SortableRankRow<'text> {
     smart_discount: ScaledDecimal,
     smart_discount_excluded: bool,
     source_index: usize,
+    total_price: Option<ScaledSortKey>,
 }
 struct RankSortRefresher<'sheet, 'strings> {
     data_last_row: u32,
@@ -155,15 +154,13 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         string_value: bool,
         formula: &mut String,
     ) -> Result<()> {
-        if is_shared_follower {
-            return self
-                .ws
-                .set_shared_formula_follower_cache_at(col, row, value, string_value);
-        }
-        formula.clear();
-        append_fmt(formula, formula_args);
+        let formula_text = (!is_shared_follower).then(|| {
+            formula.clear();
+            append_fmt(formula, formula_args);
+            formula.as_str()
+        });
         self.ws
-            .set_formula_at_with_cache(col, row, formula, value, string_value)
+            .set_formula_at_with_cache(col, row, formula_text, value, string_value)
     }
     fn apply_numeric_formula_cache(
         &mut self,
@@ -199,10 +196,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let row_text = row_num.format_into(&mut row_buffer);
         let unit_price_denominator = sort_context.unit_price_denominator;
         let prices = plan.adjusted_prices;
-        let total_price = unit_price_denominator
-            .map(|_| MasterSheetUpdater::compute_total_price(sort_context, prices))
-            .transpose()?
-            .flatten();
+        let total_price = plan.total_price;
         let has_total_price = total_price.is_some();
         let region_rate = if has_total_price {
             plan.region_rate
@@ -215,12 +209,10 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             .map(|(price, ranked)| ScaledSortKey(price.as_i128().strict_sub(ranked.as_i128())));
         let data_start = MASTER_DATA_START_ROW;
         let data_last = self.data_last_row;
-        let row_offset = row_num.strict_sub(data_start);
-        let group_start_row =
-            data_start.strict_add(row_offset.strict_sub(row_offset.rem_euclid(64)));
-        let group_last_row = group_start_row.strict_add(63).min(data_last);
-        let is_shared_follower = row_num > group_start_row
-            && group_last_row.strict_sub(group_start_row).strict_add(1) >= 6;
+        let is_shared_follower = is_shared_formula_follower(
+            row_num.strict_sub(data_start) as usize,
+            data_last.strict_sub(data_start).strict_add(1) as usize,
+        );
         self.apply_formula_cache(
             (row_num, COL_RANK),
             is_shared_follower,
@@ -392,10 +384,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             .try_get_fixed_text_at(COL_REGION, row_num, self.shared_strings)?
             .trim();
         let fuels = read_master_fuels(self.ws, row_num, self.shared_strings)?;
-        let smart_discount_excluded = self
-            .ws
-            .try_get_formula_at(COL_SMART_DISCOUNT, row_num)?
-            .is_none()
+        let smart_discount_excluded = !self.ws.has_formula_at(COL_SMART_DISCOUNT, row_num)?
             && MasterSheetUpdater::get_f64_at(
                 self.ws,
                 COL_SMART_DISCOUNT,
@@ -445,11 +434,31 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
                 .map(ScaledSortKey)
         });
-        let total_price = sort_context
-            .unit_price_denominator
-            .map(|_| MasterSheetUpdater::compute_total_price(sort_context, adjusted_prices))
-            .transpose()?
-            .flatten();
+        let total_price = if sort_context.unit_price_denominator.is_some() {
+            let mut total = ScaledSortKey::ZERO;
+            let mut complete = true;
+            for (quantity, price) in [
+                (sort_context.quantities.gasoline, adjusted_prices.gasoline),
+                (sort_context.quantities.premium, adjusted_prices.premium),
+                (sort_context.quantities.diesel, adjusted_prices.diesel),
+            ] {
+                if quantity.as_i64() > 0 {
+                    let Some(fuel_price) = price else {
+                        complete = false;
+                        break;
+                    };
+                    total = quantity
+                        .as_i128()
+                        .checked_mul(fuel_price.as_i128())
+                        .and_then(|value| total.as_i128().checked_add(value))
+                        .map(ScaledSortKey)
+                        .ok_or_else(|| err("유류비 합계 계산 중 overflow가 발생했습니다."))?;
+                }
+            }
+            complete.then_some(total)
+        } else {
+            None
+        };
         let rank_total = total_price
             .map(|price| {
                 let discount = price
@@ -494,6 +503,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             smart_discount,
             smart_discount_excluded,
             source_index,
+            total_price,
         })
     }
     fn refresh(&mut self) -> Result<()> {
@@ -631,29 +641,6 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
     }
 }
 impl<'source> MasterSheetUpdater<'source> {
-    fn compute_total_price(
-        sort_context: &RankSortContext,
-        adjusted: AdjustedFuelPrices,
-    ) -> Result<Option<ScaledSortKey>> {
-        let mut total = ScaledSortKey::ZERO;
-        for (quantity, price) in [
-            (sort_context.quantities.gasoline, adjusted.gasoline),
-            (sort_context.quantities.premium, adjusted.premium),
-            (sort_context.quantities.diesel, adjusted.diesel),
-        ] {
-            if quantity.as_i64() > 0 {
-                let Some(fuel_price) = price else {
-                    return Ok(None);
-                };
-                total = quantity
-                    .as_i128()
-                    .checked_mul(fuel_price.as_i128())
-                    .and_then(|value| total.checked_add(ScaledSortKey(value)))
-                    .ok_or_else(|| err("유류비 합계 계산 중 overflow가 발생했습니다."))?;
-            }
-        }
-        Ok(Some(total))
-    }
     fn evaluate_master_rows(
         &self,
         ws: &excel::writer::Worksheet,
@@ -917,7 +904,7 @@ impl<'source> MasterSheetUpdater<'source> {
             Some(template_row.try_copy_style(COL_SORT_KEY)?)
         };
         let data_start_index = MASTER_HEADER_ROW as usize;
-        let trailing_start_index = last_old_row.unwrap_or(MASTER_HEADER_ROW) as usize;
+        let trailing_start_index = old_data_last_row as usize;
         (trailing_start_index <= original_rows.len())
             .ok_or_else(|| err("유류비 기존 데이터 row 범위가 worksheet를 벗어났습니다."))?;
         let trailing_rows = original_rows.split_off(trailing_start_index);
@@ -1015,10 +1002,9 @@ fn append_fuel_total_text(
         .as_i128()
         .div_euclid(2)
         .strict_sub(i128::from(total < 0));
-    let rounded = ScaledSortKey(total)
-        .checked_add(ScaledSortKey(rounding_offset))
+    let rounded = total
+        .checked_add(rounding_offset)
         .ok_or_else(|| err("연료비 반올림 계산 중 overflow가 발생했습니다."))?
-        .as_i128()
         .div_euclid(DECIMAL_SCALE_SQUARED.as_i128());
     if !parts.is_empty() {
         parts.push_str(" / ");
@@ -1043,6 +1029,29 @@ fn append_fuel_total_text(
     }
     parts.push('원');
     Ok(true)
+}
+fn format_scaled_value_into(text: &mut String, value: i128, scale: i128) {
+    text.clear();
+    let abs = value.unsigned_abs();
+    let scale_abs = scale.unsigned_abs();
+    if value < 0 {
+        text.push('-');
+    }
+    let mut buffer = NumBuffer::new();
+    let whole = abs.div_euclid(scale_abs);
+    text.push_str(whole.format_into(&mut buffer));
+    let frac = abs.rem_euclid(scale_abs);
+    if frac == 0 {
+        return;
+    }
+    text.push('.');
+    let width = scale_abs.ilog10() as usize;
+    let frac_text = frac.format_into(&mut buffer);
+    for _ in frac_text.len()..width {
+        text.push('0');
+    }
+    text.push_str(frac_text);
+    text.truncate(text.trim_end_matches('0').len());
 }
 fn read_master_fuels(
     ws: &excel::writer::Worksheet,

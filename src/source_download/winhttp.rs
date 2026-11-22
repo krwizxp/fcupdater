@@ -2,7 +2,7 @@ use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
     ResponseHeaders, checked_http_buffer_len, download_error_with_source,
 };
-use crate::diagnostic::{try_string_with_capacity, try_vec_with_capacity};
+use crate::diagnostic::try_vec_with_capacity;
 use alloc::{string::String, vec::Vec};
 use core::{
     array::from_fn,
@@ -27,6 +27,7 @@ const WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE: u32 = 91;
 const WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK: u32 = 144;
 const WINHTTP_OPTION_IPV6_FAST_FALLBACK: u32 = 140;
 const WINHTTP_OPTION_DISABLE_GLOBAL_POOLING: u32 = 195;
+const WINHTTP_READ_BUFFER_BYTES_DWORD: u32 = 64 * 1024;
 const WINHTTP_SESSION_OPTIONS: [(u32, &str, Option<u32>); 3] = [
     (
         WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK,
@@ -79,7 +80,7 @@ pub(super) struct Client {
 struct Handle(NonNull<WinHttpHandle>);
 struct CachedConnect {
     handle: Handle,
-    host: String,
+    host: &'static str,
 }
 struct SessionCache {
     connects: [Option<CachedConnect>; WINHTTP_CONNECT_CACHE_LIMIT],
@@ -101,7 +102,7 @@ impl Handle {
 impl Client {
     fn begin_request(
         &mut self,
-        host: &str,
+        host: &'static str,
         path: &str,
         headers: &RequestHeaders<'_>,
         method: &[u16],
@@ -203,7 +204,7 @@ impl Client {
         })()
         .inspect_err(|_| self.session_cache = None)
     }
-    fn cached_connect(&mut self, host: &str) -> DownloadResult<NonNull<WinHttpHandle>> {
+    fn cached_connect(&mut self, host: &'static str) -> DownloadResult<NonNull<WinHttpHandle>> {
         let cache = if let Some(ref mut cache) = self.session_cache {
             cache
         } else {
@@ -280,17 +281,9 @@ impl Client {
                 0,
             )
         };
-        let handle = NonNull::new(raw_connect)
-            .map(Handle)
-            .ok_or_else(|| Self::last_error_message("WinHttpConnect"))?;
-        let mut host_key =
-            try_string_with_capacity(host.len(), "WinHTTP connect host key 메모리 확보 실패")?;
-        host_key.push_str(host);
+        let handle = Self::non_null_handle(raw_connect, "WinHttpConnect")?;
         let connect = handle.0;
-        let entry = CachedConnect {
-            handle,
-            host: host_key,
-        };
+        let entry = CachedConnect { handle, host };
         if let Some(index) = empty_slot {
             let slot = cache
                 .connects
@@ -342,7 +335,8 @@ impl Client {
                     )
                     .into());
                 }
-                (content_length_index > previous_index).ok_or("WinHTTP Content-Length header index가 진행되지 않았습니다.")?;
+                (content_length_index > previous_index)
+                    .ok_or("WinHTTP Content-Length header index가 진행되지 않았습니다.")?;
                 headers.set_content_length(value as usize)?;
             }
             let mut cookie_index = 0_u32;
@@ -361,7 +355,8 @@ impl Client {
                         &raw mut cookie_index,
                     )
                 };
-                (probe == 0_i32).ok_or("WinHTTP Set-Cookie 크기 조회가 예기치 않게 성공했습니다.")?;
+                (probe == 0_i32)
+                    .ok_or("WinHTTP Set-Cookie 크기 조회가 예기치 않게 성공했습니다.")?;
                 let code = Self::last_error_code();
                 if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
                     break;
@@ -376,7 +371,8 @@ impl Client {
                     header_bytes,
                     HTTP_MAX_HEADER_BYTES,
                 )?;
-                (header_bytes.is_multiple_of(2)).ok_or("Set-Cookie UTF-16 길이가 2바이트 단위가 아닙니다.")?;
+                (header_bytes.is_multiple_of(2))
+                    .ok_or("Set-Cookie UTF-16 길이가 2바이트 단위가 아닙니다.")?;
                 let units = header_bytes.div_euclid(2);
                 self.header_buffer.clear();
                 self.header_buffer.try_reserve(units).map_err(|source| {
@@ -396,7 +392,8 @@ impl Client {
                     )
                 };
                 Self::check_winhttp(fetched, "WinHttpQueryHeaders Set-Cookie")?;
-                (cookie_index > current_index).ok_or("WinHTTP Set-Cookie header index가 진행되지 않았습니다.")?;
+                (cookie_index > current_index)
+                    .ok_or("WinHTTP Set-Cookie header index가 진행되지 않았습니다.")?;
                 while self.header_buffer.pop_if(|unit| *unit == 0).is_some() {}
                 let value = String::from_utf16(&self.header_buffer).map_err(|source| {
                     download_error_with_source("Set-Cookie UTF-16 변환 실패", source)
@@ -404,15 +401,6 @@ impl Client {
                 headers.push_set_cookie(value.trim_ascii())?;
             }
             let body = self.read_body(request, headers.content_length, started)?;
-            if let Some(expected_len) = headers.content_length
-                && body.len() != expected_len
-            {
-                return Err(format!(
-                    "HTTP 응답 본문 길이가 Content-Length와 다릅니다: expected={expected_len}, actual={}",
-                    body.len()
-                )
-                .into());
-            }
             Ok(HttpResponse {
                 body,
                 headers,
@@ -430,9 +418,9 @@ impl Client {
         Self::windows_error_message(context, code)
     }
     fn non_null_handle(handle: HInternet, context: &str) -> DownloadResult<Handle> {
-        Ok(NonNull::new(handle)
+        NonNull::new(handle)
             .map(Handle)
-            .ok_or_else(|| Self::last_error_message(context))?)
+            .ok_or_else(|| Self::last_error_message(context).into())
     }
     fn read_body(
         &mut self,
@@ -452,9 +440,7 @@ impl Client {
                 })?;
         }
         self.read_buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
-        let bytes_to_read = u32::try_from(self.read_buffer.len()).map_err(|source| {
-            download_error_with_source("응답 read 버퍼 길이 변환 실패", source)
-        })?;
+        let bytes_to_read = WINHTTP_READ_BUFFER_BYTES_DWORD;
         loop {
             (started.elapsed() < WINHTTP_TOTAL_TIMEOUT)
                 .ok_or("HTTP 전체 전송 제한 시간(60초)을 초과했습니다.")?;
@@ -488,7 +474,7 @@ impl Client {
     pub(super) fn request(
         &mut self,
         request_body: Option<&[u8]>,
-        host: &str,
+        host: &'static str,
         path: &str,
         headers: RequestHeaders<'_>,
     ) -> DownloadResult<HttpResponse> {
