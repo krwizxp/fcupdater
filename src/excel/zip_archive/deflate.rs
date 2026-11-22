@@ -42,6 +42,7 @@ const DEFLATE_TOKEN_RESERVE_CHUNK: usize = 64 * 1024;
 const DEFLATE_WINDOW_LEN: usize = 0x8000;
 const DEFLATE_MAX_DISTANCE: usize = DEFLATE_WINDOW_LEN - MAX_MATCH - MIN_MATCH - 1;
 const TOKEN_BLOCK_LIMIT: usize = 8191;
+const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
 const MATCH_CHUNK_BYTES: usize = 16;
 const XML_MAX_INSERT_MATCH_LEN: usize = 4;
 const LENGTH_SYMBOL_TABLE: [DeflateSymbol; 256] = {
@@ -101,6 +102,8 @@ struct BitReader<'bytes> {
 struct BitWriter<'writer> {
     bit_buffer: u64,
     bit_count: u8,
+    buffer: [u8; DEFLATE_STREAM_BUFFER_LEN],
+    buffered_len: usize,
     len: usize,
     writer: &'writer mut dyn IoWrite,
 }
@@ -273,23 +276,52 @@ impl BitReader<'_> {
     }
 }
 impl BitWriter<'_> {
+    fn flush_buffer(&mut self) -> Result<()> {
+        if self.buffered_len == 0 {
+            return Ok(());
+        }
+        let buffered = self
+            .buffer
+            .get(..self.buffered_len)
+            .unwrap_or_else(|| process::abort());
+        self.writer
+            .write_all(buffered)
+            .map_err(|source| err_with_source("deflate stream 쓰기 실패", source))?;
+        self.buffered_len = 0;
+        Ok(())
+    }
     fn write_bits(&mut self, value: u16, count: u8) -> Result<()> {
         let mask = u16::MAX.unbounded_shr(u16::BITS.strict_sub(u32::from(count)));
         self.bit_buffer |= u64::from(value & mask) << self.bit_count;
         self.bit_count = self.bit_count.strict_add(count);
         if self.bit_count >= 32 {
+            if self.buffer.len().strict_sub(self.buffered_len) < 4 {
+                self.flush_buffer()?;
+            }
             let [b0, b1, b2, b3, ..] = self.bit_buffer.to_le_bytes();
-            self.write_bytes(&[b0, b1, b2, b3])?;
+            let dst = self
+                .buffer
+                .get_mut(self.buffered_len..self.buffered_len.strict_add(4))
+                .unwrap_or_else(|| process::abort());
+            dst.copy_from_slice(&[b0, b1, b2, b3]);
+            self.buffered_len = self.buffered_len.strict_add(4);
+            self.len = self.len.strict_add(4);
             self.bit_buffer >>= 32_u8;
             self.bit_count = self.bit_count.strict_sub(32);
         }
         Ok(())
     }
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer
-            .write_all(bytes)
-            .map_err(|source| err_with_source("deflate stream 쓰기 실패", source))?;
-        self.len = self.len.strict_add(bytes.len());
+    fn write_byte(&mut self, byte: u8) -> Result<()> {
+        if self.buffered_len == self.buffer.len() {
+            self.flush_buffer()?;
+        }
+        let slot = self
+            .buffer
+            .get_mut(self.buffered_len)
+            .unwrap_or_else(|| process::abort());
+        *slot = byte;
+        self.buffered_len = self.buffered_len.strict_add(1);
+        self.len = self.len.strict_add(1);
         Ok(())
     }
 }
@@ -1041,16 +1073,21 @@ impl DeflatePlan {
         let mut bit_writer = BitWriter {
             bit_buffer: 0,
             bit_count: 0,
+            buffer: [0; DEFLATE_STREAM_BUFFER_LEN],
+            buffered_len: 0,
             len: 0,
             writer,
         };
         self.write(&mut bit_writer)?;
-        while bit_writer.bit_count != 0 {
-            let [byte, ..] = bit_writer.bit_buffer.to_le_bytes();
-            bit_writer.write_bytes(&[byte])?;
+        while bit_writer.bit_count >= 8 {
+            bit_writer.write_byte(bit_writer.bit_buffer.to_le_bytes()[0])?;
             bit_writer.bit_buffer >>= 8_u8;
-            bit_writer.bit_count = bit_writer.bit_count.saturating_sub(8);
+            bit_writer.bit_count = bit_writer.bit_count.strict_sub(8);
         }
+        if bit_writer.bit_count > 0 {
+            bit_writer.write_byte(bit_writer.bit_buffer.to_le_bytes()[0])?;
+        }
+        bit_writer.flush_buffer()?;
         Ok(bit_writer.len)
     }
 }

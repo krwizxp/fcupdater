@@ -1,9 +1,6 @@
 use super::copy_text;
-use crate::{
-    diagnostic::{
-        Result, err, err_with_source, try_push_vec, try_string_with_capacity, try_vec_with_capacity,
-    },
-    sheet_util::{DecimalParseMode, parse_rounded_decimal},
+use crate::diagnostic::{
+    Result, err, err_with_source, try_push_vec, try_string_with_capacity, try_vec_with_capacity,
 };
 use alloc::borrow::Cow;
 use core::range::Range;
@@ -936,13 +933,57 @@ fn row_fuel_price(
             "Opinet 소스 {row_num}행 {label} 가격은 음수일 수 없습니다: {text}"
         )));
     }
-    let parsed_value = parse_rounded_decimal(text, DecimalParseMode::StrictFuelPrice)
-        .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| {
-            err(format!(
-                "Opinet 소스 {row_num}행 {label} 가격 형식이 올바르지 않습니다: {text}"
-            ))
-        })?;
+    let invalid_price = || {
+        err(format!(
+            "Opinet 소스 {row_num}행 {label} 가격 형식이 올바르지 않습니다: {text}"
+        ))
+    };
+    let mut value = 0_i64;
+    let mut group_len = 0_usize;
+    let mut fraction_seen = false;
+    let mut comma_seen = false;
+    let mut decimal_seen = false;
+    let mut round_up = false;
+    for byte in text.trim_prefix('+').bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                let digit = i64::from(byte.strict_sub(b'0'));
+                if decimal_seen {
+                    if !fraction_seen {
+                        round_up = digit >= 5;
+                        fraction_seen = true;
+                    }
+                } else {
+                    value = value
+                        .checked_mul(10)
+                        .and_then(|scaled| scaled.checked_add(digit))
+                        .ok_or_else(invalid_price)?;
+                    group_len = group_len.strict_add(1);
+                }
+            }
+            b',' if !decimal_seen => {
+                if group_len == 0 || comma_seen && group_len != 3 || !comma_seen && group_len > 3 {
+                    return Err(invalid_price());
+                }
+                comma_seen = true;
+                group_len = 0;
+            }
+            b'.' if !decimal_seen => {
+                if group_len == 0 || comma_seen && group_len != 3 {
+                    return Err(invalid_price());
+                }
+                decimal_seen = true;
+            }
+            _ => return Err(invalid_price()),
+        }
+    }
+    if group_len == 0 || comma_seen && group_len != 3 || decimal_seen && !fraction_seen {
+        return Err(invalid_price());
+    }
+    if round_up {
+        value = value.checked_add(1).ok_or_else(invalid_price)?;
+    }
+    let parsed_value = i32::try_from(value).map_err(|_conversion_error| invalid_price())?;
     if parsed_value == 0_i32 {
         return Ok(None);
     }

@@ -14,7 +14,6 @@ use crate::{
         try_string_with_capacity, try_vec_with_capacity,
     },
     master_sheet::{DECIMAL_SCALE, MasterSheetUpdater},
-    sheet_util::{DecimalParseMode, parse_rounded_decimal},
 };
 use alloc::{
     borrow::Cow,
@@ -22,6 +21,7 @@ use alloc::{
     rc::Rc,
 };
 use core::{
+    cmp::Ordering,
     fmt::NumBuffer,
     iter::repeat_n,
     mem,
@@ -1316,10 +1316,92 @@ impl Worksheet {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        Ok(
-            parse_rounded_decimal(trimmed, DecimalParseMode::LooseRoundedI32)
-                .and_then(|value| i32::try_from(value).ok()),
-        )
+        let (negative, digits) = trimmed.strip_prefix('-').map_or_else(
+            || (false, trimmed.trim_prefix('+')),
+            |unsigned| (true, unsigned),
+        );
+        if digits.is_empty() {
+            return Ok(None);
+        }
+        let (mantissa, exponent) =
+            if let Some((mantissa, exponent_text)) = digits.split_once(['e', 'E']) {
+                if mantissa.contains(',') {
+                    return Ok(None);
+                }
+                let Ok(exponent) = exponent_text.parse::<i64>() else {
+                    return Ok(None);
+                };
+                (mantissa, exponent)
+            } else {
+                (digits, 0_i64)
+            };
+        let integer_digits = mantissa
+            .bytes()
+            .take_while(|&byte| byte != b'.')
+            .filter(u8::is_ascii_digit)
+            .count();
+        let Some(decimal_position) = i64::try_from(integer_digits)
+            .ok()
+            .and_then(|position| position.checked_add(exponent))
+        else {
+            return Ok(None);
+        };
+        let mut whole = 0_i64;
+        let mut position = 0_i64;
+        let mut round_away_from_zero = false;
+        let mut saw_digit = false;
+        let mut seen_decimal = false;
+        for byte in mantissa.bytes() {
+            match byte {
+                b',' if !seen_decimal => {}
+                b'.' if !seen_decimal => {
+                    seen_decimal = true;
+                }
+                b'0'..=b'9' => {
+                    saw_digit = true;
+                    let digit = i64::from(byte.strict_sub(b'0'));
+                    match position.cmp(&decimal_position) {
+                        Ordering::Less => {
+                            let Some(next) = whole
+                                .checked_mul(10)
+                                .and_then(|scaled| scaled.checked_add(digit))
+                            else {
+                                return Ok(None);
+                            };
+                            whole = next;
+                        }
+                        Ordering::Equal => round_away_from_zero = digit >= 5_i64,
+                        Ordering::Greater => {}
+                    }
+                    position = position.strict_add(1);
+                }
+                _ => return Ok(None),
+            }
+        }
+        if whole != 0 && decimal_position > position {
+            let Ok(power) = u32::try_from(decimal_position.strict_sub(position)) else {
+                return Ok(None);
+            };
+            let Some(scaled) = 10_i64
+                .checked_pow(power)
+                .and_then(|scale| whole.checked_mul(scale))
+            else {
+                return Ok(None);
+            };
+            whole = scaled;
+        }
+        if !saw_digit {
+            return Ok(None);
+        }
+        let Some(magnitude) = whole.checked_add(i64::from(round_away_from_zero)) else {
+            return Ok(None);
+        };
+        let signed = if negative {
+            magnitude.checked_neg()
+        } else {
+            Some(magnitude)
+        };
+        Ok(signed.and_then(|value| i32::try_from(value).ok()))
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
         let row_obj = Self::ensure_row_mut(rows, row, "worksheet cell row 메모리 확보 실패")?;
