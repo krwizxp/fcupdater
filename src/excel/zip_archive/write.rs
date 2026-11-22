@@ -6,7 +6,7 @@ use super::{
     ZIP_MAX_ARCHIVE_BYTES, deflate,
 };
 use crate::diagnostic::{
-    Result, err, err_with_source, path_context_message, try_vec_with_capacity,
+    Result, err, err_with_source, path_err_with_source, try_vec_with_capacity,
 };
 use core::mem;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -177,34 +177,28 @@ impl<'part> StreamingZipWriter<'part, '_> {
         }
         self.append_central_directory()?;
         IoWrite::flush(&mut self.file).map_err(|source_err| {
-            err_with_source(
-                path_context_message("xlsx 압축 파일 flush 실패", self.archive_path),
-                source_err,
-            )
+            path_err_with_source("xlsx 압축 파일 flush 실패", self.archive_path, source_err)
         })?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.file
             .get_ref()
             .set_permissions(self.permissions)
             .map_err(|source_err| {
-                err_with_source(
-                    path_context_message("xlsx 압축 파일 권한 적용 실패", self.archive_path),
+                path_err_with_source(
+                    "xlsx 압축 파일 권한 적용 실패",
+                    self.archive_path,
                     source_err,
                 )
             })?;
         self.file.get_ref().sync_all().map_err(|source_err| {
-            err_with_source(
-                path_context_message("xlsx 압축 파일 sync 실패", self.archive_path),
-                source_err,
-            )
+            path_err_with_source("xlsx 압축 파일 sync 실패", self.archive_path, source_err)
         })
     }
     fn write_header_buffer(&mut self, context: &str) -> Result<()> {
         let next_bytes_written =
             self.ensure_output_limit(self.header_buffer.len(), "ZIP written byte count 계산")?;
-        IoWrite::write_all(&mut self.file, &self.header_buffer).map_err(|source_err| {
-            err_with_source(path_context_message(context, self.archive_path), source_err)
-        })?;
+        IoWrite::write_all(&mut self.file, &self.header_buffer)
+            .map_err(|source_err| path_err_with_source(context, self.archive_path, source_err))?;
         self.bytes_written = next_bytes_written;
         Ok(())
     }

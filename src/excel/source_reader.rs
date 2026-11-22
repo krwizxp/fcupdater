@@ -1,9 +1,12 @@
 use super::copy_text;
-use crate::diagnostic::{
-    Result, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
+use crate::{
+    diagnostic::{
+        Result, err, err_with_source, try_push_vec, try_string_with_capacity, try_vec_with_capacity,
+    },
+    sheet_util::{DecimalParseMode, parse_rounded_decimal},
 };
 use alloc::borrow::Cow;
-use core::{fmt::Display, range::Range};
+use core::range::Range;
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
 const CFB_END_OF_CHAIN: u32 = 0xFFFF_FFFE;
@@ -326,9 +329,8 @@ impl SourceReader {
                 continue;
             }
             if difat_entries.contains(&sector_id) {
-                return Err(err(prefixed_display_message(
-                    "CFB FAT sector가 중복 선언되었습니다: ",
-                    sector_id,
+                return Err(err(format!(
+                    "CFB FAT sector가 중복 선언되었습니다: {sector_id}"
                 )));
             }
             difat_entries.push(sector_id);
@@ -563,14 +565,13 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             if record_id != BIFF_RECORD_CONTINUE {
                 return Ok((chunks, record_start, total_chunk_bytes));
             }
-            chunks.try_reserve(1).map_err(|source| {
-                err_with_source(
-                    "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
-                    source,
-                )
-            })?;
             total_chunk_bytes = total_chunk_bytes.strict_add(chunk.len());
-            chunks.push(chunk);
+            try_push_vec(
+                &mut chunks,
+                chunk,
+                1,
+                "xls SST chunk 목록 추가 메모리 확보 실패: 1 entries",
+            )?;
         }
     }
     fn parse_globals(&self) -> Result<(usize, BiffSharedStrings)> {
@@ -602,9 +603,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                         .get(5)
                         .ok_or_else(|| err("xls BoundSheet record가 예상보다 짧습니다."))?;
                     if sheet_type != 0 {
-                        return Err(err(prefixed_display_message(
-                            "Opinet 고정 소스에서 예상하지 않은 sheet type: ",
-                            sheet_type,
+                        return Err(err(format!(
+                            "Opinet 고정 소스에서 예상하지 않은 sheet type: {sheet_type}"
                         )));
                     }
                     (sheet_offset.replace(offset).is_none())
@@ -670,20 +670,14 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             )));
         }
         if declared_total > MAX_SOURCE_CELL_COUNT {
-            return Err(err(display_limit_message(
-                "SST total count가 소스 시트 셀 한도를 초과했습니다: ",
-                declared_total,
-                "최대 ",
-                MAX_SOURCE_CELL_COUNT,
+            return Err(err(format!(
+                "SST total count가 소스 시트 셀 한도를 초과했습니다: {declared_total} (최대 {MAX_SOURCE_CELL_COUNT})"
             )));
         }
         let max_unique_count = total_chunk_bytes.strict_sub(8).div_euclid(3);
         if unique_count > max_unique_count {
-            return Err(err(display_limit_message(
-                "SST unique count가 비정상적으로 큽니다: ",
-                unique_count,
-                "최대 ",
-                max_unique_count,
+            return Err(err(format!(
+                "SST unique count가 비정상적으로 큽니다: {unique_count} (최대 {max_unique_count})"
             )));
         }
         let mut ranges = try_vec_with_capacity(unique_count, "SST 문자열 테이블 메모리 확보 실패")?;
@@ -728,9 +722,8 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
         visitor: &mut impl FnMut(SourceRecordRef<'strings>) -> Result<()>,
     ) -> Result<()> {
         if sheet_offset >= self.0.len() {
-            return Err(err(prefixed_display_message(
-                "worksheet offset이 workbook stream 범위를 벗어났습니다: ",
-                sheet_offset,
+            return Err(err(format!(
+                "worksheet offset이 workbook stream 범위를 벗어났습니다: {sheet_offset}"
             )));
         }
         let mut found_header = false;
@@ -835,17 +828,14 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                     let row = usize::from(read_u16_le(record_data, 0)?) + 1;
                     let col = usize::from(read_u16_le(record_data, 2)?);
                     if row > MAX_SOURCE_ROW {
-                        return Err(err(display_limit_message(
-                            "시트 행 인덱스가 비정상적으로 큽니다: ",
-                            row,
-                            "최대 ",
-                            MAX_SOURCE_ROW,
+                        return Err(err(format!(
+                            "시트 행 인덱스가 비정상적으로 큽니다: {row} (최대 {MAX_SOURCE_ROW})"
                         )));
                     }
                     if col >= MAX_SOURCE_COL {
-                        return Err(err(prefixed_display_message(
-                            "시트 열 인덱스가 비정상적으로 큽니다: ",
-                            col + 1,
+                        return Err(err(format!(
+                            "시트 열 인덱스가 비정상적으로 큽니다: {}",
+                            col.strict_add(1)
                         )));
                     }
                     if previous_cell.is_some_and(|(previous_row, previous_col)| {
@@ -946,57 +936,13 @@ fn row_fuel_price(
             "Opinet 소스 {row_num}행 {label} 가격은 음수일 수 없습니다: {text}"
         )));
     }
-    let invalid_price = || {
-        err(format!(
-            "Opinet 소스 {row_num}행 {label} 가격 형식이 올바르지 않습니다: {text}"
-        ))
-    };
-    let mut value = 0_i64;
-    let mut group_len = 0_usize;
-    let mut fraction_seen = false;
-    let mut comma_seen = false;
-    let mut decimal_seen = false;
-    let mut round_up = false;
-    for byte in text.trim_prefix('+').bytes() {
-        match byte {
-            b'0'..=b'9' => {
-                let digit = i64::from(byte.strict_sub(b'0'));
-                if decimal_seen {
-                    if !fraction_seen {
-                        round_up = digit >= 5;
-                        fraction_seen = true;
-                    }
-                } else {
-                    value = value
-                        .checked_mul(10)
-                        .and_then(|scaled| scaled.checked_add(digit))
-                        .ok_or_else(invalid_price)?;
-                    group_len = group_len.strict_add(1);
-                }
-            }
-            b',' if !decimal_seen => {
-                if group_len == 0 || comma_seen && group_len != 3 || !comma_seen && group_len > 3 {
-                    return Err(invalid_price());
-                }
-                comma_seen = true;
-                group_len = 0;
-            }
-            b'.' if !decimal_seen => {
-                if group_len == 0 || comma_seen && group_len != 3 {
-                    return Err(invalid_price());
-                }
-                decimal_seen = true;
-            }
-            _ => return Err(invalid_price()),
-        }
-    }
-    if group_len == 0 || comma_seen && group_len != 3 || decimal_seen && !fraction_seen {
-        return Err(invalid_price());
-    }
-    if round_up {
-        value = value.checked_add(1).ok_or_else(invalid_price)?;
-    }
-    let parsed_value = i32::try_from(value).map_err(|_conversion_error| invalid_price())?;
+    let parsed_value = parse_rounded_decimal(text, DecimalParseMode::StrictFuelPrice)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| {
+            err(format!(
+                "Opinet 소스 {row_num}행 {label} 가격 형식이 올바르지 않습니다: {text}"
+            ))
+        })?;
     if parsed_value == 0_i32 {
         return Ok(None);
     }
@@ -1139,18 +1085,7 @@ fn read_le_array<const N: usize>(
     out_of_range_prefix: &str,
 ) -> Result<[u8; N]> {
     let Some(raw_bytes) = bytes.get(offset..).and_then(|tail| tail.first_chunk::<N>()) else {
-        return Err(err(prefixed_display_message(out_of_range_prefix, offset)));
+        return Err(err(format!("{out_of_range_prefix}{offset}")));
     };
     Ok(*raw_bytes)
-}
-fn prefixed_display_message(prefix: &str, value: impl Display) -> String {
-    format!("{prefix}{value}")
-}
-fn display_limit_message(
-    prefix: &str,
-    value: impl Display,
-    limit_label: &str,
-    limit: impl Display,
-) -> String {
-    format!("{prefix}{value} ({limit_label}{limit})")
 }

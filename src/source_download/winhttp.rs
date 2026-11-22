@@ -187,20 +187,8 @@ impl Client {
             // SAFETY: request is a valid request handle and no reserved pointer is required.
             let received = unsafe { sys::WinHttpReceiveResponse(request.as_ptr(), null_mut()) };
             Self::check_winhttp(received, "WinHttpReceiveResponse")?;
-            let mut status = 0_u32;
-            let mut bytes = DWORD_BYTE_SIZE;
-            // SAFETY: status and bytes are valid output buffers for the numeric status query.
-            let queried = unsafe {
-                sys::WinHttpQueryHeaders(
-                    request.as_ptr(),
-                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                    null(),
-                    (&raw mut status).cast::<c_void>(),
-                    &raw mut bytes,
-                    null_mut(),
-                )
-            };
-            Self::check_winhttp(queried, "WinHttpQueryHeaders status")?;
+            let status = Self::query_dword_header(&request, WINHTTP_QUERY_STATUS_CODE, null_mut())
+                .map_err(|code| Self::windows_error_message("WinHttpQueryHeaders status", code))?;
             Ok((request, status, started))
         })()
         .inspect_err(|_| self.session_cache = None)
@@ -312,30 +300,21 @@ impl Client {
             let mut content_length_index = 0_u32;
             loop {
                 let previous_index = content_length_index;
-                let mut value = 0_u32;
-                let mut bytes = DWORD_BYTE_SIZE;
-                // SAFETY: request is valid and value is a DWORD output buffer.
-                let queried = unsafe {
-                    sys::WinHttpQueryHeaders(
-                        request.as_ptr(),
-                        WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-                        null(),
-                        (&raw mut value).cast::<c_void>(),
-                        &raw mut bytes,
-                        &raw mut content_length_index,
-                    )
-                };
-                if queried == 0_i32 {
-                    let code = Self::last_error_code();
-                    if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
-                        break;
+                let value = match Self::query_dword_header(
+                    request,
+                    WINHTTP_QUERY_CONTENT_LENGTH,
+                    &raw mut content_length_index,
+                ) {
+                    Ok(value) => value,
+                    Err(ERROR_WINHTTP_HEADER_NOT_FOUND) => break,
+                    Err(code) => {
+                        return Err(Self::windows_error_message(
+                            "WinHttpQueryHeaders Content-Length",
+                            code,
+                        )
+                        .into());
                     }
-                    return Err(Self::windows_error_message(
-                        "WinHttpQueryHeaders Content-Length",
-                        code,
-                    )
-                    .into());
-                }
+                };
                 (content_length_index > previous_index)
                     .ok_or("WinHTTP Content-Length header index가 진행되지 않았습니다.")?;
                 headers.set_content_length(value as usize)?;
@@ -422,6 +401,30 @@ impl Client {
         NonNull::new(handle)
             .map(Handle)
             .ok_or_else(|| Self::last_error_message(context).into())
+    }
+    fn query_dword_header(
+        request: &Handle,
+        info_level: u32,
+        index: *mut u32,
+    ) -> CoreResult<u32, u32> {
+        let mut value = 0_u32;
+        let mut bytes = DWORD_BYTE_SIZE;
+        // SAFETY: request is valid and value/bytes are valid DWORD output buffers.
+        let queried = unsafe {
+            sys::WinHttpQueryHeaders(
+                request.as_ptr(),
+                info_level | WINHTTP_QUERY_FLAG_NUMBER,
+                null(),
+                (&raw mut value).cast::<c_void>(),
+                &raw mut bytes,
+                index,
+            )
+        };
+        if queried == 0_i32 {
+            Err(Self::last_error_code())
+        } else {
+            Ok(value)
+        }
     }
     fn read_body(
         &mut self,

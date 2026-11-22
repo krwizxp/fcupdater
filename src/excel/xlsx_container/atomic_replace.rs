@@ -69,13 +69,13 @@ pub(super) enum ReplaceFilesError {
     #[cfg(target_os = "windows")]
     Restored(ReplaceFailure),
 }
-impl ReplaceFailure {
-    const fn new(replace: io::Error) -> Self {
-        Self {
+impl From<io::Error> for ReplaceFilesError {
+    fn from(replace: io::Error) -> Self {
+        Self::Failed(ReplaceFailure {
             replace,
             #[cfg(target_os = "windows")]
             restore: None,
-        }
+        })
     }
 }
 impl fmt::Display for ReplaceFailure {
@@ -153,21 +153,20 @@ cfg_select! {
             wide.push(0);
             Ok(wide)
         }
-        pub(super) fn replace_files(
+        pub(super) fn swap_files(
             target: &Path,
-            incoming: &Path,
-            backup_output: &Path,
-            restore_on_move_failure: &Path,
+            temp: &Path,
+            backup: &Path,
+            rollback: bool,
         ) -> Result<(), ReplaceFilesError> {
-            let target_wide = path_to_wide(target)
-                .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Failed)?;
-            let incoming_wide = path_to_wide(incoming)
-                .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Failed)?;
-            let backup_output_wide = path_to_wide(backup_output)
-                .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Failed)?;
+            let (incoming, backup_output) = if rollback {
+                (backup, temp)
+            } else {
+                (temp, backup)
+            };
+            let target_wide = path_to_wide(target)?;
+            let incoming_wide = path_to_wide(incoming)?;
+            let backup_output_wide = path_to_wide(backup_output)?;
             // SAFETY: all three paths are valid NUL-terminated UTF-16 buffers and reserved pointers
             // are null as required by ReplaceFileW.
             let status = unsafe {
@@ -185,10 +184,13 @@ cfg_select! {
             }
             let replace = io::Error::last_os_error();
             if replace.raw_os_error() != Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
-                return Err(ReplaceFilesError::Failed(ReplaceFailure::new(replace)));
+                return Err(replace.into());
             }
-            match fs::rename(restore_on_move_failure, target) {
-                Ok(()) => Err(ReplaceFilesError::Restored(ReplaceFailure::new(replace))),
+            match fs::rename(backup, target) {
+                Ok(()) => Err(ReplaceFilesError::Restored(ReplaceFailure {
+                    replace,
+                    restore: None,
+                })),
                 Err(restore) => Err(ReplaceFilesError::RecoveryRequired(ReplaceFailure {
                     replace,
                     restore: Some(restore),
@@ -197,16 +199,12 @@ cfg_select! {
         }
     }
     any(target_os = "linux", target_os = "macos") => {
-        pub(super) fn exchange_files(
+        pub(super) fn swap_files(
             target: &Path,
             replacement: &Path,
         ) -> Result<(), ReplaceFilesError> {
-            let target_c = path_to_c_string(target)
-                .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Failed)?;
-            let replacement_c = path_to_c_string(replacement)
-                .map_err(ReplaceFailure::new)
-                .map_err(ReplaceFilesError::Failed)?;
+            let target_c = path_to_c_string(target)?;
+            let replacement_c = path_to_c_string(replacement)?;
             let status = cfg_select! {
                 target_os = "linux" => {
                     // SAFETY: both paths are valid NUL-terminated byte strings and AT_FDCWD selects
@@ -227,11 +225,7 @@ cfg_select! {
                     unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP) }
                 }
             };
-            (status == 0_i32).ok_or_else(|| {
-                ReplaceFilesError::Failed(ReplaceFailure::new(
-                    io::Error::last_os_error(),
-                ))
-            })
+            (status == 0_i32).ok_or_else(|| io::Error::last_os_error().into())
         }
     }
     _ => {

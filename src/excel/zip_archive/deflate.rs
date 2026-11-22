@@ -749,8 +749,8 @@ impl DynamicFrequencies {
                     },
                     count,
                 ));
-            } else if current != 0 {
-                if current != previous {
+            } else {
+                if current != 0 && current != previous {
                     code_length_tokens.push(CodeLengthToken {
                         extra: 0,
                         extra_bits: 0,
@@ -758,22 +758,18 @@ impl DynamicFrequencies {
                     });
                     count = count.strict_sub(1);
                 }
+                let (symbol, extra_bits, base) = if current != 0 {
+                    (16, 2, 3)
+                } else if count <= 10 {
+                    (17, 3, 3)
+                } else {
+                    (18, 7, 11)
+                };
                 code_length_tokens.push(CodeLengthToken {
-                    extra: u16::try_from(count.strict_sub(3)).unwrap_or_else(|_| process::abort()),
-                    extra_bits: 2,
-                    symbol: 16,
-                });
-            } else if count <= 10 {
-                code_length_tokens.push(CodeLengthToken {
-                    extra: u16::try_from(count.strict_sub(3)).unwrap_or_else(|_| process::abort()),
-                    extra_bits: 3,
-                    symbol: 17,
-                });
-            } else {
-                code_length_tokens.push(CodeLengthToken {
-                    extra: u16::try_from(count.strict_sub(11)).unwrap_or_else(|_| process::abort()),
-                    extra_bits: 7,
-                    symbol: 18,
+                    extra: u16::try_from(count.strict_sub(base))
+                        .unwrap_or_else(|_| process::abort()),
+                    extra_bits,
+                    symbol,
                 });
             }
             count = 0;

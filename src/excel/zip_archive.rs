@@ -2,7 +2,7 @@ use super::{
     ArchiveFingerprint, MAX_XLSX_PART_BYTES, PackagePart, PartRole, XLSX_PARTS, ZipPackageReader,
 };
 use crate::diagnostic::{
-    AppError, Result, err, err_with_source, path_context_message, try_vec_with_capacity,
+    AppError, Result, err, err_with_source, path_err_with_source, try_vec_with_capacity,
 };
 use core::mem;
 use std::{
@@ -155,29 +155,38 @@ impl ZipEntry<'_> {
         let local_mismatch =
             |message: &'static str| -> AppError { zip_entry_message(message, self.name).into() };
         if read_u32(local_header, 0)? != LOCAL_FILE_HEADER_SIGNATURE {
-            return Err(zip_entry_message(ZIP_BAD_LOCAL_HEADER_MESSAGE, self.name).into());
+            return Err(local_mismatch(ZIP_BAD_LOCAL_HEADER_MESSAGE));
         }
-        if read_u16(local_header, 4)? != self.version_needed {
-            return Err(local_mismatch(
+        for (offset, expected, message) in [
+            (
+                4,
+                self.version_needed,
                 "ZIP local header version이 중앙 디렉터리와 다릅니다",
-            ));
-        }
-        if read_u16(local_header, 6)? != self.flags {
-            return Err(local_mismatch(
+            ),
+            (
+                6,
+                self.flags,
                 "ZIP local header flags가 중앙 디렉터리와 다릅니다",
-            ));
-        }
-        if read_u16(local_header, 8)? != self.method {
-            return Err(local_mismatch(
+            ),
+            (
+                8,
+                self.method,
                 "ZIP local header 압축 방식이 중앙 디렉터리와 다릅니다",
-            ));
-        }
-        if read_u16(local_header, 10)? != self.modified_time
-            || read_u16(local_header, 12)? != self.modified_date
-        {
-            return Err(local_mismatch(
+            ),
+            (
+                10,
+                self.modified_time,
                 "ZIP local header 수정 시각이 중앙 디렉터리와 다릅니다",
-            ));
+            ),
+            (
+                12,
+                self.modified_date,
+                "ZIP local header 수정 시각이 중앙 디렉터리와 다릅니다",
+            ),
+        ] {
+            if read_u16(local_header, offset)? != expected {
+                return Err(local_mismatch(message));
+            }
         }
         let local_crc = read_u32(local_header, 14)?;
         let local_compressed_size = read_u32(local_header, 18)?;
@@ -225,7 +234,7 @@ impl ZipEntry<'_> {
             .checked_add(compressed_len)
             .ok_or_else(|| err("ZIP data end 계산 실패"))?;
         let Some(compressed) = bytes.get(data_start..data_end) else {
-            return Err(zip_entry_message(ZIP_DATA_RANGE_MESSAGE, self.name).into());
+            return Err(local_mismatch(ZIP_DATA_RANGE_MESSAGE));
         };
         let local_end = if self.flags & 0x0008 == 0 {
             data_end
@@ -246,10 +255,9 @@ impl ZipEntry<'_> {
                 || read_u32(descriptor, crc_offset.strict_add(4))? != self.compressed_size
                 || read_u32(descriptor, crc_offset.strict_add(8))? != self.uncompressed_size
             {
-                return Err(err(zip_entry_message(
+                return Err(local_mismatch(
                     "ZIP data descriptor가 중앙 디렉터리와 다릅니다",
-                    self.name,
-                )));
+                ));
             }
             data_end
                 .checked_add(descriptor_len)
@@ -273,10 +281,10 @@ impl ZipEntry<'_> {
             (mem::take(bytes), crc)
         };
         if output.len() != expected_len {
-            return Err(zip_entry_message(ZIP_BAD_SIZE_MESSAGE, self.name).into());
+            return Err(local_mismatch(ZIP_BAD_SIZE_MESSAGE));
         }
         if output_crc32 != self.crc32 {
-            return Err(zip_entry_message(ZIP_BAD_CRC_MESSAGE, self.name).into());
+            return Err(local_mismatch(ZIP_BAD_CRC_MESSAGE));
         }
         let archive_local_end = bytes_offset
             .checked_add(local_end)
@@ -560,10 +568,7 @@ fn archive_changed(archive_path: &Path) -> AppError {
 }
 pub(super) fn archive_file_len(file: &File, archive_path: &Path) -> Result<usize> {
     let metadata = file.metadata().map_err(|source| {
-        err_with_source(
-            path_context_message("xlsx 압축 파일 정보 확인 실패", archive_path),
-            source,
-        )
+        path_err_with_source("xlsx 압축 파일 정보 확인 실패", archive_path, source)
     })?;
     let archive_len = usize::try_from(metadata.len()).map_err(|source| {
         err(format!(
@@ -589,10 +594,7 @@ fn read_archive_range(
     if let Some(seek_offset) = offset {
         file.seek(SeekFrom::Start(seek_offset as u64))
             .map_err(|source| {
-                err_with_source(
-                    path_context_message("xlsx 압축 파일 range 이동 실패", archive_path),
-                    source,
-                )
+                path_err_with_source("xlsx 압축 파일 range 이동 실패", archive_path, source)
             })?;
     }
     buffer.clear();
@@ -602,10 +604,7 @@ fn read_archive_range(
     file.take(len as u64)
         .read_to_end(buffer)
         .map_err(|source| {
-            err_with_source(
-                path_context_message("xlsx 압축 파일 range 읽기 실패", archive_path),
-                source,
-            )
+            path_err_with_source("xlsx 압축 파일 range 읽기 실패", archive_path, source)
         })?;
     if buffer.len() != len {
         return Err(archive_changed(archive_path));

@@ -9,7 +9,7 @@ use super::{
     zip_archive::{ZIP_FINGERPRINT_BUFFER_BYTES, archive_file_len, crc32_update},
 };
 use crate::diagnostic::{
-    AppError, Result, err, err_with_source, path_context_message, terminal_safe,
+    AppError, Result, err, err_with_source, path_err_with_source, terminal_safe, try_push_vec,
     try_string_with_capacity, try_vec_with_capacity,
 };
 #[cfg(target_os = "windows")]
@@ -185,10 +185,7 @@ impl ReservedTempArchive {
     }
     fn validate_path_identity(&self) -> Result<()> {
         let file = open_regular(&self.path, false).map_err(|source| {
-            err_with_source(
-                path_context_message("xlsx 임시 파일 identity 검증 실패", &self.path),
-                source,
-            )
+            path_err_with_source("xlsx 임시 파일 identity 검증 실패", &self.path, source)
         })?;
         (file.identity == self.identity).ok_or_else(|| {
             err(format!(
@@ -201,37 +198,27 @@ impl ReservedTempArchive {
         let mut saved_handle = self.file.take().unwrap_or_else(|| process::abort());
         let saved_archive = self.path();
         saved_handle.rewind().map_err(|source| {
-            err_with_source(
-                path_context_message("저장 검증용 xlsx seek 실패", saved_archive),
-                source,
-            )
+            path_err_with_source("저장 검증용 xlsx seek 실패", saved_archive, source)
         })?;
         let saved_container = (|| {
             let saved_file = validate_open_file(saved_handle).map_err(|source_err| {
-                err_with_source(
-                    path_context_message("마스터 xlsx 파일 검증 실패", saved_archive),
-                    source_err,
-                )
+                path_err_with_source("마스터 xlsx 파일 검증 실패", saved_archive, source_err)
             })?;
             XlsxContainer::from_validated_file(saved_file, saved_archive)
         })()
         .map_err(|source_err| {
-            err_with_source(
-                path_context_message(
-                    "저장 검증 실패: 저장 직후 ZIP package 점검에 실패했습니다",
-                    saved_archive,
-                ),
+            path_err_with_source(
+                "저장 검증 실패: 저장 직후 ZIP package 점검에 실패했습니다",
+                saved_archive,
                 source_err,
             )
         })?;
         super::writer::Workbook::from_container(saved_container)
             .map(|_| ())
             .map_err(|source_err| {
-                err_with_source(
-                    path_context_message(
-                        "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
-                        saved_archive,
-                    ),
+                path_err_with_source(
+                    "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
+                    saved_archive,
                     source_err,
                 )
             })
@@ -327,8 +314,9 @@ impl TempArchivePromotion<'_> {
         #[cfg(target_os = "windows")]
         self.backup_archive.validate_path_identity()?;
         let target_file = open_regular(self.target_xlsx, false).map_err(|source| {
-            err_with_source(
-                path_context_message("저장 직전 원본 xlsx identity 검증 실패", self.target_xlsx),
+            path_err_with_source(
+                "저장 직전 원본 xlsx identity 검증 실패",
+                self.target_xlsx,
                 source,
             )
         })?;
@@ -343,20 +331,14 @@ impl TempArchivePromotion<'_> {
             drop(self.temp_archive.file.take());
             drop(self.backup_archive.file.take());
         }
-        let replace_result = cfg_select! {
-            target_os = "windows" => {
-                atomic_replace::replace_files(
-                    self.target_xlsx,
-                    self.temp_archive.path(),
-                    self.backup_archive.path(),
-                    self.backup_archive.path(),
-                )
-            }
-            any(target_os = "linux", target_os = "macos") => {
-                atomic_replace::exchange_files(self.target_xlsx, self.temp_archive.path())
-            }
-            _ => { compile_error!("fcupdater archive promotion supports only Windows, Linux, and macOS.") }
-        };
+        let replace_result = atomic_replace::swap_files(
+            self.target_xlsx,
+            self.temp_archive.path(),
+            #[cfg(target_os = "windows")]
+            self.backup_archive.path(),
+            #[cfg(target_os = "windows")]
+            false,
+        );
         match replace_result {
             Ok(()) => {}
             Err(atomic_replace::ReplaceFilesError::Failed(source)) => {
@@ -395,19 +377,14 @@ impl TempArchivePromotion<'_> {
         }
         let saved_validation = (|| {
             let saved_file = open_regular(self.target_xlsx, true).map_err(|source| {
-                err_with_source(
-                    path_context_message("저장된 xlsx identity 검증 실패", self.target_xlsx),
-                    source,
-                )
+                path_err_with_source("저장된 xlsx identity 검증 실패", self.target_xlsx, source)
             })?;
             (saved_file.identity == self.temp_archive.identity)
                 .ok_or(err("저장된 xlsx identity가 임시 archive와 다릅니다."))?;
             saved_file.file.sync_all().map_err(|source| {
-                err_with_source(
-                    path_context_message(
-                        "xlsx 저장 완료 후 파일 내구성 동기화 실패",
-                        self.target_xlsx,
-                    ),
+                path_err_with_source(
+                    "xlsx 저장 완료 후 파일 내구성 동기화 실패",
+                    self.target_xlsx,
                     source,
                 )
             })
@@ -420,10 +397,7 @@ impl TempArchivePromotion<'_> {
         self.backup_archive.disable_drop_cleanup();
         let captured_original = self.displaced_original_path();
         fs::remove_file(captured_original).map_err(|source| {
-            err_with_source(
-                path_context_message("교체된 원본 xlsx 정리 실패", captured_original),
-                source,
-            )
+            path_err_with_source("교체된 원본 xlsx 정리 실패", captured_original, source)
         })?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -435,8 +409,9 @@ impl TempArchivePromotion<'_> {
             fs::File::open(parent)
                 .and_then(|file| file.sync_all())
                 .map_err(|source| {
-                    err_with_source(
-                        path_context_message("xlsx 저장 완료 후 폴더 내구성 동기화 실패", parent),
+                    path_err_with_source(
+                        "xlsx 저장 완료 후 폴더 내구성 동기화 실패",
+                        parent,
                         source,
                     )
                 })?;
@@ -444,20 +419,14 @@ impl TempArchivePromotion<'_> {
         Ok(())
     }
     fn rollback_after_validation_failure(&mut self, validation_error: AppError) -> Result<()> {
-        let replace_result = cfg_select! {
-            target_os = "windows" => {
-                atomic_replace::replace_files(
-                    self.target_xlsx,
-                    self.backup_archive.path(),
-                    self.temp_archive.path(),
-                    self.backup_archive.path(),
-                )
-            }
-            any(target_os = "linux", target_os = "macos") => {
-                atomic_replace::exchange_files(self.target_xlsx, self.temp_archive.path())
-            }
-            _ => { compile_error!("fcupdater archive rollback supports only Windows, Linux, and macOS.") }
-        };
+        let replace_result = atomic_replace::swap_files(
+            self.target_xlsx,
+            self.temp_archive.path(),
+            #[cfg(target_os = "windows")]
+            self.backup_archive.path(),
+            #[cfg(target_os = "windows")]
+            true,
+        );
         let rollback_error = match replace_result {
             Ok(()) => return Err(validation_error),
             #[cfg(target_os = "windows")]
@@ -472,10 +441,7 @@ impl TempArchivePromotion<'_> {
     fn validate_displaced_original(&self) -> Result<()> {
         let captured_original = self.displaced_original_path();
         let captured_file = open_regular(captured_original, false).map_err(|source| {
-            err_with_source(
-                path_context_message("교체된 원본 xlsx 열기 실패", captured_original),
-                source,
-            )
+            path_err_with_source("교체된 원본 xlsx 열기 실패", captured_original, source)
         })?;
         if captured_file.identity != self.expected_identity {
             return Err(err(format!(
@@ -490,10 +456,7 @@ impl TempArchivePromotion<'_> {
         let mut bytes_read = 0_usize;
         loop {
             let read_len = limited.read(buffer.as_mut()).map_err(|source| {
-                err_with_source(
-                    path_context_message("교체된 원본 xlsx 검증 실패", captured_original),
-                    source,
-                )
+                path_err_with_source("교체된 원본 xlsx 검증 실패", captured_original, source)
             })?;
             if read_len == 0 {
                 break;
@@ -804,19 +767,17 @@ impl XlsxContainer {
                 *slot = None;
                 continue;
             }
-            let bytes = match name {
-                "[Content_Types].xml" => {
-                    canonical_excel_fragment(EXCEL_CONTENT_TYPES_XML)?.into_bytes()
-                }
-                "_rels/.rels" => canonical_excel_fragment(EXCEL_ROOT_RELS_XML)?.into_bytes(),
-                "xl/_rels/workbook.xml.rels" => {
-                    canonical_excel_fragment(EXCEL_WORKBOOK_RELS_XML)?.into_bytes()
-                }
-                "xl/styles.xml" if !canonical_styles => {
-                    canonical_excel_fragment(EXCEL_STYLES_XML)?.into_bytes()
-                }
-                "xl/theme/theme1.xml" => canonical_excel_fragment(EXCEL_THEME_XML)?.into_bytes(),
-                _ => slot.take().unwrap_or_else(|| process::abort()),
+            let canonical_xml = match name {
+                "[Content_Types].xml" => Some(EXCEL_CONTENT_TYPES_XML),
+                "_rels/.rels" => Some(EXCEL_ROOT_RELS_XML),
+                "xl/_rels/workbook.xml.rels" => Some(EXCEL_WORKBOOK_RELS_XML),
+                "xl/styles.xml" if !canonical_styles => Some(EXCEL_STYLES_XML),
+                "xl/theme/theme1.xml" => Some(EXCEL_THEME_XML),
+                _ => None,
+            };
+            let bytes = match canonical_xml {
+                Some(xml) => canonical_excel_fragment(xml)?.into_bytes(),
+                None => slot.take().unwrap_or_else(|| process::abort()),
             };
             *slot = Some(bytes);
         }
@@ -888,17 +849,11 @@ impl XlsxContainer {
             ))
         };
         let mut tmp_archive = reserve_archive(&temp_archive_prefix).map_err(|source| {
-            err_with_source(
-                path_context_message("임시 저장 파일 생성 실패", target_xlsx),
-                source,
-            )
+            path_err_with_source("임시 저장 파일 생성 실패", target_xlsx, source)
         })?;
         #[cfg(target_os = "windows")]
         let mut backup_archive = reserve_archive(&backup_archive_prefix).map_err(|source| {
-            err_with_source(
-                path_context_message("교체 예약 파일 생성 실패", target_xlsx),
-                source,
-            )
+            path_err_with_source("교체 예약 파일 생성 실패", target_xlsx, source)
         })?;
         let result = (|| -> Result<()> {
             cfg_select! {
@@ -1277,13 +1232,12 @@ fn find_equivalent_xf(
             source_attrs.clear();
             let mut source_attr_scanner = XmlAttrScanner::new(source_tag.raw)?;
             while let Some((name, value)) = source_attr_scanner.next()? {
-                source_attrs.try_reserve(1).map_err(|allocation_error| {
-                    err_with_source(
-                        "style source 속성 목록 추가 메모리 확보 실패",
-                        allocation_error,
-                    )
-                })?;
-                source_attrs.push((name, value));
+                try_push_vec(
+                    &mut source_attrs,
+                    (name, value),
+                    1,
+                    "style source 속성 목록 추가 메모리 확보 실패",
+                )?;
             }
             let source_attr_count = source_attrs.len();
             let mut candidate_attr_count = 0_usize;

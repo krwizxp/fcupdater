@@ -1,6 +1,6 @@
 use crate::{
     change_log::ChangeLogUpdater,
-    diagnostic::{Result, err, err_with_source, path_context_message, terminal_safe},
+    diagnostic::{Result, err, err_with_source, path_err_with_source, terminal_safe},
     excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::{ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, StoreRow},
@@ -122,10 +122,7 @@ impl UpdateRun<'_> {
     ) -> Result<(StdWorkbook, MasterSheetUpdateResult<'source>)> {
         writeln!(self.out, "마스터 파일 처리 중...")?;
         let master_file = open_regular(self.master_path, false).map_err(|source| {
-            err_with_source(
-                path_context_message("마스터 xlsx 파일 열기 실패", self.master_path),
-                source,
-            )
+            path_err_with_source("마스터 xlsx 파일 열기 실패", self.master_path, source)
         })?;
         let container = XlsxContainer::from_validated_file(master_file, self.master_path)?;
         let mut book = StdWorkbook::from_container(container)?;

@@ -8,21 +8,23 @@ use super::{
         XmlAttrScanner, XmlScanner, decode_xml_entities, extract_first_tag_text, is_valid_xml_char,
     },
 };
-use crate::diagnostic::{
-    Result, append_fmt, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
+use crate::{
+    diagnostic::{
+        Result, append_fmt, err, err_with_source, parse_unsigned_decimal, try_push_vec,
+        try_string_with_capacity, try_vec_with_capacity,
+    },
+    master_sheet::{DECIMAL_SCALE, MasterSheetUpdater},
+    sheet_util::{DecimalParseMode, parse_rounded_decimal},
 };
-use crate::master_sheet::{DECIMAL_SCALE, MasterSheetUpdater};
 use alloc::{
     borrow::Cow,
     collections::{BTreeMap, btree_map::Entry},
     rc::Rc,
 };
 use core::{
-    cmp::Ordering,
     fmt::NumBuffer,
     iter::repeat_n,
     mem,
-    num::IntErrorKind,
     range::{Range, RangeInclusive},
 };
 use std::{collections::HashMap, path::Path, process};
@@ -381,13 +383,15 @@ impl Workbook {
                     || decoded.chars().next_back().is_some_and(char::is_whitespace);
                 attrs.retain(|attr| attr.name != "xml:space");
                 if preserve {
-                    attrs.try_reserve(1).map_err(|source| {
-                        err_with_source("XML 속성 목록 추가 메모리 확보 실패", source)
-                    })?;
-                    attrs.push(XmlAttr {
-                        name: "xml:space",
-                        value: Cow::Borrowed("preserve"),
-                    });
+                    try_push_vec(
+                        &mut attrs,
+                        XmlAttr {
+                            name: "xml:space",
+                            value: Cow::Borrowed("preserve"),
+                        },
+                        1,
+                        "XML 속성 목록 추가 메모리 확보 실패",
+                    )?;
                 }
                 append_text_tag(&mut xml, &attrs, false)?;
                 let escaped = try_xml_escape_text(
@@ -644,10 +648,8 @@ impl WorksheetParser<'_, '_> {
             }
             let col = reference.col;
             if col < next_col {
-                return Err(err(row_col_error(
-                    "worksheet cell 순서는 column 오름차순이어야 합니다. (row=",
-                    row_num,
-                    col,
+                return Err(err(format!(
+                    "worksheet cell 순서는 column 오름차순이어야 합니다. (row={row_num}, col={col})"
                 )));
             }
             let omit_empty_master_note_cell = self.sheet == ExcelSheetKind::Master
@@ -658,20 +660,16 @@ impl WorksheetParser<'_, '_> {
                 .then_some(style_value)
                 .flatten()
                 .map(|value| {
-                    parse_u32_decimal(
+                    parse_unsigned_decimal::<u32>(
                         &value,
                         || {
-                            Cow::Owned(row_col_error(
-                                "worksheet cell style이 음이 아닌 10진수 형식이 아닙니다. (row=",
-                                row_num,
-                                col,
+                            Cow::Owned(format!(
+                                "worksheet cell style이 음이 아닌 10진수 형식이 아닙니다. (row={row_num}, col={col})"
                             ))
                         },
                         || {
-                            Cow::Owned(row_col_error(
-                                "worksheet cell style 해석 실패 (row=",
-                                row_num,
-                                col,
+                            Cow::Owned(format!(
+                                "worksheet cell style 해석 실패 (row={row_num}, col={col})"
                             ))
                         },
                     )
@@ -741,19 +739,15 @@ impl WorksheetParser<'_, '_> {
                     .ok_or(err("shared string cell 본문 형식이 올바르지 않습니다."))?;
                     value.body
                 };
-                (!value_body.starts_with('+')).ok_or(err(
-                    "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.",
-                ))?;
-                let index = value_body.parse::<usize>().map_err(|source| {
-                    if matches!(
-                        source.kind(),
-                        IntErrorKind::Empty | IntErrorKind::InvalidDigit
-                    ) {
-                        err("shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.")
-                    } else {
-                        err_with_source("shared string index 해석 실패", source)
-                    }
-                })?;
+                let index = parse_unsigned_decimal::<usize>(
+                    value_body,
+                    || {
+                        Cow::Borrowed(
+                            "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.",
+                        )
+                    },
+                    || Cow::Borrowed("shared string index 해석 실패"),
+                )?;
                 Some(Cell {
                     col,
                     inner_xml: String::new(),
@@ -870,7 +864,7 @@ impl WorksheetParser<'_, '_> {
                     let si_text = shared_index
                         .as_deref()
                         .ok_or_else(|| err("shared formula에 si 속성이 없습니다."))?;
-                    let si = parse_u32_decimal(
+                    let si = parse_unsigned_decimal::<u32>(
                         si_text,
                         || Cow::Borrowed("shared formula si가 음이 아닌 10진수가 아닙니다."),
                         || Cow::Borrowed("shared formula si 해석 실패"),
@@ -977,7 +971,7 @@ impl WorksheetParser<'_, '_> {
             parse_tag_attrs_into(row_info.raw, &mut row_attrs)?;
             let row_num_text = get_attr(&row_attrs, "r")
                 .ok_or_else(|| err("고정 workbook의 worksheet row에 r 속성이 없습니다."))?;
-            let row_num = parse_u32_decimal(
+            let row_num = parse_unsigned_decimal::<u32>(
                 row_num_text,
                 || Cow::Borrowed("worksheet row 번호가 양의 10진수 형식이 아닙니다."),
                 || Cow::Borrowed("worksheet row 번호 해석 실패"),
@@ -1009,7 +1003,7 @@ impl WorksheetParser<'_, '_> {
             }
             let style = get_attr(&row_attrs, "s")
                 .map(|value| {
-                    parse_u32_decimal(
+                    parse_unsigned_decimal::<u32>(
                         value,
                         || Cow::Borrowed("row style이 10진수가 아닙니다."),
                         || Cow::Borrowed("row style 해석 실패"),
@@ -1221,14 +1215,17 @@ impl Worksheet {
                     let cell = Self::get_or_create_cell_mut(&mut self.rows, col, shared_row)?;
                     (!cell.inner_xml.is_empty())
                         .ok_or(err("shared formula 대상 cell 본문이 없습니다."))?;
-                    if shared_row == row {
-                        let inner = &cell.inner_xml;
-                        let formula_span = XmlScanner::new(inner)
+                    let formula_span = if shared_row != row && cell.inner_xml.starts_with("<f/>") {
+                        (0..4).into()
+                    } else {
+                        XmlScanner::new(&cell.inner_xml)
                             .next_element_named("f")?
                             .map(|formula| formula.span)
-                            .ok_or_else(|| err("cell formula 태그를 찾지 못했습니다."))?;
+                            .ok_or_else(|| err("cell formula 태그를 찾지 못했습니다."))?
+                    };
+                    if shared_row == row {
                         cell.inner_xml = replace_formula_tag_at(
-                            inner,
+                            &cell.inner_xml,
                             formula_span,
                             FormulaTag::SharedRoot {
                                 formula: &owned_anchor,
@@ -1237,14 +1234,6 @@ impl Worksheet {
                             },
                         )?;
                     } else {
-                        let formula_span = if cell.inner_xml.starts_with("<f/>") {
-                            (0..4).into()
-                        } else {
-                            XmlScanner::new(&cell.inner_xml)
-                                .next_element_named("f")?
-                                .map(|formula| formula.span)
-                                .ok_or_else(|| err("cell formula 태그를 찾지 못했습니다."))?
-                        };
                         let span_len = formula_span.end.strict_sub(formula_span.start);
                         let additional = follower_xml.len().saturating_sub(span_len);
                         cell.inner_xml.try_reserve(additional).map_err(|source| {
@@ -1327,92 +1316,10 @@ impl Worksheet {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let (negative, digits) = trimmed.strip_prefix('-').map_or_else(
-            || (false, trimmed.trim_prefix('+')),
-            |unsigned| (true, unsigned),
-        );
-        if digits.is_empty() {
-            return Ok(None);
-        }
-        let (mantissa, exponent) =
-            if let Some((mantissa, exponent_text)) = digits.split_once(['e', 'E']) {
-                if mantissa.contains(',') {
-                    return Ok(None);
-                }
-                let Ok(exponent) = exponent_text.parse::<i64>() else {
-                    return Ok(None);
-                };
-                (mantissa, exponent)
-            } else {
-                (digits, 0_i64)
-            };
-        let integer_digits = mantissa
-            .bytes()
-            .take_while(|&byte| byte != b'.')
-            .filter(u8::is_ascii_digit)
-            .count();
-        let Some(decimal_position) = i64::try_from(integer_digits)
-            .ok()
-            .and_then(|position| position.checked_add(exponent))
-        else {
-            return Ok(None);
-        };
-        let mut whole = 0_i64;
-        let mut position = 0_i64;
-        let mut round_away_from_zero = false;
-        let mut saw_digit = false;
-        let mut seen_decimal = false;
-        for byte in mantissa.bytes() {
-            match byte {
-                b',' if !seen_decimal => {}
-                b'.' if !seen_decimal => {
-                    seen_decimal = true;
-                }
-                b'0'..=b'9' => {
-                    saw_digit = true;
-                    let digit = i64::from(byte.strict_sub(b'0'));
-                    match position.cmp(&decimal_position) {
-                        Ordering::Less => {
-                            let Some(next) = whole
-                                .checked_mul(10)
-                                .and_then(|scaled| scaled.checked_add(digit))
-                            else {
-                                return Ok(None);
-                            };
-                            whole = next;
-                        }
-                        Ordering::Equal => round_away_from_zero = digit >= 5_i64,
-                        Ordering::Greater => {}
-                    }
-                    position = position.strict_add(1);
-                }
-                _ => return Ok(None),
-            }
-        }
-        if whole != 0 && decimal_position > position {
-            let Ok(power) = u32::try_from(decimal_position.strict_sub(position)) else {
-                return Ok(None);
-            };
-            let Some(scaled) = 10_i64
-                .checked_pow(power)
-                .and_then(|scale| whole.checked_mul(scale))
-            else {
-                return Ok(None);
-            };
-            whole = scaled;
-        }
-        if !saw_digit {
-            return Ok(None);
-        }
-        let Some(magnitude) = whole.checked_add(i64::from(round_away_from_zero)) else {
-            return Ok(None);
-        };
-        let signed = if negative {
-            magnitude.checked_neg()
-        } else {
-            Some(magnitude)
-        };
-        Ok(signed.and_then(|value| i32::try_from(value).ok()))
+        Ok(
+            parse_rounded_decimal(trimmed, DecimalParseMode::LooseRoundedI32)
+                .and_then(|value| i32::try_from(value).ok()),
+        )
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
         let row_obj = Self::ensure_row_mut(rows, row, "worksheet cell row 메모리 확보 실패")?;
@@ -2201,9 +2108,12 @@ fn parse_tag_attrs_into<'tag>(tag: &'tag str, out: &mut Vec<XmlAttr<'tag>>) -> R
             .ok_or(err("XML 속성 개수가 허용 한도를 초과했습니다."))?;
         (!out.iter().any(|attr| attr.name == name))
             .ok_or(err("XML 태그에 중복 속성이 있습니다."))?;
-        out.try_reserve(1)
-            .map_err(|source| err_with_source("XML 속성 목록 추가 메모리 확보 실패", source))?;
-        out.push(XmlAttr { name, value });
+        try_push_vec(
+            out,
+            XmlAttr { name, value },
+            1,
+            "XML 속성 목록 추가 메모리 확보 실패",
+        )?;
     }
     Ok(())
 }
@@ -2218,22 +2128,6 @@ pub(crate) const fn is_shared_formula_follower(offset: usize, total: usize) -> b
     let group_offset = offset.rem_euclid(group_size);
     let group_start = offset.strict_sub(group_offset);
     group_offset != 0 && total.strict_sub(group_start) >= MIN_SHARED_FORMULA_CELLS as usize
-}
-fn parse_u32_decimal(
-    value: &str,
-    format_error: impl FnOnce() -> Cow<'static, str>,
-    parse_context: impl FnOnce() -> Cow<'static, str>,
-) -> Result<u32> {
-    if value.starts_with('+') {
-        return Err(err(format_error()));
-    }
-    value.parse::<u32>().map_err(|source| {
-        if source.kind() == &IntErrorKind::PosOverflow {
-            err_with_source(parse_context(), source)
-        } else {
-            err(format_error())
-        }
-    })
 }
 fn try_xml_escape_text<'text>(
     text: &'text str,
@@ -2325,7 +2219,4 @@ fn append_text_tag(out: &mut String, attrs: &[XmlAttr<'_>], self_closing: bool) 
     }
     out.push_str(suffix);
     Ok(())
-}
-fn row_col_error(prefix: &str, row_num: u32, col: u32) -> String {
-    format!("{prefix}{row_num}, col={col})")
 }

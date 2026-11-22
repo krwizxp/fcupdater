@@ -4,9 +4,10 @@ use super::{
     NETFUNNEL_ENTRY_ACTION_ID, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
     OIL_PRICE_DOWNLOAD_TAR_URL, OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH,
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
-    download_error_with_source, try_string_with_capacity,
+    download_error_with_source, parse_unsigned_decimal, try_push_vec, try_string_with_capacity,
 };
-use core::{fmt::NumBuffer, mem, num::IntErrorKind, range::Range, time::Duration};
+use alloc::borrow::Cow;
+use core::{fmt::NumBuffer, mem, range::Range, time::Duration};
 use std::{
     process,
     thread::sleep,
@@ -82,13 +83,9 @@ impl CookieJar {
             )
             .into());
         }
-        self.cookies
-            .try_reserve(1)
-            .map_err(|source| download_error_with_source("Cookie 목록 메모리 확보 실패", source))?;
         let mut pair = try_string_with_capacity(pair_len, "Cookie 메모리 확보 실패")?;
         pair.extend([name, "=", value]);
-        self.cookies.push(pair);
-        Ok(())
+        try_push_vec(&mut self.cookies, pair, 1, "Cookie 목록 메모리 확보 실패")
     }
 }
 impl SourceDownload {
@@ -442,17 +439,9 @@ fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     Ok(result)
 }
 fn parse_netfunnel_u32(value: &str, context: &'static str) -> DownloadResult<u32> {
-    if value.starts_with('+') {
-        return Err(format!("{context}: 음이 아닌 10진수 형식이 아닙니다.").into());
-    }
-    value.parse::<u32>().map_err(|source| {
-        if matches!(
-            source.kind(),
-            IntErrorKind::Empty | IntErrorKind::InvalidDigit
-        ) {
-            format!("{context}: 음이 아닌 10진수 형식이 아닙니다.").into()
-        } else {
-            download_error_with_source(format!("{context} 해석 실패"), source)
-        }
-    })
+    parse_unsigned_decimal(
+        value,
+        || Cow::Owned(format!("{context}: 음이 아닌 10진수 형식이 아닙니다.")),
+        || Cow::Owned(format!("{context} 해석 실패")),
+    )
 }

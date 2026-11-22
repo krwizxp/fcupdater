@@ -2,7 +2,9 @@ use alloc::borrow::Cow;
 use core::{
     error::Error,
     fmt::{self, Display, Write as _},
+    num::{IntErrorKind, ParseIntError},
     result::Result as CoreResult,
+    str::FromStr,
 };
 use std::{io::Error as IoError, path::Path};
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -94,8 +96,44 @@ pub(super) fn try_vec_with_capacity<T>(capacity: usize, context: &'static str) -
         .map_err(|source| err_with_source(context, source))?;
     Ok(value)
 }
-pub(super) fn path_context_message(label: &str, path: &Path) -> String {
-    format!("{label}: {}", path.display())
+pub(super) fn try_push_vec<T>(
+    vec: &mut Vec<T>,
+    value: T,
+    growth: usize,
+    context: &'static str,
+) -> Result<()> {
+    if vec.len() == vec.capacity() {
+        vec.try_reserve(growth)
+            .map_err(|source| err_with_source(context, source))?;
+    }
+    vec.push(value);
+    Ok(())
+}
+pub(super) fn path_err_with_source(
+    label: &str,
+    path: &Path,
+    source: impl Into<BoxError>,
+) -> AppError {
+    err_with_source(format!("{label}: {}", path.display()), source)
+}
+pub(super) fn parse_unsigned_decimal<T>(
+    value: &str,
+    format_error: impl FnOnce() -> Cow<'static, str>,
+    parse_context: impl FnOnce() -> Cow<'static, str>,
+) -> Result<T>
+where
+    T: FromStr<Err = ParseIntError>,
+{
+    if value.starts_with('+') {
+        return Err(err(format_error()));
+    }
+    value.parse::<T>().map_err(|source| {
+        if source.kind() == &IntErrorKind::PosOverflow {
+            err_with_source(parse_context(), source)
+        } else {
+            err(format_error())
+        }
+    })
 }
 pub(super) fn append_fmt(target: &mut String, args: fmt::Arguments<'_>) {
     assert!(

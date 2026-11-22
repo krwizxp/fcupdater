@@ -1,6 +1,6 @@
 use crate::diagnostic::{
     Result as DownloadResult, err_with_source as download_error_with_source,
-    try_string_with_capacity,
+    parse_unsigned_decimal, try_push_vec, try_string_with_capacity,
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
@@ -98,14 +98,15 @@ impl ResponseHeaders {
         self.set_content_length(parsed)
     }
     fn push_set_cookie(&mut self, value: &str) -> DownloadResult<()> {
-        self.set_cookies.try_reserve(1).map_err(|source| {
-            download_error_with_source("HTTP Set-Cookie 목록 메모리 확보 실패", source)
-        })?;
         let mut owned =
             try_string_with_capacity(value.len(), "HTTP Set-Cookie 값 메모리 확보 실패")?;
         owned.push_str(value);
-        self.set_cookies.push(owned);
-        Ok(())
+        try_push_vec(
+            &mut self.set_cookies,
+            owned,
+            1,
+            "HTTP Set-Cookie 목록 메모리 확보 실패",
+        )
     }
     fn set_content_length(&mut self, parsed: usize) -> DownloadResult<()> {
         (parsed <= HTTP_MAX_BODY_BYTES).ok_or_else(|| {
