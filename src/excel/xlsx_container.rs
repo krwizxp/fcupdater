@@ -9,8 +9,8 @@ use super::{
     zip_archive::{ZIP_FINGERPRINT_BUFFER_BYTES, archive_file_len, crc32_update},
 };
 use crate::diagnostic::{
-    AppError, Result, err, err_with_source, path_err_with_source, terminal_safe, try_push_vec,
-    try_string_with_capacity, try_vec_with_capacity,
+    AppError, Result, append_fmt, err, err_with_source, path_err_with_source, terminal_safe,
+    try_push_vec, try_string_with_capacity, try_vec_with_capacity,
 };
 #[cfg(target_os = "windows")]
 use crate::temp_entry::configure_replaceable_file;
@@ -122,7 +122,34 @@ const EXCEL_THEME_XML: &str = include_str!("excel_theme.xml");
 const EXCEL_CONTENT_TYPES_XML: &str = include_str!("excel_content_types.xml");
 const EXCEL_ROOT_RELS_XML: &str = include_str!("excel_root_rels.xml");
 const EXCEL_WORKBOOK_RELS_XML: &str = include_str!("excel_workbook_rels.xml");
-const LIBREOFFICE_CELL_XFS_XML: &str = include_str!("libreoffice_cell_xfs.xml");
+const LIBREOFFICE_CELL_XFS: [[u8; 6]; 26] = [
+    [164, 0, 0, 0, 0, 0],
+    [164, 24, 31, 10, 0, 111],
+    [164, 25, 0, 10, 0, 175],
+    [164, 26, 0, 10, 0, 175],
+    [164, 7, 0, 0, 64, 31],
+    [164, 7, 0, 0, 63, 13],
+    [164, 27, 0, 10, 0, 175],
+    [164, 0, 0, 11, 0, 31],
+    [164, 27, 0, 10, 0, 111],
+    [169, 27, 0, 10, 0, 111],
+    [164, 7, 0, 0, 46, 29],
+    [171, 27, 0, 10, 0, 111],
+    [164, 24, 31, 10, 63, 111],
+    [164, 24, 31, 12, 0, 111],
+    [164, 0, 0, 10, 0, 111],
+    [166, 0, 0, 10, 63, 111],
+    [169, 0, 0, 10, 63, 111],
+    [166, 0, 0, 10, 63, 47],
+    [164, 28, 0, 10, 0, 111],
+    [164, 7, 0, 0, 63, 29],
+    [166, 0, 0, 12, 63, 47],
+    [164, 26, 0, 0, 0, 143],
+    [164, 26, 0, 0, 63, 29],
+    [164, 0, 0, 10, 0, 79],
+    [164, 0, 0, 10, 0, 175],
+    [172, 7, 0, 10, 0, 79],
+];
 const EXCEL_CANONICAL_STYLE_COUNT: u32 = 27;
 const LIBREOFFICE_UNMAPPED_STYLE_INDEX: usize = 7;
 const LIBREOFFICE_STYLE_MAP: [u32; 26] = [
@@ -629,7 +656,30 @@ impl XlsxContainer {
             let source_borders = style_entries(source_styles, "borders", "border")?;
             let excel_fonts = style_entries(EXCEL_STYLES_XML, "fonts", "font")?;
             let excel_borders = style_entries(EXCEL_STYLES_XML, "borders", "border")?;
-            let libreoffice_xfs = style_entries(LIBREOFFICE_CELL_XFS_XML, "cellXfs", "xf")?;
+            let mut libreoffice_xml = String::with_capacity(8192);
+            libreoffice_xml.push_str("<cellXfs count=\"26\">");
+            for &[num_fmt, font, fill, border, xf_id, flags] in &LIBREOFFICE_CELL_XFS {
+                let horiz = match flags >> 6_u8 {
+                    1 => "center",
+                    2 => "left",
+                    _ => "general",
+                };
+                let vert = if flags & 16 != 0 { "bottom" } else { "center" };
+                let bool_str = |mask: u8| if flags & mask != 0 { "true" } else { "false" };
+                append_fmt(
+                    &mut libreoffice_xml,
+                    format_args!(
+                        "<xf numFmtId=\"{num_fmt}\" fontId=\"{font}\" fillId=\"{fill}\" borderId=\"{border}\" xfId=\"{xf_id}\" applyFont=\"{}\" applyBorder=\"{}\" applyAlignment=\"{}\" applyProtection=\"{}\"><alignment horizontal=\"{horiz}\" vertical=\"{vert}\" textRotation=\"0\" wrapText=\"{}\" indent=\"0\" shrinkToFit=\"false\"/><protection locked=\"true\" hidden=\"false\"/></xf>",
+                        bool_str(1),
+                        bool_str(2),
+                        bool_str(4),
+                        bool_str(8),
+                        bool_str(32),
+                    ),
+                );
+            }
+            libreoffice_xml.push_str("</cellXfs>");
+            let libreoffice_xfs = style_entries(&libreoffice_xml, "cellXfs", "xf")?;
             if libreoffice_xfs.len() != LIBREOFFICE_STYLE_MAP.len() {
                 return Err(err(
                     "내장 LibreOffice style mapping 수가 올바르지 않습니다.",

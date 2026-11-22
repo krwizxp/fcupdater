@@ -823,15 +823,29 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             }
             match record_id {
                 BIFF_RECORD_LABEL_SST => {
-                    if record_data.len() != 10 {
+                    let Ok(
+                        &[
+                            row_lo,
+                            row_hi,
+                            col_lo,
+                            col_hi,
+                            _,
+                            _,
+                            idx_0,
+                            idx_1,
+                            idx_2,
+                            idx_3,
+                        ],
+                    ) = <&[u8; 10]>::try_from(record_data)
+                    else {
                         return Err(err(format!(
                             "LABELSST record 길이가 예상과 다릅니다: expected=10, actual={}",
                             record_data.len()
                         )));
-                    }
+                    };
                     label_sst_count = label_sst_count.strict_add(1);
-                    let row = usize::from(read_u16_le(record_data, 0)?) + 1;
-                    let col = usize::from(read_u16_le(record_data, 2)?);
+                    let row = usize::from(u16::from_le_bytes([row_lo, row_hi])).strict_add(1);
+                    let col = usize::from(u16::from_le_bytes([col_lo, col_hi]));
                     if row > MAX_SOURCE_ROW {
                         return Err(err(format!(
                             "시트 행 인덱스가 비정상적으로 큽니다: {row} (최대 {MAX_SOURCE_ROW})"
@@ -858,7 +872,7 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
                         current_row = SourceRow::default();
                     }
                     previous_cell = Some((row, col));
-                    let idx = read_u32_le(record_data, 6)? as usize;
+                    let idx = u32::from_le_bytes([idx_0, idx_1, idx_2, idx_3]) as usize;
                     let value = shared_strings.get(idx).ok_or_else(|| {
                         err(format!(
                             "LABELSST가 존재하지 않는 SST index를 참조합니다: {idx}"

@@ -1,4 +1,4 @@
-use self::cell_ref::{MAX_A1_ROW, parse_ref_with_locks, with_unlocked_ref_parts};
+use self::cell_ref::{MAX_A1_ROW, col_name_into, parse_ref_with_locks};
 use super::{
     CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH, CanonicalStyleMap, FILTER_DATABASE_REF_PREFIX,
     MASTER_SHEET_NAME, MASTER_SHEET_PATH, SPREADSHEETML_NAMESPACE, SaveVerification,
@@ -1198,9 +1198,9 @@ impl Worksheet {
                 let row_text = row.format_into(&mut row_buffer);
                 let mut last_row_buffer = NumBuffer::new();
                 let last_row_text = last_row.format_into(&mut last_row_buffer);
-                with_unlocked_ref_parts(col, row, |col_name, _| {
-                    reference.extend([col_name, row_text, ":", col_name, last_row_text]);
-                })?;
+                let mut col_buffer = [0_u8; 3];
+                let col_name = col_name_into(col, &mut col_buffer)?;
+                reference.extend([col_name, row_text, ":", col_name, last_row_text]);
                 let mut si_buffer = NumBuffer::new();
                 let si_text = next_si.format_into(&mut si_buffer);
                 follower_xml.clear();
@@ -1502,6 +1502,25 @@ impl Worksheet {
                     if master_address && !display.trim().is_empty() {
                         last_master_address_row = Some(row_num);
                     }
+                }
+                if cell.inner_xml.is_empty() {
+                    continue;
+                }
+                if let Some(plain_value) = cell
+                    .inner_xml
+                    .strip_prefix("<v>")
+                    .and_then(|rest| rest.strip_suffix("</v>"))
+                    .filter(|body| !body.as_bytes().contains(&b'<'))
+                {
+                    let has_payload = if plain_value.as_bytes().contains(&b'&') {
+                        !decode_xml_entities(plain_value)?.trim().is_empty()
+                    } else {
+                        !plain_value.trim().is_empty()
+                    };
+                    if row_num >= layout.data_start_row && col <= last_col && has_payload {
+                        last_data_row = Some(row_num);
+                    }
+                    continue;
                 }
                 let mut content_scanner = XmlScanner::new(&cell.inner_xml);
                 let content = content_scanner.next_direct_element("worksheet cell")?;
@@ -1837,19 +1856,17 @@ impl Worksheet {
         for (row_num, row) in (1_u32..=MAX_A1_ROW).zip(&self.rows) {
             let mut row_buffer = NumBuffer::new();
             let row_text = row_num.format_into(&mut row_buffer);
-            out.extend(["<row", " r=\"", row_text, "\"", row.attrs_xml.as_str()]);
+            out.extend(["<row r=\"", row_text, "\"", row.attrs_xml.as_str()]);
             if row.cells.is_empty() {
                 out.push_str("/>");
                 continue;
             }
             out.push('>');
+            let mut col_buffer = [0_u8; 3];
             for cell in &row.cells {
                 let col = cell.col;
-                out.extend(["<c", " r=\""]);
-                with_unlocked_ref_parts(col, row_num, |col_text, _| {
-                    out.extend([col_text, row_text]);
-                })?;
-                out.push('"');
+                let col_text = col_name_into(col, &mut col_buffer)?;
+                out.extend(["<c r=\"", col_text, row_text, "\""]);
                 if let Some(style) = cell.style {
                     out.push_str(" s=\"");
                     push_decimal_text!(&mut out, style);
@@ -1862,7 +1879,7 @@ impl Worksheet {
                     shared_string_reference_count = shared_string_reference_count.strict_add(1);
                     out.push_str("><v>");
                     push_decimal_text!(&mut out, index);
-                    out.extend(["</v>", "</c>"]);
+                    out.push_str("</v></c>");
                 } else if !cell.inner_xml.is_empty() {
                     out.extend([">", cell.inner_xml.as_str(), "</c>"]);
                 } else {

@@ -155,7 +155,7 @@ impl EasyHandle {
     fn setopt_off_t(&self, option: CurlOption, value: CurlOffT) -> DownloadResult<()> {
         curl_setopt!(self, option, value)
     }
-    fn setopt_ptr<T>(&self, option: CurlOption, value: *const T) -> DownloadResult<()> {
+    fn setopt_ptr(&self, option: CurlOption, value: *const c_void) -> DownloadResult<()> {
         curl_setopt!(self, option, value)
     }
 }
@@ -238,11 +238,11 @@ impl Client {
                         sys::curl_easy_reset(reset_handle.as_ptr());
                     }
                 });
-                handle.setopt_ptr(CURLOPT_URL, url.as_ptr())?;
-                handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
+                handle.setopt_ptr(CURLOPT_URL, url.as_ptr().cast::<c_void>())?;
+                handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr().cast::<c_void>())?;
                 handle.setopt_ptr(
                     CURLOPT_ERRORBUFFER,
-                    error_buffer.as_mut_ptr().cast::<c_char>(),
+                    error_buffer.as_mut_ptr().cast::<c_void>(),
                 )?;
                 handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
                 handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
@@ -258,7 +258,10 @@ impl Client {
                 ] {
                     handle.setopt_long(option, value)?;
                 }
-                handle.setopt_ptr(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
+                handle.setopt_ptr(
+                    CURLOPT_PROTOCOLS_STR,
+                    HTTPS_PROTOCOL.as_ptr().cast::<c_void>(),
+                )?;
                 handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, HTTP_MAX_BODY_BYTES_OFF_T)?;
                 if let Some(body_bytes) = request_body {
                     handle.setopt_long(CURLOPT_POST, 1)?;
@@ -268,7 +271,7 @@ impl Client {
                     handle.setopt_long(CURLOPT_POSTFIELDSIZE, body_len)?;
                     if !body_bytes.is_empty() {
                         handle
-                            .setopt_ptr(CURLOPT_POSTFIELDS, body_bytes.as_ptr().cast::<c_char>())?;
+                            .setopt_ptr(CURLOPT_POSTFIELDS, body_bytes.as_ptr().cast::<c_void>())?;
                     }
                 } else {
                     handle.setopt_long(CURLOPT_HTTPGET, 1)?;

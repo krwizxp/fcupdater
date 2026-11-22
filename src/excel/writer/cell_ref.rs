@@ -57,21 +57,16 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         row_locked,
     })
 }
-pub(super) fn with_unlocked_ref_parts<R>(
+pub(super) fn col_name_into(
     mut col: u32,
-    row: u32,
-    use_parts: impl FnOnce(&str, u32) -> R,
-) -> Result<R> {
+    col_buffer: &mut [u8; MAX_A1_COLUMN_LETTERS],
+) -> Result<&str> {
     (1..=MAX_A1_COL)
         .contains(&col)
         .ok_or_else(|| err(format!("Excel column 범위를 벗어났습니다: {col}")))?;
-    (1..=MAX_A1_ROW)
-        .contains(&row)
-        .ok_or_else(|| err(format!("Excel row 범위를 벗어났습니다: {row}")))?;
     if let Some(&single) = SINGLE_LETTER_COLUMNS.get((col.strict_sub(1)) as usize) {
-        return Ok(use_parts(single, row));
+        return Ok(single);
     }
-    let mut col_buffer = [0_u8; MAX_A1_COLUMN_LETTERS];
     let mut index = col_buffer.len();
     while col > 0 {
         let base = col.strict_sub(1);
@@ -82,7 +77,8 @@ pub(super) fn with_unlocked_ref_parts<R>(
             .unwrap_or_else(|| process::abort()) = b'A'.strict_add(rem);
         col = base.div_euclid(26);
     }
-    let col_name = str::from_utf8(col_buffer.get(index..).unwrap_or_else(|| process::abort()))
-        .unwrap_or_else(|_| process::abort());
-    Ok(use_parts(col_name, row))
+    Ok(
+        str::from_utf8(col_buffer.get(index..).unwrap_or_else(|| process::abort()))
+            .unwrap_or_else(|_| process::abort()),
+    )
 }

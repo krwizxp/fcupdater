@@ -285,8 +285,10 @@ impl BitWriter<'_> {
         Ok(())
     }
     fn write_bits(&mut self, value: u16, count: u8) -> Result<()> {
-        let mask = u16::MAX.unbounded_shr(u16::BITS.strict_sub(u32::from(count)));
-        self.bit_buffer |= u64::from(value & mask) << self.bit_count;
+        self.write_bits_u32(u32::from(value), count)
+    }
+    fn write_bits_u32(&mut self, value: u32, count: u8) -> Result<()> {
+        self.bit_buffer |= u64::from(value) << self.bit_count;
         self.bit_count = self.bit_count.strict_add(count);
         if self.bit_count >= 32 {
             if self.buffer.len().strict_sub(self.buffered_len) < 4 {
@@ -455,6 +457,9 @@ impl InflateState<'_> {
         let Some((&base, &extra_bits)) = bases.get(index).zip(extra_bits_table.get(index)) else {
             return Err(err(error_message));
         };
+        if extra_bits == 0 {
+            return Ok(base);
+        }
         let extra = usize::from(self.reader.read_bits(extra_bits)?);
         Ok(base.strict_add(extra))
     }
@@ -1075,6 +1080,8 @@ impl DeflateWriter<'_, '_> {
                 };
                 let min_candidate = position.saturating_sub(DEFLATE_MAX_DISTANCE);
                 let max_len = bytes.len().strict_sub(position).min(MAX_MATCH);
+                let nice_len = XML_NICE_MATCH_LEN.min(max_len);
+                let mut best_tail = None;
                 let mut chain_len = 0_usize;
                 while candidate != usize::MAX
                     && candidate >= min_candidate
@@ -1086,8 +1093,7 @@ impl DeflateWriter<'_, '_> {
                         return Ok(None);
                     }
                     if best_len < MIN_MATCH
-                        || bytes.get(candidate.strict_add(best_len))
-                            == bytes.get(position.strict_add(best_len))
+                        || bytes.get(candidate.strict_add(best_len)).copied() == best_tail
                     {
                         let mut len = 0_usize;
                         let mut mismatch_found = false;
@@ -1120,9 +1126,10 @@ impl DeflateWriter<'_, '_> {
                         if len > best_len && len >= MIN_MATCH {
                             best_len = len;
                             best_distance = position.strict_sub(candidate);
-                            if len >= XML_NICE_MATCH_LEN {
+                            if len >= nice_len {
                                 break;
                             }
+                            best_tail = bytes.get(position.strict_add(best_len)).copied();
                         }
                     }
                     let Some(&previous_distance) =
@@ -1408,36 +1415,69 @@ fn write_huffman_symbol(codes: &[u32], writer: &mut BitWriter<'_>, symbol: u16) 
     }
     writer.write_bits(u16::from_le_bytes([low, high]), len)
 }
+fn write_huffman_with_extra(
+    codes: &[u32],
+    writer: &mut BitWriter<'_>,
+    symbol: u16,
+    extra: u16,
+    extra_bits: u8,
+) -> Result<()> {
+    let [low, high, len, _] = huffman_get(codes, usize::from(symbol)).to_le_bytes();
+    if len == 0 {
+        process::abort();
+    }
+    let combined = u32::from(u16::from_le_bytes([low, high])) | (u32::from(extra) << len);
+    writer.write_bits_u32(combined, len.strict_add(extra_bits))
+}
 fn write_deflate_tokens(
     tokens: &[DeflateToken],
     writer: &mut BitWriter<'_>,
     dynamic: Option<(&[u32], &[u32])>,
 ) -> Result<()> {
-    for &token in tokens {
-        match token.into_kind() {
-            DeflateTokenKind::Literal(byte) => match dynamic {
-                Some((literal_huffman, _)) => write_huffman_symbol(literal_huffman, writer, byte)?,
-                None => write_fixed_symbol(writer, byte)?,
-            },
-            DeflateTokenKind::Match { distance, length } => {
-                let length_code = DeflateWriter::length_symbol(length);
-                let distance_code = DeflateWriter::distance_symbol(distance);
-                if let Some((literal_huffman, distance_huffman)) = dynamic {
-                    write_huffman_symbol(literal_huffman, writer, length_code.symbol)?;
-                    writer.write_bits(length_code.extra, length_code.extra_bits)?;
-                    write_huffman_symbol(distance_huffman, writer, distance_code.symbol)?;
-                } else {
-                    write_fixed_symbol(writer, length_code.symbol)?;
-                    writer.write_bits(length_code.extra, length_code.extra_bits)?;
-                    writer.write_bits(reverse_low_bits(distance_code.symbol, 5), 5)?;
+    if let Some((literal_huffman, distance_huffman)) = dynamic {
+        for &token in tokens {
+            match token.into_kind() {
+                DeflateTokenKind::Literal(byte) => {
+                    write_huffman_symbol(literal_huffman, writer, byte)?;
                 }
-                writer.write_bits(distance_code.extra, distance_code.extra_bits)?;
+                DeflateTokenKind::Match { distance, length } => {
+                    let length_code = DeflateWriter::length_symbol(length);
+                    let distance_code = DeflateWriter::distance_symbol(distance);
+                    write_huffman_with_extra(
+                        literal_huffman,
+                        writer,
+                        length_code.symbol,
+                        length_code.extra,
+                        length_code.extra_bits,
+                    )?;
+                    write_huffman_with_extra(
+                        distance_huffman,
+                        writer,
+                        distance_code.symbol,
+                        distance_code.extra,
+                        distance_code.extra_bits,
+                    )?;
+                }
             }
         }
-    }
-    match dynamic {
-        Some((literal_huffman, _)) => write_huffman_symbol(literal_huffman, writer, 256),
-        None => write_fixed_symbol(writer, 256),
+        write_huffman_symbol(literal_huffman, writer, 256)
+    } else {
+        for &token in tokens {
+            match token.into_kind() {
+                DeflateTokenKind::Literal(byte) => write_fixed_symbol(writer, byte)?,
+                DeflateTokenKind::Match { distance, length } => {
+                    let length_code = DeflateWriter::length_symbol(length);
+                    let distance_code = DeflateWriter::distance_symbol(distance);
+                    write_fixed_symbol(writer, length_code.symbol)?;
+                    writer.write_bits(length_code.extra, length_code.extra_bits)?;
+                    let dist_combined = u32::from(reverse_low_bits(distance_code.symbol, 5))
+                        | (u32::from(distance_code.extra) << 5_u8);
+                    writer
+                        .write_bits_u32(dist_combined, 5_u8.strict_add(distance_code.extra_bits))?;
+                }
+            }
+        }
+        write_fixed_symbol(writer, 256)
     }
 }
 fn write_fixed_symbol(writer: &mut BitWriter<'_>, symbol: u16) -> Result<()> {
