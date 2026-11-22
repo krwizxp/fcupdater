@@ -110,18 +110,25 @@ impl<'xml> XmlScanner<'xml> {
         })
     }
     fn find_tag_end(&self, tag_start: usize) -> Option<usize> {
-        let tail = self.xml.get(tag_start..)?;
-        if tail.starts_with("<!--") {
-            return find_delimited_markup_end(self.xml, tag_start, 4, "-->");
+        let bytes = self.xml.as_bytes();
+        let next_byte = *bytes.get(tag_start.strict_add(1))?;
+        if next_byte == b'/' {
+            let tail = self.xml.get(tag_start.strict_add(2)..)?;
+            return tail
+                .find('>')
+                .map(|offset| tag_start.strict_add(2).strict_add(offset));
         }
-        if tail.starts_with("<!") {
-            return None;
-        }
-        if tail.starts_with("<?") {
+        if matches!(next_byte, b'!' | b'?') {
+            let tail = self.xml.get(tag_start..)?;
+            if tail.starts_with("<!--") {
+                return find_delimited_markup_end(self.xml, tag_start, 4, "-->");
+            }
+            if next_byte == b'!' {
+                return None;
+            }
             return find_delimited_markup_end(self.xml, tag_start, 2, "?>");
         }
-        let bytes = self.xml.as_bytes();
-        let mut cursor = tag_start;
+        let mut cursor = tag_start.strict_add(1);
         let mut quote = None;
         while let Some(&byte) = bytes.get(cursor) {
             match quote {
@@ -462,24 +469,46 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
     while cursor < text.len() {
         let tail = text.get(cursor..).unwrap_or_else(|| process::abort());
         let mut amp = None;
-        for (relative, ch) in tail.char_indices() {
-            if !is_valid_xml_char(ch) {
-                return Err(err(format!(
-                    "XML text: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{:04X}",
-                    u32::from(ch)
-                )));
-            }
-            (ch != '<').ok_or(err("XML text에 raw '<' 문자가 포함되어 있습니다."))?;
-            (ch != ']'
-                || !tail
-                    .get(relative..)
-                    .is_some_and(|remaining| remaining.starts_with("]]>")))
-            .ok_or(err(
-                "XML text에 허용되지 않는 ']]>' 시퀀스가 포함되어 있습니다.",
-            ))?;
-            if ch == '&' {
-                amp = Some(relative);
-                break;
+        let tail_bytes = tail.as_bytes();
+        for (relative, &byte) in tail_bytes.iter().enumerate() {
+            match byte {
+                0x00..=0x1F => {
+                    if !matches!(byte, b'\t' | b'\n' | b'\r') {
+                        return Err(err(format!(
+                            "XML text: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{byte:04X}",
+                        )));
+                    }
+                }
+                b'&' => {
+                    amp = Some(relative);
+                    break;
+                }
+                b'<' => return Err(err("XML text에 raw '<' 문자가 포함되어 있습니다.")),
+                b']' => {
+                    if tail_bytes
+                        .get(relative.strict_add(1)..relative.strict_add(3))
+                        .is_some_and(|next| next == b"]>")
+                    {
+                        return Err(err(
+                            "XML text에 허용되지 않는 ']]>' 시퀀스가 포함되어 있습니다.",
+                        ));
+                    }
+                }
+                0xEF => {
+                    if let Some(&[0xBF, third @ (0xBE | 0xBF)]) =
+                        tail_bytes.get(relative.strict_add(1)..relative.strict_add(3))
+                    {
+                        let code = if third == 0xBE {
+                            0xFFFE_u32
+                        } else {
+                            0xFFFF_u32
+                        };
+                        return Err(err(format!(
+                            "XML text: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{code:04X}",
+                        )));
+                    }
+                }
+                _ => {}
             }
         }
         let Some(relative_amp) = amp else {
@@ -529,7 +558,9 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                 "XML numeric entity가 유효한 Unicode scalar value가 아닙니다: &{entity};"
             )));
         };
-        if !is_valid_xml_char(decoded_char) {
+        if !((decoded_char >= ' ' && decoded_char != '\u{fffe}' && decoded_char != '\u{ffff}')
+            || matches!(decoded_char, '\t' | '\n' | '\r'))
+        {
             return Err(err(format!(
                 "XML numeric entity가 XML 1.0 유효 문자 범위를 벗어났습니다: &{entity};"
             )));
@@ -569,9 +600,6 @@ fn parse_numeric_entity(
             err_with_source(parse_context, source)
         }
     })
-}
-pub(super) const fn is_valid_xml_char(ch: char) -> bool {
-    (ch >= ' ' && ch != '\u{fffe}' && ch != '\u{ffff}') || matches!(ch, '\t' | '\n' | '\r')
 }
 fn local_tag_name(name: &str) -> &str {
     name.rsplit_once(':').map_or(name, |(_, local)| local)

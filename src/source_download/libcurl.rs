@@ -436,6 +436,8 @@ fn nul_terminated_buffer<'buffer>(
         download_error_with_source(format!("{label}에 NUL 문자가 포함되어 있습니다"), source)
     })
 }
+#[cold]
+#[inline(never)]
 fn curl_error(context: &str, code: CurlCode) -> String {
     // SAFETY: curl_easy_strerror returns either null or a static NUL-terminated message for code.
     let raw_ptr = unsafe { sys::curl_easy_strerror(code) };

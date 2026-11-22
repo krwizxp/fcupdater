@@ -391,6 +391,8 @@ impl Client {
         // SAFETY: GetLastError has no preconditions.
         unsafe { sys::GetLastError() }
     }
+    #[cold]
+    #[inline(never)]
     fn last_error_message(context: &str) -> String {
         let code = Self::last_error_code();
         Self::windows_error_message(context, code)
@@ -508,6 +510,8 @@ impl Client {
         };
         (ok != 0_i32).ok_or_else(Self::last_error_code)
     }
+    #[cold]
+    #[inline(never)]
     fn windows_error_message(context: &str, code: u32) -> String {
         format!("{context} 실패: Windows error {code}")
     }

@@ -486,7 +486,13 @@ impl SstChunkReader<'_, '_> {
                 pending_surrogate
                     .is_none()
                     .ok_or_else(|| err("SST UTF-16 서로게이트 쌍이 올바르지 않습니다."))?;
-                out.extend(bytes.iter().copied().map(char::from));
+                if bytes.is_ascii()
+                    && let Ok(ascii) = str::from_utf8(bytes)
+                {
+                    out.push_str(ascii);
+                } else {
+                    out.extend(bytes.iter().copied().map(char::from));
+                }
             }
             self.offset_in_chunk = end;
             remaining = remaining.strict_sub(chars_here);

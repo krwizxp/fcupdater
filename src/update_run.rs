@@ -169,7 +169,7 @@ impl UpdateRun<'_> {
     fn print_summary_rows<'row>(
         &mut self,
         title: &str,
-        rows: impl ExactSizeIterator<Item = (&'row str, &'row str, &'row str)>,
+        rows: &mut dyn ExactSizeIterator<Item = (&'row str, &'row str, &'row str)>,
     ) -> Result<()> {
         let row_count = rows.len();
         if row_count == 0 {
@@ -209,13 +209,13 @@ impl UpdateRun<'_> {
         writeln!(self.out, "- 저장 검증: {verification_state}")?;
         self.print_summary_rows(
             "신규 업체 추가 목록 (상위 20개)",
-            added
+            &mut added
                 .iter()
                 .map(|item| (item.region, item.name.as_str(), item.address.as_str())),
         )?;
         self.print_summary_rows(
             "폐업 업체 삭제 목록 (상위 20개)",
-            deleted.iter().map(|item| {
+            &mut deleted.iter().map(|item| {
                 (
                     item.region.as_str(),
                     item.name.as_str(),

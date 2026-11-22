@@ -4,9 +4,7 @@ use super::{
     MASTER_SHEET_NAME, MASTER_SHEET_PATH, SPREADSHEETML_NAMESPACE, SaveVerification,
     canonical_excel_fragment, copy_text,
     xlsx_container::{XlsxContainer, validate_spreadsheet_xml_document},
-    xml::{
-        XmlAttrScanner, XmlScanner, decode_xml_entities, extract_first_tag_text, is_valid_xml_char,
-    },
+    xml::{XmlAttrScanner, XmlScanner, decode_xml_entities, extract_first_tag_text},
 };
 use crate::{
     diagnostic::{
@@ -1405,6 +1403,16 @@ impl Worksheet {
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
         let row_obj = Self::ensure_row_mut(rows, row, "worksheet cell row 메모리 확보 실패")?;
+        if let Some(dense_index) = col
+            .checked_sub(1)
+            .and_then(|idx| usize::try_from(idx).ok())
+            .filter(|&idx| row_obj.cells.get(idx).is_some_and(|cell| cell.col == col))
+        {
+            return Ok(row_obj
+                .cells
+                .get_mut(dense_index)
+                .unwrap_or_else(|| process::abort()));
+        }
         match row_obj.cells.binary_search_by_key(&col, |cell| cell.col) {
             Ok(index) => Ok(row_obj
                 .cells
@@ -1955,6 +1963,14 @@ impl Worksheet {
 }
 impl Row {
     fn cell(&self, col: u32) -> Option<&Cell> {
+        if let Some(cell) = col
+            .checked_sub(1)
+            .and_then(|idx| usize::try_from(idx).ok())
+            .and_then(|idx| self.cells.get(idx))
+            .filter(|cell| cell.col == col)
+        {
+            return Some(cell);
+        }
         let index = self
             .cells
             .binary_search_by_key(&col, |cell| cell.col)
@@ -2229,28 +2245,54 @@ fn validated_xml_escaped_len(
     context: XmlEscapeContext,
     error_context: &str,
 ) -> Result<usize> {
-    text.chars().try_fold(0_usize, |total, ch| {
-        if !is_valid_xml_char(ch) {
-            return Err(err(format!(
-                "{error_context}: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{:04X}",
-                u32::from(ch)
-            )));
+    let bytes = text.as_bytes();
+    let mut total = bytes.len();
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            0x00..=0x1F => {
+                if !matches!(byte, b'\t' | b'\n' | b'\r') {
+                    return Err(err(format!(
+                        "{error_context}: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{byte:04X}",
+                    )));
+                }
+                if let Some(replacement) = xml_escape_replacement(byte, context) {
+                    total = total.strict_add(replacement.len().strict_sub(1));
+                }
+            }
+            0x20..=0x7F => {
+                if let Some(replacement) = xml_escape_replacement(byte, context) {
+                    total = total.strict_add(replacement.len().strict_sub(1));
+                }
+            }
+            0xEF => {
+                if let Some(&[0xBF, third @ (0xBE | 0xBF)]) =
+                    bytes.get(index.strict_add(1)..index.strict_add(3))
+                {
+                    let code = if third == 0xBE {
+                        0xFFFE_u32
+                    } else {
+                        0xFFFF_u32
+                    };
+                    return Err(err(format!(
+                        "{error_context}: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{code:04X}",
+                    )));
+                }
+            }
+            _ => {}
         }
-        let encoded_len =
-            xml_escape_replacement(ch, context).map_or_else(|| ch.len_utf8(), str::len);
-        Ok(total.strict_add(encoded_len))
-    })
+    }
+    Ok(total)
 }
 fn append_xml_escaped(out: &mut String, text: &str, context: XmlEscapeContext) {
     let mut unescaped_start = 0_usize;
-    for (index, ch) in text.char_indices() {
-        if let Some(replacement) = xml_escape_replacement(ch, context) {
+    for (index, &byte) in text.as_bytes().iter().enumerate() {
+        if let Some(replacement) = xml_escape_replacement(byte, context) {
             let prefix = text
                 .get(unescaped_start..index)
                 .unwrap_or_else(|| process::abort());
             out.push_str(prefix);
             out.push_str(replacement);
-            unescaped_start = index.strict_add(ch.len_utf8());
+            unescaped_start = index.strict_add(1);
         }
     }
     let tail = text
@@ -2258,16 +2300,16 @@ fn append_xml_escaped(out: &mut String, text: &str, context: XmlEscapeContext) {
         .unwrap_or_else(|| process::abort());
     out.push_str(tail);
 }
-const fn xml_escape_replacement(ch: char, context: XmlEscapeContext) -> Option<&'static str> {
-    match ch {
-        '\t' if matches!(context, XmlEscapeContext::Attribute) => Some("&#x9;"),
-        '\n' if matches!(context, XmlEscapeContext::Attribute) => Some("&#xA;"),
-        '\r' => Some("&#xD;"),
-        '&' => Some("&amp;"),
-        '<' => Some("&lt;"),
-        '>' => Some("&gt;"),
-        '"' if matches!(context, XmlEscapeContext::Attribute) => Some("&quot;"),
-        '\'' if matches!(context, XmlEscapeContext::Attribute) => Some("&apos;"),
+const fn xml_escape_replacement(byte: u8, context: XmlEscapeContext) -> Option<&'static str> {
+    match byte {
+        b'\t' if matches!(context, XmlEscapeContext::Attribute) => Some("&#x9;"),
+        b'\n' if matches!(context, XmlEscapeContext::Attribute) => Some("&#xA;"),
+        b'\r' => Some("&#xD;"),
+        b'&' => Some("&amp;"),
+        b'<' => Some("&lt;"),
+        b'>' => Some("&gt;"),
+        b'"' if matches!(context, XmlEscapeContext::Attribute) => Some("&quot;"),
+        b'\'' if matches!(context, XmlEscapeContext::Attribute) => Some("&apos;"),
         _ => None,
     }
 }

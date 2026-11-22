@@ -569,10 +569,12 @@ impl XlsxContainer {
             source_permissions,
         };
         container.validate_content_types()?;
+        let mut root_ids = [const { None }; ROOT_RELATIONSHIPS.len()];
         validate_relationship_set(
             container.text("_rels/.rels")?,
             "_rels/.rels",
             &ROOT_RELATIONSHIPS,
+            &mut root_ids,
             &container,
         )?;
         if container.has_part("docProps/custom.xml") {
@@ -881,10 +883,12 @@ impl XlsxContainer {
     }
     fn take_workbook_dependencies(&mut self, workbook_xml: &str) -> Result<()> {
         let workbook_relationships = self.take_text("xl/_rels/workbook.xml.rels")?;
-        let relationship_ids = validate_relationship_set(
+        let mut relationship_ids = [const { None }; WORKBOOK_RELATIONSHIPS.len()];
+        validate_relationship_set(
             &workbook_relationships,
             "workbook.xml.rels",
             &WORKBOOK_RELATIONSHIPS,
+            &mut relationship_ids,
             self,
         )?;
         let [_, change_log_rid, master_rid, _, _, _] = relationship_ids;
@@ -934,10 +938,12 @@ impl XlsxContainer {
             ))?;
             if has_relationships {
                 let relationships_xml = self.take_text("xl/worksheets/_rels/sheet1.xml.rels")?;
-                let mut relationships = validate_relationship_set(
+                let mut relationships = [const { None }; SHEET_RELATIONSHIPS.len()];
+                validate_relationship_set(
                     &relationships_xml,
                     "sheet1.xml.rels",
                     &SHEET_RELATIONSHIPS,
+                    &mut relationships,
                     self,
                 )?;
                 let rid = relationships
@@ -1018,7 +1024,7 @@ impl XlsxContainer {
             "Types",
             CONTENT_TYPES_NAMESPACE,
             "[Content_Types].xml",
-            |local_name, raw| {
+            &mut |local_name, raw| {
                 let (is_default, key_name) = match local_name {
                     "Default" => (true, "Extension"),
                     "Override" => (false, "PartName"),
@@ -1290,31 +1296,49 @@ fn parse_attrs<'tag, const N: usize>(
     }
     Ok(values)
 }
-fn validate_exact_attrs<const N: usize>(
-    tag: &str,
-    expected: &[(&str, &str); N],
-    context: &str,
-) -> Result<()> {
-    let values = parse_attrs(tag, expected.map(|(name, _)| name), context)?;
-    values
-        .iter()
-        .zip(expected)
-        .all(|(value, expected_attr)| value.as_deref() == Some(expected_attr.1))
-        .ok_or_else(|| err(format!("{context} 속성이 고정 스키마와 다릅니다.")))
+fn validate_exact_attrs(tag: &str, expected: &[(&str, &str)], context: &str) -> Result<()> {
+    let mut seen = 0_u32;
+    let mut attributes = XmlAttrScanner::new(tag)?;
+    while let Some((name, value)) = attributes.next()? {
+        let Some((index, &(_, expected_value))) = expected
+            .iter()
+            .enumerate()
+            .find(|&(_, &(candidate, _))| candidate == name)
+        else {
+            return Err(err(format!(
+                "{context}에 알 수 없는 {name} 속성이 있습니다."
+            )));
+        };
+        let bit = 1_u32
+            .checked_shl(u32::try_from(index).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        if seen & bit != 0 {
+            return Err(err(format!("{context}에 {name} 속성이 중복되었습니다.")));
+        }
+        seen |= bit;
+        if value.as_ref() != expected_value {
+            return Err(err(format!("{context} 속성이 고정 스키마와 다릅니다.")));
+        }
+    }
+    let expected_mask = 1_u32
+        .checked_shl(u32::try_from(expected.len()).unwrap_or(u32::MAX))
+        .unwrap_or(0)
+        .strict_sub(1);
+    (seen == expected_mask).ok_or_else(|| err(format!("{context} 속성이 고정 스키마와 다릅니다.")))
 }
-fn validate_relationship_set<'xml, const N: usize>(
+fn validate_relationship_set<'xml>(
     xml: &'xml str,
     context: &str,
-    expected: &[RelationshipSpec; N],
+    expected: &[RelationshipSpec],
+    ids: &mut [Option<Cow<'xml, str>>],
     container: &XlsxContainer,
-) -> Result<[Option<Cow<'xml, str>>; N]> {
-    let mut ids: [Option<Cow<'xml, str>>; N] = array::repeat(None);
+) -> Result<()> {
     visit_direct_xml_children(
         xml,
         "Relationships",
         PACKAGE_RELATIONSHIPS_NAMESPACE,
         context,
-        |local_name, raw| {
+        &mut |local_name, raw| {
             if local_name != "Relationship" {
                 return Err(err(format!("{context} 관계 태그가 올바르지 않습니다.")));
             }
@@ -1358,7 +1382,7 @@ fn validate_relationship_set<'xml, const N: usize>(
             Ok(())
         },
     )?;
-    for (candidate, id) in expected.iter().zip(&ids) {
+    for (candidate, id) in expected.iter().zip(ids.iter()) {
         let required = candidate
             .optional_part
             .is_none_or(|part| container.has_part(part));
@@ -1369,8 +1393,9 @@ fn validate_relationship_set<'xml, const N: usize>(
             )));
         }
     }
-    Ok(ids)
+    Ok(())
 }
+
 fn scan_xml_root<'xml>(
     xml: &'xml str,
     expected_name: &str,
@@ -1489,10 +1514,10 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
     }
     Err(err(format!("{context}에 닫히지 않은 XML 요소가 있습니다.")))
 }
-fn validate_empty_xml_root<const N: usize>(
+fn validate_empty_xml_root(
     xml: &str,
     expected_name: &str,
-    expected_attrs: &[(&str, &str); N],
+    expected_attrs: &[(&str, &str)],
     context: &str,
 ) -> Result<()> {
     let (mut scanner, root) = scan_xml_root(xml, expected_name, context)?;
@@ -1521,7 +1546,7 @@ fn visit_direct_xml_children<'xml>(
     root_local_name: &str,
     expected_namespace: &str,
     context: &str,
-    mut visit: impl FnMut(&'xml str, &'xml str) -> Result<()>,
+    visit: &mut dyn FnMut(&'xml str, &'xml str) -> Result<()>,
 ) -> Result<()> {
     let (mut scanner, root) = scan_xml_root(xml, root_local_name, context)?;
     if root.self_closing {

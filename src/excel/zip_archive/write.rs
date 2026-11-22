@@ -66,10 +66,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
                 entry.uncompressed_size,
                 entry.part.name.len(),
             )?;
-            write_u16(&mut self.header_buffer, 0);
-            write_u16(&mut self.header_buffer, 0);
-            write_u16(&mut self.header_buffer, 0);
-            write_u32(&mut self.header_buffer, 0);
+            self.header_buffer.extend_from_slice(&[0_u8; 10]);
             write_u32(&mut self.header_buffer, entry.local_header_offset);
             self.header_buffer
                 .extend_from_slice(entry.part.name.as_bytes());
@@ -228,11 +225,18 @@ fn append_common_zip_fields(
 ) -> Result<()> {
     let name_len_u16 = u16::try_from(name_len)
         .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?;
-    write_u16(out, VERSION_NEEDED);
-    write_u16(out, EXCEL_ENTRY_FLAGS);
-    write_u16(out, METHOD_DEFLATE);
-    write_u16(out, 0);
-    write_u16(out, 0x0021);
+    out.extend_from_slice(&[
+        VERSION_NEEDED.to_le_bytes()[0],
+        VERSION_NEEDED.to_le_bytes()[1],
+        EXCEL_ENTRY_FLAGS.to_le_bytes()[0],
+        EXCEL_ENTRY_FLAGS.to_le_bytes()[1],
+        METHOD_DEFLATE.to_le_bytes()[0],
+        METHOD_DEFLATE.to_le_bytes()[1],
+        0,
+        0,
+        0x21,
+        0x00,
+    ]);
     write_u32(out, crc32);
     write_u32(out, compressed_size);
     write_u32(out, uncompressed_size);
