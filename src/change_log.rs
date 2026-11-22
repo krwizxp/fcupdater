@@ -15,19 +15,12 @@ const CHANGELOG_COL_NAME: u32 = 2;
 const CHANGELOG_COL_ADDRESS: u32 = 3;
 const CHANGELOG_COL_REASON: u32 = 4;
 const CHANGELOG_COL_OLD_GAS: u32 = 5;
-const CHANGELOG_COL_NEW_GAS: u32 = 6;
-const CHANGELOG_COL_DELTA_GAS: u32 = 7;
-const CHANGELOG_COL_OLD_PREMIUM: u32 = 8;
-const CHANGELOG_COL_NEW_PREMIUM: u32 = 9;
-const CHANGELOG_COL_DELTA_PREMIUM: u32 = 10;
-const CHANGELOG_COL_OLD_DIESEL: u32 = 11;
-const CHANGELOG_COL_NEW_DIESEL: u32 = 12;
 const CHANGELOG_COL_DELTA_DIESEL: u32 = 13;
 const ROW_DECIMAL_TEXT_MAX_LEN: usize = 10;
-const DELTA_FORMULA_COLUMNS: [(&str, &str, u32); 3] = [
-    ("E", "F", CHANGELOG_COL_DELTA_GAS),
-    ("H", "I", CHANGELOG_COL_DELTA_PREMIUM),
-    ("K", "L", CHANGELOG_COL_DELTA_DIESEL),
+const FUEL_COLUMNS: [(u32, u32, u32, &str, &str); 3] = [
+    (5, 6, 7, "E", "F"),
+    (8, 9, 10, "H", "I"),
+    (11, 12, 13, "K", "L"),
 ];
 pub(super) struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
     pub added: &'data [&'source SourceRecord],
@@ -62,26 +55,20 @@ impl ChangeLogRowValues<'_> {
         ] {
             shared_strings.set_cell(worksheet, col, row, value)?;
         }
-        for (col, value) in [
-            (CHANGELOG_COL_OLD_GAS, self.old_fuels.gasoline),
-            (CHANGELOG_COL_NEW_GAS, self.new_fuels.gasoline),
-            (CHANGELOG_COL_OLD_PREMIUM, self.old_fuels.premium),
-            (CHANGELOG_COL_NEW_PREMIUM, self.new_fuels.premium),
-            (CHANGELOG_COL_OLD_DIESEL, self.old_fuels.diesel),
-            (CHANGELOG_COL_NEW_DIESEL, self.new_fuels.diesel),
-        ] {
-            worksheet.set_i32_at(col, row, value)?;
+        let fuels = FUEL_COLUMNS.iter().zip(
+            self.old_fuels
+                .into_array()
+                .into_iter()
+                .zip(self.new_fuels.into_array()),
+        );
+        for (&(old_col_num, new_col_num, ..), (old_value, new_value)) in fuels.clone() {
+            worksheet.set_i32_at(old_col_num, row, old_value)?;
+            worksheet.set_i32_at(new_col_num, row, new_value)?;
         }
         let mut row_buffer = NumBuffer::new();
         let row_text = row.format_into(&mut row_buffer);
         let mut cache_buffer = NumBuffer::new();
-        for (&(old_col, new_col, target_col), (old_value, new_value)) in
-            DELTA_FORMULA_COLUMNS.iter().zip([
-                (self.old_fuels.gasoline, self.new_fuels.gasoline),
-                (self.old_fuels.premium, self.new_fuels.premium),
-                (self.old_fuels.diesel, self.new_fuels.diesel),
-            ])
-        {
+        for (&(_, _, target_col, old_col, new_col), (old_value, new_value)) in fuels {
             let cached_value = old_value
                 .zip(new_value)
                 .map(|(old, new)| new.strict_sub(old));

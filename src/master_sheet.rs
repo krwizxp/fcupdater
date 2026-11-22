@@ -258,21 +258,15 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             self.ws
                 .set_i32_at(COL_SMART_DISCOUNT, row_num, Some(0_i32))?;
         } else {
-            format_scaled_value_into(
-                &mut buffers.cache,
-                plan.smart_discount.as_i128(),
-                DECIMAL_SCALE.as_i128(),
-            );
-            let smart_discount_cache = buffers.cache.as_str();
-            self.apply_formula_cache(
+            self.apply_numeric_formula_cache(
                 (row_num, COL_SMART_DISCOUNT),
                 false,
                 format_args!(
                     r#"IF(AND(IFERROR(SEARCH("{SMART_DISCOUNT_BRAND_KEYWORD}",$C{row_text}),0)>0,IFERROR(SEARCH("{SMART_DISCOUNT_DIRECT_KEYWORD}",$C{row_text}),0)>0),$B${SMART_DISCOUNT_INPUT_ROW},0)"#
                 ),
-                Some(smart_discount_cache),
-                false,
-                &mut buffers.formula,
+                Some(plan.smart_discount.as_i128()),
+                DECIMAL_SCALE.as_i128(),
+                buffers,
             )?;
         }
         for (col, source_col, price) in [
@@ -507,16 +501,14 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         })
     }
     fn refresh(&mut self) -> Result<()> {
-        let gasoline = MasterSheetUpdater::get_f64_at(self.ws, 2, 4, self.shared_strings)?
-            .unwrap_or(ScaledDecimal::ZERO);
-        let premium = MasterSheetUpdater::get_f64_at(self.ws, 2, 5, self.shared_strings)?
-            .unwrap_or(ScaledDecimal::ZERO);
-        let diesel = MasterSheetUpdater::get_f64_at(self.ws, 2, 6, self.shared_strings)?
-            .unwrap_or(ScaledDecimal::ZERO);
+        let read_quantity = |row| {
+            MasterSheetUpdater::get_f64_at(self.ws, 2, row, self.shared_strings)
+                .map(|value| value.unwrap_or(ScaledDecimal::ZERO))
+        };
         let quantities = FuelValues {
-            diesel,
-            gasoline,
-            premium,
+            gasoline: read_quantity(4)?,
+            premium: read_quantity(5)?,
+            diesel: read_quantity(6)?,
         };
         let mut region_rates = [None; TARGET_REGION_COUNT];
         for row in 4..=13 {
@@ -977,9 +969,13 @@ impl<'source> MasterSheetUpdater<'source> {
         ] {
             shared_strings.set_cell(ws, col, row, value)?;
         }
-        ws.set_i32_at(COL_GASOLINE, row, src.fuels.gasoline)?;
-        ws.set_i32_at(COL_PREMIUM, row, src.fuels.premium)?;
-        ws.set_i32_at(COL_DIESEL, row, src.fuels.diesel)
+        for (col, value) in [COL_GASOLINE, COL_PREMIUM, COL_DIESEL]
+            .into_iter()
+            .zip(src.fuels.into_array())
+        {
+            ws.set_i32_at(col, row, value)?;
+        }
+        Ok(())
     }
 }
 fn append_fuel_total_text(
@@ -1058,16 +1054,14 @@ fn read_master_fuels(
     row: u32,
     shared_strings: &SharedStringTable,
 ) -> Result<FuelValues<Option<i32>>> {
+    let read_price = |col| {
+        ws.get_i32_at(col, row, shared_strings)
+            .map(|value| value.filter(|price| *price > 0_i32))
+    };
     Ok(FuelValues {
-        diesel: ws
-            .get_i32_at(COL_DIESEL, row, shared_strings)?
-            .filter(|price| *price > 0_i32),
-        gasoline: ws
-            .get_i32_at(COL_GASOLINE, row, shared_strings)?
-            .filter(|price| *price > 0_i32),
-        premium: ws
-            .get_i32_at(COL_PREMIUM, row, shared_strings)?
-            .filter(|price| *price > 0_i32),
+        diesel: read_price(COL_DIESEL)?,
+        gasoline: read_price(COL_GASOLINE)?,
+        premium: read_price(COL_PREMIUM)?,
     })
 }
 fn try_push_row<T>(rows: &mut Vec<T>, max_len: usize, row: T) -> Result<()> {

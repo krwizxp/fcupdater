@@ -196,19 +196,14 @@ impl SourceDownload {
                 body.push('=');
                 Self::push_percent_encoded(&mut body, value.as_bytes());
             }
-            let headers = Self::request_headers(
-                &self.cookie_jars,
-                &mut self.cookie_header_buffer,
-                HttpHost::Opinet,
+            self.send_request(
+                (HttpHost::Opinet, OPINET_HOST, path),
+                Some(body.as_bytes()),
                 "text/html, */*; q=0.01",
                 Some("application/x-www-form-urlencoded; charset=UTF-8"),
                 referer,
                 matches!(profile, PostHeaderProfile::Ajax),
-            )?;
-            let response =
-                self.platform
-                    .request(Some(body.as_bytes()), OPINET_HOST, path, headers)?;
-            self.finish_response(HttpHost::Opinet, response)
+            )
         })();
         self.form_body_buffer = body;
         result
@@ -233,19 +228,14 @@ impl SourceDownload {
     }
     pub(crate) fn refresh_source(mut self) -> DownloadResult<Vec<u8>> {
         (|| -> DownloadResult<Vec<u8>> {
-            let headers = Self::request_headers(
-                &self.cookie_jars,
-                &mut self.cookie_header_buffer,
-                HttpHost::Opinet,
+            let body = self.send_request(
+                (HttpHost::Opinet, OPINET_HOST, OPDOWNLOAD_PATH),
+                None,
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 None,
                 None,
                 false,
             )?;
-            let opdownload_response =
-                self.platform
-                    .request(None, OPINET_HOST, OPDOWNLOAD_PATH, headers)?;
-            let body = self.finish_response(HttpHost::Opinet, opdownload_response)?;
             let opdownload_page = String::from_utf8(body).map_err(|source| {
                 download_error_with_source("HTTP 응답 UTF-8 변환 실패", source)
             })?;
@@ -326,48 +316,6 @@ impl SourceDownload {
             error
         })
     }
-    fn request_headers<'request>(
-        cookie_jars: &(CookieJar, CookieJar),
-        cookie_header: &'request mut String,
-        host: HttpHost,
-        accept: &'static str,
-        content_type: Option<&'static str>,
-        referer: Option<&'request str>,
-        requested_with: bool,
-    ) -> DownloadResult<RequestHeaders<'request>> {
-        cookie_header.clear();
-        let jar = match host {
-            HttpHost::Opinet => &cookie_jars.0,
-            HttpHost::Netfunnel => &cookie_jars.1,
-        };
-        let cookie_text = if jar.cookies.is_empty() {
-            None
-        } else {
-            let separator_capacity = jar.cookies.len().strict_sub(1).strict_mul(2);
-            let capacity = jar.cookies.iter().fold(separator_capacity, |sum, cookie| {
-                sum.strict_add(cookie.len())
-            });
-            cookie_header
-                .try_reserve_exact(capacity)
-                .map_err(|source| {
-                    download_error_with_source("Cookie header 메모리 확보 실패", source)
-                })?;
-            for (index, cookie) in jar.cookies.iter().enumerate() {
-                if index != 0 {
-                    cookie_header.push_str("; ");
-                }
-                cookie_header.push_str(cookie);
-            }
-            Some(cookie_header.as_str())
-        };
-        Ok(RequestHeaders {
-            accept,
-            content_type,
-            cookie: cookie_text,
-            referer,
-            requested_with,
-        })
-    }
     fn request_netfunnel(
         &mut self,
         action_id: &str,
@@ -401,19 +349,14 @@ impl SourceDownload {
             ]);
             let mut timestamp_buffer = NumBuffer::new();
             path.push_str(timestamp.format_into(&mut timestamp_buffer));
-            let headers = Self::request_headers(
-                &self.cookie_jars,
-                &mut self.cookie_header_buffer,
-                HttpHost::Netfunnel,
+            self.send_request(
+                (HttpHost::Netfunnel, NETFUNNEL_HOST, &path),
+                None,
                 "application/javascript,*/*;q=0.8",
                 None,
                 None,
                 false,
-            )?;
-            let response = self
-                .platform
-                .request(None, NETFUNNEL_HOST, &path, headers)?;
-            self.finish_response(HttpHost::Netfunnel, response)
+            )
         };
         self.netfunnel_path_buffer = path;
         let response = response_result?;
@@ -427,6 +370,52 @@ impl SourceDownload {
         let value_range = text.substr_range(value).unwrap_or_else(|| process::abort());
         retain_substr(&mut text, value_range);
         Ok(text)
+    }
+    fn send_request(
+        &mut self,
+        (host, host_name, path): (HttpHost, &'static str, &str),
+        request_body: Option<&[u8]>,
+        accept: &'static str,
+        content_type: Option<&'static str>,
+        referer: Option<&str>,
+        requested_with: bool,
+    ) -> DownloadResult<Vec<u8>> {
+        self.cookie_header_buffer.clear();
+        let jar = match host {
+            HttpHost::Opinet => &self.cookie_jars.0,
+            HttpHost::Netfunnel => &self.cookie_jars.1,
+        };
+        let cookie_text = if jar.cookies.is_empty() {
+            None
+        } else {
+            let separator_capacity = jar.cookies.len().strict_sub(1).strict_mul(2);
+            let capacity = jar.cookies.iter().fold(separator_capacity, |sum, cookie| {
+                sum.strict_add(cookie.len())
+            });
+            self.cookie_header_buffer
+                .try_reserve_exact(capacity)
+                .map_err(|source| {
+                    download_error_with_source("Cookie header 메모리 확보 실패", source)
+                })?;
+            for (index, cookie) in jar.cookies.iter().enumerate() {
+                if index != 0 {
+                    self.cookie_header_buffer.push_str("; ");
+                }
+                self.cookie_header_buffer.push_str(cookie);
+            }
+            Some(self.cookie_header_buffer.as_str())
+        };
+        let headers = RequestHeaders {
+            accept,
+            content_type,
+            cookie: cookie_text,
+            referer,
+            requested_with,
+        };
+        let response = self
+            .platform
+            .request(request_body, host_name, path, headers)?;
+        self.finish_response(host, response)
     }
 }
 const fn hex_digit(nibble: u8) -> u8 {

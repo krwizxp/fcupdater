@@ -145,24 +145,25 @@ impl Client {
                 )
             };
             let request = Self::non_null_handle(raw_request, "WinHttpOpenRequest")?;
-            Self::set_dword_option(
-                &request,
-                WINHTTP_OPTION_ENABLE_FEATURE,
-                WINHTTP_ENABLE_SSL_REVOCATION,
-                "WinHttpSetOption ENABLE_FEATURE",
-            )?;
-            Self::set_dword_option(
-                &request,
-                WINHTTP_OPTION_DISABLE_FEATURE,
-                WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS,
-                "WinHttpSetOption DISABLE_FEATURE",
-            )?;
-            Self::set_dword_option(
-                &request,
-                WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
-                HTTP_MAX_HEADER_BYTES_DWORD,
-                "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
-            )?;
+            for (option, value, context) in [
+                (
+                    WINHTTP_OPTION_ENABLE_FEATURE,
+                    WINHTTP_ENABLE_SSL_REVOCATION,
+                    "WinHttpSetOption ENABLE_FEATURE",
+                ),
+                (
+                    WINHTTP_OPTION_DISABLE_FEATURE,
+                    WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS,
+                    "WinHttpSetOption DISABLE_FEATURE",
+                ),
+                (
+                    WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,
+                    HTTP_MAX_HEADER_BYTES_DWORD,
+                    "WinHttpSetOption MAX_RESPONSE_HEADER_SIZE",
+                ),
+            ] {
+                Self::set_dword_option(&request, option, value, context)?;
+            }
             let body_len = u32::try_from(body.len())
                 .map_err(|source| download_error_with_source("요청 본문 길이 변환 실패", source))?;
             let body_ptr = if body.is_empty() {

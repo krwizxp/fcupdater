@@ -130,28 +130,16 @@ const LIBREOFFICE_UNMAPPED_STYLE_INDEX: usize = 7;
 const LIBREOFFICE_STYLE_MAP: [u32; 26] = [
     0, 3, 4, 24, 2, 1, 22, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 23, 18, 19, 20, 21,
 ];
-const EXCEL_CORE_PROPERTIES: [(&str, &str, &str); 9] = [
-    ("dc:title", "<dc:title>", "</dc:title>"),
-    ("dc:subject", "<dc:subject>", "</dc:subject>"),
-    ("dc:creator", "<dc:creator>", "</dc:creator>"),
-    ("dc:description", "<dc:description>", "</dc:description>"),
-    (
-        "cp:lastModifiedBy",
-        "<cp:lastModifiedBy>",
-        "</cp:lastModifiedBy>",
-    ),
-    ("cp:revision", "<cp:revision>", "</cp:revision>"),
-    (
-        "dcterms:created",
-        "<dcterms:created xsi:type=\"dcterms:W3CDTF\">",
-        "</dcterms:created>",
-    ),
-    (
-        "dcterms:modified",
-        "<dcterms:modified xsi:type=\"dcterms:W3CDTF\">",
-        "</dcterms:modified>",
-    ),
-    ("dc:language", "<dc:language>", "</dc:language>"),
+const EXCEL_CORE_PROPERTIES: [(&str, &str); 9] = [
+    ("dc:title", ""),
+    ("dc:subject", ""),
+    ("dc:creator", ""),
+    ("dc:description", ""),
+    ("cp:lastModifiedBy", ""),
+    ("cp:revision", ""),
+    ("dcterms:created", " xsi:type=\"dcterms:W3CDTF\""),
+    ("dcterms:modified", " xsi:type=\"dcterms:W3CDTF\""),
+    ("dc:language", ""),
 ];
 #[derive(Clone, Copy)]
 struct RelationshipSpec {
@@ -768,11 +756,9 @@ impl XlsxContainer {
             })?;
             *slot = Some(body);
         }
-        for ((_, opening, closing), body_value) in
-            EXCEL_CORE_PROPERTIES.into_iter().zip(core_values)
-        {
+        for ((name, extra), body_value) in EXCEL_CORE_PROPERTIES.into_iter().zip(core_values) {
             if let Some(body) = body_value {
-                core_xml.extend([opening, body, closing]);
+                core_xml.extend(["<", name, extra, ">", body, "</", name, ">"]);
             }
         }
         core_xml.push_str("</cp:coreProperties>");
@@ -1269,26 +1255,21 @@ fn find_equivalent_xf(
         return Ok(Some(index));
     }
     let mut source_attrs = try_vec_with_capacity(4, "style source 속성 목록 메모리 확보 실패")?;
-    for (index, candidate) in catalog.iter().enumerate() {
+    'candidate: for (index, candidate) in catalog.iter().enumerate() {
         let mut source_scanner = XmlScanner::new(source);
         let mut candidate_scanner = XmlScanner::new(candidate);
-        let mut equivalent = true;
         loop {
             let (source_tag, candidate_tag) =
                 match (source_scanner.next_tag(), candidate_scanner.next_tag()) {
                     (Some(source_entry), Some(candidate_entry)) => (source_entry, candidate_entry),
-                    (None, None) => break,
-                    (None | Some(_), None | Some(_)) => {
-                        equivalent = false;
-                        break;
-                    }
+                    (None, None) => return Ok(Some(index)),
+                    (None | Some(_), None | Some(_)) => continue 'candidate,
                 };
             if source_tag.is_start != candidate_tag.is_start
                 || source_tag.name != candidate_tag.name
                 || source_tag.self_closing != candidate_tag.self_closing
             {
-                equivalent = false;
-                break;
+                continue 'candidate;
             }
             if !source_tag.is_start {
                 continue;
@@ -1311,12 +1292,10 @@ fn find_equivalent_xf(
                 candidate_attr_count = candidate_attr_count.strict_add(1);
                 let mut source_matches = source_attrs.iter().filter(|entry| entry.0 == name);
                 let Some(source_entry) = source_matches.next() else {
-                    equivalent = false;
-                    break;
+                    continue 'candidate;
                 };
                 if source_matches.next().is_some() {
-                    equivalent = false;
-                    break;
+                    continue 'candidate;
                 }
                 let source_value = &source_entry.1;
                 let indexed_resources = match name {
@@ -1349,20 +1328,12 @@ fn find_equivalent_xf(
                     source_value.as_ref() == candidate_value.as_ref()
                 };
                 if !values_match {
-                    equivalent = false;
-                    break;
+                    continue 'candidate;
                 }
             }
-            if !equivalent {
-                break;
-            }
             if source_attr_count != candidate_attr_count {
-                equivalent = false;
-                break;
+                continue 'candidate;
             }
-        }
-        if equivalent {
-            return Ok(Some(index));
         }
     }
     Ok(None)

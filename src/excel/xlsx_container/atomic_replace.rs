@@ -134,30 +134,22 @@ cfg_select! {
             let mut wide = Vec::new();
             wide.try_reserve_exact(capacity).map_err(io::Error::other)?;
             wide.extend(extended_prefix.encode_utf16());
-            let mut path_wide = absolute.as_os_str().encode_wide();
-            for _ in 0_usize..skipped_units {
-                let Some(unit) = path_wide.next() else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Windows UNC path is invalid",
-                    ));
-                };
+            let mut seen_units = 0_usize;
+            for unit in absolute.as_os_str().encode_wide() {
                 (unit != 0).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "Windows file path contains a NUL character",
                     )
                 })?;
+                if seen_units >= skipped_units {
+                    wide.push(unit);
+                }
+                seen_units = seen_units.strict_add(1);
             }
-            for unit in path_wide {
-                (unit != 0).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Windows file path contains a NUL character",
-                    )
-                })?;
-                wide.push(unit);
-            }
+            (seen_units >= skipped_units).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Windows UNC path is invalid")
+            })?;
             wide.push(0);
             Ok(wide)
         }

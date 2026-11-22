@@ -38,7 +38,6 @@ const DECODE_ROOT_SIZE: usize = 1 << DECODE_ROOT_BITS;
 const FINAL_FIXED_BLOCK_BITS: usize = 3 + 7;
 const HUFFMAN_NODE_CAPACITY: usize = LITERAL_LENGTH_SYMBOLS.strict_mul(2).strict_add(1);
 const DEFLATE_SEARCH_WORK_LIMIT: usize = 512 * 1024 * 1024;
-const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
 const DEFLATE_TOKEN_RESERVE_CHUNK: usize = 64 * 1024;
 const DEFLATE_WINDOW_LEN: usize = 0x8000;
 const DEFLATE_MAX_DISTANCE: usize = DEFLATE_WINDOW_LEN - MAX_MATCH - MIN_MATCH - 1;
@@ -102,8 +101,6 @@ struct BitReader<'bytes> {
 struct BitWriter<'writer> {
     bit_buffer: u64,
     bit_count: u8,
-    buffer: [u8; DEFLATE_STREAM_BUFFER_LEN],
-    buffered_len: usize,
     len: usize,
     writer: &'writer mut dyn IoWrite,
 }
@@ -276,52 +273,23 @@ impl BitReader<'_> {
     }
 }
 impl BitWriter<'_> {
-    fn flush_buffer(&mut self) -> Result<()> {
-        if self.buffered_len == 0 {
-            return Ok(());
-        }
-        let buffered = self
-            .buffer
-            .get(..self.buffered_len)
-            .unwrap_or_else(|| process::abort());
-        self.writer
-            .write_all(buffered)
-            .map_err(|source| err_with_source("deflate stream 쓰기 실패", source))?;
-        self.buffered_len = 0;
-        Ok(())
-    }
     fn write_bits(&mut self, value: u16, count: u8) -> Result<()> {
         let mask = u16::MAX.unbounded_shr(u16::BITS.strict_sub(u32::from(count)));
         self.bit_buffer |= u64::from(value & mask) << self.bit_count;
         self.bit_count = self.bit_count.strict_add(count);
         if self.bit_count >= 32 {
-            if self.buffer.len().strict_sub(self.buffered_len) < 4 {
-                self.flush_buffer()?;
-            }
             let [b0, b1, b2, b3, ..] = self.bit_buffer.to_le_bytes();
-            let dst = self
-                .buffer
-                .get_mut(self.buffered_len..self.buffered_len.strict_add(4))
-                .unwrap_or_else(|| process::abort());
-            dst.copy_from_slice(&[b0, b1, b2, b3]);
-            self.buffered_len = self.buffered_len.strict_add(4);
-            self.len = self.len.strict_add(4);
+            self.write_bytes(&[b0, b1, b2, b3])?;
             self.bit_buffer >>= 32_u8;
             self.bit_count = self.bit_count.strict_sub(32);
         }
         Ok(())
     }
-    fn write_byte(&mut self, byte: u8) -> Result<()> {
-        if self.buffered_len == self.buffer.len() {
-            self.flush_buffer()?;
-        }
-        let slot = self
-            .buffer
-            .get_mut(self.buffered_len)
-            .unwrap_or_else(|| process::abort());
-        *slot = byte;
-        self.buffered_len = self.buffered_len.strict_add(1);
-        self.len = self.len.strict_add(1);
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer
+            .write_all(bytes)
+            .map_err(|source| err_with_source("deflate stream 쓰기 실패", source))?;
+        self.len = self.len.strict_add(bytes.len());
         Ok(())
     }
 }
@@ -480,22 +448,15 @@ impl InflateState<'_> {
         }
         Ok(())
     }
-    fn decode_distance(&mut self, symbol: u16) -> Result<usize> {
-        let index = usize::from(symbol);
-        let Some((&base, &extra_bits)) = DISTANCE_BASES
-            .get(index)
-            .zip(DISTANCE_EXTRA_BITS.get(index))
-        else {
-            return Err(err("deflate distance symbol 범위 오류"));
-        };
-        let extra = usize::from(self.reader.read_bits(extra_bits)?);
-        Ok(base.strict_add(extra))
-    }
-    fn decode_length(&mut self, symbol: u16) -> Result<usize> {
-        let index = usize::from(symbol.strict_sub(257));
-        let Some((&base, &extra_bits)) = LENGTH_BASES.get(index).zip(LENGTH_EXTRA_BITS.get(index))
-        else {
-            return Err(err("deflate length symbol 범위 오류"));
+    fn decode_extra(
+        &mut self,
+        index: usize,
+        bases: &[usize],
+        extra_bits_table: &[u8],
+        error_message: &'static str,
+    ) -> Result<usize> {
+        let Some((&base, &extra_bits)) = bases.get(index).zip(extra_bits_table.get(index)) else {
+            return Err(err(error_message));
         };
         let extra = usize::from(self.reader.read_bits(extra_bits)?);
         Ok(base.strict_add(extra))
@@ -581,12 +542,22 @@ impl InflateState<'_> {
                 }
                 256 => return Ok(()),
                 257..=285 => {
-                    let length = self.decode_length(symbol)?;
+                    let length = self.decode_extra(
+                        usize::from(symbol.strict_sub(257)),
+                        &LENGTH_BASES,
+                        &LENGTH_EXTRA_BITS,
+                        "deflate length symbol 범위 오류",
+                    )?;
                     let Some(distance_huffman) = distance_tree else {
                         return Err(err("deflate distance tree가 없습니다."));
                     };
                     let distance_symbol = distance_huffman.decode(&mut self.reader)?;
-                    let distance = self.decode_distance(distance_symbol)?;
+                    let distance = self.decode_extra(
+                        usize::from(distance_symbol),
+                        &DISTANCE_BASES,
+                        &DISTANCE_EXTRA_BITS,
+                        "deflate distance symbol 범위 오류",
+                    )?;
                     self.copy_previous(distance, length)?;
                 }
                 _ => {
@@ -871,24 +842,11 @@ impl DynamicDeflatePlan {
                 .write_symbol(writer, u16::from(token.symbol))?;
             writer.write_bits(token.extra, token.extra_bits)?;
         }
-        for &token in tokens {
-            match token.into_kind() {
-                DeflateTokenKind::Literal(byte) => {
-                    self.literal_huffman.write_symbol(writer, byte)?;
-                }
-                DeflateTokenKind::Match { distance, length } => {
-                    let length_code = DeflateWriter::length_symbol(length);
-                    self.literal_huffman
-                        .write_symbol(writer, length_code.symbol)?;
-                    writer.write_bits(length_code.extra, length_code.extra_bits)?;
-                    let distance_code = DeflateWriter::distance_symbol(distance);
-                    self.distance_huffman
-                        .write_symbol(writer, distance_code.symbol)?;
-                    writer.write_bits(distance_code.extra, distance_code.extra_bits)?;
-                }
-            }
-        }
-        self.literal_huffman.write_symbol(writer, 256)
+        write_deflate_tokens(
+            tokens,
+            writer,
+            Some((&self.literal_huffman, &self.distance_huffman)),
+        )
     }
 }
 impl<const N: usize> HuffmanLengthBuilder<'_, N> {
@@ -1076,20 +1034,7 @@ impl DeflatePlan {
             } else {
                 writer.write_bits(0, 1)?;
                 writer.write_bits(1, 2)?;
-                for &token in tokens {
-                    match token.into_kind() {
-                        DeflateTokenKind::Literal(byte) => write_fixed_symbol(writer, byte)?,
-                        DeflateTokenKind::Match { distance, length } => {
-                            let length_code = DeflateWriter::length_symbol(length);
-                            write_fixed_symbol(writer, length_code.symbol)?;
-                            writer.write_bits(length_code.extra, length_code.extra_bits)?;
-                            let distance_code = DeflateWriter::distance_symbol(distance);
-                            writer.write_bits(reverse_low_bits(distance_code.symbol, 5), 5)?;
-                            writer.write_bits(distance_code.extra, distance_code.extra_bits)?;
-                        }
-                    }
-                }
-                write_fixed_symbol(writer, 256)?;
+                write_deflate_tokens(tokens, writer, None)?;
             }
         }
         writer.write_bits(1, 1)?;
@@ -1100,21 +1045,16 @@ impl DeflatePlan {
         let mut bit_writer = BitWriter {
             bit_buffer: 0,
             bit_count: 0,
-            buffer: [0; DEFLATE_STREAM_BUFFER_LEN],
-            buffered_len: 0,
             len: 0,
             writer,
         };
         self.write(&mut bit_writer)?;
-        while bit_writer.bit_count >= 8 {
-            bit_writer.write_byte(bit_writer.bit_buffer.to_le_bytes()[0])?;
+        while bit_writer.bit_count != 0 {
+            let [byte, ..] = bit_writer.bit_buffer.to_le_bytes();
+            bit_writer.write_bytes(&[byte])?;
             bit_writer.bit_buffer >>= 8_u8;
-            bit_writer.bit_count = bit_writer.bit_count.strict_sub(8);
+            bit_writer.bit_count = bit_writer.bit_count.saturating_sub(8);
         }
-        if bit_writer.bit_count > 0 {
-            bit_writer.write_byte(bit_writer.bit_buffer.to_le_bytes()[0])?;
-        }
-        bit_writer.flush_buffer()?;
         Ok(bit_writer.len)
     }
 }
@@ -1452,6 +1392,38 @@ fn reverse_low_bits(value: u16, count: u8) -> u16 {
     value
         .reverse_bits()
         .unbounded_shr(u16::BITS.strict_sub(u32::from(count)))
+}
+fn write_deflate_tokens(
+    tokens: &[DeflateToken],
+    writer: &mut BitWriter<'_>,
+    dynamic: Option<(&WriteHuffman, &WriteHuffman)>,
+) -> Result<()> {
+    for &token in tokens {
+        match token.into_kind() {
+            DeflateTokenKind::Literal(byte) => match dynamic {
+                Some((literal_huffman, _)) => literal_huffman.write_symbol(writer, byte)?,
+                None => write_fixed_symbol(writer, byte)?,
+            },
+            DeflateTokenKind::Match { distance, length } => {
+                let length_code = DeflateWriter::length_symbol(length);
+                let distance_code = DeflateWriter::distance_symbol(distance);
+                if let Some((literal_huffman, distance_huffman)) = dynamic {
+                    literal_huffman.write_symbol(writer, length_code.symbol)?;
+                    writer.write_bits(length_code.extra, length_code.extra_bits)?;
+                    distance_huffman.write_symbol(writer, distance_code.symbol)?;
+                } else {
+                    write_fixed_symbol(writer, length_code.symbol)?;
+                    writer.write_bits(length_code.extra, length_code.extra_bits)?;
+                    writer.write_bits(reverse_low_bits(distance_code.symbol, 5), 5)?;
+                }
+                writer.write_bits(distance_code.extra, distance_code.extra_bits)?;
+            }
+        }
+    }
+    match dynamic {
+        Some((literal_huffman, _)) => literal_huffman.write_symbol(writer, 256),
+        None => write_fixed_symbol(writer, 256),
+    }
 }
 fn write_fixed_symbol(writer: &mut BitWriter<'_>, symbol: u16) -> Result<()> {
     let (code, bit_count) = match symbol {

@@ -1,5 +1,12 @@
 use crate::diagnostic::{Result, err, err_with_source};
 use std::process;
+const CITY_REGIONS: [(TargetRegion, &str, &str); 5] = [
+    (TargetRegion::Cheongju, "충북", "청주"),
+    (TargetRegion::Gongju, "충남", "공주"),
+    (TargetRegion::Boryeong, "충남", "보령"),
+    (TargetRegion::Asan, "충남", "아산"),
+    (TargetRegion::Cheonan, "충남", "천안"),
+];
 pub(super) const TARGET_REGION_COUNT: usize = 7;
 const DAEJEON_DISTRICT_KEYS: [&str; 5] = ["대덕구", "동구", "서구", "유성구", "중구"];
 pub(super) const TARGET_REGIONS: [TargetRegion; TARGET_REGION_COUNT] = [
@@ -34,16 +41,9 @@ pub(super) enum TargetRegionPolicy {
 }
 impl TargetRegion {
     pub(super) fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "대전" => Some(Self::Daejeon),
-            "세종" => Some(Self::Sejong),
-            "청주" => Some(Self::Cheongju),
-            "공주" => Some(Self::Gongju),
-            "보령" => Some(Self::Boryeong),
-            "아산" => Some(Self::Asan),
-            "천안" => Some(Self::Cheonan),
-            _ => None,
-        }
+        TARGET_REGIONS
+            .into_iter()
+            .find(|region| region.label() == label)
     }
     const fn index(self) -> usize {
         match self {
@@ -148,16 +148,18 @@ pub(super) fn target_region(
                 .is_some_and(|district| DAEJEON_DISTRICT_KEYS.contains(&district))
         {
             Some(TargetRegion::Daejeon)
+        } else if normalized_region == "세종시" {
+            Some(TargetRegion::Sejong)
         } else {
-            match normalized_region {
-                "세종시" => Some(TargetRegion::Sejong),
-                "충북청주시" => Some(TargetRegion::Cheongju),
-                "충남공주시" => Some(TargetRegion::Gongju),
-                "충남보령시" => Some(TargetRegion::Boryeong),
-                "충남아산시" => Some(TargetRegion::Asan),
-                "충남천안시" => Some(TargetRegion::Cheonan),
-                _ => None,
-            }
+            CITY_REGIONS
+                .into_iter()
+                .find_map(|(target, province, city)| {
+                    (normalized_region
+                        .strip_prefix(province)
+                        .and_then(|tail| tail.strip_suffix("시"))
+                        == Some(city))
+                    .then_some(target)
+                })
         };
         return match (parsed_region, address_region) {
             (Some(region_match), Some(address_match)) if region_match == address_match => {
@@ -225,20 +227,12 @@ fn target_region_from_normalized(text: &str) -> Option<TargetRegion> {
     if text.starts_with("세종") {
         return Some(TargetRegion::Sejong);
     }
-    if text.starts_with("충북청주") || text.starts_with("청주") {
-        return Some(TargetRegion::Cheongju);
-    }
-    if text.starts_with("충남공주") || text.starts_with("공주") {
-        return Some(TargetRegion::Gongju);
-    }
-    if text.starts_with("충남보령") || text.starts_with("보령") {
-        return Some(TargetRegion::Boryeong);
-    }
-    if text.starts_with("충남아산") || text.starts_with("아산") {
-        return Some(TargetRegion::Asan);
-    }
-    if text.starts_with("충남천안") || text.starts_with("천안") {
-        return Some(TargetRegion::Cheonan);
-    }
-    None
+    CITY_REGIONS
+        .into_iter()
+        .find_map(|(target, province, city)| {
+            text.strip_prefix(province)
+                .unwrap_or(text)
+                .starts_with(city)
+                .then_some(target)
+        })
 }

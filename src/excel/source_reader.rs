@@ -51,6 +51,9 @@ pub(crate) struct FuelValues<T> {
     pub premium: T,
 }
 impl<T> FuelValues<T> {
+    pub(crate) fn into_array(self) -> [T; 3] {
+        [self.gasoline, self.premium, self.diesel]
+    }
     pub(crate) fn map<U>(self, mut map: impl FnMut(T) -> U) -> FuelValues<U> {
         FuelValues {
             diesel: map(self.diesel),
@@ -1010,11 +1013,17 @@ fn row_text_trimmed<'strings>(row: &SourceRow<'strings>, idx: usize) -> &'string
 const fn is_regular_sector_id(sector_id: u32) -> bool {
     sector_id < CFB_DIFAT_SECT
 }
+fn sector_offset(sector_id: u32) -> Option<usize> {
+    let index = (sector_id as usize).checked_add(1)?;
+    index.checked_mul(CFB_SECTOR_SIZE)
+}
+fn next_fat_sector(fat: &[u32], sector_id: u32) -> Result<u32> {
+    fat.get(sector_id as usize)
+        .copied()
+        .ok_or_else(|| err(format!("FAT 인덱스 범위 오류: sector={sector_id}")))
+}
 fn get_sector_slice(data: &[u8], sector_id: u32) -> Result<&[u8; CFB_SECTOR_SIZE]> {
-    let start_offset = (sector_id as usize)
-        .checked_add(1)
-        .and_then(|index| index.checked_mul(CFB_SECTOR_SIZE));
-    start_offset
+    sector_offset(sector_id)
         .and_then(|offset| data.get(offset..))
         .and_then(<[u8]>::first_chunk::<CFB_SECTOR_SIZE>)
         .ok_or_else(|| {
@@ -1075,13 +1084,7 @@ fn read_stream_from_fat_chain<'data>(
         if previous_sid.is_some_and(|previous: u32| sid != previous.strict_add(1)) {
             contiguous = false;
         }
-        let sid_usize = sid as usize;
-        let next_sid = *fat.get(sid_usize).ok_or_else(|| {
-            err(prefixed_display_message(
-                "FAT 인덱스 범위 오류: sector=",
-                sid,
-            ))
-        })?;
+        let next_sid = next_fat_sector(fat, sid)?;
         if next_sid == CFB_FREE_SECT {
             return Err(err(format!(
                 "FAT chain이 free sector를 참조합니다: {stream_name} (sector={next_sid})"
@@ -1102,10 +1105,8 @@ fn read_stream_from_fat_chain<'data>(
         )));
     }
     if contiguous {
-        let start_offset = (start_sector as usize)
-            .checked_add(1)
-            .and_then(|index| index.checked_mul(CFB_SECTOR_SIZE))
-            .ok_or_else(|| err("CFB stream 시작 범위 계산 실패"))?;
+        let start_offset =
+            sector_offset(start_sector).ok_or_else(|| err("CFB stream 시작 범위 계산 실패"))?;
         let end_offset = start_offset
             .checked_add(stream_len)
             .ok_or_else(|| err("CFB stream 끝 범위 계산 실패"))?;
@@ -1118,17 +1119,11 @@ fn read_stream_from_fat_chain<'data>(
     let mut copy_remaining = stream_len;
     let mut copy_sid = start_sector;
     while copy_remaining != 0 {
-        let sid_usize = copy_sid as usize;
         let sector = get_sector_slice(data, copy_sid)?;
         let take = copy_remaining.min(sector.len());
         out.extend_from_slice(sector.split_at(take).0);
         copy_remaining = copy_remaining.strict_sub(take);
-        copy_sid = *fat.get(sid_usize).ok_or_else(|| {
-            err(prefixed_display_message(
-                "FAT 인덱스 범위 오류: sector=",
-                copy_sid,
-            ))
-        })?;
+        copy_sid = next_fat_sector(fat, copy_sid)?;
     }
     Ok((Cow::Owned(out), previous_sid))
 }

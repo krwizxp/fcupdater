@@ -1295,22 +1295,26 @@ impl Worksheet {
             .and_then(|index| self.rows.get(index))
             .ok_or_else(|| err(format!("worksheet style 원본 row가 없습니다: {source_row}")))?;
         let copied = src.try_copy_style(max_col)?;
-        let target_index = row_index(target_row).unwrap_or_else(|| process::abort());
-        let required_len = target_index.strict_add(1);
-        if self.rows.len() < required_len {
-            self.rows
-                .try_reserve(required_len.strict_sub(self.rows.len()))
-                .map_err(|source| {
-                    err_with_source("worksheet style 대상 row 메모리 확보 실패", source)
-                })?;
-            self.rows.resize_with(required_len, Row::default);
-        }
-        let target = self
-            .rows
-            .get_mut(target_index)
-            .unwrap_or_else(|| process::abort());
-        *target = copied;
+        *Self::ensure_row_mut(
+            &mut self.rows,
+            target_row,
+            "worksheet style 대상 row 메모리 확보 실패",
+        )? = copied;
         Ok(())
+    }
+    fn ensure_row_mut<'rows>(
+        rows: &'rows mut Vec<Row>,
+        row: u32,
+        context: &'static str,
+    ) -> Result<&'rows mut Row> {
+        let index = row_index(row).unwrap_or_else(|| process::abort());
+        let required_len = index.strict_add(1);
+        if rows.len() < required_len {
+            rows.try_reserve(required_len.strict_sub(rows.len()))
+                .map_err(|source| err_with_source(context, source))?;
+            rows.resize_with(required_len, Row::default);
+        }
+        Ok(rows.get_mut(index).unwrap_or_else(|| process::abort()))
     }
     pub(crate) fn get_i32_at(
         &self,
@@ -1411,14 +1415,7 @@ impl Worksheet {
         Ok(signed.and_then(|value| i32::try_from(value).ok()))
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
-        let row_index = row_index(row).unwrap_or_else(|| process::abort());
-        let required_len = row_index.strict_add(1);
-        if rows.len() < required_len {
-            rows.try_reserve(required_len.strict_sub(rows.len()))
-                .map_err(|source| err_with_source("worksheet cell row 메모리 확보 실패", source))?;
-            rows.resize_with(required_len, Row::default);
-        }
-        let row_obj = rows.get_mut(row_index).unwrap_or_else(|| process::abort());
+        let row_obj = Self::ensure_row_mut(rows, row, "worksheet cell row 메모리 확보 실패")?;
         match row_obj.cells.binary_search_by_key(&col, |cell| cell.col) {
             Ok(index) => Ok(row_obj
                 .cells
@@ -1672,13 +1669,16 @@ impl Worksheet {
         inner
             .try_reserve_exact(sum_lengths(&[prefix_reserve, value_len.unwrap_or(0)]))
             .map_err(|source| err_with_source("formula/cache XML 메모리 확보 실패", source))?;
-        if let Some((formula_text, escaped_len)) = formula.zip(formula_len) {
-            inner.push_str("<f>");
-            if escaped_len == formula_text.len() {
-                inner.push_str(formula_text);
+        let append_value = |out: &mut String, text: &str, escaped_len: Option<usize>| {
+            if escaped_len == Some(text.len()) {
+                out.push_str(text);
             } else {
-                append_xml_escaped(inner, formula_text, XmlEscapeContext::Text);
+                append_xml_escaped(out, text, XmlEscapeContext::Text);
             }
+        };
+        if let Some(formula_text) = formula {
+            inner.push_str("<f>");
+            append_value(inner, formula_text, formula_len);
             inner.push_str("</f>");
         } else {
             inner.push_str("<f/>");
@@ -1687,11 +1687,7 @@ impl Worksheet {
             inner.push_str("<v/>");
         } else {
             inner.push_str("<v>");
-            if value_len == Some(cached.len()) {
-                inner.push_str(cached);
-            } else {
-                append_xml_escaped(inner, cached, XmlEscapeContext::Text);
-            }
+            append_value(inner, cached, value_len);
             inner.push_str("</v>");
         }
         Ok(())
@@ -1766,14 +1762,14 @@ impl Worksheet {
         mem::take(&mut self.rows)
     }
     fn to_fragments(&self, sheet: ExcelSheetKind, last_data_row: u32) -> Result<(String, String)> {
-        let (prefix_source, suffix_source, dimension_reference, max_col) = match sheet {
+        let (prefix_source, suffix_source, dimension_reference, end_col) = match sheet {
             ExcelSheetKind::ChangeLog => (
                 EXCEL_CHANGE_LOG_PREFIX,
                 EXCEL_CHANGE_LOG_SUFFIX,
                 "A1:M243",
-                13,
+                "M",
             ),
-            ExcelSheetKind::Master => (EXCEL_MASTER_PREFIX, EXCEL_MASTER_SUFFIX, "A1:W884", 23),
+            ExcelSheetKind::Master => (EXCEL_MASTER_PREFIX, EXCEL_MASTER_SUFFIX, "A1:W884", "W"),
         };
         let mut prefix = canonical_excel_fragment(prefix_source)?;
         let mut suffix = canonical_excel_fragment(suffix_source)?;
@@ -1782,14 +1778,7 @@ impl Worksheet {
             .iter()
             .rposition(|row| !row.cells.is_empty())
             .map_or(1, |index| worksheet_row_count(index.strict_add(1)));
-        let dimension = build_ref_range(
-            "A",
-            RangeInclusive {
-                start: 1,
-                last: max_row,
-            },
-            max_col,
-        )?;
+        let dimension = format!("A1:{end_col}{max_row}");
         replace_canonical_text(
             &mut prefix,
             dimension_reference,
@@ -1798,31 +1787,10 @@ impl Worksheet {
         )?;
         match sheet {
             ExcelSheetKind::Master => {
-                let filter = build_ref_range(
-                    "A",
-                    RangeInclusive {
-                        start: 14,
-                        last: last_data_row.max(14),
-                    },
-                    23,
-                )?;
+                let filter = format!("A14:W{}", last_data_row.max(14));
                 let last_row = worksheet_row_count(self.rows.len());
-                let sort_state = build_ref_range(
-                    "A",
-                    RangeInclusive {
-                        start: 15,
-                        last: last_row,
-                    },
-                    23,
-                )?;
-                let sort_condition = build_ref_range(
-                    "A",
-                    RangeInclusive {
-                        start: 15,
-                        last: last_row,
-                    },
-                    1,
-                )?;
+                let sort_state = format!("A15:W{last_row}");
+                let sort_condition = format!("A15:A{last_row}");
                 for (old, new, context) in [
                     ("A14:W882", filter.as_str(), "worksheet autoFilter"),
                     ("A15:W884", sort_state.as_str(), "worksheet sortState"),
@@ -1836,23 +1804,13 @@ impl Worksheet {
                 }
             }
             ExcelSheetKind::ChangeLog => {
-                for (column, col, old) in [
-                    ("G", 7_u32, "G4:G52"),
-                    ("J", 10_u32, "J4:J52"),
-                    ("M", 13_u32, "M4:M52"),
-                ] {
-                    let mut reference = build_ref_range(
-                        column,
-                        RangeInclusive {
-                            start: CHANGE_LOG_FORMULA_LAYOUT.data_start_row,
-                            last: last_data_row.max(CHANGE_LOG_FORMULA_LAYOUT.data_start_row),
-                        },
-                        col,
-                    )?;
-                    if last_data_row <= CHANGE_LOG_FORMULA_LAYOUT.data_start_row {
-                        let colon = reference.find(':').unwrap_or_else(|| process::abort());
-                        reference.truncate(colon);
-                    }
+                let start = CHANGE_LOG_FORMULA_LAYOUT.data_start_row;
+                for (column, old) in [("G", "G4:G52"), ("J", "J4:J52"), ("M", "M4:M52")] {
+                    let reference = if last_data_row <= start {
+                        format!("{column}{start}")
+                    } else {
+                        format!("{column}{start}:{column}{last_data_row}")
+                    };
                     replace_canonical_text(
                         &mut suffix,
                         old,
@@ -2367,34 +2325,6 @@ fn append_text_tag(out: &mut String, attrs: &[XmlAttr<'_>], self_closing: bool) 
     }
     out.push_str(suffix);
     Ok(())
-}
-fn build_ref_range(
-    start_col_text: &str,
-    rows: RangeInclusive<u32>,
-    end_col: u32,
-) -> Result<String> {
-    with_unlocked_ref_parts(end_col, rows.last, |end_col_text, end_row| {
-        let mut start_row_buffer = NumBuffer::new();
-        let start_row_text = rows.start.format_into(&mut start_row_buffer);
-        let mut end_row_buffer = NumBuffer::new();
-        let end_row_text = end_row.format_into(&mut end_row_buffer);
-        let capacity = sum_lengths(&[
-            start_col_text.len(),
-            start_row_text.len(),
-            ":".len(),
-            end_col_text.len(),
-            end_row_text.len(),
-        ]);
-        let mut out = try_string_with_capacity(capacity, "cell range reference 메모리 확보 실패")?;
-        out.extend([
-            start_col_text,
-            start_row_text,
-            ":",
-            end_col_text,
-            end_row_text,
-        ]);
-        Ok(out)
-    })?
 }
 fn row_col_error(prefix: &str, row_num: u32, col: u32) -> String {
     format!("{prefix}{row_num}, col={col})")

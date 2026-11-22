@@ -167,9 +167,6 @@ impl EasyHandle {
     fn setopt_ptr<T>(&self, option: CurlOption, value: *const T) -> DownloadResult<()> {
         curl_setopt!(self, option, value)
     }
-    fn setopt_str(&self, option: CurlOption, value: *const c_char) -> DownloadResult<()> {
-        curl_setopt!(self, option, value)
-    }
 }
 impl HeaderList {
     fn append(&mut self, header: &CStr) -> DownloadResult<()> {
@@ -250,7 +247,7 @@ impl Client {
                         sys::curl_easy_reset(reset_handle.as_ptr());
                     }
                 });
-                handle.setopt_str(CURLOPT_URL, url.as_ptr())?;
+                handle.setopt_ptr(CURLOPT_URL, url.as_ptr())?;
                 handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr())?;
                 handle.setopt_ptr(
                     CURLOPT_ERRORBUFFER,
@@ -270,7 +267,7 @@ impl Client {
                 ] {
                     handle.setopt_long(option, value)?;
                 }
-                handle.setopt_str(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
+                handle.setopt_ptr(CURLOPT_PROTOCOLS_STR, HTTPS_PROTOCOL.as_ptr())?;
                 handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, HTTP_MAX_BODY_BYTES_OFF_T)?;
                 if let Some(body_bytes) = request_body {
                     handle.setopt_long(CURLOPT_POST, 1)?;

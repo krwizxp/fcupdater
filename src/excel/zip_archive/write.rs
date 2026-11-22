@@ -59,20 +59,13 @@ impl<'part> StreamingZipWriter<'part, '_> {
             self.prepare_header_buffer(record_len, "ZIP 중앙 디렉터리 메모리 확보 실패")?;
             write_u32(&mut self.header_buffer, CENTRAL_DIRECTORY_SIGNATURE);
             write_u16(&mut self.header_buffer, VERSION_MADE_BY);
-            write_u16(&mut self.header_buffer, VERSION_NEEDED);
-            write_u16(&mut self.header_buffer, EXCEL_ENTRY_FLAGS);
-            write_u16(&mut self.header_buffer, METHOD_DEFLATE);
-            write_u16(&mut self.header_buffer, 0);
-            write_u16(&mut self.header_buffer, 0x0021);
-            write_u32(&mut self.header_buffer, entry.crc32);
-            write_u32(&mut self.header_buffer, entry.compressed_size);
-            write_u32(&mut self.header_buffer, entry.uncompressed_size);
-            write_u16(
+            append_common_zip_fields(
                 &mut self.header_buffer,
-                u16::try_from(entry.part.name.len())
-                    .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?,
-            );
-            write_u16(&mut self.header_buffer, 0);
+                entry.crc32,
+                entry.compressed_size,
+                entry.uncompressed_size,
+                entry.part.name.len(),
+            )?;
             write_u16(&mut self.header_buffer, 0);
             write_u16(&mut self.header_buffer, 0);
             write_u16(&mut self.header_buffer, 0);
@@ -133,20 +126,13 @@ impl<'part> StreamingZipWriter<'part, '_> {
         self.ensure_output_limit(entry_output_size, "ZIP entry 출력 크기 계산")?;
         self.prepare_header_buffer(local_header_len, "ZIP local header 메모리 확보 실패")?;
         write_u32(&mut self.header_buffer, LOCAL_FILE_HEADER_SIGNATURE);
-        write_u16(&mut self.header_buffer, VERSION_NEEDED);
-        write_u16(&mut self.header_buffer, EXCEL_ENTRY_FLAGS);
-        write_u16(&mut self.header_buffer, METHOD_DEFLATE);
-        write_u16(&mut self.header_buffer, 0);
-        write_u16(&mut self.header_buffer, 0x0021);
-        write_u32(&mut self.header_buffer, crc32);
-        write_u32(&mut self.header_buffer, compressed_size_u32);
-        write_u32(&mut self.header_buffer, uncompressed_size_u32);
-        write_u16(
+        append_common_zip_fields(
             &mut self.header_buffer,
-            u16::try_from(part.name.len())
-                .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?,
-        );
-        write_u16(&mut self.header_buffer, 0);
+            crc32,
+            compressed_size_u32,
+            uncompressed_size_u32,
+            part.name.len(),
+        )?;
         self.header_buffer.extend_from_slice(part.name.as_bytes());
         self.write_header_buffer("xlsx 압축 local header 쓰기 실패")?;
         let actual_written = plan.write_to(&mut self.file)?;
@@ -238,6 +224,27 @@ impl ZipArchiveBuilder<'_, '_> {
         }
         .write(self.parts)
     }
+}
+fn append_common_zip_fields(
+    out: &mut Vec<u8>,
+    crc32: u32,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    name_len: usize,
+) -> Result<()> {
+    let name_len_u16 = u16::try_from(name_len)
+        .map_err(|source| err_with_source("ZIP entry 이름 길이 변환 실패", source))?;
+    write_u16(out, VERSION_NEEDED);
+    write_u16(out, EXCEL_ENTRY_FLAGS);
+    write_u16(out, METHOD_DEFLATE);
+    write_u16(out, 0);
+    write_u16(out, 0x0021);
+    write_u32(out, crc32);
+    write_u32(out, compressed_size);
+    write_u32(out, uncompressed_size);
+    write_u16(out, name_len_u16);
+    write_u16(out, 0);
+    Ok(())
 }
 fn write_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
