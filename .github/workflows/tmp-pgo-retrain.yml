@@ -5,30 +5,17 @@ on:
     paths: [.github/workflows/tmp-pgo-retrain.yml]
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
+  actions: read
 jobs:
   retrain:
-    name: PGO ${{ matrix.os }} / ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          persist-credentials: false
-      - name: Install Rust stable + llvm-tools
-        shell: bash
-        run: |
-          rustup toolchain install stable --profile minimal --component llvm-tools --no-self-update
-          rustc +stable -Vv
-      - name: Install Linux deps
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libcurl4-openssl-dev
+          persist-credentials: true
+          fetch-depth: 0
       - name: Apply perf patch
         shell: bash
         run: |
@@ -75,65 +62,34 @@ jobs:
               '            let saved = open_regular(self.target_xlsx)\n                .map_err(|src| path_err("저장된 xlsx 검증 실패", self.target_xlsx, src))?;\n            ensure(\n                saved.identity == self.temp_archive.identity,\n                "저장된 xlsx identity 불일치",\n            )', 1)
           open("src/excel/xlsx_container.rs", "w", encoding="utf-8").write(s)
           PY
-      - name: Build instrumented binary
-        shell: bash
+      - name: Download PGO profiles, verify SHA-256, and push
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p pgo-raw
-          RUSTFLAGS="-Cprofile-generate=$(pwd)/pgo-raw" cargo +stable build --release --frozen --bin fcupdater --target "${{ matrix.target }}" --target-dir target-gen
-      - name: Train PGO on Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          mkdir -p work-train
-          cp fuel_cost_chungcheong.xlsx work-train/fuel_cost_chungcheong.xlsx
-          (cd work-train && "../target-gen/${{ matrix.target }}/release/fcupdater" --verify)
-      - name: Train PGO on Windows (with bounded TLS restore if needed)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force work-train | Out-Null
-          Copy-Item fuel_cost_chungcheong.xlsx work-train/fuel_cost_chungcheong.xlsx
-          $exe = (Resolve-Path "target-gen/${{ matrix.target }}/release/fcupdater.exe").Path
-          Push-Location work-train
-          $out = & $exe --verify 2>&1
-          $rc = $LASTEXITCODE
-          Pop-Location
-          if ($rc -ne 0) {
-            $suite = "TLS_RSA_WITH_AES_256_GCM_SHA384"
-            $origSuites = (Get-TlsCipherSuite).Name
-            $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'; $hasPolicyFunctions = $false; $origFunctions = $null; $origFunctionsKind = $null; if (Test-Path $regPath) { $k = Get-Item $regPath; if ($null -ne $k.GetValue('Functions', $null)) { $hasPolicyFunctions = $true; $origFunctions = $k.GetValue('Functions'); $origFunctionsKind = $k.GetValueKind('Functions') }; $k.Close() }
-            Enable-TlsCipherSuite -Name $suite -Position ([uint32]::MaxValue); if ($hasPolicyFunctions) { if ($origFunctionsKind -eq [Microsoft.Win32.RegistryValueKind]::MultiString) { $arr = @($origFunctions); if ($arr -notcontains $suite) { Set-ItemProperty -Path $regPath -Name 'Functions' -Value ($arr + $suite) -Type MultiString } } else { $s = [string]$origFunctions; $parts = $s -split ',' | Where-Object { $_ -ne '' }; if ($parts -notcontains $suite) { $nv = if ([string]::IsNullOrEmpty($s)) { $suite } elseif ($s.EndsWith(',')) { "$s$suite" } else { "$s,$suite" }; Set-ItemProperty -Path $regPath -Name 'Functions' -Value $nv -Type $origFunctionsKind } } }
-            try {
-              Copy-Item fuel_cost_chungcheong.xlsx work-train/fuel_cost_chungcheong.xlsx -Force
-              Push-Location work-train
-              & $exe --verify
-              if ($LASTEXITCODE -ne 0) { throw "fcupdater --verify failed even with $suite" }
-              Pop-Location
-            } finally {
-              Disable-TlsCipherSuite -Name $suite; if ($hasPolicyFunctions) { Set-ItemProperty -Path $regPath -Name 'Functions' -Value $origFunctions -Type $origFunctionsKind }; if ((Get-Location).Path -like '*work-train*') { Pop-Location }
-            }
-            $restored = (Get-TlsCipherSuite).Name
-            if (($origSuites -join ',') -ne ($restored -join ',')) { throw "TLS cipher suite restoration mismatch" }
-          }
-      - name: Merge profdata & verify build-pgo
-        shell: bash
-        run: |
-          PROFDATA="$(rustc +stable --print target-libdir)/../bin/llvm-profdata"
-          "$PROFDATA" merge -o "pgo/${{ matrix.target }}.profdata" pgo-raw
-          cargo +stable build-pgo 2>&1 | tee pgo-build.log
-          ext=""
-          [[ "${{ runner.os }}" == "Windows" ]] && ext=".exe"
-          sz=$(wc -c < "target/${{ matrix.target }}/release/fcupdater${ext}")
-          sha=$(sha256sum "pgo/${{ matrix.target }}.profdata" | awk '{print $1}')
-          warns=$(grep -c "hash mismatch" pgo-build.log || true)
-          echo "### PGO ${{ matrix.os }} (${{ matrix.target }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "- profdata sha256: \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- PGO release binary: ${sz} B, hash-mismatch warnings: ${warns}" >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload fresh profdata
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: pgo-${{ matrix.target }}
-          path: pgo/${{ matrix.target }}.profdata
-          archive: false
-          if-no-files-found: error
-          retention-days: 14
+          set -euo pipefail
+          mkdir -p pgo-dl pgo
+          gh run download 45187132444 -D pgo-dl
+          gh run download 45200782845 -n pgo-x86_64-pc-windows-msvc -D pgo-dl/pgo-x86_64-pc-windows-msvc
+          for f in x86_64-unknown-linux-gnu.profdata x86_64-apple-darwin.profdata aarch64-apple-darwin.profdata x86_64-pc-windows-msvc.profdata; do
+            src=$(find pgo-dl -type f -name "$f" | head -n 1)
+            test -n "$src"
+            cp -f "$src" "pgo/$f"
+          done
+          rm -rf pgo-dl
+          sha256sum -c <<'EOF'
+          e93ba7f8c8f74e838c8a8143701b21cbeb96c666c32452b2d3f62a666e961f1a  pgo/x86_64-unknown-linux-gnu.profdata
+          ca40df3fa85cb6c30e117cb21d30574e15a0e84bab579ef5300f9d79253ce52f  pgo/x86_64-apple-darwin.profdata
+          9f727a05368582ea6754bbd88c685aa97dac8de030895fea2751d7ae43799058  pgo/aarch64-apple-darwin.profdata
+          f66e86125cd2e1fb8314c750da948cd467ab022cb7cabbd54d094902a0d7fe3e  pgo/x86_64-pc-windows-msvc.profdata
+          EOF
+          git rm .github/workflows/tmp-pgo-retrain.yml
+          changed=$(git diff --name-only origin/main)
+          echo "$changed"
+          test "$(echo "$changed" | wc -l)" -eq 12
+          test "$(echo "$changed" | grep -c '^src/')" -eq 8
+          test "$(echo "$changed" | grep -c '^pgo/.*\.profdata$')" -eq 4
+          git add src/ pgo/*.profdata
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Apply perf optimizations and updated PGO profiles"
+          git push origin HEAD:tmp/perf-validate
