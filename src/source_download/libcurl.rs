@@ -1,8 +1,9 @@
 use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
-    ResponseHeaders, checked_http_buffer_len, download_error_with_source,
+    ResponseHeaders, checked_http_buffer_len, download_error_with_source, err_fmt, reserve_err,
 };
 use crate::diagnostic::AppError as DownloadError;
+use crate::diagnostic::err_fmt_with_source;
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{
     ffi::{CStr, c_char, c_long, c_uint, c_void},
@@ -16,7 +17,7 @@ macro_rules! curl_setopt {
     ($handle:expr, $option:expr, $value:expr) => {{
         // SAFETY: call sites pair each option with a wrapper using its documented libcurl ABI type.
         let code = unsafe { sys::curl_easy_setopt($handle.as_ptr(), $option, $value) };
-        (code == CURLE_OK).ok_or_else(|| curl_error("curl_easy_setopt", code).into())
+        (code == CURLE_OK).ok_or_else(|| curl_error("curl_easy_setopt", code))
     }};
 }
 const CURLE_OK: CurlCode = 0;
@@ -238,12 +239,20 @@ impl Client {
                         sys::curl_easy_reset(reset_handle.as_ptr());
                     }
                 });
-                handle.setopt_ptr(CURLOPT_URL, url.as_ptr().cast::<c_void>())?;
-                handle.setopt_ptr(CURLOPT_HTTPHEADER, header_list.as_ptr().cast::<c_void>())?;
-                handle.setopt_ptr(
-                    CURLOPT_ERRORBUFFER,
-                    error_buffer.as_mut_ptr().cast::<c_void>(),
-                )?;
+                for (option, ptr) in [
+                    (CURLOPT_URL, url.as_ptr().cast::<c_void>()),
+                    (CURLOPT_HTTPHEADER, header_list.as_ptr().cast::<c_void>()),
+                    (
+                        CURLOPT_ERRORBUFFER,
+                        error_buffer.as_mut_ptr().cast::<c_void>(),
+                    ),
+                    (
+                        CURLOPT_PROTOCOLS_STR,
+                        HTTPS_PROTOCOL.as_ptr().cast::<c_void>(),
+                    ),
+                ] {
+                    handle.setopt_ptr(option, ptr)?;
+                }
                 handle.setopt_callback(CURLOPT_WRITEFUNCTION, write_callback)?;
                 handle.setopt_callback(CURLOPT_HEADERFUNCTION, write_callback)?;
                 for (option, value) in [
@@ -258,10 +267,6 @@ impl Client {
                 ] {
                     handle.setopt_long(option, value)?;
                 }
-                handle.setopt_ptr(
-                    CURLOPT_PROTOCOLS_STR,
-                    HTTPS_PROTOCOL.as_ptr().cast::<c_void>(),
-                )?;
                 handle.setopt_off_t(CURLOPT_MAXFILESIZE_LARGE, HTTP_MAX_BODY_BYTES_OFF_T)?;
                 if let Some(body_bytes) = request_body {
                     handle.setopt_long(CURLOPT_POST, 1)?;
@@ -302,12 +307,14 @@ impl Client {
                     && !message_cstr.is_empty()
                 {
                     let message = message_cstr.to_string_lossy();
-                    format!("curl_easy_perform 실패: {message} ({perform_code})")
+                    err_fmt(format_args!(
+                        "curl_easy_perform 실패: {message} ({perform_code})"
+                    ))
                 } else {
                     curl_error("curl_easy_perform", perform_code)
                 };
                 self.easy_handle = None;
-                return Err(perform_error.into());
+                return Err(perform_error);
             }
             let raw_status = response_info.unwrap_or_else(|| process::abort())?;
             u32::try_from(raw_status)
@@ -430,18 +437,21 @@ fn nul_terminated_buffer<'buffer>(
         .fold(1_usize, |capacity, part| capacity.strict_add(part.len()));
     out.clear();
     out.try_reserve_exact(capacity)
-        .map_err(|source| download_error_with_source("libcurl 문자열 메모리 확보 실패", source))?;
+        .map_err(|source| reserve_err("libcurl 문자열 메모리 확보 실패", source))?;
     for part in parts {
         out.extend_from_slice(part);
     }
     out.push(0);
     CStr::from_bytes_with_nul(out).map_err(|source| {
-        download_error_with_source(format!("{label}에 NUL 문자가 포함되어 있습니다"), source)
+        err_fmt_with_source(
+            format_args!("{label}에 NUL 문자가 포함되어 있습니다"),
+            source.into(),
+        )
     })
 }
 #[cold]
 #[inline(never)]
-fn curl_error(context: &str, code: CurlCode) -> String {
+fn curl_error(context: &str, code: CurlCode) -> DownloadError {
     // SAFETY: curl_easy_strerror returns either null or a static NUL-terminated message for code.
     let raw_ptr = unsafe { sys::curl_easy_strerror(code) };
     let message = if raw_ptr.is_null() {
@@ -450,7 +460,7 @@ fn curl_error(context: &str, code: CurlCode) -> String {
         // SAFETY: libcurl guarantees a valid NUL-terminated string for non-null strerror results.
         unsafe { CStr::from_ptr(raw_ptr) }.to_string_lossy()
     };
-    format!("{context} 실패: {message} ({code})")
+    err_fmt(format_args!("{context} 실패: {message} ({code})"))
 }
 unsafe extern "C" fn write_callback(
     ptr: *mut c_char,

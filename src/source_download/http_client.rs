@@ -4,10 +4,10 @@ use super::{
     NETFUNNEL_ENTRY_ACTION_ID, NETFUNNEL_HOST, NETFUNNEL_POLL_LIMIT, NETFUNNEL_SERVICE_ID,
     OIL_PRICE_DOWNLOAD_TAR_URL, OLE2_SIGNATURE, OPDOWNLOAD_EXCEL_PATH, OPDOWNLOAD_LAYOUT_PATH,
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
-    download_error_with_source, parse_unsigned_decimal, try_push_vec, try_string_with_capacity,
+    download_error_with_source, parse_unsigned_u32, reserve_err, try_push_vec,
+    try_string_with_capacity,
 };
 use crate::diagnostic::err_fmt;
-use alloc::borrow::Cow;
 use core::{fmt::NumBuffer, mem, range::Range, time::Duration};
 use std::{
     process,
@@ -57,10 +57,9 @@ impl CookieJar {
         .ok_or("Cookie 값에 허용되지 않는 문자가 포함되어 있습니다.")?;
         let pair_len = name.len().strict_add(1).strict_add(value.len());
         if pair_len > MAX_COOKIE_PAIR_BYTES {
-            return Err(format!(
+            return Err(err_fmt(format_args!(
                 "Cookie 이름과 값이 허용 한도({MAX_COOKIE_PAIR_BYTES} bytes)를 초과했습니다."
-            )
-            .into());
+            )));
         }
         if let Some(cookie) = self.cookies.iter_mut().find(|cookie| {
             cookie
@@ -79,10 +78,9 @@ impl CookieJar {
             return Ok(());
         }
         if self.cookies.len() >= MAX_COOKIES_PER_HOST {
-            return Err(format!(
+            return Err(err_fmt(format_args!(
                 "호스트별 Cookie 수가 허용 한도({MAX_COOKIES_PER_HOST}개)를 초과했습니다."
-            )
-            .into());
+            )));
         }
         let mut pair = try_string_with_capacity(pair_len, "Cookie 메모리 확보 실패")?;
         pair.extend([name, "=", value]);
@@ -150,16 +148,19 @@ impl SourceDownload {
         if let Some(expected_len) = headers.content_length
             && body.len() != expected_len
         {
-            return Err(format!(
+            return Err(err_fmt(format_args!(
                 "HTTP 응답 본문 길이가 Content-Length와 다릅니다: expected={expected_len}, actual={}",
                 body.len()
-            )
-            .into());
+            )));
         }
         for value in &headers.set_cookies {
             let (cookie_name, cookie_value) = split_head_or_all(value, ';')
                 .split_once('=')
-                .ok_or_else(|| format!("HTTP Set-Cookie 형식이 올바르지 않습니다: {value}"))?;
+                .ok_or_else(|| {
+                    err_fmt(format_args!(
+                        "HTTP Set-Cookie 형식이 올바르지 않습니다: {value}"
+                    ))
+                })?;
             self.add_cookie_for_host(host, cookie_name.trim_ascii(), cookie_value.trim_ascii())?;
         }
         if !(200..300).contains(&status) {
@@ -185,9 +186,7 @@ impl SourceDownload {
             });
             body.clear();
             body.try_reserve_exact(required_capacity)
-                .map_err(|source| {
-                    download_error_with_source("HTTP form body 메모리 확보 실패", source)
-                })?;
+                .map_err(|source| reserve_err("HTTP form body 메모리 확보 실패", source))?;
             for (index, &(name, value)) in form.iter().enumerate() {
                 if index != 0 {
                     body.push('&');
@@ -366,7 +365,7 @@ impl SourceDownload {
         let (value, _) = text
             .split_once("result='")
             .and_then(|(_, tail)| tail.split_once('\''))
-            .ok_or_else(|| format!("NetFunnel result 파싱 실패: {text}"))?;
+            .ok_or_else(|| err_fmt(format_args!("NetFunnel result 파싱 실패: {text}")))?;
         let value_range = text.substr_range(value).unwrap_or_else(|| process::abort());
         retain_substr(&mut text, value_range);
         Ok(text)
@@ -394,9 +393,7 @@ impl SourceDownload {
             });
             self.cookie_header_buffer
                 .try_reserve_exact(capacity)
-                .map_err(|source| {
-                    download_error_with_source("Cookie header 메모리 확보 실패", source)
-                })?;
+                .map_err(|source| reserve_err("Cookie header 메모리 확보 실패", source))?;
             for (index, cookie) in jar.cookies.iter().enumerate() {
                 if index != 0 {
                     self.cookie_header_buffer.push_str("; ");
@@ -432,9 +429,11 @@ fn split_head_or_all(value: &str, separator: char) -> &str {
 fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     let (_, value_tail) = result
         .split_once("key=")
-        .ok_or_else(|| format!("NetFunnel key 없음: {result}"))?;
+        .ok_or_else(|| err_fmt(format_args!("NetFunnel key 없음: {result}")))?;
     let value = split_head_or_all(value_tail, '&');
-    (!value.is_empty()).ok_or_else(|| format!("NetFunnel key 비어 있음: {result}"))?;
+    if value.is_empty() {
+        return Err(err_fmt(format_args!("NetFunnel key 비어 있음: {result}")));
+    }
     let value_range = result
         .substr_range(value)
         .unwrap_or_else(|| process::abort());
@@ -442,9 +441,9 @@ fn take_netfunnel_key(mut result: String) -> DownloadResult<String> {
     Ok(result)
 }
 fn parse_netfunnel_u32(value: &str, context: &'static str) -> DownloadResult<u32> {
-    parse_unsigned_decimal(
+    parse_unsigned_u32(
         value,
-        || Cow::Owned(format!("{context}: 음이 아닌 10진수 형식이 아닙니다.")),
-        || Cow::Owned(format!("{context} 해석 실패")),
+        format_args!("{context}: 음이 아닌 10진수 형식이 아닙니다."),
+        format_args!("{context} 해석 실패"),
     )
 }

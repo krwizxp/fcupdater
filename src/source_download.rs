@@ -1,6 +1,6 @@
 use crate::diagnostic::{
-    Result as DownloadResult, err_with_source as download_error_with_source,
-    parse_unsigned_decimal, try_push_vec, try_string_with_capacity,
+    Result as DownloadResult, err_fmt, err_with_source as download_error_with_source,
+    parse_unsigned_u32, reserve_err, try_push_vec, try_string_with_capacity,
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
@@ -109,9 +109,11 @@ impl ResponseHeaders {
         )
     }
     fn set_content_length(&mut self, parsed: usize) -> DownloadResult<()> {
-        (parsed <= HTTP_MAX_BODY_BYTES).ok_or_else(|| {
-            format!("HTTP Content-Length가 허용 한도({HTTP_MAX_BODY_BYTES} bytes)를 초과했습니다.")
-        })?;
+        if parsed > HTTP_MAX_BODY_BYTES {
+            return Err(err_fmt(format_args!(
+                "HTTP Content-Length가 허용 한도({HTTP_MAX_BODY_BYTES} bytes)를 초과했습니다."
+            )));
+        }
         self.content_length
             .is_none_or(|previous| previous == parsed)
             .ok_or("HTTP Content-Length 헤더 값이 서로 다릅니다.")?;
@@ -127,8 +129,11 @@ fn checked_http_buffer_len(
 ) -> DownloadResult<usize> {
     let next_len = current_len
         .checked_add(additional_len)
-        .ok_or_else(|| format!("HTTP 응답 {label} 크기 계산 실패"))?;
-    (next_len <= limit).then_some(next_len).ok_or_else(|| {
-        format!("HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다.").into()
-    })
+        .ok_or_else(|| err_fmt(format_args!("HTTP 응답 {label} 크기 계산 실패")))?;
+    if next_len > limit {
+        return Err(err_fmt(format_args!(
+            "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
+        )));
+    }
+    Ok(next_len)
 }

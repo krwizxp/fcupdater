@@ -1,6 +1,8 @@
 use crate::{
     change_log::ChangeLogUpdater,
-    diagnostic::{Result, err, err_fmt, err_with_source, path_err_with_source, terminal_safe},
+    diagnostic::{
+        Result, err, err_fmt, err_with_source, path_err_with_source, reserve_err, terminal_safe,
+    },
     excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::{ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, StoreRow},
@@ -29,8 +31,7 @@ struct LoadedSource {
 impl LoadedSource {
     fn finish_validation(&self) -> Result<()> {
         let target_record_count = self.index.len();
-        (target_record_count != 0)
-            .ok_or_else(|| err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."))?;
+        (target_record_count != 0).ok_or("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다.")?;
         for (region, count) in TARGET_REGIONS.iter().zip(self.region_counts.iter()) {
             (*count != 0).ok_or_else(|| {
                 err_fmt(format_args!(
@@ -94,7 +95,7 @@ impl UpdateRun<'_> {
                         .index
                         .try_reserve(SOURCE_INDEX_GROWTH)
                         .map_err(|source| {
-                            err_with_source("소스 index 맵 추가 메모리 확보 실패", source)
+                            reserve_err("소스 index 맵 추가 메모리 확보 실패", source)
                         })?;
                 }
                 match loaded_source.index.entry(key) {
@@ -147,16 +148,15 @@ impl UpdateRun<'_> {
                 && *existing_count != 0
                 && *matched_existing_count < existing_count.div_ceil(HALF_COUNT_DIVISOR)
             {
-                region_validation_error = Some(format!(
+                region_validation_error = Some(err_fmt(format_args!(
                     "대상 지역의 기존 주소 일치 건수가 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing_count}건 / 기존 주소 일치 {matched_existing_count}건 / 소스 {source_count}건"
-                ));
+                )));
             }
         }
-        if let Some(message) = region_validation_error {
-            return Err(err(message));
+        if let Some(error) = region_validation_error {
+            return Err(error);
         }
-        (master_update.existing_count != 0)
-            .ok_or_else(|| err("현행화 대상 레코드를 찾지 못했습니다."))?;
+        (master_update.existing_count != 0).ok_or("현행화 대상 레코드를 찾지 못했습니다.")?;
         let deleted_count = master_update.deleted.len();
         if deleted_count >= master_update.existing_count.div_ceil(HALF_COUNT_DIVISOR) {
             return Err(err_fmt(format_args!(
@@ -233,7 +233,7 @@ impl UpdateRun<'_> {
             .map_err(|source| err_with_source("현재 시간 조회 실패", source))?;
         let kst = since_epoch
             .checked_add(KST_OFFSET)
-            .ok_or_else(|| err("KST 날짜 초 계산 중 범위 오류가 발생했습니다."))?;
+            .ok_or("KST 날짜 초 계산 중 범위 오류가 발생했습니다.")?;
         let shifted_days = kst
             .as_secs()
             .div_euclid(SECS_PER_DAY_U64)

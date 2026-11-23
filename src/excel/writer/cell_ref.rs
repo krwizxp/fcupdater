@@ -2,7 +2,7 @@ use super::CellReference;
 use crate::diagnostic::{Result, err_fmt};
 use std::process;
 const MAX_A1_COLUMN_LETTERS: usize = 3;
-const SINGLE_LETTER_COLUMNS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+pub(super) const SINGLE_LETTER_COLUMNS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
 pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {

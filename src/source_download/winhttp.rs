@@ -1,7 +1,8 @@
 use super::{
     DownloadResult, HTTP_MAX_BODY_BYTES, HTTP_MAX_HEADER_BYTES, HttpResponse, RequestHeaders,
-    ResponseHeaders, checked_http_buffer_len, download_error_with_source,
+    ResponseHeaders, checked_http_buffer_len, download_error_with_source, err_fmt, reserve_err,
 };
+use crate::diagnostic::AppError as DownloadError;
 use crate::diagnostic::try_vec_with_capacity;
 use alloc::{string::String, vec::Vec};
 use core::{
@@ -118,7 +119,7 @@ impl Client {
         self.header_buffer.clear();
         self.header_buffer
             .try_reserve_exact(header_capacity)
-            .map_err(|source| download_error_with_source("요청 헤더 메모리 확보 실패", source))?;
+            .map_err(|source| reserve_err("요청 헤더 메모리 확보 실패", source))?;
         for (name, value) in headers.iter() {
             self.header_buffer.extend(name.encode_utf16());
             self.header_buffer.extend_from_slice(&HEADER_SEPARATOR_WIDE);
@@ -236,15 +237,14 @@ impl Client {
                     return Err(Self::windows_error_message(
                         "WinHttpSetOption SECURE_PROTOCOLS",
                         code,
-                    )
-                    .into());
+                    ));
                 }
             }
             for (option, context, ignored_error) in WINHTTP_SESSION_OPTIONS {
                 if let Err(code) = Self::try_set_dword_option(&session, option, 1)
                     && ignored_error != Some(code)
                 {
-                    return Err(Self::windows_error_message(context, code).into());
+                    return Err(Self::windows_error_message(context, code));
                 }
             }
             self.session_cache.insert(SessionCache {
@@ -285,7 +285,7 @@ impl Client {
         Ok(connect)
     }
     fn check_winhttp(ok: i32, context: &str) -> DownloadResult<()> {
-        (ok != 0_i32).ok_or_else(|| Self::last_error_message(context).into())
+        (ok != 0_i32).ok_or_else(|| Self::last_error_message(context))
     }
     fn complete_request(
         &mut self,
@@ -309,8 +309,7 @@ impl Client {
                         return Err(Self::windows_error_message(
                             "WinHttpQueryHeaders Content-Length",
                             code,
-                        )
-                        .into());
+                        ));
                     }
                 };
                 (content_length_index > previous_index)
@@ -353,9 +352,9 @@ impl Client {
                     .ok_or("Set-Cookie UTF-16 길이가 2바이트 단위가 아닙니다.")?;
                 let units = header_bytes.div_euclid(2);
                 self.header_buffer.clear();
-                self.header_buffer.try_reserve(units).map_err(|source| {
-                    download_error_with_source("Set-Cookie 메모리 확보 실패", source)
-                })?;
+                self.header_buffer
+                    .try_reserve(units)
+                    .map_err(|source| reserve_err("Set-Cookie 메모리 확보 실패", source))?;
                 self.header_buffer.resize(units, 0_u16);
                 cookie_index = current_index;
                 // SAFETY: buffer has the probed size and request is valid.
@@ -393,14 +392,14 @@ impl Client {
     }
     #[cold]
     #[inline(never)]
-    fn last_error_message(context: &str) -> String {
+    fn last_error_message(context: &str) -> DownloadError {
         let code = Self::last_error_code();
         Self::windows_error_message(context, code)
     }
     fn non_null_handle(handle: HInternet, context: &str) -> DownloadResult<Handle> {
         NonNull::new(handle)
             .map(Handle)
-            .ok_or_else(|| Self::last_error_message(context).into())
+            .ok_or_else(|| Self::last_error_message(context))
     }
     fn query_dword_header(
         request: &Handle,
@@ -439,9 +438,7 @@ impl Client {
         if self.read_buffer.capacity() < WINHTTP_READ_BUFFER_BYTES {
             self.read_buffer
                 .try_reserve_exact(WINHTTP_READ_BUFFER_BYTES)
-                .map_err(|source| {
-                    download_error_with_source("응답 read 버퍼 메모리 확보 실패", source)
-                })?;
+                .map_err(|source| reserve_err("응답 read 버퍼 메모리 확보 실패", source))?;
         }
         self.read_buffer.resize(WINHTTP_READ_BUFFER_BYTES, 0);
         let bytes_to_read = WINHTTP_READ_BUFFER_BYTES_DWORD;
@@ -496,7 +493,7 @@ impl Client {
         context: &str,
     ) -> DownloadResult<()> {
         Self::try_set_dword_option(handle, option, value)
-            .map_err(|code| Self::windows_error_message(context, code).into())
+            .map_err(|code| Self::windows_error_message(context, code))
     }
     fn try_set_dword_option(handle: &Handle, option: u32, value: u32) -> CoreResult<(), u32> {
         // SAFETY: handle is valid and value points to a DWORD option value for this call.
@@ -512,8 +509,8 @@ impl Client {
     }
     #[cold]
     #[inline(never)]
-    fn windows_error_message(context: &str, code: u32) -> String {
-        format!("{context} 실패: Windows error {code}")
+    fn windows_error_message(context: &str, code: u32) -> DownloadError {
+        err_fmt(format_args!("{context} 실패: Windows error {code}"))
     }
 }
 fn wide(value: &str) -> DownloadResult<Vec<u16>> {

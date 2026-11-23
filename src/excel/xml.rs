@@ -346,9 +346,9 @@ impl<'tag> XmlAttrScanner<'tag> {
     }
     pub(super) fn new(tag: &'tag str) -> Result<Self> {
         let bytes = tag.as_bytes();
-        let Some(tag_start) = tag.find('<') else {
-            return Err(err("XML 태그 시작 문자를 찾지 못했습니다."));
-        };
+        let tag_start = tag
+            .find('<')
+            .ok_or("XML 태그 시작 문자를 찾지 못했습니다.")?;
         let mut cursor = tag_start.strict_add(1);
         while bytes
             .get(cursor)
@@ -391,9 +391,9 @@ impl<'tag> XmlAttrScanner<'tag> {
         }
         self.cursor = self.cursor.strict_add(1);
         skip_xml_whitespace(bytes, &mut self.cursor);
-        let Some(&quote) = bytes.get(self.cursor) else {
-            return Err(err("XML 속성 값 quote 문자를 찾지 못했습니다."));
-        };
+        let &quote = bytes
+            .get(self.cursor)
+            .ok_or("XML 속성 값 quote 문자를 찾지 못했습니다.")?;
         if quote != b'"' && quote != b'\'' {
             return Err(err("XML 속성 값 quote 문자가 올바르지 않습니다."));
         }
@@ -402,9 +402,9 @@ impl<'tag> XmlAttrScanner<'tag> {
             .tag
             .get(value_start..)
             .unwrap_or_else(|| process::abort());
-        let Some(value_end_rel) = value_tail.find(char::from(quote)) else {
-            return Err(err("XML 속성 값 종료 quote를 찾지 못했습니다."));
-        };
+        let value_end_rel = value_tail
+            .find(char::from(quote))
+            .ok_or("XML 속성 값 종료 quote를 찾지 못했습니다.")?;
         let value_end = value_start.strict_add(value_end_rel);
         let name = self
             .tag

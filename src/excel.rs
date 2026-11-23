@@ -106,3 +106,10 @@ fn copy_text(text: &str) -> Result<String> {
     out.push_str(text);
     Ok(out)
 }
+
+fn read_le_chunk<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+    bytes
+        .get(offset..)
+        .and_then(|tail| tail.first_chunk::<N>())
+        .copied()
+}

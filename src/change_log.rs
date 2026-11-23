@@ -1,5 +1,5 @@
 use crate::{
-    diagnostic::{Result, append_fmt, err, try_string_with_capacity},
+    diagnostic::{Result, append_fmt, try_string_with_capacity},
     excel::{
         FuelValues, SourceRecord,
         writer::{SharedStringTable, Worksheet, is_shared_formula_follower},
@@ -91,7 +91,7 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
     pub(super) fn update(&mut self) -> Result<u32> {
         self.worksheet
             .has_any_row_format(CHANGELOG_STYLE_TEMPLATE_ROW, CHANGELOG_COL_DELTA_DIESEL)
-            .ok_or_else(|| err("변경내역 243행에 고정 style template이 없습니다."))?;
+            .ok_or("변경내역 243행에 고정 style template이 없습니다.")?;
         let date_text = format!("현행화 일자: {}", self.today);
         self.shared_string_table
             .set_cell(self.worksheet, 1, 2, &date_text)?;

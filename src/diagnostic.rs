@@ -2,9 +2,8 @@ use alloc::{borrow::Cow, collections::TryReserveError};
 use core::{
     error::Error,
     fmt::{self, Display, Write as _},
-    num::{IntErrorKind, ParseIntError},
+    num::IntErrorKind,
     result::Result as CoreResult,
-    str::FromStr,
 };
 use std::{io::Error as IoError, path::Path};
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -16,9 +15,14 @@ pub(super) struct AppError {
 struct ControlEscapingWriter<'formatter, 'output>(&'formatter mut fmt::Formatter<'output>);
 impl AppError {
     fn context(context: impl Into<Cow<'static, str>>, source: impl Into<BoxError>) -> Self {
+        Self::context_boxed(context.into(), source.into())
+    }
+    #[cold]
+    #[inline(never)]
+    fn context_boxed(context: Cow<'static, str>, source: BoxError) -> Self {
         Self {
-            message: context.into(),
-            source: Some(source.into()),
+            message: context,
+            source: Some(source),
         }
     }
     fn message(message: impl Into<Cow<'static, str>>) -> Self {
@@ -87,6 +91,13 @@ pub(super) fn err_fmt(args: fmt::Arguments<'_>) -> AppError {
     append_fmt(&mut message, args);
     AppError::message(message)
 }
+#[cold]
+#[inline(never)]
+pub(super) fn err_fmt_with_source(args: fmt::Arguments<'_>, source: BoxError) -> AppError {
+    let mut message = String::new();
+    append_fmt(&mut message, args);
+    AppError::context_boxed(Cow::Owned(message), source)
+}
 pub(super) fn err_with_source(
     context: impl Into<Cow<'static, str>>,
     source: impl Into<BoxError>,
@@ -125,31 +136,26 @@ pub(super) fn try_push_vec<T>(
     vec.push(value);
     Ok(())
 }
-#[cold]
-#[inline(never)]
 pub(super) fn path_err_with_source(
     label: &str,
     path: &Path,
     source: impl Into<BoxError>,
 ) -> AppError {
-    AppError::context(format!("{label}: {}", path.display()), source)
+    err_fmt_with_source(format_args!("{label}: {}", path.display()), source.into())
 }
-pub(super) fn parse_unsigned_decimal<T>(
+pub(super) fn parse_unsigned_u32(
     value: &str,
-    format_error: impl FnOnce() -> Cow<'static, str>,
-    parse_context: impl FnOnce() -> Cow<'static, str>,
-) -> Result<T>
-where
-    T: FromStr<Err = ParseIntError>,
-{
+    format_error: fmt::Arguments<'_>,
+    parse_context: fmt::Arguments<'_>,
+) -> Result<u32> {
     if value.starts_with('+') {
-        return Err(err(format_error()));
+        return Err(err_fmt(format_error));
     }
-    value.parse::<T>().map_err(|source| {
+    value.parse::<u32>().map_err(|source| {
         if source.kind() == &IntErrorKind::PosOverflow {
-            err_with_source(parse_context(), source)
+            err_fmt_with_source(parse_context, source.into())
         } else {
-            err(format_error())
+            err_fmt(format_error)
         }
     })
 }

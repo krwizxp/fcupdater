@@ -6,7 +6,7 @@ use super::{
     ZIP_MAX_ARCHIVE_BYTES, deflate,
 };
 use crate::diagnostic::{
-    Result, err, err_fmt, err_with_source, path_err_with_source, reserve_err, try_vec_with_capacity,
+    Result, err_fmt, err_with_source, path_err_with_source, reserve_err, try_vec_with_capacity,
 };
 use core::mem;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -43,19 +43,19 @@ impl<'part> StreamingZipWriter<'part, '_> {
             .iter()
             .map(|entry| CENTRAL_DIRECTORY_HEADER_LEN.saturating_add(entry.part.name.len()))
             .try_fold(0_usize, usize::checked_add)
-            .ok_or_else(|| err("ZIP 중앙 디렉터리 크기 계산 실패"))?;
+            .ok_or("ZIP 중앙 디렉터리 크기 계산 실패")?;
         let entry_count_u16 = u16::try_from(entries.len())
             .map_err(|source| err_with_source("ZIP entry 수 변환 실패", source))?;
         let central_output_size = central_dir_size_usize
             .checked_add(END_OF_CENTRAL_DIRECTORY_LEN)
-            .ok_or_else(|| err("ZIP 중앙 디렉터리 출력 크기 계산 실패"))?;
+            .ok_or("ZIP 중앙 디렉터리 출력 크기 계산 실패")?;
         self.ensure_output_limit(central_output_size, "ZIP 중앙 디렉터리 출력 크기 계산")?;
         let central_dir_size = u32::try_from(central_dir_size_usize)
             .map_err(|source| err_with_source("ZIP 중앙 디렉터리 크기 변환 실패", source))?;
         for entry in &entries {
             let record_len = CENTRAL_DIRECTORY_HEADER_LEN
                 .checked_add(entry.part.name.len())
-                .ok_or_else(|| err("ZIP 중앙 디렉터리 entry 길이 계산 실패"))?;
+                .ok_or("ZIP 중앙 디렉터리 entry 길이 계산 실패")?;
             self.prepare_header_buffer(record_len, "ZIP 중앙 디렉터리 메모리 확보 실패")?;
             write_u32(&mut self.header_buffer, CENTRAL_DIRECTORY_SIGNATURE);
             write_u16(&mut self.header_buffer, VERSION_MADE_BY);
@@ -116,10 +116,10 @@ impl<'part> StreamingZipWriter<'part, '_> {
             .map_err(|source| err_with_source("ZIP offset 변환 실패", source))?;
         let local_header_len = LOCAL_FILE_HEADER_LEN
             .checked_add(part.name.len())
-            .ok_or_else(|| err("ZIP local header 길이 계산 실패"))?;
+            .ok_or("ZIP local header 길이 계산 실패")?;
         let entry_output_size = local_header_len
             .checked_add(compressed_size)
-            .ok_or_else(|| err("ZIP entry 출력 크기 계산 실패"))?;
+            .ok_or("ZIP entry 출력 크기 계산 실패")?;
         self.ensure_output_limit(entry_output_size, "ZIP entry 출력 크기 계산")?;
         self.prepare_header_buffer(local_header_len, "ZIP local header 메모리 확보 실패")?;
         write_u32(&mut self.header_buffer, LOCAL_FILE_HEADER_SIGNATURE);

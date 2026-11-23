@@ -226,7 +226,7 @@ impl BitReader<'_> {
     fn read_bits(&mut self, count: u8) -> Result<u16> {
         let value = self
             .try_peek_bits(count)
-            .ok_or_else(|| err("deflate bitstream이 예기치 않게 끝났습니다."))?;
+            .ok_or("deflate bitstream이 예기치 않게 끝났습니다.")?;
         self.consume_bits(count)?;
         Ok(value)
     }
@@ -235,10 +235,11 @@ impl BitReader<'_> {
         let start = self.cursor;
         let end = start
             .checked_add(len)
-            .ok_or_else(|| err("deflate 저장 블록 크기 계산 실패"))?;
-        let Some(bytes) = self.bytes.get(Range { start, end }) else {
-            return Err(err("deflate 저장 블록이 입력보다 깁니다."));
-        };
+            .ok_or("deflate 저장 블록 크기 계산 실패")?;
+        let bytes = self
+            .bytes
+            .get(Range { start, end })
+            .ok_or("deflate 저장 블록이 입력보다 깁니다.")?;
         self.cursor = end;
         Ok(bytes)
     }
@@ -325,7 +326,7 @@ impl DecodeHuffman {
                 .root
                 .get(usize::from(prefix))
                 .copied()
-                .ok_or_else(|| err("deflate root decode table 범위 오류"))?;
+                .ok_or("deflate root decode table 범위 오류")?;
             if entry.is_direct() {
                 let len = entry.bit_len();
                 reader.bit_buffer >>= len;
@@ -390,7 +391,7 @@ impl DecodeHuffman {
         // RFC 1951 permits a single one-bit literal/distance code, not an incomplete code-length tree.
         (code_end == code_limit
             || (allow_single_code && symbol_count == 1 && huffman_get(&counts, 1) == 1))
-            .ok_or(err("Incomplete deflate Huffman tree"))?;
+            .ok_or("Incomplete deflate Huffman tree")?;
         let mut root = [DecodeEntry::EMPTY; DECODE_ROOT_SIZE];
         let mut symbols = [0_u16; DECODE_MAX_SYMBOLS];
         for (symbol_u16, &bit_len) in zip(0_u16.., lengths) {
@@ -418,7 +419,7 @@ impl DecodeHuffman {
                 let root_index = base | suffix.strict_shl(u32::from(bit_len));
                 let root_slot = root
                     .get_mut(root_index)
-                    .ok_or_else(|| err("deflate root decode table 생성 범위 오류"))?;
+                    .ok_or("deflate root decode table 생성 범위 오류")?;
                 ensure(
                     !root_slot.is_direct(),
                     "deflate root decode code가 충돌합니다.",
@@ -488,17 +489,17 @@ impl InflateState<'_> {
         let code_length_count = usize::from(self.reader.read_bits(4)?).strict_add(4);
         let mut code_lengths = [0_u8; 19];
         for &symbol in CODE_LENGTH_ORDER.iter().take(code_length_count) {
-            let Some(slot) = code_lengths.get_mut(usize::from(symbol)) else {
-                return Err(err("deflate code length symbol 범위 오류"));
-            };
+            let slot = code_lengths
+                .get_mut(usize::from(symbol))
+                .ok_or("deflate code length symbol 범위 오류")?;
             let [length, _] = self.reader.read_bits(3)?.to_le_bytes();
             *slot = length;
         }
         let code_tree = DecodeHuffman::from_lengths(&code_lengths, false)?
-            .ok_or_else(|| err("deflate code length tree가 비어 있습니다."))?;
+            .ok_or("deflate code length tree가 비어 있습니다.")?;
         let total = literal_count
             .checked_add(distance_count)
-            .ok_or_else(|| err("deflate code length 총합 계산 실패"))?;
+            .ok_or("deflate code length 총합 계산 실패")?;
         let mut lengths = [0_u8; LITERAL_LENGTH_SYMBOLS + FIXED_DISTANCE_SYMBOLS];
         let mut length_count = 0_usize;
         while length_count < total {
@@ -513,7 +514,7 @@ impl InflateState<'_> {
                         .checked_sub(1)
                         .and_then(|index| lengths.get(index))
                         .copied()
-                        .ok_or_else(|| err("deflate repeat code에 이전 길이가 없습니다."))?;
+                        .ok_or("deflate repeat code에 이전 길이가 없습니다.")?;
                     (
                         previous,
                         usize::from(self.reader.read_bits(2)?).strict_add(3),
@@ -527,7 +528,7 @@ impl InflateState<'_> {
             };
             let next_len = length_count
                 .checked_add(repeat)
-                .ok_or_else(|| err("deflate repeat 길이 계산 실패"))?;
+                .ok_or("deflate repeat 길이 계산 실패")?;
             ensure(
                 next_len <= total,
                 "deflate repeat 길이가 code length 총합을 초과합니다.",
@@ -545,7 +546,7 @@ impl InflateState<'_> {
             return Err(err("deflate literal/distance length 범위 오류"));
         };
         let literal = DecodeHuffman::from_lengths(literal_lengths, true)?
-            .ok_or_else(|| err("deflate literal Huffman tree가 비어 있습니다."))?;
+            .ok_or("deflate literal Huffman tree가 비어 있습니다.")?;
         let distance = DecodeHuffman::from_lengths(distance_lengths, true)?;
         Ok(DynamicTrees { distance, literal })
     }
@@ -558,9 +559,10 @@ impl InflateState<'_> {
             let symbol = literal_tree.decode(&mut self.reader)?;
             match symbol {
                 0..=255 => {
-                    if self.output.len() == self.expected_len {
-                        return Err(err("deflate 출력이 ZIP 선언 해제 크기를 초과했습니다."));
-                    }
+                    ensure(
+                        self.output.len() != self.expected_len,
+                        "deflate 출력이 ZIP 선언 해제 크기를 초과했습니다.",
+                    )?;
                     let [byte, _] = symbol.to_le_bytes();
                     self.output.push(byte);
                 }
@@ -572,9 +574,8 @@ impl InflateState<'_> {
                         &LENGTH_EXTRA_BITS,
                         "deflate length symbol 범위 오류",
                     )?;
-                    let Some(distance_huffman) = distance_tree else {
-                        return Err(err("deflate distance tree가 없습니다."));
-                    };
+                    let distance_huffman =
+                        distance_tree.ok_or("deflate distance tree가 없습니다.")?;
                     let distance_symbol = distance_huffman.decode(&mut self.reader)?;
                     let distance = self.decode_extra(
                         usize::from(distance_symbol),
@@ -719,11 +720,21 @@ impl DynamicFrequencies {
         }
         bit_len
     }
-    fn plan(&self) -> Result<DynamicDeflatePlan> {
+    fn plan(&self, state: &mut HuffmanBuildState) -> Result<DynamicDeflatePlan> {
         let mut literal_lengths = [0_u8; LITERAL_LENGTH_SYMBOLS];
-        build_huffman_lengths(&self.literal, DEFLATE_MAX_BITS_U8, &mut literal_lengths);
+        build_huffman_lengths(
+            state,
+            &self.literal,
+            DEFLATE_MAX_BITS_U8,
+            &mut literal_lengths,
+        );
         let mut distance_lengths = [0_u8; DISTANCE_SYMBOLS];
-        build_huffman_lengths(&self.distance, DEFLATE_MAX_BITS_U8, &mut distance_lengths);
+        build_huffman_lengths(
+            state,
+            &self.distance,
+            DEFLATE_MAX_BITS_U8,
+            &mut distance_lengths,
+        );
         let literal_count = literal_lengths
             .iter()
             .rposition(|&len| len != 0)
@@ -810,7 +821,7 @@ impl DynamicFrequencies {
             *freq = freq.strict_add(1);
         }
         let mut code_lengths = [0_u8; CODE_LENGTH_SYMBOLS];
-        build_huffman_lengths(&code_length_freq, 7, &mut code_lengths);
+        build_huffman_lengths(state, &code_length_freq, 7, &mut code_lengths);
         let code_length_count = CODE_LENGTH_ORDER
             .iter()
             .rposition(|&symbol| huffman_get(&code_lengths, usize::from(symbol)) != 0)
@@ -912,7 +923,7 @@ impl DeflatePlan {
             let tokens = self
                 .tokens
                 .get(block.token_range)
-                .ok_or_else(|| err("deflate block token 범위 오류"))?;
+                .ok_or("deflate block token 범위 오류")?;
             if let Some(dynamic_plan) = block.dynamic_plan.as_ref() {
                 dynamic_plan.write_block(tokens, writer)?;
             } else {
@@ -1062,6 +1073,7 @@ impl DeflateWriter<'_, '_> {
             tokens.len().div_ceil(TOKEN_BLOCK_LIMIT),
             "deflate block plan 메모리 확보 실패",
         )?;
+        let mut huffman_state: Option<Box<HuffmanBuildState>> = None;
         let mut total_bits = FINAL_FIXED_BLOCK_BITS;
         for (block_index, block_tokens) in tokens.chunks(TOKEN_BLOCK_LIMIT).enumerate() {
             let start = block_index.strict_mul(TOKEN_BLOCK_LIMIT);
@@ -1074,7 +1086,22 @@ impl DeflateWriter<'_, '_> {
                 literal: [0_u32; LITERAL_LENGTH_SYMBOLS],
             };
             let (has_distance, fixed_bit_len) = frequencies.collect(block_tokens);
-            let dynamic_plan = has_distance.then(|| frequencies.plan()).transpose()?;
+            let dynamic_plan = if has_distance {
+                let state = huffman_state.get_or_insert_with(|| {
+                    Box::new(HuffmanBuildState {
+                        depths: [0_u16; HUFFMAN_NODE_CAPACITY],
+                        frequencies: [0_u32; HUFFMAN_NODE_CAPACITY],
+                        heap: [0_u16; HUFFMAN_NODE_CAPACITY],
+                        heap_len: 0,
+                        heap_max: 0,
+                        max_symbol: 0,
+                        parents: [u16::MAX; HUFFMAN_NODE_CAPACITY],
+                    })
+                });
+                Some(frequencies.plan(state)?)
+            } else {
+                None
+            };
             let (chosen_dynamic, bit_len) = dynamic_plan.map_or((None, fixed_bit_len), |dynamic| {
                 let dynamic_bit_len = frequencies.encoded_bit_len(&dynamic);
                 if dynamic_bit_len < fixed_bit_len {
@@ -1208,7 +1235,7 @@ impl DeflateWriter<'_, '_> {
                 )?;
                 let next_position = position
                     .checked_add(best_len)
-                    .ok_or_else(|| err("deflate 위치 계산 실패"))?;
+                    .ok_or("deflate 위치 계산 실패")?;
                 if best_len <= XML_MAX_INSERT_MATCH_LEN {
                     for insert_position in position.strict_add(1)..next_position {
                         Self::insert_position(
@@ -1222,9 +1249,7 @@ impl DeflateWriter<'_, '_> {
                 }
                 position = next_position;
             } else {
-                let Some(&byte) = bytes.get(position) else {
-                    return Err(err("deflate literal 범위 오류"));
-                };
+                let &byte = bytes.get(position).ok_or("deflate literal 범위 오류")?;
                 try_push_vec(
                     &mut tokens,
                     DeflateToken(u32::from(byte)),
@@ -1249,18 +1274,22 @@ where
 fn huffman_set<T>(values: &mut [T], index: usize, value: T) {
     *values.get_mut(index).unwrap_or_else(|| process::abort()) = value;
 }
-fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) {
+fn build_huffman_lengths(
+    state: &mut HuffmanBuildState,
+    frequencies: &[u32],
+    max_bits: u8,
+    lengths: &mut [u8],
+) {
     let symbol_count = frequencies.len();
     let node_capacity = symbol_count.strict_mul(2).strict_add(1);
-    let mut state = HuffmanBuildState {
-        depths: [0_u16; HUFFMAN_NODE_CAPACITY],
-        frequencies: [0_u32; HUFFMAN_NODE_CAPACITY],
-        heap: [0_u16; HUFFMAN_NODE_CAPACITY],
-        heap_len: 0,
-        heap_max: node_capacity,
-        max_symbol: 0,
-        parents: [u16::MAX; HUFFMAN_NODE_CAPACITY],
-    };
+    state
+        .depths
+        .get_mut(..symbol_count)
+        .unwrap_or_else(|| process::abort())
+        .fill(0);
+    state.heap_len = 0;
+    state.heap_max = node_capacity;
+    state.max_symbol = 0;
     state
         .frequencies
         .get_mut(..symbol_count)
@@ -1393,9 +1422,9 @@ fn canonical_next_codes(
         if length == 0 {
             continue;
         }
-        let Some(count) = length_counts.get_mut(usize::from(length)) else {
-            return Err(err("deflate Huffman code 길이가 너무 깁니다."));
-        };
+        let count = length_counts
+            .get_mut(usize::from(length))
+            .ok_or("deflate Huffman code 길이가 너무 깁니다.")?;
         *count = count.strict_add(1);
     }
     if length_counts.iter().skip(1).all(|count| *count == 0) {
@@ -1407,7 +1436,7 @@ fn canonical_next_codes(
         code = code
             .checked_add(previous_count)
             .and_then(|sum| sum.checked_mul(2))
-            .ok_or_else(|| err("deflate Huffman canonical code가 범위를 초과했습니다."))?;
+            .ok_or("deflate Huffman canonical code가 범위를 초과했습니다.")?;
         *next_code = code;
     }
     Ok(Some(next_codes))
@@ -1419,7 +1448,7 @@ fn ensure_deflate_output_len(
 ) -> Result<()> {
     let next_len = current_len
         .checked_add(additional_len)
-        .ok_or_else(|| err("deflate 출력 크기 계산 실패"))?;
+        .ok_or("deflate 출력 크기 계산 실패")?;
     (next_len <= expected_len).ok_or(err("deflate 출력이 ZIP 선언 해제 크기를 초과했습니다."))
 }
 fn hash3(bytes: &[u8], position: usize) -> Option<usize> {

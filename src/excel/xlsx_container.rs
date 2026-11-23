@@ -9,8 +9,9 @@ use super::{
     zip_archive::{ZIP_FINGERPRINT_BUFFER_BYTES, archive_file_len, crc32_update},
 };
 use crate::diagnostic::{
-    AppError, Result, append_fmt, err, err_fmt, err_with_source, path_err_with_source,
-    terminal_safe, try_push_vec, try_string_with_capacity, try_vec_with_capacity,
+    AppError, Result, append_fmt, ensure, err, err_fmt, err_fmt_with_source, err_with_source,
+    path_err_with_source, terminal_safe, try_push_vec, try_string_with_capacity,
+    try_vec_with_capacity,
 };
 #[cfg(target_os = "windows")]
 use crate::temp_entry::configure_replaceable_file;
@@ -387,7 +388,7 @@ impl TempArchivePromotion<'_> {
                 path_err_with_source("저장된 xlsx identity 검증 실패", self.target_xlsx, source)
             })?;
             (saved_file.identity == self.temp_archive.identity)
-                .ok_or(err("저장된 xlsx identity가 임시 archive와 다릅니다."))?;
+                .ok_or("저장된 xlsx identity가 임시 archive와 다릅니다.")?;
             saved_file.file.sync_all().map_err(|source| {
                 path_err_with_source(
                     "xlsx 저장 완료 후 파일 내구성 동기화 실패",
@@ -502,7 +503,7 @@ impl XlsxContainer {
         )?;
         (required_xml_attr(root.raw, "xmlns:r", "workbook.xml")?.as_ref()
             == OFFICE_DOCUMENT_REL_NAMESPACE)
-            .ok_or(err("workbook.xml의 xmlns:r namespace가 올바르지 않습니다."))?;
+            .ok_or("workbook.xml의 xmlns:r namespace가 올바르지 않습니다.")?;
         let workbook_xml = workbook_text.as_str();
         let mut scanner = XmlScanner::new(workbook_xml);
         scanner.skip_to(root.end.strict_add(1));
@@ -552,9 +553,10 @@ impl XlsxContainer {
             let mut date_system = None;
             let mut attributes = XmlAttrScanner::from_tag(&properties.opening);
             while let Some((name, value)) = attributes.next()? {
-                if name == "date1904" && date_system.replace(value).is_some() {
-                    return Err(err("workbookPr에 date1904 속성이 중복되었습니다."));
-                }
+                ensure(
+                    name == "date1904" && date_system.replace(value).is_none(),
+                    "workbookPr에 date1904 속성이 중복되었습니다.",
+                )?;
             }
             if date_system
                 .as_deref()
@@ -562,9 +564,10 @@ impl XlsxContainer {
             {
                 return Err(err("workbookPr의 1904 날짜 체계는 지원하지 않습니다."));
             }
-            if properties_scanner.next_start_named("workbookPr").is_some() {
-                return Err(err("workbook에 workbookPr 요소가 여러 개 있습니다."));
-            }
+            ensure(
+                properties_scanner.next_start_named("workbookPr").is_none(),
+                "workbook에 workbookPr 요소가 여러 개 있습니다.",
+            )?;
         }
         Ok(())
     }
@@ -789,9 +792,7 @@ impl XlsxContainer {
                 .trim_matches([' ', '\t', '\r', '\n'])
                 .parse::<i32>()
                 .map_err(|source| err_with_source("app.xml의 TotalTime 해석 실패", source))?;
-            if value < 0_i32 {
-                return Err(err("app.xml의 TotalTime은 음수일 수 없습니다."));
-            }
+            ensure(value >= 0_i32, "app.xml의 TotalTime은 음수일 수 없습니다.")?;
             app_xml.extend(["<TotalTime>", body, "</TotalTime>"]);
         }
         app_xml.extend(["<Application>", crate::APP_NAME, "</Application><HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>워크시트</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>유류비</vt:lpstr><vt:lpstr>변경내역</vt:lpstr></vt:vector></TitlesOfParts></Properties>"]);
@@ -842,9 +843,9 @@ impl XlsxContainer {
             .parent()
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let temp_archive_prefix = format!(".{}.tmp_", crate::MASTER_PATH);
+        let temp_archive_prefix = ".fuel_cost_chungcheong.xlsx.tmp_";
         #[cfg(target_os = "windows")]
-        let backup_archive_prefix = format!(".{}.backup_", crate::MASTER_PATH);
+        let backup_archive_prefix = ".fuel_cost_chungcheong.xlsx.backup_";
         let reserve_archive = |prefix: &str| -> io::Result<ReservedTempArchive> {
             const ATTEMPTS: u32 = 1024;
             let pid = process::id();
@@ -880,11 +881,11 @@ impl XlsxContainer {
                 "임시 항목 이름 충돌이 반복되었습니다. 잠시 후 다시 시도하세요.",
             ))
         };
-        let mut tmp_archive = reserve_archive(&temp_archive_prefix).map_err(|source| {
+        let mut tmp_archive = reserve_archive(temp_archive_prefix).map_err(|source| {
             path_err_with_source("임시 저장 파일 생성 실패", target_xlsx, source)
         })?;
         #[cfg(target_os = "windows")]
-        let mut backup_archive = reserve_archive(&backup_archive_prefix).map_err(|source| {
+        let mut backup_archive = reserve_archive(backup_archive_prefix).map_err(|source| {
             path_err_with_source("교체 예약 파일 생성 실패", target_xlsx, source)
         })?;
         let result = (|| -> Result<()> {
@@ -918,12 +919,12 @@ impl XlsxContainer {
         if tmp_archive.remove_on_drop
             && let Err(error) = tmp_archive.remove_owned()
         {
-            return Err(err_with_source(
-                format!(
+            return Err(err_fmt_with_source(
+                format_args!(
                     "xlsx 임시 저장 파일 삭제 실패: {} ({error})",
                     tmp_archive.path().display(),
                 ),
-                source,
+                source.into(),
             ));
         }
         Err(source)
@@ -935,8 +936,12 @@ impl XlsxContainer {
     }
     fn take_text(&mut self, name: &str) -> Result<String> {
         let bytes = mem::take(self.part_mut(name));
-        String::from_utf8(bytes)
-            .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
+        String::from_utf8(bytes).map_err(|source| {
+            err_fmt_with_source(
+                format_args!("xlsx part UTF-8 해석 실패: {name}"),
+                source.into(),
+            )
+        })
     }
     fn take_workbook_dependencies(&mut self, workbook_xml: &str) -> Result<()> {
         let workbook_relationships = self.take_text("xl/_rels/workbook.xml.rels")?;
@@ -952,15 +957,15 @@ impl XlsxContainer {
         let sheet_ids = [
             master_rid
                 .as_deref()
-                .ok_or_else(|| err("유류비 worksheet relationship Id가 없습니다."))?,
+                .ok_or("유류비 worksheet relationship Id가 없습니다.")?,
             change_log_rid
                 .as_deref()
-                .ok_or_else(|| err("변경내역 worksheet relationship Id가 없습니다."))?,
+                .ok_or("변경내역 worksheet relationship Id가 없습니다.")?,
         ];
         let mut workbook_scanner = XmlScanner::new(workbook_xml);
         workbook_scanner
             .next_start_named("sheets")
-            .ok_or_else(|| err("workbook.xml의 sheets 시작 태그를 찾지 못했습니다."))?;
+            .ok_or("workbook.xml의 sheets 시작 태그를 찾지 못했습니다.")?;
         for ((expected_name, expected_sheet_id), expected_rid) in
             [(MASTER_SHEET_NAME, "1"), (CHANGE_LOG_SHEET_NAME, "2")]
                 .into_iter()
@@ -969,7 +974,7 @@ impl XlsxContainer {
             let sheet_tag = workbook_scanner
                 .next_start_named("sheet")
                 .filter(|tag| tag.name == "sheet" && tag.self_closing)
-                .ok_or_else(|| err("workbook sheet 태그가 올바르지 않습니다."))?;
+                .ok_or("workbook sheet 태그가 올바르지 않습니다.")?;
             let mut sheet_attrs = [None, None, None, None];
             parse_attrs_into(
                 sheet_tag.raw,
@@ -982,11 +987,12 @@ impl XlsxContainer {
                 && sheet_id.as_deref() == Some(expected_sheet_id)
                 && rid.as_deref() == Some(expected_rid)
                 && state.as_deref().is_none_or(|value| value == "visible"))
-            .ok_or(err("workbook.xml sheet 구성이 고정 스키마와 다릅니다."))?;
+            .ok_or("workbook.xml sheet 구성이 고정 스키마와 다릅니다.")?;
         }
-        if workbook_scanner.next_start_named("sheet").is_some() {
-            return Err(err("workbook sheet 수가 고정 스키마의 2개보다 많습니다."));
-        }
+        ensure(
+            workbook_scanner.next_start_named("sheet").is_none(),
+            "workbook sheet 수가 고정 스키마의 2개보다 많습니다.",
+        )?;
         Ok(())
     }
     pub(super) fn take_worksheet_text(&mut self, name: &str) -> Result<String> {
@@ -1009,7 +1015,7 @@ impl XlsxContainer {
                 let rid = relationships
                     .first_mut()
                     .and_then(Option::take)
-                    .ok_or_else(|| err("worksheet drawing relationship Id가 없습니다."))?
+                    .ok_or("worksheet drawing relationship Id가 없습니다.")?
                     .into_owned();
                 validate_empty_xml_root(
                     &self.take_text("xl/drawings/drawing1.xml")?,
@@ -1052,9 +1058,10 @@ impl XlsxContainer {
                 )?;
                 let span = tag.start..tag.end.strict_add(1);
                 drawing_scanner.skip_to(span.end);
-                if drawing_scanner.next_start_named("drawing").is_some() {
-                    return Err(err("sheet1.xml에 drawing 참조가 여러 개 있습니다."));
-                }
+                ensure(
+                    drawing_scanner.next_start_named("drawing").is_none(),
+                    "sheet1.xml에 drawing 참조가 여러 개 있습니다.",
+                )?;
                 xml.replace_range(span, "");
             }
             (Some(_), None) => {
@@ -1075,8 +1082,12 @@ impl XlsxContainer {
             .get(part_index(name))
             .and_then(Option::as_deref)
             .unwrap_or_else(|| process::abort());
-        str::from_utf8(bytes)
-            .map_err(|source| err_with_source(format!("xlsx part UTF-8 해석 실패: {name}"), source))
+        str::from_utf8(bytes).map_err(|source| {
+            err_fmt_with_source(
+                format_args!("xlsx part UTF-8 해석 실패: {name}"),
+                source.into(),
+            )
+        })
     }
     fn validate_content_types(&self) -> Result<()> {
         let content_types_xml = self.text("[Content_Types].xml")?;
@@ -1110,9 +1121,8 @@ impl XlsxContainer {
                         "[Content_Types].xml entry에 {key_name} 속성이 없습니다."
                     ))
                 })?;
-                let content_type = content_type_attr.ok_or_else(|| {
-                    err("[Content_Types].xml entry에 ContentType 속성이 없습니다.")
-                })?;
+                let content_type = content_type_attr
+                    .ok_or("[Content_Types].xml entry에 ContentType 속성이 없습니다.")?;
                 let matching_entry = if is_default {
                     CONTENT_TYPE_DEFAULTS
                         .iter()
@@ -1193,7 +1203,10 @@ fn style_entries<'text>(
     let declared_count = required_xml_attr(element.opening.raw, "count", group_name)?
         .parse::<usize>()
         .map_err(|source| {
-            err_with_source(format!("styles.xml {group_name} count 해석 실패"), source)
+            err_fmt_with_source(
+                format_args!("styles.xml {group_name} count 해석 실패"),
+                source.into(),
+            )
         })?;
     let capacity = declared_count.min(
         element

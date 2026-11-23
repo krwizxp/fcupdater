@@ -1,7 +1,7 @@
 use crate::{
     diagnostic::{
-        Result, append_fmt, err, err_fmt, err_with_source, reserve_err, try_string_with_capacity,
-        try_vec_with_capacity,
+        Result, append_fmt, ensure, err, err_fmt, err_with_source, reserve_err, try_push_vec,
+        try_string_with_capacity, try_vec_with_capacity,
     },
     excel,
     excel::writer::{
@@ -191,6 +191,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         plan: &SortableRankRow<'_>,
         sort_context: &RankSortContext,
         rank_cache: Option<&str>,
+        smart_discount_follower: bool,
         buffers: &mut FormulaBuffers,
     ) -> Result<()> {
         let mut row_buffer = NumBuffer::new();
@@ -261,7 +262,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         } else {
             self.apply_numeric_formula_cache(
                 (row_num, COL_SMART_DISCOUNT),
-                false,
+                smart_discount_follower,
                 format_args!(
                     r#"IF(AND(IFERROR(SEARCH("{SMART_DISCOUNT_BRAND_KEYWORD}",$C{row_text}),0)>0,IFERROR(SEARCH("{SMART_DISCOUNT_DIRECT_KEYWORD}",$C{row_text}),0)>0),$B${SMART_DISCOUNT_INPUT_ROW},0)"#
                 ),
@@ -423,7 +424,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         };
         let region_multiplier = DECIMAL_SCALE
             .checked_sub(region_rate)
-            .ok_or_else(|| err("지역 보정률이 100%를 초과했습니다."))?;
+            .ok_or("지역 보정률이 100%를 초과했습니다.")?;
         let regional_adjusted = adjusted_prices.map(|price| {
             price
                 .and_then(|value| value.as_i128().checked_mul(region_multiplier.as_i128()))
@@ -447,7 +448,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                         .checked_mul(fuel_price.as_i128())
                         .and_then(|value| total.as_i128().checked_add(value))
                         .map(ScaledSortKey)
-                        .ok_or_else(|| err("유류비 합계 계산 중 overflow가 발생했습니다."))?;
+                        .ok_or("유류비 합계 계산 중 overflow가 발생했습니다.")?;
                 }
             }
             complete.then_some(total)
@@ -461,7 +462,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                     .checked_mul(region_rate.as_i128())
                     .and_then(|value| value.checked_div(DECIMAL_SCALE_CUBED.as_i128()))
                     .and_then(|value| value.checked_mul(DECIMAL_SCALE_SQUARED.as_i128()))
-                    .ok_or_else(|| err("지역화폐 할인 계산 중 overflow가 발생했습니다."))?;
+                    .ok_or("지역화폐 할인 계산 중 overflow가 발생했습니다.")?;
                 price
                     .as_i128()
                     .checked_sub(discount)
@@ -531,7 +532,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
             .gasoline
             .checked_add(quantities.premium)
             .and_then(|total| total.checked_add(quantities.diesel))
-            .ok_or_else(|| err("유류비 고정 입력값 합계가 허용 범위를 초과했습니다."))?;
+            .ok_or("유류비 고정 입력값 합계가 허용 범위를 초과했습니다.")?;
         let unit_price_denominator = (derived_total_qty != ScaledDecimal::ZERO)
             .then(|| {
                 derived_total_qty
@@ -593,8 +594,10 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let mut rows = self.ws.take_rows();
         let data_start_index = MASTER_DATA_START_ROW.strict_sub(1) as usize;
         let data_end_index = self.data_last_row as usize;
-        (data_end_index <= rows.len())
-            .ok_or_else(|| err("정렬 대상 row 범위가 worksheet를 벗어났습니다."))?;
+        ensure(
+            data_end_index <= rows.len(),
+            "정렬 대상 row 범위가 worksheet를 벗어났습니다.",
+        )?;
         let trailing_rows = rows.split_off(data_end_index);
         let mut source_rows = rows.split_off(data_start_index);
         let additional = source_rows.len().strict_add(trailing_rows.len());
@@ -619,7 +622,36 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let mut ranked_count = 0_usize;
         let mut current_rank = 0_usize;
         let mut previous_total = None;
-        for (row, plan) in (MASTER_DATA_START_ROW..=self.data_last_row).zip(&row_plans) {
+        let (mut smart_group_end, mut smart_seen_gap, mut smart_prev_row) = (0_u32, false, None);
+        for (index, (row, plan)) in (MASTER_DATA_START_ROW..=self.data_last_row)
+            .zip(&row_plans)
+            .enumerate()
+        {
+            let smart_discount_follower = if plan.smart_discount_excluded {
+                false
+            } else if row <= smart_group_end {
+                true
+            } else {
+                let interrupted = smart_seen_gap
+                    || smart_prev_row.is_some_and(|prev: u32| row > prev.strict_add(1));
+                let max_cells = if interrupted { 32_usize } else { 64_usize };
+                let run_len = row_plans
+                    .get(index..)
+                    .unwrap_or_else(|| process::abort())
+                    .iter()
+                    .take(max_cells)
+                    .take_while(|candidate| !candidate.smart_discount_excluded)
+                    .count();
+                let last_row = row.strict_add(
+                    u32::try_from(run_len.strict_sub(1)).unwrap_or_else(|_| process::abort()),
+                );
+                (smart_seen_gap, smart_prev_row, smart_group_end) = (
+                    interrupted,
+                    Some(last_row),
+                    if run_len >= 6 { last_row } else { 0 },
+                );
+                false
+            };
             let rank_cache = plan.rank_value.map(|current| {
                 ranked_count = ranked_count.strict_add(1);
                 if previous_total != Some(current.to_bits()) {
@@ -628,7 +660,14 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
                 }
                 current_rank.format_into(&mut rank_buffer)
             });
-            self.apply_row_formulas_and_caches(row, plan, &sort_context, rank_cache, &mut buffers)?;
+            self.apply_row_formulas_and_caches(
+                row,
+                plan,
+                &sort_context,
+                rank_cache,
+                smart_discount_follower,
+                &mut buffers,
+            )?;
         }
         Ok(())
     }
@@ -695,7 +734,8 @@ impl<'source> MasterSheetUpdater<'source> {
                     old_row,
                     region: region.into_owned(),
                 };
-                try_push_row(&mut deleted, row_count, row)?;
+                let growth = row_count.saturating_sub(deleted.len()).clamp(1, 64);
+                try_push_vec(&mut deleted, row, growth, "변경 행 목록 메모리 확보 실패")?;
                 continue;
             };
             record_address(Cow::Borrowed(matched_key.as_str()))?;
@@ -735,7 +775,8 @@ impl<'source> MasterSheetUpdater<'source> {
                     reason,
                     record: src,
                 };
-                try_push_row(&mut changes, row_count, row)?;
+                let growth = row_count.saturating_sub(changes.len()).clamp(1, 64);
+                try_push_vec(&mut changes, row, growth, "변경 행 목록 메모리 확보 실패")?;
             }
             kept_source_rows.push((old_row, Some(src)));
         }
@@ -899,7 +940,7 @@ impl<'source> MasterSheetUpdater<'source> {
         let data_start_index = MASTER_HEADER_ROW as usize;
         let trailing_start_index = old_data_last_row as usize;
         (trailing_start_index <= original_rows.len())
-            .ok_or_else(|| err("유류비 기존 데이터 row 범위가 worksheet를 벗어났습니다."))?;
+            .ok_or("유류비 기존 데이터 row 범위가 worksheet를 벗어났습니다.")?;
         let trailing_rows = original_rows.split_off(trailing_start_index);
         let source_rows = original_rows.split_off(data_start_index);
         let additional = kept_count
@@ -1003,7 +1044,7 @@ fn append_fuel_total_text(
         .strict_sub(i128::from(total < 0));
     let rounded = total
         .checked_add(rounding_offset)
-        .ok_or_else(|| err("연료비 반올림 계산 중 overflow가 발생했습니다."))?
+        .ok_or("연료비 반올림 계산 중 overflow가 발생했습니다.")?
         .div_euclid(DECIMAL_SCALE_SQUARED.as_i128());
     if !parts.is_empty() {
         parts.push_str(" / ");
@@ -1073,14 +1114,6 @@ fn read_master_fuels(
         gasoline: read_price(COL_GASOLINE)?,
         premium: read_price(COL_PREMIUM)?,
     })
-}
-fn try_push_row<T>(rows: &mut Vec<T>, max_len: usize, row: T) -> Result<()> {
-    if rows.len() == rows.capacity() {
-        rows.try_reserve_exact(rows.capacity().max(1).min(max_len.strict_sub(rows.len())))
-            .map_err(|source| reserve_err("행 목록 메모리 확보 실패", source))?;
-    }
-    rows.push(row);
-    Ok(())
 }
 fn trim_cow(value: Cow<'_, str>) -> Cow<'_, str> {
     match value {

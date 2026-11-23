@@ -1,4 +1,4 @@
-use self::cell_ref::{MAX_A1_ROW, col_name_into, parse_ref_with_locks};
+use self::cell_ref::{MAX_A1_ROW, SINGLE_LETTER_COLUMNS, col_name_into, parse_ref_with_locks};
 use super::{
     CHANGE_LOG_SHEET_NAME, CHANGE_LOG_SHEET_PATH, CanonicalStyleMap, FILTER_DATABASE_REF_PREFIX,
     MASTER_SHEET_NAME, MASTER_SHEET_PATH, SPREADSHEETML_NAMESPACE, SaveVerification,
@@ -8,22 +8,19 @@ use super::{
 };
 use crate::{
     diagnostic::{
-        Result, append_fmt, ensure, err, err_fmt, err_with_source, parse_unsigned_decimal,
-        reserve_err, try_push_vec, try_string_with_capacity, try_vec_with_capacity,
+        Result, append_fmt, ensure, err_fmt, parse_unsigned_u32, reserve_err, try_push_vec,
+        try_string_with_capacity, try_vec_with_capacity,
     },
     master_sheet::{DECIMAL_SCALE, MasterSheetUpdater},
 };
-use alloc::{
-    borrow::Cow,
-    collections::{BTreeMap, btree_map::Entry},
-    rc::Rc,
-};
+use alloc::{borrow::Cow, rc::Rc};
 use core::{
     cmp::Ordering,
     fmt::NumBuffer,
     iter::repeat_n,
     mem,
     range::{Range, RangeInclusive},
+    result::Result as CoreResult,
 };
 use std::{collections::HashMap, path::Path, process};
 mod cell_ref;
@@ -185,8 +182,9 @@ struct XmlAttr<'text> {
 struct WorksheetParser<'xml, 'styles> {
     cell_count: usize,
     input_styles: &'styles CanonicalStyleMap,
-    shared_formula_heads: BTreeMap<u32, SharedFormulaHead>,
+    shared_formula_heads: Vec<SharedFormulaHead>,
     sheet: ExcelSheetKind,
+    sparse_formula_heads: HashMap<u32, SharedFormulaHead>,
     xml: &'xml str,
 }
 #[derive(Clone, Copy)]
@@ -206,6 +204,18 @@ impl SharedStringTable {
         self.entries.get(index).map(|entry| entry.text.as_ref())
     }
     fn intern(&mut self, value: &str) -> Result<usize> {
+        if self.index.is_empty() && !self.entries.is_empty() {
+            self.index
+                .try_reserve(self.entries.len())
+                .map_err(|source| {
+                    reserve_err("shared string index map 메모리 확보 실패", source)
+                })?;
+            for (value_index, entry) in self.entries.iter().enumerate() {
+                self.index
+                    .entry(Rc::clone(&entry.text))
+                    .or_insert(value_index);
+            }
+        }
         if let Some(&index) = self.index.get(value) {
             return Ok(index);
         }
@@ -218,12 +228,12 @@ impl SharedStringTable {
             SHARED_STRING_GROWTH.min(MAX_SHARED_STRING_COUNT.strict_sub(self.entries.len()));
         if self.index.len() == self.index.capacity() {
             self.index.try_reserve(growth).map_err(|source| {
-                err_with_source("shared string index 추가 메모리 확보 실패", source)
+                reserve_err("shared string index 추가 메모리 확보 실패", source)
             })?;
         }
         if self.entries.len() == self.entries.capacity() {
             self.entries.try_reserve(growth).map_err(|source| {
-                err_with_source("sharedStrings XML entry 추가 메모리 확보 실패", source)
+                reserve_err("sharedStrings XML entry 추가 메모리 확보 실패", source)
             })?;
         }
         let index = self.entries.len();
@@ -318,7 +328,7 @@ impl Workbook {
         let mut shared_strings_scanner = XmlScanner::new(&shared_strings_xml_text);
         let sst = shared_strings_scanner
             .next_start_named("sst")
-            .ok_or_else(|| err("sharedStrings XML에 <sst>가 없습니다."))?;
+            .ok_or("sharedStrings XML에 <sst>가 없습니다.")?;
         let mut entries = try_vec_with_capacity(
             SHARED_STRING_INITIAL_CAPACITY,
             "shared string entry 메모리 확보 실패",
@@ -342,7 +352,7 @@ impl Workbook {
                 entries
                     .try_reserve(SHARED_STRING_GROWTH)
                     .map_err(|source| {
-                        err_with_source("shared string entry 메모리 확보 실패", source)
+                        reserve_err("shared string entry 메모리 확보 실패", source)
                     })?;
             }
             let si_xml = shared_strings_xml_text
@@ -405,7 +415,7 @@ impl Workbook {
                         out_text
                             .try_reserve_exact(decoded.len())
                             .map_err(|source| {
-                                err_with_source("XML tag text 메모리 확보 실패", source)
+                                reserve_err("XML tag text 메모리 확보 실패", source)
                             })?;
                         out_text.push_str(decoded.as_ref());
                     } else if let Some(previous) = first_text.take() {
@@ -434,18 +444,15 @@ impl Workbook {
                 xml: Some(xml),
             });
         }
-        let mut index = HashMap::new();
-        index.try_reserve(entries.len()).map_err(|source| {
-            err_with_source("shared string index map 메모리 확보 실패", source)
-        })?;
-        for (value_index, entry) in entries.iter().enumerate() {
-            index.entry(Rc::clone(&entry.text)).or_insert(value_index);
-        }
-        let shared_strings = SharedStringTable { entries, index };
+        let shared_strings = SharedStringTable {
+            entries,
+            index: HashMap::new(),
+        };
         let master_sheet = WorksheetParser {
             cell_count: 0,
             input_styles: &input_styles,
-            shared_formula_heads: BTreeMap::new(),
+            shared_formula_heads: Vec::new(),
+            sparse_formula_heads: HashMap::new(),
             sheet: ExcelSheetKind::Master,
             xml: &master_xml,
         }
@@ -454,7 +461,8 @@ impl Workbook {
         let change_log_sheet = WorksheetParser {
             cell_count: 0,
             input_styles: &input_styles,
-            shared_formula_heads: BTreeMap::new(),
+            shared_formula_heads: Vec::new(),
+            sparse_formula_heads: HashMap::new(),
             sheet: ExcelSheetKind::ChangeLog,
             xml: &change_log_xml,
         }
@@ -502,7 +510,7 @@ impl Workbook {
             Some(
                 gasoline_qty
                     .checked_mul(gasoline_weight)
-                    .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?,
+                    .ok_or("혼합 옥탄가 계산 중 overflow가 발생했습니다.")?,
             )
         };
         for (column, weight) in [(11, premium_weight), (12, diesel_weight)] {
@@ -510,7 +518,7 @@ impl Workbook {
                 let numerator = premium_qty
                     .checked_mul(weight)
                     .and_then(|premium| gasoline_term.checked_add(premium))
-                    .ok_or_else(|| err("혼합 옥탄가 계산 중 overflow가 발생했습니다."))?;
+                    .ok_or("혼합 옥탄가 계산 중 overflow가 발생했습니다.")?;
                 format_excel_ratio_into(
                     &mut cache,
                     numerator,
@@ -664,18 +672,12 @@ impl WorksheetParser<'_, '_> {
                 .then_some(style_value)
                 .flatten()
                 .map(|value| {
-                    parse_unsigned_decimal::<u32>(
+                    parse_unsigned_u32(
                         &value,
-                        || {
-                            Cow::Owned(format!(
-                                "worksheet cell style이 음이 아닌 10진수 형식이 아닙니다. (row={row_num}, col={col})"
-                            ))
-                        },
-                        || {
-                            Cow::Owned(format!(
-                                "worksheet cell style 해석 실패 (row={row_num}, col={col})"
-                            ))
-                        },
+                        format_args!(
+                            "worksheet cell style이 음이 아닌 10진수 형식이 아닙니다. (row={row_num}, col={col})"
+                        ),
+                        format_args!("worksheet cell style 해석 실패 (row={row_num}, col={col})"),
                     )
                 })
                 .transpose()?
@@ -699,7 +701,7 @@ impl WorksheetParser<'_, '_> {
             };
             let has_attrs = style.is_some() || value_type != CellValueType::General;
             if cell_info.self_closing {
-                (!shared_string).ok_or_else(|| err("shared string cell 본문이 없습니다."))?;
+                ensure(!shared_string, "shared string cell 본문이 없습니다.")?;
                 if has_attrs {
                     self.retain_cell(
                         row_num,
@@ -716,11 +718,7 @@ impl WorksheetParser<'_, '_> {
                 continue;
             }
             let retained_cell = if shared_string {
-                let value_body = if let Some(body) = inner_xml_text
-                    .strip_prefix("<v>")
-                    .and_then(|rest| rest.strip_suffix("</v>"))
-                    && !body.as_bytes().contains(&b'<')
-                {
+                let value_body = if let Some(body) = simple_value_body(inner_xml_text) {
                     body
                 } else {
                     let mut value_scanner = XmlScanner::new(inner_xml_text);
@@ -729,31 +727,31 @@ impl WorksheetParser<'_, '_> {
                         .filter(|element| {
                             element.opening.name == "v" && !element.opening.self_closing
                         })
-                        .ok_or_else(|| err("shared string cell에 v 태그가 없습니다."))?;
+                        .ok_or("shared string cell에 v 태그가 없습니다.")?;
                     let mut value_attrs = XmlAttrScanner::from_tag(&value.opening);
                     ensure(
                         value_attrs.next()?.is_none(),
                         "shared string v 태그에 속성이 있습니다.",
                     )?;
-                    (value_scanner.next_tag().is_none()
-                        && inner_xml_text
-                            .get(..value.span.start)
-                            .is_some_and(|text| text.trim().is_empty())
-                        && inner_xml_text
-                            .get(value.span.end..)
-                            .is_some_and(|text| text.trim().is_empty()))
-                    .ok_or(err("shared string cell 본문 형식이 올바르지 않습니다."))?;
+                    ensure(
+                        value_scanner.next_tag().is_none()
+                            && inner_xml_text
+                                .get(..value.span.start)
+                                .is_some_and(|text| text.trim().is_empty())
+                            && inner_xml_text
+                                .get(value.span.end..)
+                                .is_some_and(|text| text.trim().is_empty()),
+                        "shared string cell 본문 형식이 올바르지 않습니다.",
+                    )?;
                     value.body
                 };
-                let index = parse_unsigned_decimal::<usize>(
+                let index = parse_unsigned_u32(
                     value_body,
-                    || {
-                        Cow::Borrowed(
-                            "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다.",
-                        )
-                    },
-                    || Cow::Borrowed("shared string index 해석 실패"),
-                )?;
+                    format_args!(
+                        "shared string index 해석 실패: 음이 아닌 10진수 형식이 아닙니다."
+                    ),
+                    format_args!("shared string index 해석 실패"),
+                )? as usize;
                 Some(Cell {
                     col,
                     inner_xml: String::new(),
@@ -841,8 +839,10 @@ impl WorksheetParser<'_, '_> {
                             )));
                         }
                     };
-                    (slot.replace(value).is_none())
-                        .ok_or_else(|| err("XML 태그에 중복 속성이 있습니다."))?;
+                    ensure(
+                        slot.replace(value).is_none(),
+                        "XML 태그에 중복 속성이 있습니다.",
+                    )?;
                 }
                 let shared = formula_type.as_deref() == Some("shared");
                 if !shared
@@ -861,15 +861,17 @@ impl WorksheetParser<'_, '_> {
                     )));
                 }
                 if shared {
-                    aca.is_none()
-                        .ok_or_else(|| err("shared formula에 지원하지 않는 속성이 있습니다."))?;
+                    ensure(
+                        aca.is_none(),
+                        "shared formula에 지원하지 않는 속성이 있습니다.",
+                    )?;
                     let si_text = shared_index
                         .as_deref()
-                        .ok_or_else(|| err("shared formula에 si 속성이 없습니다."))?;
-                    let si = parse_unsigned_decimal::<u32>(
+                        .ok_or("shared formula에 si 속성이 없습니다.")?;
+                    let si = parse_unsigned_u32(
                         si_text,
-                        || Cow::Borrowed("shared formula si가 음이 아닌 10진수가 아닙니다."),
-                        || Cow::Borrowed("shared formula si 해석 실패"),
+                        format_args!("shared formula si가 음이 아닌 10진수가 아닙니다."),
+                        format_args!("shared formula si 해석 실패"),
                     )?;
                     let range = reference
                         .as_deref()
@@ -879,21 +881,40 @@ impl WorksheetParser<'_, '_> {
                                 .unwrap_or((reference_text, reference_text));
                             let start = parse_ref_with_locks(start_text)
                                 .filter(|value| !value.col_locked && !value.row_locked)
-                                .ok_or_else(|| {
-                                    err("shared formula ref 시작 형식이 올바르지 않습니다.")
-                                })?;
+                                .ok_or("shared formula ref 시작 형식이 올바르지 않습니다.")?;
                             let end = parse_ref_with_locks(end_text)
                                 .filter(|value| !value.col_locked && !value.row_locked)
-                                .ok_or_else(|| {
-                                    err("shared formula ref 끝 형식이 올바르지 않습니다.")
-                                })?;
+                                .ok_or("shared formula ref 끝 형식이 올바르지 않습니다.")?;
                             Ok((start, end))
                         })
                         .transpose()?;
-                    let is_anchor = !decoded_formula.is_empty();
-                    let head = if is_anchor {
-                        let (start, end) = range
-                            .ok_or_else(|| err("shared formula anchor에 ref 범위가 없습니다."))?;
+                    let dense = &mut self.shared_formula_heads;
+                    let sparse = &mut self.sparse_formula_heads;
+                    let slot = si as usize;
+                    if decoded_formula.is_empty() {
+                        ensure(
+                            range.is_none(),
+                            "shared formula follower에 ref 범위가 있습니다.",
+                        )?;
+                        let head = dense
+                            .get_mut(slot)
+                            .or_else(|| sparse.get_mut(&si))
+                            .ok_or_else(|| {
+                                err_fmt(format_args!(
+                                    "shared formula anchor를 찾지 못했습니다: si={si}"
+                                ))
+                            })?;
+                        if col != head.anchor_col
+                            || !(head.anchor_row..=head.last_row).contains(&row_num)
+                        {
+                            return Err(err_fmt(format_args!(
+                                "shared formula follower가 ref 범위를 벗어났습니다: si={si}, row={row_num}, col={col}"
+                            )));
+                        }
+                        head.seen = head.seen.strict_add(1);
+                    } else {
+                        let (start, end) =
+                            range.ok_or("shared formula anchor에 ref 범위가 없습니다.")?;
                         if (start.col, start.row) != (col, row_num)
                             || start.col != end.col
                             || start.row > end.row
@@ -902,37 +923,26 @@ impl WorksheetParser<'_, '_> {
                                 "shared formula ref가 세로 anchor 범위와 다릅니다: row={row_num}, col={col}"
                             )));
                         }
-                        match self.shared_formula_heads.entry(si) {
-                            Entry::Vacant(entry) => entry.insert(SharedFormulaHead {
-                                anchor_col: col,
-                                anchor_row: row_num,
-                                last_row: end.row,
-                                seen: 0,
-                            }),
-                            Entry::Occupied(_) => {
-                                return Err(err_fmt(format_args!(
-                                    "shared formula si anchor가 중복됩니다: {si}"
-                                )));
-                            }
+                        if slot < dense.len() || sparse.contains_key(&si) {
+                            return Err(err_fmt(format_args!(
+                                "shared formula si anchor가 중복됩니다: {si}"
+                            )));
                         }
-                    } else {
-                        range
-                            .is_none()
-                            .ok_or_else(|| err("shared formula follower에 ref 범위가 있습니다."))?;
-                        self.shared_formula_heads.get_mut(&si).ok_or_else(|| {
-                            err_fmt(format_args!(
-                                "shared formula anchor를 찾지 못했습니다: si={si}"
-                            ))
-                        })?
-                    };
-                    if col != head.anchor_col
-                        || !(head.anchor_row..=head.last_row).contains(&row_num)
-                    {
-                        return Err(err_fmt(format_args!(
-                            "shared formula follower가 ref 범위를 벗어났습니다: si={si}, row={row_num}, col={col}"
-                        )));
+                        let head = SharedFormulaHead {
+                            anchor_col: col,
+                            anchor_row: row_num,
+                            last_row: end.row,
+                            seen: 1,
+                        };
+                        if slot == dense.len() && sparse.is_empty() {
+                            try_push_vec(dense, head, 1, "shared formula anchor 메모리 확보 실패")?;
+                        } else {
+                            sparse.try_reserve(1).map_err(|source| {
+                                reserve_err("shared formula anchor 메모리 확보 실패", source)
+                            })?;
+                            sparse.insert(si, head);
+                        }
                     }
-                    head.seen = head.seen.strict_add(1);
                 } else {
                     let escaped = try_xml_escape_text(
                         decoded_formula.as_ref(),
@@ -974,11 +984,11 @@ impl WorksheetParser<'_, '_> {
         )? {
             parse_tag_attrs_into(&row_info, &mut row_attrs)?;
             let row_num_text = get_attr(&row_attrs, "r")
-                .ok_or_else(|| err("고정 workbook의 worksheet row에 r 속성이 없습니다."))?;
-            let row_num = parse_unsigned_decimal::<u32>(
+                .ok_or("고정 workbook의 worksheet row에 r 속성이 없습니다.")?;
+            let row_num = parse_unsigned_u32(
                 row_num_text,
-                || Cow::Borrowed("worksheet row 번호가 양의 10진수 형식이 아닙니다."),
-                || Cow::Borrowed("worksheet row 번호 해석 실패"),
+                format_args!("worksheet row 번호가 양의 10진수 형식이 아닙니다."),
+                format_args!("worksheet row 번호 해석 실패"),
             )?;
             ensure(row_num != 0, "worksheet row 번호는 1 이상이어야 합니다.")?;
             if !(1..=MAX_A1_ROW).contains(&row_num) {
@@ -1002,10 +1012,10 @@ impl WorksheetParser<'_, '_> {
             }
             let style = get_attr(&row_attrs, "s")
                 .map(|value| {
-                    parse_unsigned_decimal::<u32>(
+                    parse_unsigned_u32(
                         value,
-                        || Cow::Borrowed("row style이 10진수가 아닙니다."),
-                        || Cow::Borrowed("row style 해석 실패"),
+                        format_args!("row style이 10진수가 아닙니다."),
+                        format_args!("row style 해석 실패"),
                     )
                 })
                 .transpose()?
@@ -1062,9 +1072,9 @@ impl WorksheetParser<'_, '_> {
     }
     fn scan_worksheet(mut self) -> Result<Worksheet> {
         let mut scanner = XmlScanner::new(self.xml);
-        let Some(sheet_data) = scanner.next_start_named("sheetData") else {
-            return Err(err("worksheet XML에 <sheetData>가 없습니다."));
-        };
+        let sheet_data = scanner
+            .next_start_named("sheetData")
+            .ok_or("worksheet XML에 <sheetData>가 없습니다.")?;
         ensure(
             !sheet_data.self_closing,
             "고정 workbook의 sheetData는 비어 있을 수 없습니다.",
@@ -1082,14 +1092,23 @@ impl WorksheetParser<'_, '_> {
             false,
             Some(&sheet_data_span),
         )?;
-        for (si, head) in self.shared_formula_heads {
+        let invalid_count = |si, head: SharedFormulaHead| {
             let expected = head.last_row.strict_sub(head.anchor_row).strict_add(1);
-            if head.seen != expected {
-                return Err(err_fmt(format_args!(
-                    "shared formula ref의 cell 수가 다릅니다: si={si}, expected={expected}, actual={}",
-                    head.seen
-                )));
-            }
+            (head.seen != expected).then_some((si, expected, head.seen))
+        };
+        let invalid = (0_u32..)
+            .zip(self.shared_formula_heads)
+            .find_map(|(si, head)| invalid_count(si, head))
+            .or_else(|| {
+                self.sparse_formula_heads
+                    .into_iter()
+                    .filter_map(|(si, head)| invalid_count(si, head))
+                    .min_by_key(|&(si, ..)| si)
+            });
+        if let Some((si, expected, actual)) = invalid {
+            return Err(err_fmt(format_args!(
+                "shared formula ref의 cell 수가 다릅니다: si={si}, expected={expected}, actual={actual}"
+            )));
         }
         Ok(Worksheet { rows })
     }
@@ -1209,7 +1228,7 @@ impl Worksheet {
                 follower_xml.clear();
                 let follower_len = "<f t=\"shared\" si=\"\"/>".len().strict_add(si_text.len());
                 follower_xml.try_reserve(follower_len).map_err(|source| {
-                    err_with_source("shared formula follower 태그 메모리 확보 실패", source)
+                    reserve_err("shared formula follower 태그 메모리 확보 실패", source)
                 })?;
                 follower_xml.extend(["<f t=\"shared\" si=\"", si_text, "\"/>"]);
                 for shared_row in row..=last_row {
@@ -1224,7 +1243,7 @@ impl Worksheet {
                         XmlScanner::new(&cell.inner_xml)
                             .next_element_named("f")?
                             .map(|formula| formula.span)
-                            .ok_or_else(|| err("cell formula 태그를 찾지 못했습니다."))?
+                            .ok_or("cell formula 태그를 찾지 못했습니다.")?
                     };
                     if shared_row == row {
                         cell.inner_xml = replace_formula_tag_at(
@@ -1240,7 +1259,7 @@ impl Worksheet {
                         let span_len = formula_span.end.strict_sub(formula_span.start);
                         let additional = follower_xml.len().saturating_sub(span_len);
                         cell.inner_xml.try_reserve(additional).map_err(|source| {
-                            err_with_source("shared formula follower XML 메모리 확보 실패", source)
+                            reserve_err("shared formula follower XML 메모리 확보 실패", source)
                         })?;
                         cell.inner_xml.replace_range(formula_span, &follower_xml);
                     }
@@ -1412,17 +1431,7 @@ impl Worksheet {
     }
     fn get_or_create_cell_mut(rows: &mut Vec<Row>, col: u32, row: u32) -> Result<&mut Cell> {
         let row_obj = Self::ensure_row_mut(rows, row, "worksheet cell row 메모리 확보 실패")?;
-        if let Some(dense_index) = col
-            .checked_sub(1)
-            .and_then(|idx| usize::try_from(idx).ok())
-            .filter(|&idx| row_obj.cells.get(idx).is_some_and(|cell| cell.col == col))
-        {
-            return Ok(row_obj
-                .cells
-                .get_mut(dense_index)
-                .unwrap_or_else(|| process::abort()));
-        }
-        match row_obj.cells.binary_search_by_key(&col, |cell| cell.col) {
+        match row_obj.cell_slot(col) {
             Ok(index) => Ok(row_obj
                 .cells
                 .get_mut(index)
@@ -1433,7 +1442,7 @@ impl Worksheet {
                         .cells
                         .try_reserve(WORKSHEET_CELL_GROWTH)
                         .map_err(|source| {
-                            err_with_source("worksheet cell 추가 메모리 확보 실패", source)
+                            reserve_err("worksheet cell 추가 메모리 확보 실패", source)
                         })?;
                 }
                 Ok(row_obj.cells.insert_mut(
@@ -1638,14 +1647,14 @@ impl Worksheet {
             .checked_sub(start_col)
             .and_then(|value| value.checked_add(1))
             .map(|value| value as usize)
-            .ok_or_else(|| err("worksheet style 대상 column 범위가 올바르지 않습니다."))?;
+            .ok_or("worksheet style 대상 column 범위가 올바르지 않습니다.")?;
         let end = start
             .checked_add(cell_count)
-            .ok_or_else(|| err("worksheet style 대상 cell 범위 계산 실패"))?;
+            .ok_or("worksheet style 대상 cell 범위 계산 실패")?;
         let cells = row_obj
             .cells
             .get_mut(start..end)
-            .ok_or_else(|| err("worksheet style 대상 cell 범위가 올바르지 않습니다."))?;
+            .ok_or("worksheet style 대상 cell 범위가 올바르지 않습니다.")?;
         for (expected_col, cell) in (start_col..=end_col).zip(cells) {
             if cell.col != expected_col {
                 return Err(err_fmt(format_args!(
@@ -1739,9 +1748,9 @@ impl Worksheet {
             .transpose()?;
         let value_text = encoded.as_deref().unwrap_or("");
         let xml = &mut cell.inner_xml;
-        let Some(element) = XmlScanner::new(xml).next_element_named("v")? else {
-            return Err(err("v 태그를 찾지 못했습니다."));
-        };
+        let element = XmlScanner::new(xml)
+            .next_element_named("v")?
+            .ok_or("v 태그를 찾지 못했습니다.")?;
         if value_text.is_empty() {
             if element.opening.self_closing {
                 return Ok(());
@@ -1794,43 +1803,46 @@ impl Worksheet {
             .iter()
             .rposition(|row| !row.cells.is_empty())
             .map_or(1, |index| worksheet_row_count(index.strict_add(1)));
-        let dimension = format!("A1:{end_col}{max_row}");
+        let mut ref_buf = String::with_capacity(24);
+        let mut num_buf = NumBuffer::new();
+        ref_buf.extend(["A1:", end_col, max_row.format_into(&mut num_buf)]);
         replace_canonical_text(
             &mut prefix,
             dimension_reference,
-            &dimension,
+            &ref_buf,
             "worksheet dimension",
         )?;
         match sheet {
             ExcelSheetKind::Master => {
-                let filter = format!("A14:W{}", last_data_row.max(14));
-                let last_row = worksheet_row_count(self.rows.len());
-                let sort_state = format!("A15:W{last_row}");
-                let sort_condition = format!("A15:A{last_row}");
-                for (old, new, context) in [
-                    ("A14:W882", filter.as_str(), "worksheet autoFilter"),
-                    ("A15:W884", sort_state.as_str(), "worksheet sortState"),
-                    (
-                        "A15:A884",
-                        sort_condition.as_str(),
-                        "worksheet sortCondition",
-                    ),
+                ref_buf.clear();
+                ref_buf.extend(["A14:W", last_data_row.max(14).format_into(&mut num_buf)]);
+                replace_canonical_text(&mut suffix, "A14:W882", &ref_buf, "worksheet autoFilter")?;
+                let last_row_text = worksheet_row_count(self.rows.len()).format_into(&mut num_buf);
+                for (old, prefix_text, context) in [
+                    ("A15:W884", "A15:W", "worksheet sortState"),
+                    ("A15:A884", "A15:A", "worksheet sortCondition"),
                 ] {
-                    replace_canonical_text(&mut suffix, old, new, context)?;
+                    ref_buf.clear();
+                    ref_buf.extend([prefix_text, last_row_text]);
+                    replace_canonical_text(&mut suffix, old, &ref_buf, context)?;
                 }
             }
             ExcelSheetKind::ChangeLog => {
                 let start = CHANGE_LOG_FORMULA_LAYOUT.data_start_row;
+                let mut start_buf = NumBuffer::new();
+                let start_text = start.format_into(&mut start_buf);
+                let end_text =
+                    (last_data_row > start).then(|| last_data_row.format_into(&mut num_buf));
                 for (column, old) in [("G", "G4:G52"), ("J", "J4:J52"), ("M", "M4:M52")] {
-                    let reference = if last_data_row <= start {
-                        format!("{column}{start}")
-                    } else {
-                        format!("{column}{start}:{column}{last_data_row}")
-                    };
+                    ref_buf.clear();
+                    ref_buf.extend([column, start_text]);
+                    if let Some(end_row) = end_text {
+                        ref_buf.extend([":", column, end_row]);
+                    }
                     replace_canonical_text(
                         &mut suffix,
                         old,
-                        &reference,
+                        &ref_buf,
                         "worksheet conditionalFormatting",
                     )?;
                 }
@@ -1866,7 +1878,13 @@ impl Worksheet {
             }
             out.push('>');
             for cell in &row.cells {
-                let col_text = col_name_into(cell.col, &mut col_buffer)?;
+                let col_text = if let Some(single) = cell.col.checked_sub(1).and_then(|idx| {
+                    SINGLE_LETTER_COLUMNS.get(idx as usize..(idx as usize).strict_add(1))
+                }) {
+                    single
+                } else {
+                    col_name_into(cell.col, &mut col_buffer)?
+                };
                 out.extend(["<c r=\"", col_text, row_text, "\""]);
                 if let Some(style) = cell.style {
                     out.extend([" s=\"", style.format_into(&mut style_buffer), "\""]);
@@ -1987,19 +2005,18 @@ impl Worksheet {
 }
 impl Row {
     fn cell(&self, col: u32) -> Option<&Cell> {
-        if let Some(cell) = col
+        let index = self.cell_slot(col).ok()?;
+        self.cells.get(index)
+    }
+    fn cell_slot(&self, col: u32) -> CoreResult<usize, usize> {
+        if let Some(dense_index) = col
             .checked_sub(1)
             .and_then(|idx| usize::try_from(idx).ok())
-            .and_then(|idx| self.cells.get(idx))
-            .filter(|cell| cell.col == col)
+            .filter(|&idx| self.cells.get(idx).is_some_and(|cell| cell.col == col))
         {
-            return Some(cell);
+            return Ok(dense_index);
         }
-        let index = self
-            .cells
-            .binary_search_by_key(&col, |cell| cell.col)
-            .ok()?;
-        self.cells.get(index)
+        self.cells.binary_search_by_key(&col, |cell| cell.col)
     }
     pub(crate) fn try_copy_style(&self, max_col: u32) -> Result<Self> {
         let cell_count = self.cells.partition_point(|cell| cell.col <= max_col);
