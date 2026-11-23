@@ -5,7 +5,8 @@ use super::{
     MIN_MATCH, crc32_update, read_u16,
 };
 use crate::diagnostic::{
-    Result, ensure, err, err_with_source, reserve_err, try_push_vec, try_vec_with_capacity,
+    Result, ensure, err, err_with_source, map_reserve, reserve_err, try_push_vec,
+    try_vec_with_capacity,
 };
 use core::{
     array::from_fn,
@@ -146,6 +147,7 @@ pub(super) struct DeflateInflater<'bytes> {
 #[derive(Default)]
 pub(super) struct DeflateWorkspace {
     head: Vec<u32>,
+    huffman_state: Option<Box<HuffmanBuildState>>,
     position_bias: u32,
     previous: Vec<u16>,
     tokens: Vec<DeflateToken>,
@@ -979,9 +981,10 @@ impl DeflateWorkspace {
         self.work_budget = DeflateWorkBudget::default();
         self.tokens.clear();
         let initial_token_capacity = input_len.min(DEFLATE_TOKEN_RESERVE_CHUNK);
-        self.tokens
-            .try_reserve_exact(initial_token_capacity)
-            .map_err(|source| reserve_err("deflate token 메모리 확보 실패", source))?;
+        map_reserve(
+            self.tokens.try_reserve_exact(initial_token_capacity),
+            "deflate token 메모리 확보 실패",
+        )?;
         let input_len_u32 = u32::try_from(input_len).unwrap_or(u32::MAX);
         let needs_reset = self.head.len() != HASH_SIZE
             || self.position_bias == 0
@@ -995,9 +998,10 @@ impl DeflateWorkspace {
                 self.head.fill(0);
             } else {
                 self.head.clear();
-                self.head
-                    .try_reserve_exact(HASH_SIZE)
-                    .map_err(|source| reserve_err("deflate hash head 메모리 확보 실패", source))?;
+                map_reserve(
+                    self.head.try_reserve_exact(HASH_SIZE),
+                    "deflate hash head 메모리 확보 실패",
+                )?;
                 self.head.resize(HASH_SIZE, 0);
             }
             self.position_bias = 1;
@@ -1073,7 +1077,6 @@ impl DeflateWriter<'_, '_> {
             tokens.len().div_ceil(TOKEN_BLOCK_LIMIT),
             "deflate block plan 메모리 확보 실패",
         )?;
-        let mut huffman_state: Option<Box<HuffmanBuildState>> = None;
         let mut total_bits = FINAL_FIXED_BLOCK_BITS;
         for (block_index, block_tokens) in tokens.chunks(TOKEN_BLOCK_LIMIT).enumerate() {
             let start = block_index.strict_mul(TOKEN_BLOCK_LIMIT);
@@ -1087,7 +1090,7 @@ impl DeflateWriter<'_, '_> {
             };
             let (has_distance, fixed_bit_len) = frequencies.collect(block_tokens);
             let dynamic_plan = if has_distance {
-                let state = huffman_state.get_or_insert_with(|| {
+                let state = self.workspace.huffman_state.get_or_insert_with(|| {
                     Box::new(HuffmanBuildState {
                         depths: [0_u16; HUFFMAN_NODE_CAPACITY],
                         frequencies: [0_u32; HUFFMAN_NODE_CAPACITY],

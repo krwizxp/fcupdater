@@ -1,6 +1,6 @@
 use crate::{
     diagnostic::{
-        Result, append_fmt, ensure, err, err_fmt, err_with_source, reserve_err, try_push_vec,
+        Result, append_fmt, ensure, err, err_fmt, err_with_source, map_reserve, try_push_vec,
         try_string_with_capacity, try_vec_with_capacity,
     },
     excel,
@@ -601,8 +601,10 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let trailing_rows = rows.split_off(data_end_index);
         let mut source_rows = rows.split_off(data_start_index);
         let additional = source_rows.len().strict_add(trailing_rows.len());
-        rows.try_reserve(additional)
-            .map_err(|source| reserve_err("정렬 결과 행 메모리 확보 실패", source))?;
+        map_reserve(
+            rows.try_reserve(additional),
+            "정렬 결과 행 메모리 확보 실패",
+        )?;
         for row_plan in &row_plans {
             let source_row = source_rows
                 .get_mut(row_plan.source_index)
@@ -680,9 +682,10 @@ impl<'source> MasterSheetUpdater<'source> {
     ) -> Result<MasterRowEvaluation<'source>> {
         let row_count = ws.row_count();
         let mut master_address_rows: HashMap<Cow<'source, str>, u32> = HashMap::new();
-        master_address_rows
-            .try_reserve(row_count)
-            .map_err(|source| reserve_err("마스터 주소 행 맵 메모리 확보 실패", source))?;
+        map_reserve(
+            master_address_rows.try_reserve(row_count),
+            "마스터 주소 행 맵 메모리 확보 실패",
+        )?;
         let mut kept_source_rows = try_vec_with_capacity(row_count, "행 목록 메모리 확보 실패")?;
         let mut changes = Vec::new();
         let mut deleted = Vec::new();
@@ -946,9 +949,10 @@ impl<'source> MasterSheetUpdater<'source> {
         let additional = kept_count
             .strict_add(added.len())
             .strict_add(trailing_rows.len());
-        original_rows
-            .try_reserve(additional)
-            .map_err(|source| reserve_err("유류비 결과행 메모리 확보 실패", source))?;
+        map_reserve(
+            original_rows.try_reserve(additional),
+            "유류비 결과행 메모리 확보 실패",
+        )?;
         let mut kept_rows = kept_source_rows.iter();
         let mut next_kept_row = kept_rows.next();
         for (old_row, source_row) in (MASTER_DATA_START_ROW..=old_data_last_row).zip(source_rows) {

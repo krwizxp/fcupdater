@@ -18,7 +18,7 @@ mod write;
 const CENTRAL_DIRECTORY_HEADER_LEN: usize = 46;
 const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const CODE_LENGTH_SYMBOLS: usize = 19;
-const CRC32_TABLES: [[u32; 256]; 16] = {
+const CRC32_TABLES: [[u32; 256]; 8] = {
     let mut previous = [0_u32; 256];
     let mut seeds: &mut [u32] = &mut previous;
     let mut seed = 0_u32;
@@ -27,7 +27,7 @@ const CRC32_TABLES: [[u32; 256]; 16] = {
         seeds = tail;
         seed = seed.strict_add(1);
     }
-    let mut tables = [[0_u32; 256]; 16];
+    let mut tables = [[0_u32; 256]; 8];
     let mut remaining: &mut [[u32; 256]] = &mut tables;
     while let Some((slot, tail)) = remaining.split_first_mut() {
         let mut values: &mut [u32] = &mut previous;
@@ -145,7 +145,7 @@ impl ZipEntry<'_> {
         let relative_local_offset = local_offset
             .checked_sub(bytes_offset)
             .ok_or("ZIP local record 상대 offset 계산 실패")?;
-        let (local_header, _) = split_header_at::<LOCAL_FILE_HEADER_LEN>(
+        let (local_header, after_header) = split_header_at::<LOCAL_FILE_HEADER_LEN>(
             bytes,
             relative_local_offset,
             ZIP_BAD_LOCAL_HEADER_MESSAGE,
@@ -210,40 +210,31 @@ impl ZipEntry<'_> {
         }
         let name_len = usize::from(read_u16(local_header, 26)?);
         let extra_len = usize::from(read_u16(local_header, 28)?);
-        let name_start = relative_local_offset
-            .checked_add(LOCAL_FILE_HEADER_LEN)
-            .ok_or("ZIP local entry 이름 시작 계산 실패")?;
-        let extra_start = name_start
-            .checked_add(name_len)
-            .ok_or("ZIP local extra offset 계산 실패")?;
-        let local_name = bytes
-            .get(name_start..extra_start)
+        let (local_name, after_name) = after_header
+            .split_at_checked(name_len)
             .ok_or("ZIP local header 이름 범위 오류")?;
         if local_name != self.name.as_bytes() {
             return Err(local_mismatch(
                 "ZIP local header 이름이 중앙 디렉터리와 다릅니다",
             ));
         }
-        let data_start = extra_start
-            .checked_add(extra_len)
-            .ok_or("ZIP data offset 계산 실패")?;
-        let local_extra = bytes
-            .get(extra_start..data_start)
+        let (local_extra, after_extra) = after_name
+            .split_at_checked(extra_len)
             .ok_or("ZIP local extra 범위 오류")?;
         validate_zip_extra(local_extra, self.name)?;
         let compressed_len = self.compressed_size as usize;
-        let data_end = data_start
-            .checked_add(compressed_len)
-            .ok_or("ZIP data end 계산 실패")?;
-        let Some(compressed) = bytes.get(data_start..data_end) else {
+        let Some((compressed, descriptor_tail)) = after_extra.split_at_checked(compressed_len)
+        else {
             return Err(local_mismatch(ZIP_DATA_RANGE_MESSAGE));
         };
+        let data_start = relative_local_offset
+            .strict_add(LOCAL_FILE_HEADER_LEN)
+            .strict_add(name_len)
+            .strict_add(extra_len);
+        let data_end = data_start.strict_add(compressed_len);
         let local_end = if self.flags & 0x0008 == 0 {
             data_end
         } else {
-            let descriptor_tail = bytes
-                .get(data_end..)
-                .ok_or("ZIP data descriptor 범위 오류")?;
             let first = read_u32(descriptor_tail, 0)?;
             let (crc_offset, descriptor_len) = if first == DATA_DESCRIPTOR_SIGNATURE {
                 (4, DATA_DESCRIPTOR_LEN)
@@ -672,45 +663,7 @@ fn crc32_table_value(table_index: usize, byte: u8) -> u32 {
 pub(super) fn crc32_update(initial: u32, bytes: &[u8]) -> u32 {
     let mut crc = initial;
     let mut remaining = bytes;
-    while let Some((chunk, tail)) = remaining.split_first_chunk::<16>() {
-        let [
-            b0,
-            b1,
-            b2,
-            b3,
-            b4,
-            b5,
-            b6,
-            b7,
-            b8,
-            b9,
-            b10,
-            b11,
-            b12,
-            b13,
-            b14,
-            b15,
-        ] = *chunk;
-        let [c0, c1, c2, c3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
-        crc = crc32_table_value(15, c0)
-            ^ crc32_table_value(14, c1)
-            ^ crc32_table_value(13, c2)
-            ^ crc32_table_value(12, c3)
-            ^ crc32_table_value(11, b4)
-            ^ crc32_table_value(10, b5)
-            ^ crc32_table_value(9, b6)
-            ^ crc32_table_value(8, b7)
-            ^ crc32_table_value(7, b8)
-            ^ crc32_table_value(6, b9)
-            ^ crc32_table_value(5, b10)
-            ^ crc32_table_value(4, b11)
-            ^ crc32_table_value(3, b12)
-            ^ crc32_table_value(2, b13)
-            ^ crc32_table_value(1, b14)
-            ^ crc32_table_value(0, b15);
-        remaining = tail;
-    }
-    if let Some((chunk, tail)) = remaining.split_first_chunk::<8>() {
+    while let Some((chunk, tail)) = remaining.split_first_chunk::<8>() {
         let [b0, b1, b2, b3, b4, b5, b6, b7] = *chunk;
         let [c0, c1, c2, c3] = (crc ^ u32::from_le_bytes([b0, b1, b2, b3])).to_le_bytes();
         crc = crc32_table_value(7, c0)

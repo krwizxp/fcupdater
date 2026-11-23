@@ -1,7 +1,7 @@
 use crate::{
     change_log::ChangeLogUpdater,
     diagnostic::{
-        Result, err, err_fmt, err_with_source, path_err_with_source, reserve_err, terminal_safe,
+        Result, err, err_fmt, err_with_source, map_reserve, path_err_with_source, terminal_safe,
     },
     excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
@@ -91,12 +91,10 @@ impl UpdateRun<'_> {
                 let mut key = String::new();
                 normalize_address_key_into(borrowed_record.address, &mut key)?;
                 if loaded_source.index.len() == loaded_source.index.capacity() {
-                    loaded_source
-                        .index
-                        .try_reserve(SOURCE_INDEX_GROWTH)
-                        .map_err(|source| {
-                            reserve_err("소스 index 맵 추가 메모리 확보 실패", source)
-                        })?;
+                    map_reserve(
+                        loaded_source.index.try_reserve(SOURCE_INDEX_GROWTH),
+                        "소스 index 맵 추가 메모리 확보 실패",
+                    )?;
                 }
                 match loaded_source.index.entry(key) {
                     Entry::Vacant(entry) => {

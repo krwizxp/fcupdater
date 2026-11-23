@@ -104,6 +104,12 @@ pub(super) fn err_with_source(
 ) -> AppError {
     AppError::context(context, source)
 }
+pub(super) fn map_reserve(
+    result: CoreResult<(), TryReserveError>,
+    context: &'static str,
+) -> Result<()> {
+    result.map_err(|source| reserve_err(context, source))
+}
 #[cold]
 #[inline(never)]
 pub(super) fn reserve_err(context: &'static str, source: TryReserveError) -> AppError {

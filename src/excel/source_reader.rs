@@ -1,6 +1,6 @@
 use super::{copy_text, read_le_chunk};
 use crate::diagnostic::{
-    Result, err, err_fmt, err_with_source, reserve_err, try_push_vec, try_string_with_capacity,
+    Result, err, err_fmt, err_with_source, map_reserve, try_push_vec, try_string_with_capacity,
     try_vec_with_capacity,
 };
 use alloc::borrow::Cow;
@@ -458,8 +458,10 @@ impl SstChunkReader<'_, '_> {
                 MAX_UTF8_BYTES_PER_COMPRESSED_XL_CHAR
             };
             let additional_capacity = chars_here.strict_mul(max_utf8_bytes_per_unit);
-            out.try_reserve(additional_capacity)
-                .map_err(|source| reserve_err("SST 문자열 메모리 확보 실패", source))?;
+            map_reserve(
+                out.try_reserve(additional_capacity),
+                "SST 문자열 메모리 확보 실패",
+            )?;
             if high_byte {
                 let (mut chunks, _) = bytes.as_chunks::<2>();
                 let previous_surrogate = pending_surrogate.take();
