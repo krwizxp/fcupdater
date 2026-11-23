@@ -1,5 +1,5 @@
 use super::CellReference;
-use crate::diagnostic::{Result, err};
+use crate::diagnostic::{Result, err_fmt};
 use std::process;
 const MAX_A1_COLUMN_LETTERS: usize = 3;
 const SINGLE_LETTER_COLUMNS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -60,7 +60,7 @@ pub(super) fn col_name_into(
 ) -> Result<&str> {
     (1..=MAX_A1_COL)
         .contains(&col)
-        .ok_or_else(|| err(format!("Excel column 범위를 벗어났습니다: {col}")))?;
+        .ok_or_else(|| err_fmt(format_args!("Excel column 범위를 벗어났습니다: {col}")))?;
     let single_index = col.strict_sub(1) as usize;
     if let Some(single) = SINGLE_LETTER_COLUMNS.get(single_index..single_index.strict_add(1)) {
         return Ok(single);

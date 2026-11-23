@@ -1,6 +1,7 @@
 use crate::{
     diagnostic::{
-        Result, append_fmt, err, err_with_source, try_string_with_capacity, try_vec_with_capacity,
+        Result, append_fmt, err, err_fmt, err_with_source, reserve_err, try_string_with_capacity,
+        try_vec_with_capacity,
     },
     excel,
     excel::writer::{
@@ -598,7 +599,7 @@ impl<'strings> RankSortRefresher<'_, 'strings> {
         let mut source_rows = rows.split_off(data_start_index);
         let additional = source_rows.len().strict_add(trailing_rows.len());
         rows.try_reserve(additional)
-            .map_err(|source| err_with_source("정렬 결과 행 메모리 확보 실패", source))?;
+            .map_err(|source| reserve_err("정렬 결과 행 메모리 확보 실패", source))?;
         for row_plan in &row_plans {
             let source_row = source_rows
                 .get_mut(row_plan.source_index)
@@ -642,7 +643,7 @@ impl<'source> MasterSheetUpdater<'source> {
         let mut master_address_rows: HashMap<Cow<'source, str>, u32> = HashMap::new();
         master_address_rows
             .try_reserve(row_count)
-            .map_err(|source| err_with_source("마스터 주소 행 맵 메모리 확보 실패", source))?;
+            .map_err(|source| reserve_err("마스터 주소 행 맵 메모리 확보 실패", source))?;
         let mut kept_source_rows = try_vec_with_capacity(row_count, "행 목록 메모리 확보 실패")?;
         let mut changes = Vec::new();
         let mut deleted = Vec::new();
@@ -674,7 +675,7 @@ impl<'source> MasterSheetUpdater<'source> {
                 .get_key_value(target_region_scratch.as_str());
             let mut record_address = |key: Cow<'source, str>| -> Result<()> {
                 match master_address_rows.entry(key) {
-                    Entry::Occupied(entry) => Err(err(format!(
+                    Entry::Occupied(entry) => Err(err_fmt(format_args!(
                         "마스터 주소 중복: normalized_address={}, first_row={}, duplicate_row={old_row}",
                         entry.key(),
                         entry.get(),
@@ -778,7 +779,7 @@ impl<'source> MasterSheetUpdater<'source> {
             return Ok(None);
         }
         let invalid_value = || {
-            err(format!(
+            err_fmt(format_args!(
                 "유류비 숫자 셀 값이 올바르지 않습니다: row={row}, col={col}, value={trimmed}"
             ))
         };
@@ -889,7 +890,7 @@ impl<'source> MasterSheetUpdater<'source> {
         } else {
             let template_index = template_row_num.strict_sub(1) as usize;
             let template_row = original_rows.get(template_index).ok_or_else(|| {
-                err(format!(
+                err_fmt(format_args!(
                     "유류비 신규행 template이 없습니다: row={template_row_num}"
                 ))
             })?;
@@ -906,7 +907,7 @@ impl<'source> MasterSheetUpdater<'source> {
             .strict_add(trailing_rows.len());
         original_rows
             .try_reserve(additional)
-            .map_err(|source| err_with_source("유류비 결과행 메모리 확보 실패", source))?;
+            .map_err(|source| reserve_err("유류비 결과행 메모리 확보 실패", source))?;
         let mut kept_rows = kept_source_rows.iter();
         let mut next_kept_row = kept_rows.next();
         for (old_row, source_row) in (MASTER_DATA_START_ROW..=old_data_last_row).zip(source_rows) {
@@ -916,7 +917,9 @@ impl<'source> MasterSheetUpdater<'source> {
             }
         }
         if let Some(&(old_row, _)) = next_kept_row {
-            return Err(err(format!("유류비 기존행 XML이 없습니다: row={old_row}")));
+            return Err(err_fmt(format_args!(
+                "유류비 기존행 XML이 없습니다: row={old_row}"
+            )));
         }
         if let Some(template_row) = added_template_row {
             for _ in 1..added.len() {
@@ -1074,7 +1077,7 @@ fn read_master_fuels(
 fn try_push_row<T>(rows: &mut Vec<T>, max_len: usize, row: T) -> Result<()> {
     if rows.len() == rows.capacity() {
         rows.try_reserve_exact(rows.capacity().max(1).min(max_len.strict_sub(rows.len())))
-            .map_err(|source| err_with_source("행 목록 메모리 확보 실패", source))?;
+            .map_err(|source| reserve_err("행 목록 메모리 확보 실패", source))?;
     }
     rows.push(row);
     Ok(())

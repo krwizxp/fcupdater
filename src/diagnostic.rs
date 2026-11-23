@@ -1,4 +1,4 @@
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, collections::TryReserveError};
 use core::{
     error::Error,
     fmt::{self, Display, Write as _},
@@ -73,8 +73,19 @@ impl From<IoError> for AppError {
         Self::context("I/O 오류", value)
     }
 }
+#[inline]
+pub(super) fn ensure(condition: bool, message: &'static str) -> Result<()> {
+    if condition { Ok(()) } else { Err(err(message)) }
+}
 pub(super) fn err(msg: impl Into<Cow<'static, str>>) -> AppError {
     AppError::message(msg)
+}
+#[cold]
+#[inline(never)]
+pub(super) fn err_fmt(args: fmt::Arguments<'_>) -> AppError {
+    let mut message = String::new();
+    append_fmt(&mut message, args);
+    AppError::message(message)
 }
 pub(super) fn err_with_source(
     context: impl Into<Cow<'static, str>>,
@@ -82,18 +93,23 @@ pub(super) fn err_with_source(
 ) -> AppError {
     AppError::context(context, source)
 }
+#[cold]
+#[inline(never)]
+pub(super) fn reserve_err(context: &'static str, source: TryReserveError) -> AppError {
+    AppError::context(context, source)
+}
 pub(super) fn try_string_with_capacity(capacity: usize, context: &'static str) -> Result<String> {
     let mut value = String::new();
     value
         .try_reserve_exact(capacity)
-        .map_err(|source| err_with_source(context, source))?;
+        .map_err(|source| reserve_err(context, source))?;
     Ok(value)
 }
 pub(super) fn try_vec_with_capacity<T>(capacity: usize, context: &'static str) -> Result<Vec<T>> {
     let mut value = Vec::new();
     value
         .try_reserve_exact(capacity)
-        .map_err(|source| err_with_source(context, source))?;
+        .map_err(|source| reserve_err(context, source))?;
     Ok(value)
 }
 pub(super) fn try_push_vec<T>(
@@ -104,7 +120,7 @@ pub(super) fn try_push_vec<T>(
 ) -> Result<()> {
     if vec.len() == vec.capacity() {
         vec.try_reserve(growth)
-            .map_err(|source| err_with_source(context, source))?;
+            .map_err(|source| reserve_err(context, source))?;
     }
     vec.push(value);
     Ok(())

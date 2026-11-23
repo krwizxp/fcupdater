@@ -1,5 +1,5 @@
 extern crate alloc;
-use diagnostic::{Result, err, err_with_source};
+use diagnostic::{Result, err, err_fmt, err_with_source};
 use excel::SaveVerification;
 use std::{
     env,
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
             let is_help = token == "-h" || token == "--help";
             let is_version = token == "--version";
             if !(is_help || token == "--verify" || is_version) {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
                     token.display()
                 )));
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
                 } else {
                     "알 수 없는 옵션"
                 };
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "{context}: {}\n\n{HELP_TEXT}",
                     extra.display()
                 )));

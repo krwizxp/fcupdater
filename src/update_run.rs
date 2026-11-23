@@ -1,6 +1,6 @@
 use crate::{
     change_log::ChangeLogUpdater,
-    diagnostic::{Result, err, err_with_source, path_err_with_source, terminal_safe},
+    diagnostic::{Result, err, err_fmt, err_with_source, path_err_with_source, terminal_safe},
     excel::{SaveVerification, SourceReader, SourceRecord},
     excel::{writer::Workbook as StdWorkbook, xlsx_container::XlsxContainer},
     master_sheet::{ChangeRow, MasterSheetUpdateResult, MasterSheetUpdater, StoreRow},
@@ -33,7 +33,7 @@ impl LoadedSource {
             .ok_or_else(|| err("Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다."))?;
         for (region, count) in TARGET_REGIONS.iter().zip(self.region_counts.iter()) {
             (*count != 0).ok_or_else(|| {
-                err(format!(
+                err_fmt(format_args!(
                     "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {}",
                     region.label(),
                 ))
@@ -42,7 +42,7 @@ impl LoadedSource {
         let required_populated_count = target_record_count.div_ceil(HALF_COUNT_DIVISOR);
         let validate_field_ratio = |populated_count: usize, label: &'static str| -> Result<()> {
             (populated_count >= required_populated_count).ok_or_else(|| {
-                err(format!(
+                err_fmt(format_args!(
                     "Opinet 소스의 대상 지역 {label} 값이 비정상적으로 부족합니다: {populated_count}건 / {target_record_count}건"
                 ))
             })
@@ -104,7 +104,7 @@ impl UpdateRun<'_> {
                     }
                     Entry::Occupied(entry) => {
                         let existing = entry.get();
-                        return Err(err(format!(
+                        return Err(err_fmt(format_args!(
                             "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
                             existing.address, existing.name, borrowed_record.name
                         )));
@@ -159,7 +159,7 @@ impl UpdateRun<'_> {
             .ok_or_else(|| err("현행화 대상 레코드를 찾지 못했습니다."))?;
         let deleted_count = master_update.deleted.len();
         if deleted_count >= master_update.existing_count.div_ceil(HALF_COUNT_DIVISOR) {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "폐업 처리 건수가 비정상적으로 많아 저장을 중단합니다: {deleted_count}건 / {}건",
                 master_update.existing_count
             )));

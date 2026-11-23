@@ -4,7 +4,9 @@ use super::{
     HASH_SIZE, LENGTH_BASES, LENGTH_EXTRA_BITS, LITERAL_LENGTH_SYMBOLS, MAX_CHAIN, MAX_MATCH,
     MIN_MATCH, crc32_update, read_u16,
 };
-use crate::diagnostic::{Result, err, err_with_source, try_push_vec, try_vec_with_capacity};
+use crate::diagnostic::{
+    Result, ensure, err, err_with_source, reserve_err, try_push_vec, try_vec_with_capacity,
+};
 use core::{
     array::from_fn,
     iter::{chain, once, repeat_n, zip},
@@ -215,7 +217,7 @@ impl BitReader<'_> {
         self.bit_count = 0;
     }
     fn consume_bits(&mut self, count: u8) -> Result<()> {
-        (count <= self.bit_count).ok_or(err("deflate bit buffer 소비 범위 오류"))?;
+        ensure(count <= self.bit_count, "deflate bit buffer 소비 범위 오류")?;
         self.bit_buffer >>= u32::from(count);
         self.bit_count = self.bit_count.strict_sub(count);
         Ok(())
@@ -274,6 +276,7 @@ impl BitWriter<'_> {
         self.writer
             .write_all(buffered)
             .map_err(|source| err_with_source("deflate stream 쓰기 실패", source))?;
+        self.len = self.len.strict_add(self.buffered_len);
         self.buffered_len = 0;
         Ok(())
     }
@@ -294,7 +297,6 @@ impl BitWriter<'_> {
                 .unwrap_or_else(|| process::abort());
             dst.copy_from_slice(&[b0, b1, b2, b3]);
             self.buffered_len = self.buffered_len.strict_add(4);
-            self.len = self.len.strict_add(4);
             self.bit_buffer >>= 32_u8;
             self.bit_count = self.bit_count.strict_sub(32);
         }
@@ -310,13 +312,12 @@ impl BitWriter<'_> {
             .unwrap_or_else(|| process::abort());
         *slot = byte;
         self.buffered_len = self.buffered_len.strict_add(1);
-        self.len = self.len.strict_add(1);
         Ok(())
     }
 }
 impl DecodeHuffman {
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
-        if let Some(prefix) = reader.try_peek_bits(DECODE_ROOT_BITS) {
+        let (mut code, skip_bits) = if let Some(prefix) = reader.try_peek_bits(DECODE_ROOT_BITS) {
             let entry = self
                 .root
                 .get(usize::from(prefix))
@@ -328,14 +329,21 @@ impl DecodeHuffman {
                 reader.bit_count = reader.bit_count.strict_sub(len);
                 return Ok(entry.symbol());
             }
-        }
-        let mut code = 0_u16;
+            reader.bit_buffer >>= DECODE_ROOT_BITS;
+            reader.bit_count = reader.bit_count.strict_sub(DECODE_ROOT_BITS);
+            (
+                prefix.reverse_bits() >> u16::BITS.strict_sub(u32::from(DECODE_ROOT_BITS)),
+                usize::from(DECODE_ROOT_BITS).strict_add(1),
+            )
+        } else {
+            (0_u16, 1_usize)
+        };
         for ((&count, &first_code), &first_symbol) in self
             .counts
             .iter()
             .zip(self.first_codes.iter())
             .zip(self.first_symbols.iter())
-            .skip(1)
+            .skip(skip_bits)
         {
             code = code.strict_shl(1) | reader.read_bits(1)?;
             let Some(offset) = code.checked_sub(first_code) else {
@@ -354,8 +362,10 @@ impl DecodeHuffman {
         Err(err("deflate Huffman code를 해석하지 못했습니다."))
     }
     fn from_lengths(lengths: &[u8], allow_single_code: bool) -> Result<Option<Self>> {
-        (lengths.len() <= DECODE_MAX_SYMBOLS)
-            .ok_or(err("deflate decode symbol 수가 너무 많습니다."))?;
+        ensure(
+            lengths.len() <= DECODE_MAX_SYMBOLS,
+            "deflate decode symbol 수가 너무 많습니다.",
+        )?;
         let mut counts = [0_u16; DEFLATE_MAX_BITS + 1];
         let Some(mut next_codes) = canonical_next_codes(lengths, &mut counts)? else {
             return Ok(None);
@@ -370,7 +380,10 @@ impl DecodeHuffman {
         let code_end = u32::from(huffman_get(&first_codes, DEFLATE_MAX_BITS))
             .strict_add(u32::from(huffman_get(&counts, DEFLATE_MAX_BITS)));
         let code_limit = 1_u32.strict_shl(u32::from(DEFLATE_MAX_BITS_U8));
-        (code_end <= code_limit).ok_or(err("Oversubscribed deflate Huffman tree"))?;
+        ensure(
+            code_end <= code_limit,
+            "Oversubscribed deflate Huffman tree",
+        )?;
         // RFC 1951 permits a single one-bit literal/distance code, not an incomplete code-length tree.
         (code_end == code_limit
             || (allow_single_code && symbol_count == 1 && huffman_get(&counts, 1) == 1))
@@ -403,7 +416,10 @@ impl DecodeHuffman {
                 let root_slot = root
                     .get_mut(root_index)
                     .ok_or_else(|| err("deflate root decode table 생성 범위 오류"))?;
-                (!root_slot.is_direct()).ok_or(err("deflate root decode code가 충돌합니다."))?;
+                ensure(
+                    !root_slot.is_direct(),
+                    "deflate root decode code가 충돌합니다.",
+                )?;
                 *root_slot = entry;
             }
         }
@@ -424,8 +440,10 @@ struct InflateState<'bytes> {
 }
 impl InflateState<'_> {
     fn copy_previous(&mut self, distance: usize, length: usize) -> Result<()> {
-        (distance != 0 && distance <= self.output.len())
-            .ok_or(err("deflate back-reference distance가 올바르지 않습니다."))?;
+        ensure(
+            distance != 0 && distance <= self.output.len(),
+            "deflate back-reference distance가 올바르지 않습니다.",
+        )?;
         ensure_deflate_output_len(self.output.len(), length, self.expected_len)?;
         let source_start = self.output.len().strict_sub(distance);
         let initial_copy = length.min(distance);
@@ -459,7 +477,10 @@ impl InflateState<'_> {
     }
     fn dynamic_trees(&mut self) -> Result<DynamicTrees> {
         let literal_count = usize::from(self.reader.read_bits(5)?).strict_add(257);
-        (literal_count <= LITERAL_LENGTH_SYMBOLS).ok_or(err("deflate HLIT 범위 오류"))?;
+        ensure(
+            literal_count <= LITERAL_LENGTH_SYMBOLS,
+            "deflate HLIT 범위 오류",
+        )?;
         let distance_count = usize::from(self.reader.read_bits(5)?).strict_add(1);
         let code_length_count = usize::from(self.reader.read_bits(4)?).strict_add(4);
         let mut code_lengths = [0_u8; 19];
@@ -504,8 +525,10 @@ impl InflateState<'_> {
             let next_len = length_count
                 .checked_add(repeat)
                 .ok_or_else(|| err("deflate repeat 길이 계산 실패"))?;
-            (next_len <= total)
-                .ok_or(err("deflate repeat 길이가 code length 총합을 초과합니다."))?;
+            ensure(
+                next_len <= total,
+                "deflate repeat 길이가 code length 총합을 초과합니다.",
+            )?;
             lengths
                 .get_mut(length_count..next_len)
                 .unwrap_or_else(|| process::abort())
@@ -568,7 +591,10 @@ impl InflateState<'_> {
         let header = self.reader.read_stored_bytes(4)?;
         let len = read_u16(header, 0)?;
         let nlen = read_u16(header, 2)?;
-        (len == !nlen).ok_or(err("deflate 저장 블록 LEN/NLEN이 일치하지 않습니다."))?;
+        ensure(
+            len == !nlen,
+            "deflate 저장 블록 LEN/NLEN이 일치하지 않습니다.",
+        )?;
         let stored = self.reader.read_stored_bytes(usize::from(len))?;
         ensure_deflate_output_len(self.output.len(), stored.len(), self.expected_len)?;
         self.output.extend_from_slice(stored);
@@ -941,14 +967,14 @@ impl DeflateWorkspace {
         let initial_token_capacity = input_len.min(DEFLATE_TOKEN_RESERVE_CHUNK);
         self.tokens
             .try_reserve_exact(initial_token_capacity)
-            .map_err(|source| err_with_source("deflate token 메모리 확보 실패", source))?;
+            .map_err(|source| reserve_err("deflate token 메모리 확보 실패", source))?;
         if self.head.len() == HASH_SIZE {
             self.head.fill(u32::MAX);
         } else {
             self.head.clear();
             self.head
                 .try_reserve_exact(HASH_SIZE)
-                .map_err(|source| err_with_source("deflate hash head 메모리 확보 실패", source))?;
+                .map_err(|source| reserve_err("deflate hash head 메모리 확보 실패", source))?;
             self.head.resize(HASH_SIZE, u32::MAX);
         }
         let previous_len = input_len.min(DEFLATE_WINDOW_LEN);

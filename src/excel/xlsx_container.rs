@@ -9,8 +9,8 @@ use super::{
     zip_archive::{ZIP_FINGERPRINT_BUFFER_BYTES, archive_file_len, crc32_update},
 };
 use crate::diagnostic::{
-    AppError, Result, append_fmt, err, err_with_source, path_err_with_source, terminal_safe,
-    try_push_vec, try_string_with_capacity, try_vec_with_capacity,
+    AppError, Result, append_fmt, err, err_fmt, err_with_source, path_err_with_source,
+    terminal_safe, try_push_vec, try_string_with_capacity, try_vec_with_capacity,
 };
 #[cfg(target_os = "windows")]
 use crate::temp_entry::configure_replaceable_file;
@@ -213,7 +213,7 @@ impl ReservedTempArchive {
             path_err_with_source("xlsx 임시 파일 identity 검증 실패", &self.path, source)
         })?;
         (file.identity == self.identity).ok_or_else(|| {
-            err(format!(
+            err_fmt(format_args!(
                 "xlsx 임시 파일 identity가 실행 중 변경되었습니다: {}",
                 self.path.display()
             ))
@@ -336,7 +336,7 @@ impl TempArchivePromotion<'_> {
             )
         })?;
         if target_file.identity != self.expected_identity {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "원본 xlsx identity가 실행 중 변경되어 저장을 중단했습니다: {}",
                 self.target_xlsx.display()
             )));
@@ -450,7 +450,7 @@ impl TempArchivePromotion<'_> {
             path_err_with_source("교체된 원본 xlsx 열기 실패", captured_original, source)
         })?;
         if captured_file.identity != self.expected_identity {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "교체된 원본 xlsx identity가 실행 시작 시점과 다릅니다: {}",
                 captured_original.display()
             )));
@@ -472,7 +472,7 @@ impl TempArchivePromotion<'_> {
             crc = crc32_update(crc, chunk);
         }
         if bytes_read != archive_len {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "교체된 원본 xlsx가 검증 중 변경되었습니다: {}",
                 captured_original.display()
             )));
@@ -482,7 +482,7 @@ impl TempArchivePromotion<'_> {
             len: bytes_read,
         };
         (fingerprint == self.expected_fingerprint).ok_or_else(|| {
-            err(format!(
+            err_fmt(format_args!(
                 "원본 xlsx가 실행 중 변경되어 저장을 중단했습니다: {}",
                 self.target_xlsx.display()
             ))
@@ -737,13 +737,17 @@ impl XlsxContainer {
             };
             let qualified = property.0;
             if slot.is_some() {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "core.xml에 {qualified} 요소가 여러 개 있습니다."
                 )));
             }
             let body = (!element.body.contains('<'))
                 .then_some(element.body)
-                .ok_or_else(|| err(format!("core.xml의 {qualified} 본문이 올바르지 않습니다.")))?;
+                .ok_or_else(|| {
+                    err_fmt(format_args!(
+                        "core.xml의 {qualified} 본문이 올바르지 않습니다."
+                    ))
+                })?;
             decode_xml_entities(body).map_err(|source| {
                 err_with_source(
                     format!("core.xml의 {qualified} 본문이 올바르지 않습니다."),
@@ -1084,7 +1088,7 @@ impl XlsxContainer {
                     "Default" => (true, "Extension"),
                     "Override" => (false, "PartName"),
                     _ => {
-                        return Err(err(format!(
+                        return Err(err_fmt(format_args!(
                             "[Content_Types].xml에 알 수 없는 {local_name} 항목이 있습니다."
                         )));
                     }
@@ -1098,7 +1102,7 @@ impl XlsxContainer {
                 )?;
                 let [key_attr, content_type_attr] = entry_attrs;
                 let key = key_attr.ok_or_else(|| {
-                    err(format!(
+                    err_fmt(format_args!(
                         "[Content_Types].xml entry에 {key_name} 속성이 없습니다."
                     ))
                 })?;
@@ -1122,7 +1126,7 @@ impl XlsxContainer {
                     )
                 };
                 let Some(seen_entry) = matching_entry else {
-                    return Err(err(format!(
+                    return Err(err_fmt(format_args!(
                         "[Content_Types].xml에 지원하지 않는 {local_name} 항목이 있습니다: {key}"
                     )));
                 };
@@ -1131,12 +1135,12 @@ impl XlsxContainer {
                         .strip_prefix('/')
                         .is_some_and(|name| self.has_part(name))
                 {
-                    return Err(err(format!(
+                    return Err(err_fmt(format_args!(
                         "[Content_Types].xml Override 대상 part가 없습니다: {key}"
                     )));
                 }
                 if mem::replace(seen_entry, true) {
-                    return Err(err(format!(
+                    return Err(err_fmt(format_args!(
                         "[Content_Types].xml 항목이 중복되었습니다: {key}"
                     )));
                 }
@@ -1147,14 +1151,14 @@ impl XlsxContainer {
             let required = role == PartRole::Required
                 || role == PartRole::OptionalInput && self.has_part("docProps/thumbnail.emf");
             if required && !present {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "[Content_Types].xml 필수 항목이 없습니다: {key}"
                 )));
             }
         }
         for (&(part, _, content_type), present) in XLSX_PARTS.iter().zip(seen_overrides) {
             if content_type.is_some() && self.has_part(part) && !present {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "[Content_Types].xml 필수 항목이 없습니다: /{part}"
                 )));
             }
@@ -1178,7 +1182,7 @@ fn style_entries<'text>(
         .next_element_named(group_name)?
         .filter(|element| element.opening.name == group_name && !element.opening.self_closing)
         .ok_or_else(|| {
-            err(format!(
+            err_fmt(format_args!(
                 "styles.xml의 {group_name} 시작 태그가 올바르지 않습니다."
             ))
         })?;
@@ -1197,7 +1201,7 @@ fn style_entries<'text>(
     let mut child_scanner = XmlScanner::new(element.body);
     while let Some(entry) = child_scanner.next_direct_element(group_name)? {
         if entry.opening.name != entry_name {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "styles.xml {group_name}에 알 수 없는 {} 요소가 있습니다.",
                 entry.opening.name
             )));
@@ -1213,12 +1217,12 @@ fn style_entries<'text>(
         )?;
     }
     if scanner.next_start_named(group_name).is_some() {
-        return Err(err(format!(
+        return Err(err_fmt(format_args!(
             "styles.xml에 {group_name} 태그가 여러 개 있습니다."
         )));
     }
     if entries.len() != declared_count {
-        return Err(err(format!(
+        return Err(err_fmt(format_args!(
             "styles.xml {group_name} count가 실제 {entry_name} 수와 다릅니다: declared={declared_count}, actual={}",
             entries.len()
         )));
@@ -1347,12 +1351,14 @@ fn parse_attrs_into<'tag>(
             .zip(values.iter_mut())
             .find(|&(candidate, _)| *candidate == name)
         else {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}에 알 수 없는 {name} 속성이 있습니다."
             )));
         };
         if slot.replace(value).is_some() {
-            return Err(err(format!("{context}에 {name} 속성이 중복되었습니다.")));
+            return Err(err_fmt(format_args!(
+                "{context}에 {name} 속성이 중복되었습니다."
+            )));
         }
     }
     Ok(())
@@ -1366,7 +1372,7 @@ fn validate_exact_attrs(tag: &str, expected: &[(&str, &str)], context: &str) -> 
             .enumerate()
             .find(|&(_, &(candidate, _))| candidate == name)
         else {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}에 알 수 없는 {name} 속성이 있습니다."
             )));
         };
@@ -1374,18 +1380,23 @@ fn validate_exact_attrs(tag: &str, expected: &[(&str, &str)], context: &str) -> 
             .checked_shl(u32::try_from(index).unwrap_or(u32::MAX))
             .unwrap_or(0);
         if seen & bit != 0 {
-            return Err(err(format!("{context}에 {name} 속성이 중복되었습니다.")));
+            return Err(err_fmt(format_args!(
+                "{context}에 {name} 속성이 중복되었습니다."
+            )));
         }
         seen |= bit;
         if value.as_ref() != expected_value {
-            return Err(err(format!("{context} 속성이 고정 스키마와 다릅니다.")));
+            return Err(err_fmt(format_args!(
+                "{context} 속성이 고정 스키마와 다릅니다."
+            )));
         }
     }
     let expected_mask = 1_u32
         .checked_shl(u32::try_from(expected.len()).unwrap_or(u32::MAX))
         .unwrap_or(0)
         .strict_sub(1);
-    (seen == expected_mask).ok_or_else(|| err(format!("{context} 속성이 고정 스키마와 다릅니다.")))
+    (seen == expected_mask)
+        .ok_or_else(|| err_fmt(format_args!("{context} 속성이 고정 스키마와 다릅니다.")))
 }
 fn validate_relationship_set<'xml>(
     xml: &'xml str,
@@ -1401,32 +1412,37 @@ fn validate_relationship_set<'xml>(
         context,
         &mut |local_name, raw| {
             if local_name != "Relationship" {
-                return Err(err(format!("{context} 관계 태그가 올바르지 않습니다.")));
+                return Err(err_fmt(format_args!(
+                    "{context} 관계 태그가 올바르지 않습니다."
+                )));
             }
             let mut rel_attrs = [None, None, None];
             parse_attrs_into(raw, &["Id", "Type", "Target"], &mut rel_attrs, context)?;
             let [id_attr, type_attr, target_attr] = rel_attrs;
-            let id = id_attr.ok_or_else(|| err(format!("{context} 관계에 Id가 없습니다.")))?;
+            let id =
+                id_attr.ok_or_else(|| err_fmt(format_args!("{context} 관계에 Id가 없습니다.")))?;
             if id.is_empty() {
-                return Err(err(format!("{context} 관계 Id가 비어 있습니다.")));
+                return Err(err_fmt(format_args!("{context} 관계 Id가 비어 있습니다.")));
             }
-            let type_ =
-                type_attr.ok_or_else(|| err(format!("{context} 관계에 Type이 없습니다.")))?;
-            let target =
-                target_attr.ok_or_else(|| err(format!("{context} 관계에 Target이 없습니다.")))?;
+            let type_ = type_attr
+                .ok_or_else(|| err_fmt(format_args!("{context} 관계에 Type이 없습니다.")))?;
+            let target = target_attr
+                .ok_or_else(|| err_fmt(format_args!("{context} 관계에 Target이 없습니다.")))?;
             if ids
                 .iter()
                 .flatten()
                 .any(|candidate| candidate == id.as_ref())
             {
-                return Err(err(format!("{context} 관계 Id가 중복되었습니다: {id}")));
+                return Err(err_fmt(format_args!(
+                    "{context} 관계 Id가 중복되었습니다: {id}"
+                )));
             }
             let Some((candidate, slot)) = expected
                 .iter()
                 .zip(ids.iter_mut())
                 .find(|item| type_ == item.0.type_ && target == item.0.target)
             else {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "{context}에 지원하지 않는 관계가 있습니다: {type_} -> {target}"
                 )));
             };
@@ -1434,12 +1450,14 @@ fn validate_relationship_set<'xml>(
                 .optional_part
                 .is_some_and(|part| !container.has_part(part))
             {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "{context} 관계 대상 part가 없습니다: {target}"
                 )));
             }
             if slot.replace(id).is_some() {
-                return Err(err(format!("{context} 관계가 중복되었습니다: {target}")));
+                return Err(err_fmt(format_args!(
+                    "{context} 관계가 중복되었습니다: {target}"
+                )));
             }
             Ok(())
         },
@@ -1449,7 +1467,7 @@ fn validate_relationship_set<'xml>(
             .optional_part
             .is_none_or(|part| container.has_part(part));
         if required != id.is_some() {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context} 필수 관계 구성이 올바르지 않습니다: {}",
                 candidate.target
             )));
@@ -1467,10 +1485,14 @@ fn scan_xml_root<'xml>(
     let root = scanner
         .next_tag()
         .filter(|tag| tag.is_start && tag.name == expected_name)
-        .ok_or_else(|| err(format!("{context}의 XML root 태그가 올바르지 않습니다.")))?;
+        .ok_or_else(|| {
+            err_fmt(format_args!(
+                "{context}의 XML root 태그가 올바르지 않습니다."
+            ))
+        })?;
     let leading = xml.get(..root.start).unwrap_or_else(|| process::abort());
     if !xml_misc_only(leading, true) {
-        return Err(err(format!(
+        return Err(err_fmt(format_args!(
             "{context}의 XML root 앞 내용이 올바르지 않습니다."
         )));
     }
@@ -1485,10 +1507,12 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
 ) -> Result<XmlTag<'xml>> {
     let (mut scanner, root) = scan_xml_root(xml, expected_root, context)?;
     if root.self_closing {
-        return Err(err(format!("{context}의 XML root 태그가 비어 있습니다.")));
+        return Err(err_fmt(format_args!(
+            "{context}의 XML root 태그가 비어 있습니다."
+        )));
     }
     if required_xml_attr(root.raw, "xmlns", context)?.as_ref() != SPREADSHEETML_NAMESPACE {
-        return Err(err(format!(
+        return Err(err_fmt(format_args!(
             "{context}의 root namespace가 올바르지 않습니다."
         )));
     }
@@ -1498,7 +1522,7 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
     while let Some(tag) = scanner.next_tag() {
         if tag.is_start {
             if !allow_extensions && tag.name != tag.local_name {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "{context}의 prefixed core element는 지원하지 않습니다: {}",
                     tag.name
                 )));
@@ -1512,14 +1536,14 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
                     {
                         continue;
                     }
-                    return Err(err(format!(
+                    return Err(err_fmt(format_args!(
                         "{context}의 descendant namespace 재정의는 지원하지 않습니다."
                     )));
                 }
             }
             if expected_root == "worksheet" && tag.local_name == "sheetData" {
                 if depth != 1 || sheet_data_seen {
-                    return Err(err(format!(
+                    return Err(err_fmt(format_args!(
                         "{context}의 sheetData 위치 또는 개수가 올바르지 않습니다."
                     )));
                 }
@@ -1530,7 +1554,7 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
                         || parsed_span.end <= tag.end
                         || xml.get(parsed_span.start..parsed_span.end).is_none()
                     {
-                        return Err(err(format!(
+                        return Err(err_fmt(format_args!(
                             "{context}의 사전 해석된 sheetData 범위가 올바르지 않습니다."
                         )));
                     }
@@ -1539,9 +1563,9 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
                 }
             }
             if !tag.self_closing {
-                let slot = ancestors
-                    .get_mut(depth)
-                    .ok_or_else(|| err(format!("{context}의 XML 중첩 깊이가 너무 큽니다.")))?;
+                let slot = ancestors.get_mut(depth).ok_or_else(|| {
+                    err_fmt(format_args!("{context}의 XML 중첩 깊이가 너무 큽니다."))
+                })?;
                 *slot = tag.name;
                 depth = depth.strict_add(1);
             }
@@ -1553,28 +1577,30 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
             .copied()
             .unwrap_or_else(|| process::abort());
         if open != tag.name {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}의 XML 태그 쌍이 일치하지 않습니다: {open} / {}",
                 tag.name
             )));
         }
         if depth == 0 {
             if expected_root == "worksheet" && !sheet_data_seen {
-                return Err(err(format!("{context}에 sheetData가 없습니다.")));
+                return Err(err_fmt(format_args!("{context}에 sheetData가 없습니다.")));
             }
             let document_end = tag.end.strict_add(1);
             if !xml
                 .get(document_end..)
                 .is_some_and(|trailing| xml_misc_only(trailing, false))
             {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "{context}의 XML root 뒤 내용이 올바르지 않습니다."
                 )));
             }
             return Ok(root);
         }
     }
-    Err(err(format!("{context}에 닫히지 않은 XML 요소가 있습니다.")))
+    Err(err_fmt(format_args!(
+        "{context}에 닫히지 않은 XML 요소가 있습니다."
+    )))
 }
 fn validate_empty_xml_root(
     xml: &str,
@@ -1585,7 +1611,7 @@ fn validate_empty_xml_root(
     let (mut scanner, root) = scan_xml_root(xml, expected_name, context)?;
     validate_exact_attrs(root.raw, expected_attrs, context)?;
     let empty = scanner.next_direct_element_until(&root, context)?.is_none();
-    empty.ok_or_else(|| err(format!("{context}의 XML root가 비어 있지 않습니다.")))
+    empty.ok_or_else(|| err_fmt(format_args!("{context}의 XML root가 비어 있지 않습니다.")))
 }
 fn required_xml_attr<'tag>(
     tag: &'tag str,
@@ -1596,12 +1622,12 @@ fn required_xml_attr<'tag>(
     let mut attributes = XmlAttrScanner::new(tag)?;
     while let Some((name, attr_value)) = attributes.next()? {
         if name == attr_name && value.replace(attr_value).is_some() {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}에 중복 {attr_name} 속성이 있습니다."
             )));
         }
     }
-    value.ok_or_else(|| err(format!("{context}에 {attr_name} 속성이 없습니다.")))
+    value.ok_or_else(|| err_fmt(format_args!("{context}에 {attr_name} 속성이 없습니다.")))
 }
 fn visit_direct_xml_children<'xml>(
     xml: &'xml str,
@@ -1612,7 +1638,9 @@ fn visit_direct_xml_children<'xml>(
 ) -> Result<()> {
     let (mut scanner, root) = scan_xml_root(xml, root_local_name, context)?;
     if root.self_closing {
-        return Err(err(format!("{context}의 XML root 태그가 비어 있습니다.")));
+        return Err(err_fmt(format_args!(
+            "{context}의 XML root 태그가 비어 있습니다."
+        )));
     }
     validate_exact_attrs(
         root.raw,
@@ -1622,13 +1650,13 @@ fn visit_direct_xml_children<'xml>(
     while let Some(child) = scanner.next_direct_element_until(&root, context)? {
         let tag = child.opening;
         if tag.name != tag.local_name {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}의 prefixed child element는 지원하지 않습니다: {}",
                 tag.name
             )));
         }
         if !xml_misc_only(child.body, false) {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}의 XML child 태그는 중첩되거나 text를 포함할 수 없습니다."
             )));
         }

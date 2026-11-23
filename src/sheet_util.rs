@@ -1,8 +1,8 @@
-use crate::diagnostic::{Result, err, err_with_source};
+use crate::diagnostic::{Result, err_fmt, err_with_source};
 pub(super) fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
     let offset_u32 = usize_to_u32(offset, context)?;
     base_row.checked_add(offset_u32).ok_or_else(|| {
-        err(format!(
+        err_fmt(format_args!(
             "{context} 계산 중 overflow가 발생했습니다. ({base_row} + {offset_u32})"
         ))
     })

@@ -1,4 +1,4 @@
-use crate::diagnostic::{Result, err, err_with_source};
+use crate::diagnostic::{Result, err_fmt, reserve_err};
 use std::process;
 const CITY_REGIONS: [(TargetRegion, &str, &str); 5] = [
     (TargetRegion::Cheongju, "충북", "청주"),
@@ -83,22 +83,40 @@ pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result
     let trimmed = addr.trim();
     out.clear();
     out.try_reserve(trimmed.len())
-        .map_err(|source| err_with_source("주소 key 정규화 메모리 확보 실패", source))?;
-    for ch in trimmed.chars() {
-        if ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.') {
+        .map_err(|source| reserve_err("주소 key 정규화 메모리 확보 실패", source))?;
+    let mut run_start = 0_usize;
+    for (idx, ch) in trimmed.char_indices() {
+        let skip =
+            ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.');
+        let check = matches!(ch, '도' | '시');
+        if !skip && !check {
             continue;
         }
-        out.push(ch);
-        if !matches!(ch, '도' | '시') {
-            continue;
+        let end = if skip {
+            idx
+        } else {
+            idx.strict_add(ch.len_utf8())
+        };
+        if run_start < end {
+            out.push_str(
+                trimmed
+                    .get(run_start..end)
+                    .unwrap_or_else(|| process::abort()),
+            );
         }
-        for (from, to) in ADDRESS_KEY_REPLACEMENTS {
-            if out.ends_with(from) {
-                out.truncate(out.len().strict_sub(from.len()));
-                out.push_str(to);
-                break;
+        run_start = idx.strict_add(ch.len_utf8());
+        if check {
+            for (from, to) in ADDRESS_KEY_REPLACEMENTS {
+                if out.ends_with(from) {
+                    out.truncate(out.len().strict_sub(from.len()));
+                    out.push_str(to);
+                    break;
+                }
             }
         }
+    }
+    if run_start < trimmed.len() {
+        out.push_str(trimmed.get(run_start..).unwrap_or_else(|| process::abort()));
     }
     Ok(())
 }
@@ -165,13 +183,13 @@ pub(super) fn target_region(
             (Some(region_match), Some(address_match)) if region_match == address_match => {
                 Ok(Some(address_match))
             }
-            (Some(_), Some(_)) => Err(err(format!(
+            (Some(_), Some(_)) => Err(err_fmt(format_args!(
                 "Opinet 소스의 지역 값과 주소가 서로 다른 대상 지역을 가리킵니다: region={region}, address={address}"
             ))),
-            (Some(_), None) => Err(err(format!(
+            (Some(_), None) => Err(err_fmt(format_args!(
                 "Opinet 소스의 지역 값은 대상 지역이지만 주소는 대상 지역이 아닙니다: region={region}, address={address}"
             ))),
-            (None, Some(_)) => Err(err(format!(
+            (None, Some(_)) => Err(err_fmt(format_args!(
                 "Opinet 소스의 주소는 대상 지역이지만 지역 값이 예상 형식과 다릅니다: region={region}, address={address}"
             ))),
             (None, None) => Ok(None),

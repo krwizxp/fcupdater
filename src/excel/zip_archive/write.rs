@@ -6,7 +6,7 @@ use super::{
     ZIP_MAX_ARCHIVE_BYTES, deflate,
 };
 use crate::diagnostic::{
-    Result, err, err_with_source, path_err_with_source, try_vec_with_capacity,
+    Result, err, err_fmt, err_with_source, path_err_with_source, reserve_err, try_vec_with_capacity,
 };
 use core::mem;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -89,7 +89,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
     fn append_file(&mut self, part: &'part PackagePart) -> Result<WriteEntry<'part>> {
         let uncompressed_size = part.bytes.len();
         if uncompressed_size > MAX_XLSX_PART_BYTES {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "xlsx part 크기가 허용 한도({MAX_XLSX_PART_BYTES} bytes)를 초과했습니다: {} -> {}",
                 self.archive_path.display(),
                 part.name
@@ -101,7 +101,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
         })
         .plan()?
         else {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "고정 XLSX part 압축 작업 한도를 초과했습니다: {}",
                 part.name
             )));
@@ -134,7 +134,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
         self.write_header_buffer("xlsx 압축 local header 쓰기 실패")?;
         let actual_written = plan.write_to(&mut self.file)?;
         if actual_written != compressed_size {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "ZIP deflate 출력 크기가 계획과 다릅니다: expected={compressed_size}, actual={actual_written}"
             )));
         }
@@ -152,9 +152,9 @@ impl<'part> StreamingZipWriter<'part, '_> {
         let next = self
             .bytes_written
             .checked_add(len)
-            .ok_or_else(|| err(format!("{context} 중 overflow가 발생했습니다.")))?;
+            .ok_or_else(|| err_fmt(format_args!("{context} 중 overflow가 발생했습니다.")))?;
         if next > ZIP_MAX_ARCHIVE_BYTES {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "xlsx 압축 출력 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과합니다: {}",
                 self.archive_path.display()
             )));
@@ -165,7 +165,7 @@ impl<'part> StreamingZipWriter<'part, '_> {
         self.header_buffer.clear();
         self.header_buffer
             .try_reserve_exact(capacity)
-            .map_err(|source| err_with_source(context, source))
+            .map_err(|source| reserve_err(context, source))
     }
     fn write(mut self, parts: &'part [PackagePart]) -> Result<()> {
         for part in parts {

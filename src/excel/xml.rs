@@ -1,4 +1,4 @@
-use crate::diagnostic::{Result, err, err_with_source, try_string_with_capacity};
+use crate::diagnostic::{Result, ensure, err, err_fmt, err_with_source, try_string_with_capacity};
 use alloc::borrow::Cow;
 use core::{iter, num::IntErrorKind, range::Range};
 use std::process;
@@ -44,7 +44,10 @@ impl<'xml> XmlScanner<'xml> {
         ancestor_depth: usize,
         root_name: &str,
     ) -> Result<XmlElement<'xml>> {
-        (ancestor_depth < MAX_XML_NESTING_DEPTH).ok_or(err("XML 중첩 깊이가 너무 큽니다."))?;
+        ensure(
+            ancestor_depth < MAX_XML_NESTING_DEPTH,
+            "XML 중첩 깊이가 너무 큽니다.",
+        )?;
         let tag_name = opening.name;
         let body_start = opening.end.strict_add(1);
         let (body_end, end) = if opening.self_closing {
@@ -58,13 +61,17 @@ impl<'xml> XmlScanner<'xml> {
             let mut depth = 1_usize;
             let closing = loop {
                 let tag = scanner.next_tag().ok_or_else(|| {
-                    err(format!("XML </{root_name}> 종료 태그를 찾지 못했습니다."))
+                    err_fmt(format_args!(
+                        "XML </{root_name}> 종료 태그를 찾지 못했습니다."
+                    ))
                 })?;
                 if tag.is_start {
                     if !tag.self_closing {
                         let next_depth = ancestor_depth.strict_add(depth);
-                        (next_depth < MAX_XML_NESTING_DEPTH)
-                            .ok_or(err("XML 중첩 깊이가 너무 큽니다."))?;
+                        ensure(
+                            next_depth < MAX_XML_NESTING_DEPTH,
+                            "XML 중첩 깊이가 너무 큽니다.",
+                        )?;
                         if let Some(slot) = shallow.get_mut(depth) {
                             *slot = tag.name;
                             depth = depth.strict_add(1);
@@ -80,7 +87,7 @@ impl<'xml> XmlScanner<'xml> {
                     .copied()
                     .unwrap_or_else(|| process::abort());
                 if open != tag.name {
-                    return Err(err(format!(
+                    return Err(err_fmt(format_args!(
                         "XML 태그 쌍이 일치하지 않습니다: {open} / {}",
                         tag.name
                     )));
@@ -129,17 +136,23 @@ impl<'xml> XmlScanner<'xml> {
             return find_delimited_markup_end(self.xml, tag_start, 2, "?>");
         }
         let mut cursor = tag_start.strict_add(1);
-        let mut quote = None;
-        while let Some(&byte) = bytes.get(cursor) {
-            match quote {
-                Some(active_quote) if byte == active_quote => quote = None,
-                None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
-                None if byte == b'>' => return Some(cursor),
-                Some(_) | None => {}
+        loop {
+            let tail = bytes.get(cursor..)?;
+            let relative = tail
+                .iter()
+                .position(|&byte| matches!(byte, b'>' | b'"' | b'\''))?;
+            let delimiter = *tail.get(relative)?;
+            cursor = cursor.strict_add(relative);
+            if delimiter == b'>' {
+                return Some(cursor);
             }
-            cursor = cursor.strict_add(1);
+            let quoted_start = cursor.strict_add(1);
+            let quote_end = bytes
+                .get(quoted_start..)?
+                .iter()
+                .position(|&byte| byte == delimiter)?;
+            cursor = quoted_start.strict_add(quote_end).strict_add(1);
         }
-        None
     }
     pub(super) const fn new(xml: &'xml str) -> Self {
         Self { cursor: 0, xml }
@@ -161,7 +174,9 @@ impl<'xml> XmlScanner<'xml> {
         self.validate_direct_gap(content_start, content_end, context)?;
         let Some(opening_tag) = opening else {
             return closing_name.map_or(Ok(None), |_| {
-                Err(err(format!("{context}의 XML root 종료 태그가 없습니다.")))
+                Err(err_fmt(format_args!(
+                    "{context}의 XML root 종료 태그가 없습니다."
+                )))
             });
         };
         if !opening_tag.is_start {
@@ -173,7 +188,7 @@ impl<'xml> XmlScanner<'xml> {
             {
                 return Ok(None);
             }
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}에 직접 자식이 아닌 종료 태그가 있습니다: {}",
                 opening_tag.name
             )));
@@ -213,7 +228,7 @@ impl<'xml> XmlScanner<'xml> {
     ) -> Result<Option<XmlTag<'xml>>> {
         let content_start = self.cursor;
         let Some(opening) = self.next_tag() else {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "XML </{closing_name}> 종료 태그를 찾지 못했습니다."
             )));
         };
@@ -222,13 +237,13 @@ impl<'xml> XmlScanner<'xml> {
             if opening.name == closing_name {
                 return Ok(None);
             }
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "XML 태그 쌍이 일치하지 않습니다: {closing_name} / {}",
                 opening.name
             )));
         }
         if opening.name != tag_name {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "{context}에 직접 자식 {tag_name} 외 요소가 있습니다: {}",
                 opening.name
             )));
@@ -316,7 +331,7 @@ impl<'xml> XmlScanner<'xml> {
         if xml_misc_only(between, false) {
             Ok(())
         } else {
-            Err(err(format!(
+            Err(err_fmt(format_args!(
                 "{context}의 XML 요소 사이 내용이 올바르지 않습니다."
             )))
         }
@@ -369,7 +384,7 @@ impl<'tag> XmlAttrScanner<'tag> {
             self.cursor = self.cursor.strict_add(1);
         }
         let name_end = self.cursor;
-        (name_start != name_end).ok_or(err("XML 속성 이름이 비어 있습니다."))?;
+        ensure(name_start != name_end, "XML 속성 이름이 비어 있습니다.")?;
         skip_xml_whitespace(bytes, &mut self.cursor);
         if bytes.get(self.cursor) != Some(&b'=') {
             return Err(err("XML 속성의 '=' 문자를 찾지 못했습니다."));
@@ -480,7 +495,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
             match byte {
                 0x00..=0x1F => {
                     if !matches!(byte, b'\t' | b'\n' | b'\r') {
-                        return Err(err(format!(
+                        return Err(err_fmt(format_args!(
                             "XML text: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{byte:04X}",
                         )));
                     }
@@ -509,7 +524,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
                         } else {
                             0xFFFF_u32
                         };
-                        return Err(err(format!(
+                        return Err(err_fmt(format_args!(
                             "XML text: XML 1.0에서 허용되지 않는 문자가 포함되어 있습니다: U+{code:04X}",
                         )));
                     }
@@ -530,7 +545,7 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
         let Some((entity, _)) = after_amp.split_once(';') else {
             return Err(err("XML entity 종료 세미콜론을 찾지 못했습니다."));
         };
-        (!entity.is_empty()).ok_or(err("XML entity 이름이 비어 있습니다."))?;
+        ensure(!entity.is_empty(), "XML entity 이름이 비어 있습니다.")?;
         let decoded = match entity {
             "lt" => Some('<'),
             "gt" => Some('>'),
@@ -539,7 +554,9 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
             "amp" => Some('&'),
             _ => {
                 let Some(body) = entity.strip_prefix('#') else {
-                    return Err(err(format!("지원하지 않는 XML entity입니다: &{entity};")));
+                    return Err(err_fmt(format_args!(
+                        "지원하지 않는 XML entity입니다: &{entity};"
+                    )));
                 };
                 let value = if let Some(hex) = body.strip_prefix('x') {
                     parse_numeric_entity(
@@ -560,14 +577,14 @@ pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
             }
         };
         let Some(decoded_char) = decoded else {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "XML numeric entity가 유효한 Unicode scalar value가 아닙니다: &{entity};"
             )));
         };
         if !((decoded_char >= ' ' && decoded_char != '\u{fffe}' && decoded_char != '\u{ffff}')
             || matches!(decoded_char, '\t' | '\n' | '\r'))
         {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "XML numeric entity가 XML 1.0 유효 문자 범위를 벗어났습니다: &{entity};"
             )));
         }

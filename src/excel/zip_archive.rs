@@ -2,7 +2,8 @@ use super::{
     ArchiveFingerprint, MAX_XLSX_PART_BYTES, PackagePart, PartRole, XLSX_PARTS, ZipPackageReader,
 };
 use crate::diagnostic::{
-    AppError, Result, err, err_with_source, path_err_with_source, try_vec_with_capacity,
+    AppError, Result, err, err_fmt, err_with_source, path_err_with_source, reserve_err,
+    try_vec_with_capacity,
 };
 use core::mem;
 use std::{
@@ -135,7 +136,7 @@ impl ZipEntry<'_> {
     ) -> Result<(Vec<u8>, usize)> {
         let local_offset = self.local_header_offset as usize;
         if local_offset != expected_local_offset {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "ZIP local record가 연속된 고정 순서가 아닙니다: {}",
                 self.name
             )));
@@ -419,7 +420,7 @@ impl ZipPackageReader<'_> {
         let entry_count = usize::from(entries_total);
         let mut slots = [const { None }; XLSX_PARTS.len()];
         let Some(entries) = slots.get_mut(..entry_count) else {
-            return Err(err(format!(
+            return Err(err_fmt(format_args!(
                 "ZIP entry 수가 지원 상한을 초과했습니다: {entry_count}"
             )));
         };
@@ -454,14 +455,16 @@ impl ZipPackageReader<'_> {
                 .enumerate()
                 .find(|&(_, (name, _, _))| name == entry.name)
             else {
-                return Err(err(format!(
+                return Err(err_fmt(format_args!(
                     "ZIP entry 이름이 고정 스키마에 없습니다: {}",
                     entry.name
                 )));
             };
             let present = seen.get_mut(part_index).unwrap_or_else(|| process::abort());
             if mem::replace(present, true) {
-                return Err(err(format!("ZIP entry 이름이 중복되었습니다: {part_name}")));
+                return Err(err_fmt(format_args!(
+                    "ZIP entry 이름이 중복되었습니다: {part_name}"
+                )));
             }
             let expected_len = entry.uncompressed_size as usize;
             ensure_zip_size_limit("entry 해제", expected_len, MAX_XLSX_PART_BYTES, entry.name)?;
@@ -481,7 +484,7 @@ impl ZipPackageReader<'_> {
         }
         for ((name, role, _), present) in XLSX_PARTS.into_iter().zip(seen) {
             if role == PartRole::Required && !present {
-                return Err(err(format!("ZIP 필수 entry가 없습니다: {name}")));
+                return Err(err_fmt(format_args!("ZIP 필수 entry가 없습니다: {name}")));
             }
         }
         entries.sort_unstable_by_key(|slot| slot.as_ref().map(|item| item.0.local_header_offset));
@@ -561,7 +564,7 @@ impl ZipPackageReader<'_> {
     }
 }
 fn archive_changed(archive_path: &Path) -> AppError {
-    err(format!(
+    err_fmt(format_args!(
         "xlsx 압축 파일이 읽는 중 변경되었습니다: {}",
         archive_path.display()
     ))
@@ -571,13 +574,13 @@ pub(super) fn archive_file_len(file: &File, archive_path: &Path) -> Result<usize
         path_err_with_source("xlsx 압축 파일 정보 확인 실패", archive_path, source)
     })?;
     let archive_len = usize::try_from(metadata.len()).map_err(|source| {
-        err(format!(
+        err_fmt(format_args!(
             "xlsx 압축 파일 크기 변환 실패({}): {source}",
             archive_path.display()
         ))
     })?;
     if archive_len > ZIP_MAX_ARCHIVE_BYTES {
-        return Err(err(format!(
+        return Err(err_fmt(format_args!(
             "xlsx 압축 파일 크기가 허용 한도({ZIP_MAX_ARCHIVE_BYTES} bytes)를 초과했습니다: {}",
             archive_path.display()
         )));
@@ -600,7 +603,7 @@ fn read_archive_range(
     buffer.clear();
     buffer
         .try_reserve_exact(len)
-        .map_err(|source| err_with_source("ZIP 입력 range 메모리 확보 실패", source))?;
+        .map_err(|source| reserve_err("ZIP 입력 range 메모리 확보 실패", source))?;
     file.take(len as u64)
         .read_to_end(buffer)
         .map_err(|source| {
@@ -652,7 +655,7 @@ fn ensure_zip_size_limit(
     entry_name: &str,
 ) -> Result<()> {
     (actual_len <= limit).ok_or_else(|| {
-        err(format!(
+        err_fmt(format_args!(
             "ZIP {scope} 크기가 허용 한도({limit} bytes)를 초과했습니다: {entry_name}"
         ))
     })
