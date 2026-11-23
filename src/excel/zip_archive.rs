@@ -675,6 +675,7 @@ pub(super) fn archive_file_len(file: &File, archive_path: &Path) -> Result<usize
     );
     Ok(len)
 }
+#[inline]
 fn crc32_table_value(table_index: usize, byte: u8) -> u32 {
     *or_abort(or_abort(CRC32_TABLES.get(table_index)).get(usize::from(byte)))
 }

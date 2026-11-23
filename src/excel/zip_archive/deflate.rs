@@ -141,6 +141,7 @@ struct InflateState<'bytes> {
     reader: BitReader<'bytes>,
 }
 impl BitReader<'_> {
+    #[inline]
     fn read_bits(&mut self, count: u8) -> Result<u16> {
         let val = self
             .try_peek_bits(count)
@@ -166,6 +167,7 @@ impl BitReader<'_> {
         self.cursor = end;
         Ok(bytes)
     }
+    #[inline]
     fn try_peek_bits(&mut self, count: u8) -> Option<u16> {
         if self.bit_count < count
             && let Some(&chunk) = self
@@ -232,6 +234,7 @@ impl BitWriter<'_> {
     }
 }
 impl DecodeHuffman {
+    #[inline]
     fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         let (mut code, skip_bits) = if let Some(prefix) = reader.try_peek_bits(ROOT_BITS) {
             let entry = *self
@@ -743,6 +746,7 @@ impl DeflatePlan {
     }
 }
 impl DeflateWorkspace {
+    #[inline]
     fn insert_position(
         pos: usize,
         bias: u32,
@@ -962,12 +966,14 @@ impl DeflateWorkspace {
         Ok(Some((tokens, !crc32_update(u32::MAX, bytes))))
     }
 }
+#[inline]
 fn at<T>(values: &[T], index: usize) -> T
 where
     T: Copy,
 {
     or_abort(values.get(index).copied())
 }
+#[inline]
 fn at_mut<T>(values: &mut [T], index: usize) -> &mut T {
     or_abort(values.get_mut(index))
 }
@@ -1149,6 +1155,7 @@ fn fill_write_huffman_codes(lengths: &[u8], codes: &mut [u32]) -> Result<()> {
     }
     Ok(())
 }
+#[inline]
 fn hash3(bytes: &[u8], pos: usize) -> Option<usize> {
     let &[first, second, third] = bytes.get(pos..)?.first_chunk::<3>()?;
     Some(
