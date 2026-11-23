@@ -112,7 +112,7 @@ impl UpdateRun<'_> {
         loaded: &'source LoadedSource,
     ) -> Result<(StdWorkbook, MasterSheetUpdateResult<'source>)> {
         writeln!(self.out, "마스터 파일 처리 중...")?;
-        let master_file = open_regular(self.master_path, false)
+        let master_file = open_regular(self.master_path)
             .map_err(|src| path_err("마스터 xlsx 열기 실패", self.master_path, src))?;
         let mut book = StdWorkbook::from_container(XlsxContainer::from_validated_file(
             master_file,

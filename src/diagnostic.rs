@@ -153,6 +153,7 @@ pub(super) fn parse_unsigned_u32(
 pub(super) fn path_err(label: &str, path: &Path, source: impl Into<BoxError>) -> AppError {
     err_fmt_with_source(format_args!("{label}: {}", path.display()), source.into())
 }
+#[inline]
 pub(super) fn push_vec<T>(
     vec: &mut Vec<T>,
     value: T,

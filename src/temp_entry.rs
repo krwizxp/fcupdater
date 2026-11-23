@@ -59,18 +59,9 @@ pub(crate) fn configure_no_follow(options: &mut OpenOptions) {
         _ => compile_error!("unsupported OS"),
     }
 }
-#[cfg(target_os = "windows")]
-pub(crate) fn configure_replaceable_file(options: &mut OpenOptions) {
-    options.share_mode(0x0000_0007);
-}
-pub(crate) fn open_regular(path: &Path, writable: bool) -> io::Result<ValidatedFile> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<ValidatedFile> {
     let mut opts = File::options();
     opts.read(true);
-    if writable {
-        opts.write(true);
-        #[cfg(target_os = "windows")]
-        configure_replaceable_file(&mut opts);
-    }
     configure_no_follow(&mut opts);
     validate_open_file(opts.open(path)?)
 }

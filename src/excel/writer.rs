@@ -914,6 +914,9 @@ impl Worksheet {
                             )?;
                         }
                     } else {
+                        if cell.inner_xml.starts_with(follow_xml.as_str()) {
+                            continue;
+                        }
                         let span = if cell.inner_xml.starts_with("<f/>") {
                             (0..4).into()
                         } else {
@@ -1522,6 +1525,7 @@ fn canon_style(
         .flatten()
         .ok_or_else(|| fmt_err!("style 정규형 변환 불가: {style}"))
 }
+#[inline]
 fn col_name_into(mut col: u32, buf: &mut [u8; 3]) -> Result<&str> {
     (1..=0x4000_u32)
         .contains(&col)

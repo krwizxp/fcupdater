@@ -12,8 +12,6 @@ use crate::diagnostic::{
     AppError, Result, bail, bail_fmt, ensure, ensure_fmt, err, err_src, fmt_err, fmt_src, or_abort,
     path_err, push_vec, str_cap, terminal_safe, vec_cap,
 };
-#[cfg(target_os = "windows")]
-use crate::temp_entry::configure_replaceable_file;
 use crate::temp_entry::{
     FileIdentity, ValidatedFile, configure_no_follow, open_regular, validate_open_file,
     validate_regular_file,
@@ -40,7 +38,10 @@ use std::{
 cfg_select! {
     target_os = "windows" => {
         use core::{ffi::c_void, ptr::null};
-        use std::{os::windows::ffi::OsStrExt as _, path::{Component, Prefix, absolute}};
+        use std::{
+            os::windows::{ffi::OsStrExt as _, fs::OpenOptionsExt as _},
+            path::{Component, Prefix, absolute},
+        };
     }
     any(target_os = "linux", target_os = "macos") => {
         use alloc::ffi::CString;
@@ -202,7 +203,7 @@ struct ReservedTempArchive {
 impl ReservedTempArchive {
     fn remove_owned(&mut self) -> io::Result<()> {
         self.remove_on_drop = false;
-        match open_regular(&self.path, false) {
+        match open_regular(&self.path) {
             Ok(file) if file.identity == self.identity => {
                 drop(file.file);
                 drop(self.file.take());
@@ -214,7 +215,7 @@ impl ReservedTempArchive {
         }
     }
     fn validate_path_identity(&self) -> Result<()> {
-        let file = open_regular(&self.path, false)
+        let file = open_regular(&self.path)
             .map_err(|src| path_err("임시 파일 검증 실패", &self.path, src))?;
         (file.identity == self.identity)
             .ok_or_else(|| fmt_err!("임시 파일 identity 변경됨: {}", self.path.display()))
@@ -370,7 +371,7 @@ impl TempArchivePromotion<'_> {
         self.temp_archive.validate_path_identity()?;
         #[cfg(target_os = "windows")]
         self.backup_archive.validate_path_identity()?;
-        let target_file = open_regular(self.target_xlsx, false)
+        let target_file = open_regular(self.target_xlsx)
             .map_err(|src| path_err("원본 xlsx 검증 실패", self.target_xlsx, src))?;
         ensure_fmt!(
             target_file.identity == self.expected_identity,
@@ -407,13 +408,12 @@ impl TempArchivePromotion<'_> {
             };
         }
         let saved_ok = self.validate_displaced_original().and_then(|()| {
-            let saved = open_regular(self.target_xlsx, true)
+            let saved = open_regular(self.target_xlsx)
                 .map_err(|src| path_err("저장된 xlsx 검증 실패", self.target_xlsx, src))?;
-            (saved.identity == self.temp_archive.identity).ok_or("저장된 xlsx identity 불일치")?;
-            saved
-                .file
-                .sync_all()
-                .map_err(|src| path_err("xlsx sync 실패", self.target_xlsx, src))
+            ensure(
+                saved.identity == self.temp_archive.identity,
+                "저장된 xlsx identity 불일치",
+            )
         });
         if let Err(val_err) = saved_ok {
             return self.rollback_after_validation_failure(val_err);
@@ -463,7 +463,7 @@ impl TempArchivePromotion<'_> {
     }
     fn validate_displaced_original(&self) -> Result<()> {
         let captured = self.displaced_original_path();
-        let file = open_regular(captured, false)
+        let file = open_regular(captured)
             .map_err(|src| path_err("교체된 원본 열기 실패", captured, src))?;
         ensure_fmt!(
             file.identity == self.expected_identity,
@@ -873,7 +873,7 @@ impl XlsxContainer {
                 opts.read(true).write(true).create_new(true);
                 configure_no_follow(&mut opts);
                 #[cfg(target_os = "windows")]
-                configure_replaceable_file(&mut opts);
+                opts.share_mode(0x0000_0007);
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 opts.mode(0o600);
                 match opts.open(&path) {

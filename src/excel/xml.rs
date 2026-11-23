@@ -367,7 +367,14 @@ impl<'tag> XmlAttrScanner<'tag> {
         Ok(())
     }
 }
+#[inline]
 pub(super) fn decode_xml_entities(text: &str) -> Result<Cow<'_, str>> {
+    if text
+        .bytes()
+        .all(|byte| (0x20..=0x7E).contains(&byte) && !matches!(byte, b'&' | b'<' | b']'))
+    {
+        return Ok(Cow::Borrowed(text));
+    }
     let (mut out, mut cur): (Option<String>, usize) = (None, 0);
     while cur < text.len() {
         let tail = or_abort(text.get(cur..));
