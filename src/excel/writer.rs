@@ -1506,22 +1506,6 @@ impl Worksheet {
                 if cell.inner_xml.is_empty() {
                     continue;
                 }
-                if let Some(plain_value) = cell
-                    .inner_xml
-                    .strip_prefix("<v>")
-                    .and_then(|rest| rest.strip_suffix("</v>"))
-                    .filter(|body| !body.as_bytes().contains(&b'<'))
-                {
-                    let has_payload = if plain_value.as_bytes().contains(&b'&') {
-                        !decode_xml_entities(plain_value)?.trim().is_empty()
-                    } else {
-                        !plain_value.trim().is_empty()
-                    };
-                    if row_num >= layout.data_start_row && col <= last_col && has_payload {
-                        last_data_row = Some(row_num);
-                    }
-                    continue;
-                }
                 let mut content_scanner = XmlScanner::new(&cell.inner_xml);
                 let content = content_scanner.next_direct_element("worksheet cell")?;
                 let formula_text = content

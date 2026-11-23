@@ -656,7 +656,8 @@ impl XlsxContainer {
             let source_borders = style_entries(source_styles, "borders", "border")?;
             let excel_fonts = style_entries(EXCEL_STYLES_XML, "fonts", "font")?;
             let excel_borders = style_entries(EXCEL_STYLES_XML, "borders", "border")?;
-            let mut libreoffice_xml = String::with_capacity(8192);
+            let mut libreoffice_xml =
+                try_string_with_capacity(8192, "LibreOffice style XML 메모리 확보 실패")?;
             libreoffice_xml.push_str("<cellXfs count=\"26\">");
             for &[num_fmt, font, fill, border, xf_id, flags] in &LIBREOFFICE_CELL_XFS {
                 let horiz = match flags >> 6_u8 {
