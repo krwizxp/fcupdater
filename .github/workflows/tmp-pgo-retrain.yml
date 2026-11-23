@@ -101,7 +101,8 @@ jobs:
           if ($rc -ne 0) {
             $suite = "TLS_RSA_WITH_AES_256_GCM_SHA384"
             $origSuites = (Get-TlsCipherSuite).Name
-            Enable-TlsCipherSuite -Name $suite -Position ([uint32]::MaxValue)
+            $regPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002'; $hasPolicyFunctions = $false; $origFunctions = $null; $origFunctionsKind = $null; if (Test-Path $regPath) { $k = Get-Item $regPath; if ($null -ne $k.GetValue('Functions', $null)) { $hasPolicyFunctions = $true; $origFunctions = $k.GetValue('Functions'); $origFunctionsKind = $k.GetValueKind('Functions') }; $k.Close() }
+            Enable-TlsCipherSuite -Name $suite -Position ([uint32]::MaxValue); if ($hasPolicyFunctions) { if ($origFunctionsKind -eq [Microsoft.Win32.RegistryValueKind]::MultiString) { $arr = @($origFunctions); if ($arr -notcontains $suite) { Set-ItemProperty -Path $regPath -Name 'Functions' -Value ($arr + $suite) -Type MultiString } } else { $s = [string]$origFunctions; $parts = $s -split ',' | Where-Object { $_ -ne '' }; if ($parts -notcontains $suite) { $nv = if ([string]::IsNullOrEmpty($s)) { $suite } elseif ($s.EndsWith(',')) { "$s$suite" } else { "$s,$suite" }; Set-ItemProperty -Path $regPath -Name 'Functions' -Value $nv -Type $origFunctionsKind } } }
             try {
               Copy-Item fuel_cost_chungcheong.xlsx work-train/fuel_cost_chungcheong.xlsx -Force
               Push-Location work-train
@@ -109,7 +110,7 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "fcupdater --verify failed even with $suite" }
               Pop-Location
             } finally {
-              Disable-TlsCipherSuite -Name $suite
+              Disable-TlsCipherSuite -Name $suite; if ($hasPolicyFunctions) { Set-ItemProperty -Path $regPath -Name 'Functions' -Value $origFunctions -Type $origFunctionsKind }; if ((Get-Location).Path -like '*work-train*') { Pop-Location }
             }
             $restored = (Get-TlsCipherSuite).Name
             if (($origSuites -join ',') -ne ($restored -join ',')) { throw "TLS cipher suite restoration mismatch" }
