@@ -1,5 +1,5 @@
-use crate::diagnostic::{Result, fmt_err, map_reserve, or_abort};
-const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
+use crate::diagnostic::{Result, fmt_err, or_abort, reserve};
+const ADDR_REPL: [(&str, &str); 4] = [
     ("충청남도", "충남"),
     ("충청북도", "충북"),
     ("대전광역시", "대전"),
@@ -12,7 +12,7 @@ const CITY_REGIONS: [(TargetRegion, &str, &str); 5] = [
     (TargetRegion::Asan, "충남", "아산"),
     (TargetRegion::Cheonan, "충남", "천안"),
 ];
-const DAEJEON_DISTRICT_KEYS: [&str; 5] = ["대덕구", "동구", "서구", "유성구", "중구"];
+const DJ_DISTRICTS: [&str; 5] = ["대덕구", "동구", "서구", "유성구", "중구"];
 pub(super) const TARGET_REGION_COUNT: usize = 7;
 pub(super) const TARGET_REGIONS: [TargetRegion; TARGET_REGION_COUNT] = [
     TargetRegion::Daejeon,
@@ -40,9 +40,7 @@ pub(super) enum TargetRegionPolicy {
 }
 impl TargetRegion {
     pub(super) fn from_label(label: &str) -> Option<Self> {
-        TARGET_REGIONS
-            .into_iter()
-            .find(|region| region.label() == label)
+        TARGET_REGIONS.into_iter().find(|reg| reg.label() == label)
     }
     const fn index(self) -> usize {
         match self {
@@ -77,7 +75,7 @@ impl TargetRegion {
     }
 }
 fn daejeon_region(district: &str) -> Option<TargetRegion> {
-    DAEJEON_DISTRICT_KEYS
+    DJ_DISTRICTS
         .contains(&district)
         .then_some(TargetRegion::Daejeon)
 }
@@ -91,10 +89,7 @@ pub(super) fn increment_target_region_count(
 pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     let trimmed = addr.trim();
     out.clear();
-    map_reserve(
-        out.try_reserve(trimmed.len()),
-        "주소 key 정규화 메모리 확보 실패",
-    )?;
+    reserve(out.try_reserve(trimmed.len()), "주소 key 정규화")?;
     let mut run_start = 0_usize;
     for (idx, ch) in trimmed.char_indices() {
         let skip =
@@ -110,7 +105,7 @@ pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result
         }
         run_start = next;
         if check {
-            for (from, to) in ADDRESS_KEY_REPLACEMENTS {
+            for (from, to) in ADDR_REPL {
                 if out.ends_with(from) {
                     out.truncate(out.len().strict_sub(from.len()));
                     out.push_str(to);
@@ -132,10 +127,10 @@ pub(super) fn target_region(
 ) -> Result<Option<TargetRegion>> {
     if matches!(policy, TargetRegionPolicy::StrictSource) {
         let mut tokens = address.split_whitespace();
-        let address_region = match tokens.next() {
+        let addr_reg = match tokens.next() {
             Some("대전") => match tokens.next() {
                 Some("광역시") => tokens.next().and_then(daejeon_region),
-                district => district.and_then(daejeon_region),
+                dist => dist.and_then(daejeon_region),
             },
             Some("대전광역시") => tokens.next().and_then(daejeon_region),
             Some("세종" | "세종시" | "세종특별자치시") => Some(TargetRegion::Sejong),
@@ -152,7 +147,7 @@ pub(super) fn target_region(
             },
             Some(_) | None => None,
         };
-        if address_region.is_none()
+        if addr_reg.is_none()
             && !region
                 .trim_start_matches(|ch: char| {
                     ch.is_whitespace()
@@ -163,87 +158,78 @@ pub(super) fn target_region(
             return Ok(None);
         }
         normalize_address_key_into(region, scratch)?;
-        let normalized_region = scratch.as_str();
-        let parsed_region = if normalized_region == "대전"
-            || normalized_region
+        let norm = scratch.as_str();
+        let parsed = if norm == "대전"
+            || norm
                 .strip_prefix("대전")
-                .is_some_and(|district| DAEJEON_DISTRICT_KEYS.contains(&district))
+                .is_some_and(|dist| DJ_DISTRICTS.contains(&dist))
         {
             Some(TargetRegion::Daejeon)
-        } else if normalized_region == "세종시" {
+        } else if norm == "세종시" {
             Some(TargetRegion::Sejong)
         } else {
-            CITY_REGIONS
-                .into_iter()
-                .find_map(|(target, province, city)| {
-                    (normalized_region
-                        .strip_prefix(province)
-                        .and_then(|tail| tail.strip_suffix("시"))
-                        == Some(city))
-                    .then_some(target)
-                })
+            CITY_REGIONS.into_iter().find_map(|(target, prov, city)| {
+                (norm
+                    .strip_prefix(prov)
+                    .and_then(|tail| tail.strip_suffix("시"))
+                    == Some(city))
+                .then_some(target)
+            })
         };
-        return match (parsed_region, address_region) {
-            (Some(region_match), Some(address_match)) if region_match == address_match => {
-                Ok(Some(address_match))
-            }
+        return match (parsed, addr_reg) {
+            (Some(rm), Some(am)) if rm == am => Ok(Some(am)),
             (Some(_), Some(_)) => Err(fmt_err!(
-                "Opinet 소스의 지역 값과 주소가 서로 다른 대상 지역을 가리킵니다: region={region}, address={address}"
+                "지역과 주소가 서로 다른 대상 지역: region={region}, address={address}"
             )),
             (Some(_), None) => Err(fmt_err!(
-                "Opinet 소스의 지역 값은 대상 지역이지만 주소는 대상 지역이 아닙니다: region={region}, address={address}"
+                "지역은 대상이지만 주소가 아님: region={region}, address={address}"
             )),
             (None, Some(_)) => Err(fmt_err!(
-                "Opinet 소스의 주소는 대상 지역이지만 지역 값이 예상 형식과 다릅니다: region={region}, address={address}"
+                "주소는 대상이지만 지역 형식 오류: region={region}, address={address}"
             )),
             (None, None) => Ok(None),
         };
     }
-    let trimmed_region = region.trim();
-    let (region_is_daejeon, region_match) = match TargetRegion::from_label(trimmed_region) {
+    let trimmed = region.trim();
+    let (is_dj, reg_match) = match TargetRegion::from_label(trimmed) {
         Some(TargetRegion::Daejeon) => (true, None),
         Some(target) => (false, Some(target)),
         None => {
-            normalize_address_key_into(trimmed_region, scratch)?;
-            let is_daejeon = scratch.as_str() == "대전";
+            normalize_address_key_into(trimmed, scratch)?;
+            let dj = scratch.as_str() == "대전";
             (
-                is_daejeon,
-                (!is_daejeon)
-                    .then(|| target_region_from_normalized(scratch.as_str()))
-                    .flatten(),
+                dj,
+                (!dj).then(|| region_from_norm(scratch.as_str())).flatten(),
             )
         }
     };
     normalize_address_key_into(address, scratch)?;
-    if let Some(target) = region_match.or_else(|| target_region_from_normalized(scratch.as_str())) {
+    if let Some(target) = reg_match.or_else(|| region_from_norm(scratch.as_str())) {
         return Ok(Some(target));
     }
-    Ok(region_is_daejeon
+    Ok(is_dj
         .then(|| {
-            DAEJEON_DISTRICT_KEYS
+            DJ_DISTRICTS
                 .iter()
-                .any(|district| scratch.starts_with(district))
+                .any(|dist| scratch.starts_with(dist))
                 .then_some(TargetRegion::Daejeon)
         })
         .flatten())
 }
-fn target_region_from_normalized(text: &str) -> Option<TargetRegion> {
-    if text.strip_prefix("대전").is_some_and(|tail| {
-        DAEJEON_DISTRICT_KEYS
-            .iter()
-            .any(|district| tail.starts_with(district))
-    }) {
+fn region_from_norm(text: &str) -> Option<TargetRegion> {
+    if text
+        .strip_prefix("대전")
+        .is_some_and(|tail| DJ_DISTRICTS.iter().any(|dist| tail.starts_with(dist)))
+    {
         return Some(TargetRegion::Daejeon);
     }
     if text.starts_with("세종") {
         return Some(TargetRegion::Sejong);
     }
-    CITY_REGIONS
-        .into_iter()
-        .find_map(|(target, province, city)| {
-            text.strip_prefix(province)
-                .unwrap_or(text)
-                .starts_with(city)
-                .then_some(target)
-        })
+    CITY_REGIONS.into_iter().find_map(|(target, prov, city)| {
+        text.strip_prefix(prov)
+            .unwrap_or(text)
+            .starts_with(city)
+            .then_some(target)
+    })
 }

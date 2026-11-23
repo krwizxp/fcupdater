@@ -1,5 +1,5 @@
 use crate::{
-    diagnostic::{Result, add_row_offset, append_fmt, ensure, try_string_with_capacity},
+    diagnostic::{Result, add_row_offset, append_fmt, ensure, str_cap},
     excel::{
         FuelValues, SourceRecord,
         writer::{SharedStringTable, Worksheet, is_shared_formula_follower},
@@ -7,10 +7,10 @@ use crate::{
     master_sheet::{ChangeRow, StoreRow},
 };
 use core::fmt::NumBuffer;
-const CHANGELOG_DATA_START_ROW: u32 = 4;
-const CHANGELOG_STYLE_TEMPLATE_ROW: u32 = 243;
-const CHANGELOG_COL_DELTA_DIESEL: u32 = 13;
-const FUEL_COLUMNS: [(u32, u32, u32, &str, &str); 3] = [
+const START_ROW: u32 = 4;
+const TPL_ROW: u32 = 243;
+const LAST_COL: u32 = 13;
+const FUEL_COLS: [(u32, u32, u32, &str, &str); 3] = [
     (5, 6, 7, "E", "F"),
     (8, 9, 10, "H", "I"),
     (11, 12, 13, "K", "L"),
@@ -26,9 +26,8 @@ pub(super) struct ChangeLogUpdater<'sheet, 'shared, 'data, 'source> {
 impl ChangeLogUpdater<'_, '_, '_, '_> {
     pub(super) fn update(&mut self) -> Result<u32> {
         ensure(
-            self.worksheet
-                .has_any_row_format(CHANGELOG_STYLE_TEMPLATE_ROW, CHANGELOG_COL_DELTA_DIESEL),
-            "변경내역 243행에 고정 style template이 없습니다.",
+            self.worksheet.has_any_row_format(TPL_ROW, LAST_COL),
+            "변경내역 243행 고정 style template 없음",
         )?;
         self.shared_string_table.set_cell(
             self.worksheet,
@@ -36,116 +35,91 @@ impl ChangeLogUpdater<'_, '_, '_, '_> {
             2,
             &format!("현행화 일자: {}", self.today),
         )?;
-        let last_data_row = self
-            .worksheet
-            .row_numbers_from(CHANGELOG_DATA_START_ROW)
-            .last;
-        self.worksheet.clear_cells_in_rows_through_col(
-            CHANGELOG_DATA_START_ROW,
-            last_data_row,
-            CHANGELOG_COL_DELTA_DIESEL,
-        );
-        let entry_count = self
+        let last_row = self.worksheet.row_numbers_from(START_ROW).last;
+        self.worksheet
+            .clear_cells_in_rows_through_col(START_ROW, last_row, LAST_COL);
+        let count = self
             .changes
             .len()
             .strict_add(self.added.len())
             .strict_add(self.deleted.len());
-        if entry_count == 0 {
-            self.worksheet
-                .truncate_rows_after(CHANGELOG_STYLE_TEMPLATE_ROW);
-            return Ok(CHANGELOG_DATA_START_ROW);
+        if count == 0 {
+            self.worksheet.truncate_rows_after(TPL_ROW);
+            return Ok(START_ROW);
         }
         let rows = self
             .changes
             .iter()
-            .map(|change| {
+            .map(|ch| {
                 (
-                    change.record.region,
-                    change.record.name.as_str(),
-                    change.record.address.as_str(),
-                    change.reason.as_str(),
-                    change.old_fuels,
-                    change.record.fuels,
+                    ch.record.region,
+                    ch.record.name.as_str(),
+                    ch.record.address.as_str(),
+                    ch.reason.as_str(),
+                    ch.old_fuels,
+                    ch.record.fuels,
                 )
             })
-            .chain(self.added.iter().map(|item| {
+            .chain(self.added.iter().map(|it| {
                 (
-                    item.region,
-                    item.name.as_str(),
-                    item.address.as_str(),
+                    it.region,
+                    it.name.as_str(),
+                    it.address.as_str(),
                     "신규",
                     FuelValues::default(),
-                    item.fuels,
+                    it.fuels,
                 )
             }))
-            .chain(self.deleted.iter().map(|item| {
+            .chain(self.deleted.iter().map(|it| {
                 (
-                    item.region.as_str(),
-                    item.name.as_str(),
-                    item.address.as_str(),
+                    it.region.as_str(),
+                    it.name.as_str(),
+                    it.address.as_str(),
                     "폐업",
-                    item.fuels,
+                    it.fuels,
                     FuelValues::default(),
                 )
             }));
-        let mut formula_buffer =
-            try_string_with_capacity(64, "변경내역 delta formula 메모리 확보 실패")?;
-        let (mut row_buffer, mut cache_buffer) = (NumBuffer::new(), NumBuffer::new());
-        for (index, (region, name, address, reason, old_fuels, new_fuels)) in rows.enumerate() {
-            let row = add_row_offset(CHANGELOG_DATA_START_ROW, index, "변경내역 데이터 쓰기")?;
-            if row > CHANGELOG_STYLE_TEMPLATE_ROW {
-                self.worksheet.copy_row_style(
-                    CHANGELOG_STYLE_TEMPLATE_ROW,
-                    row,
-                    CHANGELOG_COL_DELTA_DIESEL,
-                )?;
+        let mut formula_buf = str_cap(64, "변경내역 delta formula")?;
+        let (mut row_buf, mut cache_buf) = (NumBuffer::new(), NumBuffer::new());
+        for (idx, (reg, name, addr, reason, old_f, new_f)) in rows.enumerate() {
+            let row = add_row_offset(START_ROW, idx, "변경내역 쓰기")?;
+            if row > TPL_ROW {
+                self.worksheet.copy_row_style(TPL_ROW, row, LAST_COL)?;
             }
-            self.worksheet.set_existing_cell_style_in_range(
-                row,
-                5,
-                CHANGELOG_COL_DELTA_DIESEL,
-                26,
-            )?;
-            for (col, value) in [(1, region), (2, name), (3, address), (4, reason)] {
+            self.worksheet
+                .set_existing_cell_style_in_range(row, 5, LAST_COL, 26)?;
+            for (col, val) in [(1, reg), (2, name), (3, addr), (4, reason)] {
                 self.shared_string_table
-                    .set_cell(self.worksheet, col, row, value)?;
+                    .set_cell(self.worksheet, col, row, val)?;
             }
-            let row_text = row.format_into(&mut row_buffer);
-            let is_shared_follower = is_shared_formula_follower(index, entry_count);
-            for (&(old_col_num, new_col_num, target_col, old_col, new_col), (old_val, new_val)) in
-                FUEL_COLUMNS.iter().zip(
-                    old_fuels
-                        .into_array()
-                        .into_iter()
-                        .zip(new_fuels.into_array()),
-                )
+            let rt = row.format_into(&mut row_buf);
+            let follower = is_shared_formula_follower(idx, count);
+            for (&(oc, nc, tc, o_col, n_col), (ov, nv)) in FUEL_COLS
+                .iter()
+                .zip(old_f.into_array().into_iter().zip(new_f.into_array()))
             {
-                self.worksheet.set_i32_at(old_col_num, row, old_val)?;
-                self.worksheet.set_i32_at(new_col_num, row, new_val)?;
-                let cached = old_val
-                    .zip(new_val)
-                    .map(|(old, new)| new.strict_sub(old).format_into(&mut cache_buffer));
-                let formula = (!is_shared_follower).then(|| {
-                    formula_buffer.clear();
+                self.worksheet.set_i32_at(oc, row, ov)?;
+                self.worksheet.set_i32_at(nc, row, nv)?;
+                let cached = ov
+                    .zip(nv)
+                    .map(|(old, new)| new.strict_sub(old).format_into(&mut cache_buf));
+                let formula = (!follower).then(|| {
+                    formula_buf.clear();
                     append_fmt(
-                        &mut formula_buffer,
+                        &mut formula_buf,
                         format_args!(
-                            "IF(OR({old_col}{row_text}=\"\",{new_col}{row_text}=\"\"),\"\",{new_col}{row_text}-{old_col}{row_text})"
+                            "IF(OR({o_col}{rt}=\"\",{n_col}{rt}=\"\"),\"\",{n_col}{rt}-{o_col}{rt})"
                         ),
                     );
-                    formula_buffer.as_str()
+                    formula_buf.as_str()
                 });
                 self.worksheet
-                    .set_formula_at_with_cache(target_col, row, formula, cached, false)?;
+                    .set_formula_at_with_cache(tc, row, formula, cached, false)?;
             }
         }
-        let last_change_row = add_row_offset(
-            CHANGELOG_DATA_START_ROW,
-            entry_count.strict_sub(1),
-            "변경내역 마지막 행 계산",
-        )?;
-        self.worksheet
-            .truncate_rows_after(last_change_row.max(CHANGELOG_STYLE_TEMPLATE_ROW));
-        Ok(last_change_row)
+        let last_change = add_row_offset(START_ROW, count.strict_sub(1), "변경내역 마지막 행")?;
+        self.worksheet.truncate_rows_after(last_change.max(TPL_ROW));
+        Ok(last_change)
     }
 }

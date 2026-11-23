@@ -7,20 +7,14 @@ use core::{
 };
 use std::{io::Error as IoError, path::Path, process};
 macro_rules! fmt_err {
-    ($($arg:tt)*) => {
-        $crate::diagnostic::err_fmt(::core::format_args!($($arg)*))
-    };
+    ($($arg:tt)*) => { $crate::diagnostic::err_fmt(::core::format_args!($($arg)*)) };
 }
 macro_rules! bail_fmt {
-    ($($arg:tt)*) => {
-        return ::core::result::Result::Err($crate::diagnostic::err_fmt(::core::format_args!($($arg)*)))
-    };
+    ($($arg:tt)*) => { return ::core::result::Result::Err($crate::diagnostic::err_fmt(::core::format_args!($($arg)*))) };
 }
 macro_rules! ensure_fmt {
     ($cond:expr, $($arg:tt)*) => {
-        if !($cond) {
-            return ::core::result::Result::Err($crate::diagnostic::err_fmt(::core::format_args!($($arg)*)));
-        }
+        if !($cond) { return ::core::result::Result::Err($crate::diagnostic::err_fmt(::core::format_args!($($arg)*))); }
     };
 }
 macro_rules! bail {
@@ -29,9 +23,7 @@ macro_rules! bail {
     };
 }
 macro_rules! fmt_src {
-    ($src:expr, $($arg:tt)*) => {
-        $crate::diagnostic::err_fmt_with_source(::core::format_args!($($arg)*), ($src).into())
-    };
+    ($src:expr, $($arg:tt)*) => { $crate::diagnostic::err_fmt_with_source(::core::format_args!($($arg)*), ($src).into()) };
 }
 pub(crate) use {bail, bail_fmt, ensure_fmt, fmt_err, fmt_src};
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -78,7 +70,7 @@ impl Error for AppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.source
             .as_deref()
-            .map(|source| -> &(dyn Error + 'static) { source })
+            .map(|src| -> &(dyn Error + 'static) { src })
     }
 }
 impl From<String> for AppError {
@@ -93,14 +85,14 @@ impl From<&'static str> for AppError {
 }
 impl From<IoError> for AppError {
     fn from(value: IoError) -> Self {
-        err_with_source("I/O 오류", value)
+        err_src("I/O 오류", value)
     }
 }
 pub(super) fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
-    let offset_u32 = usize_to_u32(offset, context)?;
-    base_row.checked_add(offset_u32).ok_or_else(|| {
-        fmt_err!("{context} 계산 중 overflow가 발생했습니다. ({base_row} + {offset_u32})")
-    })
+    let off = usize_to_u32(offset, context)?;
+    base_row
+        .checked_add(off)
+        .ok_or_else(|| fmt_err!("{context} 계산 중 overflow가 발생했습니다. ({base_row} + {off})"))
 }
 pub(super) fn append_fmt(target: &mut String, args: fmt::Arguments<'_>) {
     assert!(
@@ -132,17 +124,11 @@ pub(super) fn err_fmt_with_source(args: fmt::Arguments<'_>, source: BoxError) ->
     append_fmt(&mut message, args);
     AppError::context_boxed(Cow::Owned(message), source)
 }
-pub(super) fn err_with_source(
+pub(super) fn err_src(
     context: impl Into<Cow<'static, str>>,
     source: impl Into<BoxError>,
 ) -> AppError {
     AppError::context_boxed(context.into(), source.into())
-}
-pub(super) fn map_reserve(
-    result: CoreResult<(), TryReserveError>,
-    context: &'static str,
-) -> Result<()> {
-    result.map_err(|source| err_with_source(context, source))
 }
 #[inline]
 pub(super) fn or_abort<T>(value: Option<T>) -> T {
@@ -164,12 +150,31 @@ pub(super) fn parse_unsigned_u32(
         }
     })
 }
-pub(super) fn path_err_with_source(
-    label: &str,
-    path: &Path,
-    source: impl Into<BoxError>,
-) -> AppError {
+pub(super) fn path_err(label: &str, path: &Path, source: impl Into<BoxError>) -> AppError {
     err_fmt_with_source(format_args!("{label}: {}", path.display()), source.into())
+}
+pub(super) fn push_vec<T>(
+    vec: &mut Vec<T>,
+    value: T,
+    growth: usize,
+    context: &'static str,
+) -> Result<()> {
+    if vec.len() == vec.capacity() {
+        reserve(vec.try_reserve(growth), context)?;
+    }
+    vec.push(value);
+    Ok(())
+}
+pub(super) fn reserve(
+    result: CoreResult<(), TryReserveError>,
+    context: &'static str,
+) -> Result<()> {
+    result.map_err(|source| err_src(context, source))
+}
+pub(super) fn str_cap(capacity: usize, context: &'static str) -> Result<String> {
+    let mut value = String::new();
+    reserve(value.try_reserve_exact(capacity), context)?;
+    Ok(value)
 }
 pub(super) const fn terminal_safe<T>(value: &T) -> impl Display + '_
 where
@@ -177,53 +182,29 @@ where
 {
     fmt::from_fn(move |formatter| write!(&mut ControlEscapingWriter(formatter), "{value}"))
 }
-pub(super) fn try_push_vec<T>(
-    vec: &mut Vec<T>,
-    value: T,
-    growth: usize,
-    context: &'static str,
-) -> Result<()> {
-    if vec.len() == vec.capacity() {
-        map_reserve(vec.try_reserve(growth), context)?;
-    }
-    vec.push(value);
-    Ok(())
-}
-pub(super) fn try_string_with_capacity(capacity: usize, context: &'static str) -> Result<String> {
-    let mut value = String::new();
-    map_reserve(value.try_reserve_exact(capacity), context)?;
-    Ok(value)
-}
-pub(super) fn try_vec_with_capacity<T>(capacity: usize, context: &'static str) -> Result<Vec<T>> {
-    let mut value = Vec::new();
-    map_reserve(value.try_reserve_exact(capacity), context)?;
-    Ok(value)
-}
 pub(super) fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
     u32::try_from(value)
         .map_err(|source| fmt_src!(source, "{context} 값이 너무 큽니다. (value={value})"))
 }
+pub(super) fn vec_cap<T>(capacity: usize, context: &'static str) -> Result<Vec<T>> {
+    let mut value = Vec::new();
+    reserve(value.try_reserve_exact(capacity), context)?;
+    Ok(value)
+}
 fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     let (mut remaining, mut consumed) = (text, 0_usize);
-    for (index, character) in text.char_indices() {
-        if character.is_control()
-            || matches!(
-                character,
-                '\u{061c}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            )
+    for (index, ch) in text.char_indices() {
+        if ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         {
-            let (plain, escaped_tail) = remaining.split_at(index.strict_sub(consumed));
+            let (plain, tail) = remaining.split_at(index.strict_sub(consumed));
             if !plain.is_empty() {
                 formatter.write_str(plain)?;
             }
-            write!(formatter, "{}", character.escape_debug())?;
-            let char_len = character.len_utf8();
-            remaining = escaped_tail.split_at(char_len).1;
-            consumed = index.strict_add(char_len);
+            write!(formatter, "{}", ch.escape_debug())?;
+            let len = ch.len_utf8();
+            remaining = tail.split_at(len).1;
+            consumed = index.strict_add(len);
         }
     }
     if remaining.is_empty() {

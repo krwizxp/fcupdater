@@ -1,5 +1,5 @@
 extern crate alloc;
-use diagnostic::{Result, bail_fmt, ensure_fmt, err, err_with_source};
+use diagnostic::{Result, bail_fmt, ensure_fmt, err, err_src};
 use excel::SaveVerification;
 use std::{
     env,
@@ -41,56 +41,53 @@ fn main() -> Result<()> {
     let save_verification = match raw_args.next() {
         None => SaveVerification::Skip,
         Some(token) => {
-            let (is_help, is_version) = (token == "-h" || token == "--help", token == "--version");
+            let (is_help, is_ver) = (token == "-h" || token == "--help", token == "--version");
             ensure_fmt!(
-                is_help || token == "--verify" || is_version,
+                is_help || token == "--verify" || is_ver,
                 "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
                 token.display()
             );
             if let Some(extra) = raw_args.next() {
-                let context = if is_version {
+                let ctx = if is_ver {
                     "알 수 없는 --version 옵션"
                 } else {
                     "알 수 없는 옵션"
                 };
-                bail_fmt!("{context}: {}\n\n{HELP_TEXT}", extra.display());
+                bail_fmt!("{ctx}: {}\n\n{HELP_TEXT}", extra.display());
             }
             if is_help {
                 return writeln!(&mut out, "{HELP_TEXT}").map_err(Into::into);
             }
-            if is_version {
+            if is_ver {
                 return writeln!(&mut out, "{APP_NAME} {APP_VERSION}").map_err(Into::into);
             }
             SaveVerification::Verify
         }
     };
-    let mut lock_options = File::options();
-    lock_options
+    let mut lock_opts = File::options();
+    lock_opts
         .read(true)
         .write(true)
         .create(true)
         .truncate(false);
-    configure_no_follow(&mut lock_options);
+    configure_no_follow(&mut lock_opts);
     cfg_select! {
-        target_os = "windows" => { lock_options.share_mode(0x0000_0003); }
-        any(target_os = "linux", target_os = "macos") => { lock_options.mode(0o600); }
+        target_os = "windows" => { lock_opts.share_mode(0x0000_0003); }
+        any(target_os = "linux", target_os = "macos") => { lock_opts.mode(0o600); }
     }
-    let run_lock = lock_options
+    let run_lock = lock_opts
         .open(Path::new(".fcupdater.lock"))
-        .map_err(|source| err_with_source("실행 잠금 파일 열기 실패", source))?;
-    let lock_validation = validate_regular_file(&run_lock)
-        .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
+        .map_err(|src| err_src("실행 잠금 파일 열기 실패", src))?;
+    let lock_val =
+        validate_regular_file(&run_lock).map_err(|src| err_src("실행 잠금 파일 검증 실패", src))?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    (lock_validation.0.mode() & 0o022 == 0)
-        .ok_or("실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.")?;
+    (lock_val.0.mode() & 0o022 == 0).ok_or("실행 잠금 파일 group/other 쓰기 권한 불가")?;
     #[cfg(target_os = "windows")]
-    let (_, _) = lock_validation;
+    let (_, _) = lock_val;
     match run_lock.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Err(err("다른 fcupdater 실행이 진행 중입니다.")),
-        Err(TryLockError::Error(source)) => {
-            return Err(err_with_source("실행 잠금 획득 실패", source));
-        }
+        Err(TryLockError::Error(src)) => return Err(err_src("실행 잠금 획득 실패", src)),
     }
     UpdateRun {
         master_path: Path::new("fuel_cost_chungcheong.xlsx"),

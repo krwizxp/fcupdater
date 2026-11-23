@@ -12,10 +12,7 @@ cfg_select! {
             fs::{MetadataExt as _, OpenOptionsExt as _},
             io::AsRawHandle as _,
         };
-        const _: () = assert!(
-            size_of::<ByHandleFileInformation>() == 52,
-            "Windows BY_HANDLE_FILE_INFORMATION size mismatch"
-        );
+        const _: () = assert!(size_of::<ByHandleFileInformation>() == 52, "BY_HANDLE_FILE_INFORMATION size");
         #[repr(C)]
         #[derive(Default)]
         struct ByHandleFileInformation {
@@ -35,10 +32,7 @@ cfg_select! {
         }
         unsafe extern "system" {
             #[link_name = "GetFileInformationByHandle"]
-            fn get_file_information_by_handle(
-                file: *mut c_void,
-                information: *mut ByHandleFileInformation,
-            ) -> i32;
+            fn get_file_information_by_handle(file: *mut c_void, info: *mut ByHandleFileInformation) -> i32;
         }
     }
     any(target_os = "linux", target_os = "macos") => {
@@ -62,7 +56,7 @@ pub(crate) fn configure_no_follow(options: &mut OpenOptions) {
         target_os = "windows" => { options.custom_flags(0x0020_0000); }
         target_os = "linux" => { options.custom_flags(0x0002_0000); }
         target_os = "macos" => { options.custom_flags(0x0000_0100); }
-        _ => compile_error!("Secure file opening supports only Windows, Linux, and macOS."),
+        _ => compile_error!("unsupported OS"),
     }
 }
 #[cfg(target_os = "windows")]
@@ -70,43 +64,39 @@ pub(crate) fn configure_replaceable_file(options: &mut OpenOptions) {
     options.share_mode(0x0000_0007);
 }
 pub(crate) fn open_regular(path: &Path, writable: bool) -> io::Result<ValidatedFile> {
-    let mut options = File::options();
-    options.read(true);
+    let mut opts = File::options();
+    opts.read(true);
     if writable {
-        options.write(true);
+        opts.write(true);
         #[cfg(target_os = "windows")]
-        configure_replaceable_file(&mut options);
+        configure_replaceable_file(&mut opts);
     }
-    configure_no_follow(&mut options);
-    validate_open_file(options.open(path)?)
+    configure_no_follow(&mut opts);
+    validate_open_file(opts.open(path)?)
 }
 pub(crate) fn validate_open_file(file: File) -> io::Result<ValidatedFile> {
-    let validation = validate_regular_file(&file)?;
+    let val = validate_regular_file(&file)?;
     Ok(ValidatedFile {
         file,
-        identity: validation.1,
+        identity: val.1,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        permissions: validation.0.permissions(),
+        permissions: val.0.permissions(),
     })
 }
 pub(crate) fn validate_regular_file(file: &File) -> io::Result<(Metadata, FileIdentity)> {
-    let metadata = file.metadata()?;
+    let meta = file.metadata()?;
     let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
     #[cfg(target_os = "windows")]
-    if metadata.file_attributes() & 0x0000_0400 != 0 {
+    if meta.file_attributes() & 0x0000_0400 != 0 {
         return Err(invalid("리파스 포인트는 허용되지 않습니다."));
     }
-    metadata
-        .is_file()
+    meta.is_file()
         .ok_or_else(|| invalid("경로는 일반 파일이어야 합니다."))?;
-    let (link_count, identity) = cfg_select! {
+    let (links, identity) = cfg_select! {
         target_os = "windows" => {{
             let mut info = ByHandleFileInformation::default();
             // SAFETY: info is a writable BY_HANDLE_FILE_INFORMATION buffer and file is open.
-            let status = unsafe {
-                get_file_information_by_handle(file.as_raw_handle(), &raw mut info)
-            };
-            if status == 0_i32 {
+            if unsafe { get_file_information_by_handle(file.as_raw_handle(), &raw mut info) } == 0_i32 {
                 return Err(io::Error::last_os_error());
             }
             (u64::from(info.number_of_links), FileIdentity {
@@ -115,13 +105,10 @@ pub(crate) fn validate_regular_file(file: &File) -> io::Result<(Metadata, FileId
             })
         }}
         any(target_os = "linux", target_os = "macos") => {
-            (metadata.nlink(), FileIdentity {
-                index: metadata.ino(),
-                volume: metadata.dev(),
-            })
+            (meta.nlink(), FileIdentity { index: meta.ino(), volume: meta.dev() })
         }
-        _ => compile_error!("File identity supports only Windows, Linux, and macOS.")
+        _ => compile_error!("unsupported OS")
     };
-    (link_count == 1).ok_or_else(|| invalid("파일의 하드 링크 수는 1이어야 합니다."))?;
-    Ok((metadata, identity))
+    (links == 1).ok_or_else(|| invalid("파일의 하드 링크 수는 1이어야 합니다."))?;
+    Ok((meta, identity))
 }

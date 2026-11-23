@@ -1,8 +1,7 @@
 use crate::{
     change_log::ChangeLogUpdater,
     diagnostic::{
-        Result, bail_fmt, ensure, ensure_fmt, err_with_source, fmt_err, map_reserve,
-        path_err_with_source, terminal_safe,
+        Result, bail_fmt, ensure, ensure_fmt, err_src, fmt_err, path_err, reserve, terminal_safe,
     },
     excel::{
         SaveVerification, SourceReader, SourceRecord, writer::Workbook as StdWorkbook,
@@ -51,10 +50,7 @@ impl UpdateRun<'_> {
                 let mut key = String::new();
                 normalize_address_key_into(record.address, &mut key)?;
                 if loaded.index.len() == loaded.index.capacity() {
-                    map_reserve(
-                        loaded.index.try_reserve(256),
-                        "소스 index 맵 추가 메모리 확보 실패",
-                    )?;
+                    reserve(loaded.index.try_reserve(256), "소스 index 맵")?;
                 }
                 match loaded.index.entry(key) {
                     Entry::Vacant(entry) => {
@@ -62,11 +58,11 @@ impl UpdateRun<'_> {
                         increment_target_region_count(&mut loaded.region_counts, region);
                     }
                     Entry::Occupied(entry) => {
-                        let existing = entry.get();
+                        let ex = entry.get();
                         bail_fmt!(
                             "Opinet 소스 주소 중복: address={}, existing={}, incoming={}",
-                            existing.address,
-                            existing.name,
+                            ex.address,
+                            ex.name,
                             record.name
                         );
                     }
@@ -82,110 +78,102 @@ impl UpdateRun<'_> {
         for (region, &count) in TARGET_REGIONS.iter().zip(&loaded.region_counts) {
             ensure_fmt!(
                 count != 0,
-                "Opinet 소스에서 대상 지역 레코드를 찾지 못했습니다: {}",
+                "Opinet 대상 지역 레코드 없음: {}",
                 region.label()
             );
         }
         let required = total.div_ceil(2);
-        let (brand_count, diesel_count, gasoline_count, has_premium) = loaded.index.values().fold(
+        let (brands, diesels, gasolines, has_prem) = loaded.index.values().fold(
             (0_usize, 0_usize, 0_usize, false),
-            |(brands, diesels, gasolines, premium), record| {
+            |(br, ds, gs, pr), rec| {
                 (
-                    brands.strict_add(usize::from(!record.brand.is_empty())),
-                    diesels.strict_add(usize::from(record.fuels.diesel.is_some())),
-                    gasolines.strict_add(usize::from(record.fuels.gasoline.is_some())),
-                    premium || record.fuels.premium.is_some(),
+                    br.strict_add(usize::from(!rec.brand.is_empty())),
+                    ds.strict_add(usize::from(rec.fuels.diesel.is_some())),
+                    gs.strict_add(usize::from(rec.fuels.gasoline.is_some())),
+                    pr || rec.fuels.premium.is_some(),
                 )
             },
         );
-        for (populated, label) in [
-            (brand_count, "상표"),
-            (diesel_count, "경유 가격"),
-            (gasoline_count, "휘발유 가격"),
+        for (pop, label) in [
+            (brands, "상표"),
+            (diesels, "경유 가격"),
+            (gasolines, "휘발유 가격"),
         ] {
             ensure_fmt!(
-                populated >= required,
-                "Opinet 소스의 대상 지역 {label} 값이 비정상적으로 부족합니다: {populated}건 / {total}건"
+                pop >= required,
+                "Opinet 대상 지역 {label} 값 부족: {pop}건 / {total}건"
             );
         }
-        ensure(
-            has_premium,
-            "Opinet 소스의 대상 지역에서 유효한 고급휘발유 가격을 찾지 못했습니다.",
-        )?;
+        ensure(has_prem, "Opinet 대상 지역 유효 고급휘발유 가격 없음")?;
         Ok(loaded)
     }
     fn open_updated_workbook<'source>(
         &mut self,
-        loaded_source: &'source LoadedSource,
+        loaded: &'source LoadedSource,
     ) -> Result<(StdWorkbook, MasterSheetUpdateResult<'source>)> {
         writeln!(self.out, "마스터 파일 처리 중...")?;
-        let master_file = open_regular(self.master_path, false).map_err(|source| {
-            path_err_with_source("마스터 xlsx 파일 열기 실패", self.master_path, source)
-        })?;
+        let master_file = open_regular(self.master_path, false)
+            .map_err(|src| path_err("마스터 xlsx 열기 실패", self.master_path, src))?;
         let mut book = StdWorkbook::from_container(XlsxContainer::from_validated_file(
             master_file,
             self.master_path,
         )?)?;
-        let master_update = MasterSheetUpdater {
-            source_index: &loaded_source.index,
+        let update = MasterSheetUpdater {
+            source_index: &loaded.index,
         }
         .update(&mut book)?;
         writeln!(self.out, "대상 지역별 건수 확인:")?;
-        let mut region_validation_error = None;
-        for (((region, &existing), &matched), &source_count) in TARGET_REGIONS
+        let mut reg_err = None;
+        for (((region, &existing), &matched), &src_cnt) in TARGET_REGIONS
             .iter()
-            .zip(&master_update.existing_region_counts)
-            .zip(&master_update.matched_existing_region_counts)
-            .zip(&loaded_source.region_counts)
+            .zip(&update.existing_region_counts)
+            .zip(&update.matched_existing_region_counts)
+            .zip(&loaded.region_counts)
         {
             let label = region.label();
             writeln!(
                 self.out,
-                "  {label}: 기존 {existing}건 / 기존 주소 일치 {matched}건 / 소스 {source_count}건"
+                "  {label}: 기존 {existing}건 / 기존 주소 일치 {matched}건 / 소스 {src_cnt}건"
             )?;
-            if region_validation_error.is_none() && existing != 0 && matched < existing.div_ceil(2)
-            {
-                region_validation_error = Some(fmt_err!(
-                    "대상 지역의 기존 주소 일치 건수가 비정상적으로 적어 저장을 중단합니다: {label} 기존 {existing}건 / 기존 주소 일치 {matched}건 / 소스 {source_count}건"
+            if reg_err.is_none() && existing != 0 && matched < existing.div_ceil(2) {
+                reg_err = Some(fmt_err!(
+                    "대상 지역 기존 주소 일치 부족으로 저장 중단: {label} 기존 {existing}건 / 일치 {matched}건 / 소스 {src_cnt}건"
                 ));
             }
         }
-        if let Some(error) = region_validation_error {
+        if let Some(error) = reg_err {
             return Err(error);
         }
-        ensure(
-            master_update.existing_count != 0,
-            "현행화 대상 레코드를 찾지 못했습니다.",
-        )?;
+        ensure(update.existing_count != 0, "현행화 대상 레코드 없음")?;
         ensure_fmt!(
-            master_update.deleted.len() < master_update.existing_count.div_ceil(2),
-            "폐업 처리 건수가 비정상적으로 많아 저장을 중단합니다: {}건 / {}건",
-            master_update.deleted.len(),
-            master_update.existing_count
+            update.deleted.len() < update.existing_count.div_ceil(2),
+            "폐업 처리 건수 과다로 저장 중단: {}건 / {}건",
+            update.deleted.len(),
+            update.existing_count
         );
-        Ok((book, master_update))
+        Ok((book, update))
     }
     fn print_summary_rows<'row>(
         &mut self,
         title: &str,
         rows: &mut dyn ExactSizeIterator<Item = (&'row str, &'row str, &'row str)>,
     ) -> Result<()> {
-        let row_count = rows.len();
-        if row_count == 0 {
+        let count = rows.len();
+        if count == 0 {
             return Ok(());
         }
         writeln!(self.out, "\n{title}")?;
-        for (display_index, (region, name, address)) in (1_usize..=20).zip(rows) {
+        for (idx, (reg, name, addr)) in (1_usize..=20).zip(rows) {
             writeln!(
                 self.out,
-                "  {display_index}. {} / {} / {}",
-                terminal_safe(region),
+                "  {idx}. {} / {} / {}",
+                terminal_safe(reg),
                 terminal_safe(name),
-                terminal_safe(address)
+                terminal_safe(addr)
             )?;
         }
-        if row_count > 20 {
-            writeln!(self.out, "  ... ({row_count}개 중 20개만 표시)")?;
+        if count > 20 {
+            writeln!(self.out, "  ... ({count}개 중 20개만 표시)")?;
         }
         Ok(())
     }
@@ -195,13 +183,13 @@ impl UpdateRun<'_> {
         added: &[&'source SourceRecord],
         deleted: &[StoreRow],
     ) -> Result<()> {
-        let verification_state = match self.save_verification {
+        let verify = match self.save_verification {
             SaveVerification::Verify => "사용",
             SaveVerification::Skip => "생략",
         };
         writeln!(
             self.out,
-            "\n==== 현행화 요약 ====\n- 파일: {}\n- 소스: Opinet 자동 다운로드\n- 기존 업체 변경: {}건\n- 신규 업체 추가: {}건\n- 폐업 업체 삭제: {}건\n- 저장 검증: {verification_state}",
+            "\n==== 현행화 요약 ====\n- 파일: {}\n- 소스: Opinet 자동 다운로드\n- 기존 업체 변경: {}건\n- 신규 업체 추가: {}건\n- 폐업 업체 삭제: {}건\n- 저장 검증: {verify}",
             self.master_path.display(),
             changes.len(),
             added.len(),
@@ -211,28 +199,24 @@ impl UpdateRun<'_> {
             "신규 업체 추가 목록 (상위 20개)",
             &mut added
                 .iter()
-                .map(|item| (item.region, item.name.as_str(), item.address.as_str())),
+                .map(|it| (it.region, it.name.as_str(), it.address.as_str())),
         )?;
         self.print_summary_rows(
             "폐업 업체 삭제 목록 (상위 20개)",
-            &mut deleted.iter().map(|item| {
-                (
-                    item.region.as_str(),
-                    item.name.as_str(),
-                    item.address.as_str(),
-                )
-            }),
+            &mut deleted
+                .iter()
+                .map(|it| (it.region.as_str(), it.name.as_str(), it.address.as_str())),
         )?;
         writeln!(self.out, "=====================\n").map_err(Into::into)
     }
     pub(super) fn run(&mut self) -> Result<()> {
-        let loaded_source = self.load_source()?;
-        let (mut book, master_update) = self.open_updated_workbook(&loaded_source)?;
+        let loaded = self.load_source()?;
+        let (mut book, update) = self.open_updated_workbook(&loaded)?;
         let kst = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|source| err_with_source("현재 시간 조회 실패", source))?
+            .map_err(|src| err_src("현재 시간 조회 실패", src))?
             .checked_add(Duration::from_hours(9))
-            .ok_or("KST 날짜 초 계산 중 범위 오류가 발생했습니다.")?;
+            .ok_or("KST 날짜 계산 오류")?;
         let shifted = kst.as_secs().div_euclid(86_400).strict_add(719_468);
         let (era, doe) = (shifted.div_euclid(146_097), shifted.rem_euclid(146_097));
         let yoe = doe
@@ -256,10 +240,10 @@ impl UpdateRun<'_> {
             .strict_add(mp.div_euclid(10));
         let today = format!("{year:04}-{month:02}-{day:02}");
         let (worksheet, shared_string_table) = book.change_log_sheet_mut();
-        let change_log_last_row = ChangeLogUpdater {
-            added: &master_update.added,
-            changes: &master_update.changes,
-            deleted: &master_update.deleted,
+        let cl_last = ChangeLogUpdater {
+            added: &update.added,
+            changes: &update.changes,
+            deleted: &update.deleted,
             shared_string_table,
             today: &today,
             worksheet,
@@ -269,19 +253,10 @@ impl UpdateRun<'_> {
         book.save(
             self.master_path,
             self.save_verification,
-            master_update.last_data_row,
-            change_log_last_row,
+            update.last_data_row,
+            cl_last,
         )?;
-        self.print_update_summary(
-            &master_update.changes,
-            &master_update.added,
-            &master_update.deleted,
-        )
-        .map_err(|source| {
-            err_with_source(
-                "마스터 파일은 저장됐지만 실행 요약 출력에 실패했습니다.",
-                source,
-            )
-        })
+        self.print_update_summary(&update.changes, &update.added, &update.deleted)
+            .map_err(|src| err_src("마스터 파일은 저장됐지만 요약 출력 실패", src))
     }
 }
