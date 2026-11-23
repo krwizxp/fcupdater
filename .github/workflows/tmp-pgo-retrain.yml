@@ -67,7 +67,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-                  mkdir -p pgo && for spec in '45187132444:.name!="pgo-x86_64-pc-windows-msvc"' '45200782845:.name=="pgo-x86_64-pc-windows-msvc"'; do run_id="${spec%%:*}"; filter="${spec#*:}"; while IFS=$'\t' read -r name url; do out="${name#pgo-}"; out="${out%.profdata}.profdata"; gh api "$url" > tmp.bin; if unzip -t tmp.bin >/dev/null 2>&1; then unzip -p tmp.bin > "pgo/$out"; else mv -f tmp.bin "pgo/$out"; fi; rm -f tmp.bin; done < <(gh api "/repos/${{ github.repository }}/actions/runs/$run_id/artifacts" --jq ".artifacts[] | select($filter) | [.name, .archive_download_url] | @tsv"); done
+                  mkdir -p pgo && for run_id in 45187132444 45200782845; do while IFS=$'\t' read -r name url; do out="${name#pgo-}"; out="${out%.profdata}.profdata"; gh api "$url" > tmp.bin; if unzip -t tmp.bin >/dev/null 2>&1; then unzip -p tmp.bin > "pgo/$out"; else mv -f tmp.bin "pgo/$out"; fi; rm -f tmp.bin; done < <(gh api "/repos/${{ github.repository }}/actions/runs/$run_id/artifacts" --jq '.artifacts[] | [.name, .archive_download_url] | @tsv'); done
           sha256sum -c <<'EOF'
           e93ba7f8c8f74e838c8a8143701b21cbeb96c666c32452b2d3f62a666e961f1a  pgo/x86_64-unknown-linux-gnu.profdata
           ca40df3fa85cb6c30e117cb21d30574e15a0e84bab579ef5300f9d79253ce52f  pgo/x86_64-apple-darwin.profdata
