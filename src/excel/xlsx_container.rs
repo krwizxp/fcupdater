@@ -152,7 +152,7 @@ const LIBREOFFICE_CELL_XFS: [[u8; 6]; 26] = [
 ];
 const EXCEL_CANONICAL_STYLE_COUNT: u32 = 27;
 const LIBREOFFICE_UNMAPPED_STYLE_INDEX: usize = 7;
-const LIBREOFFICE_STYLE_MAP: [u32; 26] = [
+const LIBREOFFICE_STYLE_MAP: [u8; 26] = [
     0, 3, 4, 24, 2, 1, 22, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 23, 18, 19, 20, 21,
 ];
 const EXCEL_CORE_PROPERTIES: [(&str, &str); 9] = [
@@ -519,7 +519,7 @@ impl XlsxContainer {
                 }
                 "connections" => (2, "workbook.xml의 외부 데이터 연결은 지원하지 않습니다."),
                 "workbookProtection" => {
-                    let mut attributes = XmlAttrScanner::new(tag.raw)?;
+                    let mut attributes = XmlAttrScanner::from_tag(&tag);
                     if tag.name == "workbookProtection"
                         && !empty_protection_seen
                         && attributes.next()?.is_none()
@@ -549,7 +549,7 @@ impl XlsxContainer {
                 return Err(err("workbookPr 요소가 올바르지 않습니다."));
             }
             let mut date_system = None;
-            let mut attributes = XmlAttrScanner::new(properties.opening.raw)?;
+            let mut attributes = XmlAttrScanner::from_tag(&properties.opening);
             while let Some((name, value)) = attributes.next()? {
                 if name == "date1904" && date_system.replace(value).is_some() {
                     return Err(err("workbookPr에 date1904 속성이 중복되었습니다."));
@@ -706,6 +706,7 @@ impl XlsxContainer {
                                 .filter(|&index| index != LIBREOFFICE_UNMAPPED_STYLE_INDEX)
                                 .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
                                 .copied()
+                                .map(u32::from)
                         }
                     };
                 mapping.push(canonical);
@@ -964,11 +965,14 @@ impl XlsxContainer {
                 .next_start_named("sheet")
                 .filter(|tag| tag.name == "sheet" && tag.self_closing)
                 .ok_or_else(|| err("workbook sheet 태그가 올바르지 않습니다."))?;
-            let [name, sheet_id, state, rid] = parse_attrs(
+            let mut sheet_attrs = [None, None, None, None];
+            parse_attrs_into(
                 sheet_tag.raw,
-                ["name", "sheetId", "state", "r:id"],
+                &["name", "sheetId", "state", "r:id"],
+                &mut sheet_attrs,
                 "workbook.xml sheet",
             )?;
+            let [name, sheet_id, state, rid] = sheet_attrs;
             (name.as_deref() == Some(expected_name)
                 && sheet_id.as_deref() == Some(expected_sheet_id)
                 && rid.as_deref() == Some(expected_rid)
@@ -1085,8 +1089,14 @@ impl XlsxContainer {
                         )));
                     }
                 };
-                let [key_attr, content_type_attr] =
-                    parse_attrs(raw, [key_name, "ContentType"], "[Content_Types].xml entry")?;
+                let mut entry_attrs = [None, None];
+                parse_attrs_into(
+                    raw,
+                    &[key_name, "ContentType"],
+                    &mut entry_attrs,
+                    "[Content_Types].xml entry",
+                )?;
+                let [key_attr, content_type_attr] = entry_attrs;
                 let key = key_attr.ok_or_else(|| {
                     err(format!(
                         "[Content_Types].xml entry에 {key_name} 속성이 없습니다."
@@ -1262,7 +1272,7 @@ fn find_equivalent_xf(
                 continue;
             }
             source_attrs.clear();
-            let mut source_attr_scanner = XmlAttrScanner::new(source_tag.raw)?;
+            let mut source_attr_scanner = XmlAttrScanner::from_tag(&source_tag);
             while let Some((name, value)) = source_attr_scanner.next()? {
                 try_push_vec(
                     &mut source_attrs,
@@ -1273,7 +1283,7 @@ fn find_equivalent_xf(
             }
             let source_attr_count = source_attrs.len();
             let mut candidate_attr_count = 0_usize;
-            let mut candidate_attrs = XmlAttrScanner::new(candidate_tag.raw)?;
+            let mut candidate_attrs = XmlAttrScanner::from_tag(&candidate_tag);
             while let Some((name, candidate_value)) = candidate_attrs.next()? {
                 candidate_attr_count = candidate_attr_count.strict_add(1);
                 let mut source_matches = source_attrs.iter().filter(|entry| entry.0 == name);
@@ -1324,17 +1334,17 @@ fn find_equivalent_xf(
     }
     Ok(None)
 }
-fn parse_attrs<'tag, const N: usize>(
+fn parse_attrs_into<'tag>(
     tag: &'tag str,
-    names: [&str; N],
+    names: &[&str],
+    values: &mut [Option<Cow<'tag, str>>],
     context: &str,
-) -> Result<[Option<Cow<'tag, str>>; N]> {
-    let mut values = array::repeat(None);
+) -> Result<()> {
     let mut attributes = XmlAttrScanner::new(tag)?;
     while let Some((name, value)) = attributes.next()? {
         let Some((_, slot)) = names
             .iter()
-            .zip(&mut values)
+            .zip(values.iter_mut())
             .find(|&(candidate, _)| *candidate == name)
         else {
             return Err(err(format!(
@@ -1345,7 +1355,7 @@ fn parse_attrs<'tag, const N: usize>(
             return Err(err(format!("{context}에 {name} 속성이 중복되었습니다.")));
         }
     }
-    Ok(values)
+    Ok(())
 }
 fn validate_exact_attrs(tag: &str, expected: &[(&str, &str)], context: &str) -> Result<()> {
     let mut seen = 0_u32;
@@ -1393,8 +1403,9 @@ fn validate_relationship_set<'xml>(
             if local_name != "Relationship" {
                 return Err(err(format!("{context} 관계 태그가 올바르지 않습니다.")));
             }
-            let [id_attr, type_attr, target_attr] =
-                parse_attrs(raw, ["Id", "Type", "Target"], context)?;
+            let mut rel_attrs = [None, None, None];
+            parse_attrs_into(raw, &["Id", "Type", "Target"], &mut rel_attrs, context)?;
+            let [id_attr, type_attr, target_attr] = rel_attrs;
             let id = id_attr.ok_or_else(|| err(format!("{context} 관계에 Id가 없습니다.")))?;
             if id.is_empty() {
                 return Err(err(format!("{context} 관계 Id가 비어 있습니다.")));
@@ -1492,7 +1503,7 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
                     tag.name
                 )));
             }
-            let mut attributes = XmlAttrScanner::new(tag.raw)?;
+            let mut attributes = XmlAttrScanner::from_tag(&tag);
             while let Some((name, value)) = attributes.next()? {
                 if name == "xmlns" || !allow_extensions && name.starts_with("xmlns:") {
                     if tag.name == "sortState"

@@ -178,15 +178,6 @@ enum CellValueType {
     SharedString(usize),
     String,
 }
-impl CellValueType {
-    const fn xml_attr(self) -> Option<&'static str> {
-        match self {
-            Self::General => None,
-            Self::SharedString(_) => Some("s"),
-            Self::String => Some("str"),
-        }
-    }
-}
 struct XmlAttr<'text> {
     name: &'text str,
     value: Cow<'text, str>,
@@ -614,7 +605,7 @@ impl WorksheetParser<'_, '_> {
         {
             let inner_xml_text = cell.body;
             let cell_info = cell.opening;
-            let mut attr_scanner = XmlAttrScanner::new(cell_info.raw)?;
+            let mut attr_scanner = XmlAttrScanner::from_tag(&cell_info);
             let mut reference_value = None;
             let mut style_value = None;
             let mut type_value = None;
@@ -724,7 +715,7 @@ impl WorksheetParser<'_, '_> {
                             element.opening.name == "v" && !element.opening.self_closing
                         })
                         .ok_or_else(|| err("shared string cell에 v 태그가 없습니다."))?;
-                    let mut value_attrs = XmlAttrScanner::new(value.opening.raw)?;
+                    let mut value_attrs = XmlAttrScanner::from_tag(&value.opening);
                     (value_attrs.next()?.is_none())
                         .ok_or(err("shared string v 태그에 속성이 있습니다."))?;
                     (value_scanner.next_tag().is_none()
@@ -788,7 +779,7 @@ impl WorksheetParser<'_, '_> {
             let mut has_cache = false;
             while let Some(child) = formula_scanner.next_direct_element("worksheet cell")? {
                 if child.opening.raw.contains("xmlns") {
-                    let mut attributes = XmlAttrScanner::new(child.opening.raw)?;
+                    let mut attributes = XmlAttrScanner::from_tag(&child.opening);
                     while let Some((name, _)) = attributes.next()? {
                         if name == "xmlns" || name.starts_with("xmlns:") {
                             return Err(err(format!(
@@ -824,7 +815,7 @@ impl WorksheetParser<'_, '_> {
                 let mut formula_type = None;
                 let mut reference = None;
                 let mut shared_index = None;
-                let mut attr_scanner = XmlAttrScanner::new(formula.opening.raw)?;
+                let mut attr_scanner = XmlAttrScanner::from_tag(&formula.opening);
                 while let Some((name, value)) = attr_scanner.next()? {
                     let slot = match name {
                         "aca" => &mut aca,
@@ -1749,12 +1740,9 @@ impl Worksheet {
         cell.value_type = CellValueType::General;
         cell.inner_xml.clear();
         if let Some(numeric_value) = value {
-            cell.inner_xml.push_str("<v>");
-            if numeric_value.is_negative() {
-                cell.inner_xml.push('-');
-            }
-            push_decimal_text!(&mut cell.inner_xml, numeric_value.unsigned_abs());
-            cell.inner_xml.push_str("</v>");
+            let mut buffer = NumBuffer::new();
+            cell.inner_xml
+                .extend(["<v>", numeric_value.format_into(&mut buffer), "</v>"]);
         }
         Ok(())
     }
@@ -1837,8 +1825,11 @@ impl Worksheet {
         out.try_reserve(additional_capacity)
             .map_err(|source| err_with_source("worksheet XML 메모리 확보 실패", source))?;
         let mut shared_string_reference_count = 0_usize;
+        let mut row_buffer = NumBuffer::new();
+        let mut style_buffer = NumBuffer::new();
+        let mut index_buffer = NumBuffer::new();
+        let mut col_buffer = [0_u8; 3];
         for (row_num, row) in (1_u32..=MAX_A1_ROW).zip(&self.rows) {
-            let mut row_buffer = NumBuffer::new();
             let row_text = row_num.format_into(&mut row_buffer);
             out.extend(["<row r=\"", row_text, "\"", row.attrs_xml.as_str()]);
             if row.cells.is_empty() {
@@ -1846,28 +1837,29 @@ impl Worksheet {
                 continue;
             }
             out.push('>');
-            let mut col_buffer = [0_u8; 3];
             for cell in &row.cells {
-                let col = cell.col;
-                let col_text = col_name_into(col, &mut col_buffer)?;
+                let col_text = col_name_into(cell.col, &mut col_buffer)?;
                 out.extend(["<c r=\"", col_text, row_text, "\""]);
                 if let Some(style) = cell.style {
-                    out.push_str(" s=\"");
-                    push_decimal_text!(&mut out, style);
-                    out.push('"');
+                    out.extend([" s=\"", style.format_into(&mut style_buffer), "\""]);
                 }
-                if let Some(value_type) = cell.value_type.xml_attr() {
-                    out.extend([" t=\"", value_type, "\""]);
-                }
-                if let CellValueType::SharedString(index) = cell.value_type {
-                    shared_string_reference_count = shared_string_reference_count.strict_add(1);
-                    out.push_str("><v>");
-                    push_decimal_text!(&mut out, index);
-                    out.push_str("</v></c>");
-                } else if !cell.inner_xml.is_empty() {
-                    out.extend([">", cell.inner_xml.as_str(), "</c>"]);
-                } else {
-                    out.push_str("/>");
+                match cell.value_type {
+                    CellValueType::SharedString(index) => {
+                        shared_string_reference_count = shared_string_reference_count.strict_add(1);
+                        out.extend([
+                            " t=\"s\"><v>",
+                            index.format_into(&mut index_buffer),
+                            "</v></c>",
+                        ]);
+                    }
+                    CellValueType::String if !cell.inner_xml.is_empty() => {
+                        out.extend([" t=\"str\">", cell.inner_xml.as_str(), "</c>"]);
+                    }
+                    CellValueType::String => out.push_str(" t=\"str\"/>"),
+                    CellValueType::General if !cell.inner_xml.is_empty() => {
+                        out.extend([">", cell.inner_xml.as_str(), "</c>"]);
+                    }
+                    CellValueType::General => out.push_str("/>"),
                 }
             }
             out.push_str("</row>");

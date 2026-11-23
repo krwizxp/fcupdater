@@ -2,10 +2,7 @@ use super::CellReference;
 use crate::diagnostic::{Result, err};
 use std::process;
 const MAX_A1_COLUMN_LETTERS: usize = 3;
-const SINGLE_LETTER_COLUMNS: [&str; 26] = [
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
-    "T", "U", "V", "W", "X", "Y", "Z",
-];
+const SINGLE_LETTER_COLUMNS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const MAX_A1_COL: u32 = 0x4000;
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
 pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
@@ -64,7 +61,8 @@ pub(super) fn col_name_into(
     (1..=MAX_A1_COL)
         .contains(&col)
         .ok_or_else(|| err(format!("Excel column 범위를 벗어났습니다: {col}")))?;
-    if let Some(&single) = SINGLE_LETTER_COLUMNS.get((col.strict_sub(1)) as usize) {
+    let single_index = col.strict_sub(1) as usize;
+    if let Some(single) = SINGLE_LETTER_COLUMNS.get(single_index..single_index.strict_add(1)) {
         return Ok(single);
     }
     let mut index = col_buffer.len();

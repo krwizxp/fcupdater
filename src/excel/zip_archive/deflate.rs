@@ -45,13 +45,9 @@ const TOKEN_BLOCK_LIMIT: usize = 8191;
 const DEFLATE_STREAM_BUFFER_LEN: usize = 8192;
 const MATCH_CHUNK_BYTES: usize = 16;
 const XML_MAX_INSERT_MATCH_LEN: usize = 4;
-const LENGTH_SYMBOL_TABLE: [DeflateSymbol; 256] = {
-    let mut table = [DeflateSymbol {
-        extra: 0,
-        extra_bits: 0,
-        symbol: 285,
-    }; 256];
-    let mut slots: &mut [DeflateSymbol] = &mut table;
+const LENGTH_SYMBOL_TABLE: [u16; 256] = {
+    let mut table = [28_u16; 256];
+    let mut slots: &mut [u16] = &mut table;
     let mut value = 0_u16;
     while let Some((slot, tail)) = slots.split_first_mut() {
         if value < 255 {
@@ -62,11 +58,8 @@ const LENGTH_SYMBOL_TABLE: [DeflateSymbol; 256] = {
             } else {
                 extra_u16.strict_add(1).strict_mul(4) | ((value >> extra_bits) & 3)
             };
-            *slot = DeflateSymbol {
-                extra: value & 1_u16.strict_shl(extra_bits as u32).strict_sub(1),
-                extra_bits,
-                symbol: 257_u16.strict_add(code_idx),
-            };
+            let extra = value & 1_u16.strict_shl(extra_bits as u32).strict_sub(1);
+            *slot = code_idx | (extra_u16 << 5_u32) | (extra << 8_u32);
         }
         value = value.strict_add(1);
         slots = tail;
@@ -195,11 +188,11 @@ struct DeflateSymbol {
 struct HuffmanBuildState {
     depths: [u16; HUFFMAN_NODE_CAPACITY],
     frequencies: [u32; HUFFMAN_NODE_CAPACITY],
-    heap: [usize; HUFFMAN_NODE_CAPACITY],
+    heap: [u16; HUFFMAN_NODE_CAPACITY],
     heap_len: usize,
     heap_max: usize,
-    max_symbol: usize,
-    parents: [usize; HUFFMAN_NODE_CAPACITY],
+    max_symbol: u16,
+    parents: [u16; HUFFMAN_NODE_CAPACITY],
 }
 impl DecodeEntry {
     const EMPTY: Self = Self(0);
@@ -450,18 +443,19 @@ impl InflateState<'_> {
     fn decode_extra(
         &mut self,
         index: usize,
-        bases: &[usize],
+        bases: &[u16],
         extra_bits_table: &[u8],
         error_message: &'static str,
     ) -> Result<usize> {
         let Some((&base, &extra_bits)) = bases.get(index).zip(extra_bits_table.get(index)) else {
             return Err(err(error_message));
         };
+        let base_usize = usize::from(base);
         if extra_bits == 0 {
-            return Ok(base);
+            return Ok(base_usize);
         }
         let extra = usize::from(self.reader.read_bits(extra_bits)?);
-        Ok(base.strict_add(extra))
+        Ok(base_usize.strict_add(extra))
     }
     fn dynamic_trees(&mut self) -> Result<DynamicTrees> {
         let literal_count = usize::from(self.reader.read_bits(5)?).strict_add(257);
@@ -470,7 +464,7 @@ impl InflateState<'_> {
         let code_length_count = usize::from(self.reader.read_bits(4)?).strict_add(4);
         let mut code_lengths = [0_u8; 19];
         for &symbol in CODE_LENGTH_ORDER.iter().take(code_length_count) {
-            let Some(slot) = code_lengths.get_mut(symbol) else {
+            let Some(slot) = code_lengths.get_mut(usize::from(symbol)) else {
                 return Err(err("deflate code length symbol 범위 오류"));
             };
             let [length, _] = self.reader.read_bits(3)?.to_le_bytes();
@@ -790,7 +784,7 @@ impl DynamicFrequencies {
         build_huffman_lengths(&code_length_freq, 7, &mut code_lengths);
         let code_length_count = CODE_LENGTH_ORDER
             .iter()
-            .rposition(|&symbol| huffman_get(&code_lengths, symbol) != 0)
+            .rposition(|&symbol| huffman_get(&code_lengths, usize::from(symbol)) != 0)
             .map_or(4, |index| index.strict_add(1).max(4));
         let mut literal_huffman = [0_u32; LITERAL_LENGTH_SYMBOLS];
         fill_write_huffman_codes(&literal_lengths, &mut literal_huffman)?;
@@ -827,7 +821,7 @@ impl DynamicDeflatePlan {
             4,
         )?;
         for &symbol in CODE_LENGTH_ORDER.iter().take(self.code_length_count) {
-            let len = huffman_get(&self.code_huffman, symbol).to_le_bytes()[2];
+            let len = huffman_get(&self.code_huffman, usize::from(symbol)).to_le_bytes()[2];
             writer.write_bits(u16::from(len), 3)?;
         }
         for &token in &self.code_length_tokens {
@@ -866,11 +860,13 @@ impl HuffmanBuildState {
         }
         huffman_set(&mut self.heap, index, node);
     }
-    fn node_is_smaller(&self, left: usize, right: usize) -> bool {
-        let left_frequency = huffman_get(&self.frequencies, left);
-        let right_frequency = huffman_get(&self.frequencies, right);
-        let left_depth = huffman_get(&self.depths, left);
-        let right_depth = huffman_get(&self.depths, right);
+    fn node_is_smaller(&self, left: u16, right: u16) -> bool {
+        let left_index = usize::from(left);
+        let right_index = usize::from(right);
+        let left_frequency = huffman_get(&self.frequencies, left_index);
+        let right_frequency = huffman_get(&self.frequencies, right_index);
+        let left_depth = huffman_get(&self.depths, left_index);
+        let right_depth = huffman_get(&self.depths, right_index);
         left_frequency < right_frequency
             || (left_frequency == right_frequency && left_depth <= right_depth)
     }
@@ -1012,7 +1008,13 @@ impl DeflateWriter<'_, '_> {
         *head_slot = u32::try_from(position).unwrap_or(u32::MAX);
     }
     fn length_symbol(length: u16) -> DeflateSymbol {
-        huffman_get(&LENGTH_SYMBOL_TABLE, usize::from(length.strict_sub(3)))
+        let packed = huffman_get(&LENGTH_SYMBOL_TABLE, usize::from(length.strict_sub(3)));
+        let [low, extra_byte] = packed.to_le_bytes();
+        DeflateSymbol {
+            extra: u16::from(extra_byte),
+            extra_bits: low >> 5_u8,
+            symbol: 257_u16.strict_add(u16::from(low & 0x1f)),
+        }
     }
     pub(super) fn plan(&mut self) -> Result<Option<DeflatePlan>> {
         let Some((tokens, crc32)) = self.tokens()? else {
@@ -1151,12 +1153,10 @@ impl DeflateWriter<'_, '_> {
             }
             Self::insert_position(position, position_hash, head, previous);
             if best_len >= MIN_MATCH {
-                let dist_bits = u32::from(
-                    deflate_u16(best_distance, "deflate match distance 변환 실패")?.strict_sub(1),
-                ) & 0x7FFF;
-                let len_bits = u32::from(
-                    deflate_u16(best_len, "deflate match length 변환 실패")?.strict_sub(3),
-                ) & 0xFF;
+                let [dist_low, dist_high, ..] = best_distance.strict_sub(1).to_le_bytes();
+                let dist_bits = u32::from(u16::from_le_bytes([dist_low, dist_high])) & 0x7FFF;
+                let [len_low, ..] = best_len.strict_sub(3).to_le_bytes();
+                let len_bits = u32::from(len_low);
                 try_push_vec(
                     &mut tokens,
                     DeflateToken(0x8000_0000 | (len_bits << 16_u32) | dist_bits),
@@ -1211,11 +1211,11 @@ fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) 
     let mut state = HuffmanBuildState {
         depths: [0_u16; HUFFMAN_NODE_CAPACITY],
         frequencies: [0_u32; HUFFMAN_NODE_CAPACITY],
-        heap: [0_usize; HUFFMAN_NODE_CAPACITY],
+        heap: [0_u16; HUFFMAN_NODE_CAPACITY],
         heap_len: 0,
         heap_max: node_capacity,
         max_symbol: 0,
-        parents: [usize::MAX; HUFFMAN_NODE_CAPACITY],
+        parents: [u16::MAX; HUFFMAN_NODE_CAPACITY],
     };
     state
         .frequencies
@@ -1226,9 +1226,10 @@ fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) 
         if frequency == 0 {
             continue;
         }
+        let symbol_u16 = u16::try_from(symbol).unwrap_or_else(|_| process::abort());
         state.heap_len = state.heap_len.strict_add(1);
-        huffman_set(&mut state.heap, state.heap_len, symbol);
-        state.max_symbol = symbol;
+        huffman_set(&mut state.heap, state.heap_len, symbol_u16);
+        state.max_symbol = symbol_u16;
     }
     while state.heap_len < 2 {
         let symbol = if state.max_symbol < 2 {
@@ -1237,14 +1238,14 @@ fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) 
         } else {
             0
         };
-        huffman_set(&mut state.frequencies, symbol, 1);
+        huffman_set(&mut state.frequencies, usize::from(symbol), 1);
         state.heap_len = state.heap_len.strict_add(1);
         huffman_set(&mut state.heap, state.heap_len, symbol);
     }
     for index in (1..=state.heap_len.div_euclid(2)).rev() {
         state.heap_down(index);
     }
-    let mut next_node = symbol_count;
+    let mut next_node = u16::try_from(symbol_count).unwrap_or_else(|_| process::abort());
     while state.heap_len >= 2 {
         let left = huffman_get(&state.heap, 1);
         let tail = huffman_get(&state.heap, state.heap_len);
@@ -1256,15 +1257,18 @@ fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) 
         huffman_set(&mut state.heap, state.heap_max, left);
         state.heap_max = state.heap_max.strict_sub(1);
         huffman_set(&mut state.heap, state.heap_max, right);
-        let parent_frequency = huffman_get(&state.frequencies, left)
-            .strict_add(huffman_get(&state.frequencies, right));
-        huffman_set(&mut state.frequencies, next_node, parent_frequency);
-        let parent_depth = huffman_get(&state.depths, left)
-            .max(huffman_get(&state.depths, right))
+        let left_idx = usize::from(left);
+        let right_idx = usize::from(right);
+        let next_idx = usize::from(next_node);
+        let parent_frequency = huffman_get(&state.frequencies, left_idx)
+            .strict_add(huffman_get(&state.frequencies, right_idx));
+        huffman_set(&mut state.frequencies, next_idx, parent_frequency);
+        let parent_depth = huffman_get(&state.depths, left_idx)
+            .max(huffman_get(&state.depths, right_idx))
             .strict_add(1);
-        huffman_set(&mut state.depths, next_node, parent_depth);
-        huffman_set(&mut state.parents, left, next_node);
-        huffman_set(&mut state.parents, right, next_node);
+        huffman_set(&mut state.depths, next_idx, parent_depth);
+        huffman_set(&mut state.parents, left_idx, next_node);
+        huffman_set(&mut state.parents, right_idx, next_node);
         huffman_set(&mut state.heap, 1, next_node);
         next_node = next_node.strict_add(1);
         state.heap_down(1);
@@ -1281,7 +1285,8 @@ fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) 
         .get(state.heap_max.strict_add(1)..node_capacity)
         .unwrap_or_else(|| process::abort());
     for &node in ordered_nodes {
-        let parent = huffman_get(&state.parents, node);
+        let node_idx = usize::from(node);
+        let parent = usize::from(huffman_get(&state.parents, node_idx));
         let mut length = usize::from(huffman_get(&node_lengths, parent)).strict_add(1);
         if length > maximum_length {
             length = maximum_length;
@@ -1289,7 +1294,7 @@ fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) 
         }
         huffman_set(
             &mut node_lengths,
-            node,
+            node_idx,
             u8::try_from(length).unwrap_or_else(|_| process::abort()),
         );
         if node <= state.max_symbol {
@@ -1327,7 +1332,7 @@ fn build_huffman_lengths(frequencies: &[u32], max_bits: u8, lengths: &mut [u8]) 
                 ordered_index = ordered_index.strict_sub(1);
                 let candidate = huffman_get(&state.heap, ordered_index);
                 if candidate <= state.max_symbol {
-                    break candidate;
+                    break usize::from(candidate);
                 }
             };
             let assigned = u8::try_from(bits).unwrap_or_else(|_| process::abort());
@@ -1362,9 +1367,6 @@ fn canonical_next_codes(
         *next_code = code;
     }
     Ok(Some(next_codes))
-}
-fn deflate_u16(value: usize, context: &'static str) -> Result<u16> {
-    u16::try_from(value).map_err(|source| err_with_source(context, source))
 }
 fn ensure_deflate_output_len(
     current_len: usize,

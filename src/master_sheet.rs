@@ -1033,10 +1033,17 @@ fn format_scaled_value_into(text: &mut String, value: i128, scale: i128) {
     if value < 0 {
         text.push('-');
     }
+    let (whole, frac) =
+        if let (Ok(abs_u64), Ok(scale_u64)) = (u64::try_from(abs), u64::try_from(scale_abs)) {
+            (
+                u128::from(abs_u64.div_euclid(scale_u64)),
+                u128::from(abs_u64.rem_euclid(scale_u64)),
+            )
+        } else {
+            (abs.div_euclid(scale_abs), abs.rem_euclid(scale_abs))
+        };
     let mut buffer = NumBuffer::new();
-    let whole = abs.div_euclid(scale_abs);
     text.push_str(whole.format_into(&mut buffer));
-    let frac = abs.rem_euclid(scale_abs);
     if frac == 0 {
         return;
     }

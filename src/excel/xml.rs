@@ -323,6 +323,12 @@ impl<'xml> XmlScanner<'xml> {
     }
 }
 impl<'tag> XmlAttrScanner<'tag> {
+    pub(super) const fn from_tag(tag: &XmlTag<'tag>) -> Self {
+        Self {
+            cursor: tag.name.len().strict_add(1),
+            tag: tag.raw,
+        }
+    }
     pub(super) fn new(tag: &'tag str) -> Result<Self> {
         let bytes = tag.as_bytes();
         let Some(tag_start) = tag.find('<') else {

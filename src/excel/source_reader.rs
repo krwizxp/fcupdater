@@ -3,7 +3,7 @@ use crate::diagnostic::{
     Result, err, err_with_source, try_push_vec, try_string_with_capacity, try_vec_with_capacity,
 };
 use alloc::borrow::Cow;
-use core::range::Range;
+use core::{iter, range::Range};
 const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const CFB_FREE_SECT: u32 = 0xFFFF_FFFF;
 const CFB_END_OF_CHAIN: u32 = 0xFFFF_FFFE;
@@ -473,14 +473,27 @@ impl SstChunkReader<'_, '_> {
                     pending_surrogate = Some(u16::from_le_bytes(*last));
                     chunks = rest;
                 }
-                for decoded in char::decode_utf16(
-                    previous_surrogate
-                        .into_iter()
-                        .chain(chunks.iter().map(|unit| u16::from_le_bytes(*unit))),
-                ) {
-                    out.push(decoded.map_err(|source| {
-                        err_with_source("SST UTF-16 문자열 해석 실패", source)
-                    })?);
+                let mut iter = chunks.iter();
+                let mut fallback_head = previous_surrogate;
+                if fallback_head.is_none() {
+                    for &unit in iter.by_ref() {
+                        let code_unit = u16::from_le_bytes(unit);
+                        if let Some(ch) = char::from_u32(u32::from(code_unit)) {
+                            out.push(ch);
+                        } else {
+                            fallback_head = Some(code_unit);
+                            break;
+                        }
+                    }
+                }
+                if let Some(first) = fallback_head {
+                    for decoded in char::decode_utf16(
+                        iter::once(first).chain(iter.map(|unit| u16::from_le_bytes(*unit))),
+                    ) {
+                        out.push(decoded.map_err(|source| {
+                            err_with_source("SST UTF-16 문자열 해석 실패", source)
+                        })?);
+                    }
                 }
             } else {
                 pending_surrogate
