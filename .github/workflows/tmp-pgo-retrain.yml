@@ -15,13 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-26.04
-            target: x86_64-unknown-linux-gnu
-          - os: macos-26-intel
-            target: x86_64-apple-darwin
-          - os: macos-26
-            target: aarch64-apple-darwin
-          - os: windows-2025
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -85,52 +79,40 @@ jobs:
         shell: bash
         run: |
           mkdir -p pgo-raw
-          RUSTFLAGS="-Cprofile-generate=$(pwd)/pgo-raw" cargo +stable build --release --frozen --bin fcupdater --target "${{ matrix.target }}" --target-dir target-gen
-      - name: Train PGO on Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          mkdir -p work-train
-          cp fuel_cost_chungcheong.xlsx work-train/fuel_cost_chungcheong.xlsx
-          (cd work-train && "../target-gen/${{ matrix.target }}/release/fcupdater" --verify)
-      - name: Train PGO on Windows (with bounded TLS restore if needed)
-        if: runner.os == 'Windows'
+          PGO_RAW_DIR=$(cygpath -m "$(pwd)/pgo-raw")
+          RUSTFLAGS="-Cprofile-generate=${PGO_RAW_DIR}" cargo +stable build --release --frozen --bin fcupdater --target ${{ matrix.target }} --target-dir target-gen
+      - name: Train PGO on Windows
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force work-train | Out-Null
-          Copy-Item fuel_cost_chungcheong.xlsx work-train/fuel_cost_chungcheong.xlsx
-          $exe = (Resolve-Path "target-gen/${{ matrix.target }}/release/fcupdater.exe").Path
+          Copy-Item fuel_cost_chungcheong.xlsx work-train\fuel_cost_chungcheong.xlsx -Force
+          $exe = (Resolve-Path "target-gen\${{ matrix.target }}\release\fcupdater.exe").Path
           Push-Location work-train
-          $out = & $exe --verify 2>&1
-          $rc = $LASTEXITCODE
-          Pop-Location
-          if ($rc -ne 0) {
-            $suite = "TLS_RSA_WITH_AES_256_GCM_SHA384"
-            $origSuites = (Get-TlsCipherSuite).Name
-            Enable-TlsCipherSuite -Name $suite -Position $origSuites.Count
-            try {
-              Copy-Item fuel_cost_chungcheong.xlsx work-train/fuel_cost_chungcheong.xlsx -Force
-              Push-Location work-train
-              & $exe --verify
-              if ($LASTEXITCODE -ne 0) { throw "fcupdater --verify failed even with $suite" }
-              Pop-Location
-            } finally {
-              Disable-TlsCipherSuite -Name $suite
-            }
-            $restored = (Get-TlsCipherSuite).Name
-            if (($origSuites -join ',') -ne ($restored -join ',')) { throw "TLS cipher suite restoration mismatch" }
+          try {
+            & $exe
+            if ($LASTEXITCODE -ne 0) { throw "fcupdater default run failed with $LASTEXITCODE" }
+            & $exe --verify
+            if ($LASTEXITCODE -ne 0) { throw "fcupdater --verify failed with $LASTEXITCODE" }
+            & $exe --help
+            if ($LASTEXITCODE -ne 0) { throw "fcupdater --help failed with $LASTEXITCODE" }
+            & $exe --version
+            if ($LASTEXITCODE -ne 0) { throw "fcupdater --version failed with $LASTEXITCODE" }
+          } finally {
+            Pop-Location
           }
       - name: Merge profdata & verify build-pgo
         shell: bash
         run: |
+          mkdir -p pgo
           PROFDATA="$(rustc +stable --print target-libdir)/../bin/llvm-profdata"
           "$PROFDATA" merge -o "pgo/${{ matrix.target }}.profdata" pgo-raw
           cargo +stable build-pgo 2>&1 | tee pgo-build.log
-          ext=""
-          [[ "${{ runner.os }}" == "Windows" ]] && ext=".exe"
-          sz=$(wc -c < "target/${{ matrix.target }}/release/fcupdater${ext}")
+          sz=$(wc -c < "target/${{ matrix.target }}/release/fcupdater.exe")
           sha=$(sha256sum "pgo/${{ matrix.target }}.profdata" | awk '{print $1}')
           warns=$(grep -c "hash mismatch" pgo-build.log || true)
+          echo "profdata sha256: ${sha}"
+          echo "PGO release binary size: ${sz} B"
+          echo "PGO hash-mismatch warnings: ${warns}"
           echo "### PGO ${{ matrix.os }} (${{ matrix.target }})" >> "$GITHUB_STEP_SUMMARY"
           echo "- profdata sha256: \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- PGO release binary: ${sz} B, hash-mismatch warnings: ${warns}" >> "$GITHUB_STEP_SUMMARY"
@@ -141,4 +123,40 @@ jobs:
           path: pgo/${{ matrix.target }}.profdata
           archive: false
           if-no-files-found: error
-          retention-days: 14
+  verify:
+    name: Verify PGO (windows-latest / x86_64-pc-windows-msvc)
+    needs: retrain
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustc +stable -Vv
+      - name: Download PGO profdata artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pgo-x86_64-pc-windows-msvc
+          path: pgo
+      - name: Build with PGO and report warnings & binary size
+        shell: bash
+        run: |
+          ls -la pgo
+          sha=$(sha256sum "pgo/x86_64-pc-windows-msvc.profdata" | awk '{print $1}')
+          cargo +stable build-pgo 2>&1 | tee pgo-verify-build.log
+          all_warns=$(grep -c "warning:" pgo-verify-build.log || true)
+          pgo_warns=$(grep -ciE "warning:.*(pgo|profdata|profile|hash mismatch)|hash mismatch" pgo-verify-build.log || true)
+          hash_warns=$(grep -c "hash mismatch" pgo-verify-build.log || true)
+          sz=$(wc -c < "target/x86_64-pc-windows-msvc/release/fcupdater.exe")
+          echo "profdata sha256: ${sha}"
+          echo "All compiler warnings: ${all_warns}"
+          echo "PGO warnings: ${pgo_warns} (hash-mismatch: ${hash_warns})"
+          echo "Final PGO binary size: ${sz} B"
+          echo "### Verify PGO (windows-latest)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- profdata sha256: \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- All warnings: ${all_warns}, PGO warnings: ${pgo_warns} (hash-mismatch: ${hash_warns})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Final PGO binary size: ${sz} B" >> "$GITHUB_STEP_SUMMARY"
