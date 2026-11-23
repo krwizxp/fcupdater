@@ -146,6 +146,7 @@ pub(super) struct DeflateInflater<'bytes> {
 #[derive(Default)]
 pub(super) struct DeflateWorkspace {
     head: Vec<u32>,
+    position_bias: u32,
     previous: Vec<u16>,
     tokens: Vec<DeflateToken>,
     work_budget: DeflateWorkBudget,
@@ -265,6 +266,8 @@ impl BitReader<'_> {
     }
 }
 impl BitWriter<'_> {
+    #[cold]
+    #[inline(never)]
     fn flush_buffer(&mut self) -> Result<()> {
         if self.buffered_len == 0 {
             return Ok(());
@@ -968,22 +971,31 @@ impl DeflateWorkspace {
         self.tokens
             .try_reserve_exact(initial_token_capacity)
             .map_err(|source| reserve_err("deflate token 메모리 확보 실패", source))?;
-        if self.head.len() == HASH_SIZE {
-            self.head.fill(u32::MAX);
-        } else {
-            self.head.clear();
-            self.head
-                .try_reserve_exact(HASH_SIZE)
-                .map_err(|source| reserve_err("deflate hash head 메모리 확보 실패", source))?;
-            self.head.resize(HASH_SIZE, u32::MAX);
+        let input_len_u32 = u32::try_from(input_len).unwrap_or(u32::MAX);
+        let needs_reset = self.head.len() != HASH_SIZE
+            || self.position_bias == 0
+            || self
+                .position_bias
+                .checked_add(input_len_u32)
+                .and_then(|end| end.checked_add(1))
+                .is_none();
+        if needs_reset {
+            if self.head.len() == HASH_SIZE {
+                self.head.fill(0);
+            } else {
+                self.head.clear();
+                self.head
+                    .try_reserve_exact(HASH_SIZE)
+                    .map_err(|source| reserve_err("deflate hash head 메모리 확보 실패", source))?;
+                self.head.resize(HASH_SIZE, 0);
+            }
+            self.position_bias = 1;
         }
         let previous_len = input_len.min(DEFLATE_WINDOW_LEN);
         if self.previous.len() < previous_len {
             self.previous
                 .try_reserve_exact(previous_len.strict_sub(self.previous.len()))
-                .map_err(|source| {
-                    err_with_source("deflate hash previous 메모리 확보 실패", source)
-                })?;
+                .map_err(|source| reserve_err("deflate hash previous 메모리 확보 실패", source))?;
             self.previous.resize(previous_len, 0);
         }
         Ok(())
@@ -1009,6 +1021,7 @@ impl DeflateWriter<'_, '_> {
     }
     fn insert_position(
         position: usize,
+        position_bias: u32,
         hash_index: Option<usize>,
         head: &mut [u32],
         previous: &mut [u16],
@@ -1017,21 +1030,20 @@ impl DeflateWriter<'_, '_> {
             return;
         };
         let head_slot = head.get_mut(hash).unwrap_or_else(|| process::abort());
-        let head_pos = *head_slot;
-        let previous_distance = if head_pos == u32::MAX {
-            0
-        } else {
-            position
-                .checked_sub(head_pos as usize)
-                .and_then(|distance| u16::try_from(distance).ok())
-                .filter(|distance| usize::from(*distance) <= DEFLATE_WINDOW_LEN)
-                .unwrap_or(0)
-        };
+        let previous_distance = (*head_slot)
+            .checked_sub(position_bias)
+            .and_then(|head_pos| position.checked_sub(head_pos as usize))
+            .and_then(|distance| u16::try_from(distance).ok())
+            .filter(|distance| usize::from(*distance) <= DEFLATE_WINDOW_LEN)
+            .unwrap_or(0);
         let slot = previous
             .get_mut(position.rem_euclid(DEFLATE_WINDOW_LEN))
             .unwrap_or_else(|| process::abort());
         *slot = previous_distance;
-        *head_slot = u32::try_from(position).unwrap_or(u32::MAX);
+        *head_slot = u32::try_from(position)
+            .ok()
+            .and_then(|pos| pos.checked_add(position_bias))
+            .unwrap_or(0);
     }
     fn length_symbol(length: u16) -> DeflateSymbol {
         let packed = huffman_get(&LENGTH_SYMBOL_TABLE, usize::from(length.strict_sub(3)));
@@ -1090,6 +1102,13 @@ impl DeflateWriter<'_, '_> {
         let workspace = &mut *self.workspace;
         workspace.prepare_for_input(bytes.len())?;
         let mut tokens = mem::take(&mut workspace.tokens);
+        let position_bias = workspace.position_bias;
+        let next_bias = u32::try_from(bytes.len())
+            .ok()
+            .and_then(|len| position_bias.checked_add(len))
+            .and_then(|end| end.checked_add(1))
+            .unwrap_or(0);
+        workspace.position_bias = next_bias;
         let head = &mut workspace.head;
         let previous = &mut workspace.previous;
         let work_budget = &mut workspace.work_budget;
@@ -1101,11 +1120,9 @@ impl DeflateWriter<'_, '_> {
             if let Some(hash) = position_hash
                 && let Some(&head_candidate) = head.get(hash)
             {
-                let mut candidate = if head_candidate == u32::MAX {
-                    usize::MAX
-                } else {
-                    head_candidate as usize
-                };
+                let mut candidate = head_candidate
+                    .checked_sub(position_bias)
+                    .map_or(usize::MAX, |pos| pos as usize);
                 let min_candidate = position.saturating_sub(DEFLATE_MAX_DISTANCE);
                 let max_len = bytes.len().strict_sub(position).min(MAX_MATCH);
                 let nice_len = XML_NICE_MATCH_LEN.min(max_len);
@@ -1177,7 +1194,7 @@ impl DeflateWriter<'_, '_> {
                     chain_len = chain_len.strict_add(1);
                 }
             }
-            Self::insert_position(position, position_hash, head, previous);
+            Self::insert_position(position, position_bias, position_hash, head, previous);
             if best_len >= MIN_MATCH {
                 let [dist_low, dist_high, ..] = best_distance.strict_sub(1).to_le_bytes();
                 let dist_bits = u32::from(u16::from_le_bytes([dist_low, dist_high])) & 0x7FFF;
@@ -1196,6 +1213,7 @@ impl DeflateWriter<'_, '_> {
                     for insert_position in position.strict_add(1)..next_position {
                         Self::insert_position(
                             insert_position,
+                            position_bias,
                             hash3(bytes, insert_position),
                             head,
                             previous,
@@ -1438,9 +1456,7 @@ fn fill_write_huffman_codes(lengths: &[u8], codes: &mut [u32]) -> Result<()> {
 }
 fn write_huffman_symbol(codes: &[u32], writer: &mut BitWriter<'_>, symbol: u16) -> Result<()> {
     let [low, high, len, _] = huffman_get(codes, usize::from(symbol)).to_le_bytes();
-    if len == 0 {
-        process::abort();
-    }
+    debug_assert!(len != 0, "deflate huffman symbol length must be non-zero");
     writer.write_bits(u16::from_le_bytes([low, high]), len)
 }
 fn write_huffman_with_extra(
@@ -1451,9 +1467,7 @@ fn write_huffman_with_extra(
     extra_bits: u8,
 ) -> Result<()> {
     let [low, high, len, _] = huffman_get(codes, usize::from(symbol)).to_le_bytes();
-    if len == 0 {
-        process::abort();
-    }
+    debug_assert!(len != 0, "deflate huffman symbol length must be non-zero");
     let combined = u32::from(u16::from_le_bytes([low, high])) | (u32::from(extra) << len);
     writer.write_bits_u32(combined, len.strict_add(extra_bits))
 }

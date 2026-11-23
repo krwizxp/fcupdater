@@ -250,24 +250,13 @@ impl SharedStringTable {
         Ok(())
     }
     fn to_xml(&self, reference_count: usize) -> Result<String> {
-        let additional_capacity =
-            self.entries
-                .iter()
-                .try_fold("</sst>".len(), |sum, entry| -> Result<usize> {
-                    let len = if let Some(xml) = entry.xml.as_ref() {
-                        xml.len()
-                    } else {
-                        shared_string_opening(&entry.text)
-                            .len()
-                            .strict_add(validated_xml_escaped_len(
-                                &entry.text,
-                                XmlEscapeContext::Text,
-                                "shared string XML",
-                            )?)
-                            .strict_add("</t></si>".len())
-                    };
-                    Ok(sum.strict_add(len))
-                })?;
+        let additional_capacity = self.entries.iter().fold("</sst>".len(), |sum, entry| {
+            let len = entry
+                .xml
+                .as_ref()
+                .map_or_else(|| entry.text.len().strict_add(48), String::len);
+            sum.strict_add(len)
+        });
         let mut xml = try_string_with_capacity(
             additional_capacity.strict_add(256),
             "sharedStrings XML 메모리 확보 실패",
@@ -281,9 +270,31 @@ impl SharedStringTable {
         );
         for entry in &self.entries {
             if let Some(original) = entry.xml.as_ref() {
+                xml.try_reserve(original.len())
+                    .map_err(|source| reserve_err("sharedStrings XML 메모리 확보 실패", source))?;
                 xml.push_str(original);
             } else {
-                xml.push_str(shared_string_opening(&entry.text));
+                let opening = if entry.text.chars().next().is_some_and(char::is_whitespace)
+                    || entry
+                        .text
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace)
+                {
+                    "<si><t xml:space=\"preserve\">"
+                } else {
+                    "<si><t>"
+                };
+                let worst_case = opening
+                    .len()
+                    .strict_add(entry.text.len().strict_mul(5))
+                    .strict_add("</t></si>".len());
+                if xml.capacity().strict_sub(xml.len()) < worst_case {
+                    xml.try_reserve(worst_case).map_err(|source| {
+                        reserve_err("sharedStrings XML 메모리 확보 실패", source)
+                    })?;
+                }
+                xml.push_str(opening);
                 append_xml_escaped(&mut xml, &entry.text, XmlEscapeContext::Text);
                 xml.push_str("</t></si>");
             }
@@ -2336,15 +2347,6 @@ const fn xml_escape_replacement(byte: u8, context: XmlEscapeContext) -> Option<&
         b'"' if matches!(context, XmlEscapeContext::Attribute) => Some("&quot;"),
         b'\'' if matches!(context, XmlEscapeContext::Attribute) => Some("&apos;"),
         _ => None,
-    }
-}
-fn shared_string_opening(value: &str) -> &'static str {
-    if value.chars().next().is_some_and(char::is_whitespace)
-        || value.chars().next_back().is_some_and(char::is_whitespace)
-    {
-        "<si><t xml:space=\"preserve\">"
-    } else {
-        "<si><t>"
     }
 }
 fn append_text_tag(out: &mut String, attrs: &[XmlAttr<'_>], self_closing: bool) -> Result<()> {

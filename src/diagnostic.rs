@@ -125,12 +125,14 @@ pub(super) fn try_push_vec<T>(
     vec.push(value);
     Ok(())
 }
+#[cold]
+#[inline(never)]
 pub(super) fn path_err_with_source(
     label: &str,
     path: &Path,
     source: impl Into<BoxError>,
 ) -> AppError {
-    err_with_source(format!("{label}: {}", path.display()), source)
+    AppError::context(format!("{label}: {}", path.display()), source)
 }
 pub(super) fn parse_unsigned_decimal<T>(
     value: &str,

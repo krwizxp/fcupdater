@@ -19,6 +19,7 @@ use crate::temp_entry::{
     validate_regular_file,
 };
 use alloc::borrow::Cow;
+use core::fmt::Arguments;
 use core::{array, mem, ops::Range, str};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -1037,6 +1038,9 @@ impl XlsxContainer {
             None
         };
         let mut xml = self.take_text(name)?;
+        if drawing_rid.is_none() && !xml.contains("drawing") {
+            return Ok(xml);
+        }
         let mut drawing_scanner = XmlScanner::new(&xml);
         let drawing = drawing_scanner.next_start_named("drawing");
         match (drawing_rid, drawing) {
@@ -1044,7 +1048,7 @@ impl XlsxContainer {
                 validate_exact_attrs(
                     tag.raw,
                     &[("r:id", expected_rid.as_str())],
-                    "sheet1.xml drawing",
+                    format_args!("sheet1.xml drawing"),
                 )?;
                 let span = tag.start..tag.end.strict_add(1);
                 drawing_scanner.skip_to(span.end);
@@ -1363,7 +1367,11 @@ fn parse_attrs_into<'tag>(
     }
     Ok(())
 }
-fn validate_exact_attrs(tag: &str, expected: &[(&str, &str)], context: &str) -> Result<()> {
+fn validate_exact_attrs(
+    tag: &str,
+    expected: &[(&str, &str)],
+    context: Arguments<'_>,
+) -> Result<()> {
     let mut seen = 0_u32;
     let mut attributes = XmlAttrScanner::new(tag)?;
     while let Some((name, value)) = attributes.next()? {
@@ -1609,7 +1617,7 @@ fn validate_empty_xml_root(
     context: &str,
 ) -> Result<()> {
     let (mut scanner, root) = scan_xml_root(xml, expected_name, context)?;
-    validate_exact_attrs(root.raw, expected_attrs, context)?;
+    validate_exact_attrs(root.raw, expected_attrs, format_args!("{context}"))?;
     let empty = scanner.next_direct_element_until(&root, context)?.is_none();
     empty.ok_or_else(|| err_fmt(format_args!("{context}의 XML root가 비어 있지 않습니다.")))
 }
@@ -1645,7 +1653,7 @@ fn visit_direct_xml_children<'xml>(
     validate_exact_attrs(
         root.raw,
         &[("xmlns", expected_namespace)],
-        &format!("{context} root"),
+        format_args!("{context} root"),
     )?;
     while let Some(child) = scanner.next_direct_element_until(&root, context)? {
         let tag = child.opening;

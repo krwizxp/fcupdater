@@ -707,7 +707,10 @@ impl<'workbook> BiffWorkbookReader<'workbook> {
             "SST 문자열 테이블 메모리 확보 실패",
         )?;
         offsets.push(0_u32);
-        let mut text = try_string_with_capacity(total_chunk_bytes, "SST 문자열 메모리 확보 실패")?;
+        let mut text = try_string_with_capacity(
+            total_chunk_bytes.strict_add(total_chunk_bytes.div_euclid(2)),
+            "SST 문자열 메모리 확보 실패",
+        )?;
         for _ in 0..unique_count {
             reader.ensure_available()?;
             let header_chunk = reader.chunk_index;

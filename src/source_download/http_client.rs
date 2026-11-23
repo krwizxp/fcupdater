@@ -6,6 +6,7 @@ use super::{
     OPDOWNLOAD_PATH, OPDOWNLOAD_URL, OPINET_HOST, RequestHeaders, SourceDownload,
     download_error_with_source, parse_unsigned_decimal, try_push_vec, try_string_with_capacity,
 };
+use crate::diagnostic::err_fmt;
 use alloc::borrow::Cow;
 use core::{fmt::NumBuffer, mem, range::Range, time::Duration};
 use std::{
@@ -109,7 +110,7 @@ impl SourceDownload {
             self.add_cookie_for_host(HttpHost::Netfunnel, "NetFunnel_ID", &result)?;
             self.add_cookie_for_host(HttpHost::Opinet, "NetFunnel_ID", &result)?;
             let Some((_opcode, code_tail)) = result.split_once(':') else {
-                return Err(format!("NetFunnel 코드 없음: {result}").into());
+                return Err(err_fmt(format_args!("NetFunnel 코드 없음: {result}")));
             };
             let code_text = split_head_or_all(code_tail, ':');
             let code = parse_netfunnel_u32(code_text, "NetFunnel 코드 파싱 실패")?;
@@ -119,7 +120,9 @@ impl SourceDownload {
                 }
                 201 | 202 => {
                     let Some((_, ttl_tail)) = result.split_once("ttl=") else {
-                        return Err(format!("NetFunnel 대기 응답에 ttl 없음: {result}").into());
+                        return Err(err_fmt(format_args!(
+                            "NetFunnel 대기 응답에 ttl 없음: {result}"
+                        )));
                     };
                     let ttl_text = split_head_or_all(ttl_tail, '&');
                     let ttl = parse_netfunnel_u32(ttl_text, "NetFunnel ttl 파싱 실패")?;
@@ -128,8 +131,8 @@ impl SourceDownload {
                     current_key = Some(take_netfunnel_key(result)?);
                     sleep(Duration::from_secs(u64::from(wait_secs)));
                 }
-                302 => return Err(format!("NetFunnel IP 차단: {result}").into()),
-                _ => return Err(format!("NetFunnel 응답 오류: {result}").into()),
+                302 => return Err(err_fmt(format_args!("NetFunnel IP 차단: {result}"))),
+                _ => return Err(err_fmt(format_args!("NetFunnel 응답 오류: {result}"))),
             }
         }
         Err("NetFunnel 대기 횟수를 초과했습니다.".into())
@@ -162,7 +165,7 @@ impl SourceDownload {
         if !(200..300).contains(&status) {
             let body_preview =
                 String::from_utf8_lossy(body.get(..HTTP_ERROR_PREVIEW_BYTES).unwrap_or(&body));
-            return Err(format!("HTTP {status}: {body_preview}").into());
+            return Err(err_fmt(format_args!("HTTP {status}: {body_preview}")));
         }
         Ok(body)
     }
