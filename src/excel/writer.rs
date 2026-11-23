@@ -124,9 +124,10 @@ enum CellType {
 }
 struct WorksheetParser<'styles> {
     cell_count: usize,
-    formula_heads: HashMap<u32, SharedFormulaHead>,
+    dense_formula_heads: Vec<SharedFormulaHead>,
     input_styles: &'styles CanonicalStyleMap,
     sheet: Sheet,
+    sparse_formula_heads: HashMap<u32, SharedFormulaHead>,
 }
 impl SharedStringTable {
     fn get(&self, index: usize) -> Option<&str> {
@@ -323,7 +324,8 @@ impl Workbook {
         let load = |kind, xml| -> Result<Worksheet> {
             let ws = WorksheetParser {
                 cell_count: 0,
-                formula_heads: HashMap::new(),
+                dense_formula_heads: Vec::new(),
+                sparse_formula_heads: HashMap::new(),
                 input_styles: &styles,
                 sheet: kind,
             }
@@ -492,8 +494,11 @@ impl WorksheetParser<'_> {
         };
         validate_spreadsheet_xml_document(xml, "worksheet", ctx, false, Some(&span))?;
         let invalid = self
-            .formula_heads
+            .dense_formula_heads
             .into_iter()
+            .zip(0_u32..)
+            .map(|(head, id)| (id, head))
+            .chain(self.sparse_formula_heads)
             .filter_map(|(si, hd)| {
                 let exp = hd.last_row.strict_sub(hd.anchor_row).strict_add(1);
                 (hd.seen != exp).then_some((si, exp, hd.seen))
@@ -516,9 +521,17 @@ impl WorksheetParser<'_> {
             sc.next_direct_element_named_until("c", row_name, 2, "worksheet row")?
         {
             let (body, info) = (cell.body, cell.opening);
-            let mut attrs = [None, None, None];
-            XmlAttrScanner::parse_into(info.raw, &["r", "s", "t"], &mut attrs, "cell")?;
-            let [ref_val, style_val, type_val] = attrs;
+            let (mut ref_val, mut style_val, mut type_val) = (None, None, None);
+            let mut attributes = XmlAttrScanner::from_tag(&info);
+            while let Some((name, value)) = attributes.next()? {
+                let slot = match name {
+                    "r" => &mut ref_val,
+                    "s" => &mut style_val,
+                    "t" => &mut type_val,
+                    _ => bail_fmt!("cell 알 수 없는 {name} 속성"),
+                };
+                ensure_fmt!(slot.replace(value).is_none(), "cell {name} 속성 중복");
+            }
             let ref_tx = ref_val
                 .as_deref()
                 .ok_or_else(|| fmt_err!("cell ref 없음: row={row_num}"))?;
@@ -627,14 +640,18 @@ impl WorksheetParser<'_> {
             }
             if let Some(formula) = formula_el {
                 let decoded = decode_xml_entities(formula.body)?;
-                let mut f_attrs = [None, None, None, None];
-                XmlAttrScanner::parse_into(
-                    formula.opening.raw,
-                    &["aca", "ref", "si", "t"],
-                    &mut f_attrs,
-                    "formula",
-                )?;
-                let [aca, fref, fsi, ftype] = f_attrs;
+                let (mut aca, mut fref, mut fsi, mut ftype) = (None, None, None, None);
+                let mut attributes = XmlAttrScanner::from_tag(&formula.opening);
+                while let Some((name, value)) = attributes.next()? {
+                    let slot = match name {
+                        "aca" => &mut aca,
+                        "ref" => &mut fref,
+                        "si" => &mut fsi,
+                        "t" => &mut ftype,
+                        _ => bail_fmt!("formula 알 수 없는 {name} 속성"),
+                    };
+                    ensure_fmt!(slot.replace(value).is_none(), "formula {name} 속성 중복");
+                }
                 let shared = ftype.as_deref() == Some("shared");
                 ensure_fmt!(
                     shared
@@ -664,11 +681,13 @@ impl WorksheetParser<'_> {
                             Ok((unlocked(lhs)?, unlocked(rhs)?))
                         })
                         .transpose()?;
+                    let index = si as usize;
                     if decoded.is_empty() {
                         ensure(range.is_none(), "shared formula follower에 ref 범위 있음")?;
                         let hd = self
-                            .formula_heads
-                            .get_mut(&si)
+                            .dense_formula_heads
+                            .get_mut(index)
+                            .or_else(|| self.sparse_formula_heads.get_mut(&si))
                             .ok_or_else(|| fmt_err!("anchor 없음: si={si}"))?;
                         ensure_fmt!(
                             col == hd.anchor_col
@@ -683,19 +702,32 @@ impl WorksheetParser<'_> {
                             "shared formula ref 범위 오류"
                         );
                         ensure_fmt!(
-                            !self.formula_heads.contains_key(&si),
+                            index >= self.dense_formula_heads.len()
+                                && !self.sparse_formula_heads.contains_key(&si),
                             "shared formula si 중복: {si}"
                         );
-                        reserve(self.formula_heads.try_reserve(1), "shared formula anchor")?;
-                        self.formula_heads.insert(
-                            si,
-                            SharedFormulaHead {
-                                anchor_col: col,
-                                anchor_row: row_num,
-                                last_row: end.1,
-                                seen: 1,
-                            },
-                        );
+                        let head = SharedFormulaHead {
+                            anchor_col: col,
+                            anchor_row: row_num,
+                            last_row: end.1,
+                            seen: 1,
+                        };
+                        if index == self.dense_formula_heads.len()
+                            && self.sparse_formula_heads.is_empty()
+                        {
+                            push_vec(
+                                &mut self.dense_formula_heads,
+                                head,
+                                1,
+                                "shared formula anchor",
+                            )?;
+                        } else {
+                            reserve(
+                                self.sparse_formula_heads.try_reserve(1),
+                                "shared formula anchor",
+                            )?;
+                            self.sparse_formula_heads.insert(si, head);
+                        }
                     }
                 } else {
                     let esc = xml_escape(&decoded, false, "formula escape")?;
@@ -1190,24 +1222,24 @@ impl Worksheet {
             .map_or(34_usize, |len| 14_usize.strict_add(len))
             .strict_add(v_len.unwrap_or(0));
         reserve(inner.try_reserve_exact(cap), "formula/cache XML")?;
-        for (tag, text, esc_len) in [
-            ("f", formula, f_len),
-            ("v", (!cached.is_empty()).then_some(cached), v_len),
-        ] {
-            if let Some(raw) = text.filter(|raw| !raw.is_empty()) {
-                inner.extend(["<", tag, ">"]);
-                if esc_len == Some(raw.len()) {
-                    inner.push_str(raw);
+        let append_tag =
+            |output: &mut String, tag: &str, text: Option<&str>, esc_len: Option<usize>| {
+                if let Some(raw) = text.filter(|raw| !raw.is_empty()) {
+                    output.extend(["<", tag, ">"]);
+                    if esc_len == Some(raw.len()) {
+                        output.push_str(raw);
+                    } else {
+                        push_xml_esc(output, raw, false);
+                    }
+                    output.extend(["</", tag, ">"]);
+                } else if text.is_some() {
+                    output.extend(["<", tag, "></", tag, ">"]);
                 } else {
-                    push_xml_esc(inner, raw, false);
+                    output.extend(["<", tag, "/>"]);
                 }
-                inner.extend(["</", tag, ">"]);
-            } else if text.is_some() {
-                inner.extend(["<", tag, "></", tag, ">"]);
-            } else {
-                inner.extend(["<", tag, "/>"]);
-            }
-        }
+            };
+        append_tag(inner, "f", formula, f_len);
+        append_tag(inner, "v", (!cached.is_empty()).then_some(cached), v_len);
         Ok(())
     }
     fn set_formula_cached_value_at(
