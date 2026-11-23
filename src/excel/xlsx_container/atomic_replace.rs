@@ -18,7 +18,6 @@ cfg_select! {
 }
 cfg_select! {
     target_os = "windows" => {
-        const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn ReplaceFileW(
@@ -32,8 +31,6 @@ cfg_select! {
         }
     }
     target_os = "linux" => {
-        const AT_FDCWD: c_int = -100;
-        const RENAME_EXCHANGE: c_uint = 2;
         unsafe extern "C" {
             fn renameat2(
                 old_dir_fd: c_int,
@@ -45,7 +42,6 @@ cfg_select! {
         }
     }
     target_os = "macos" => {
-        const RENAME_SWAP: c_uint = 2;
         unsafe extern "C" {
             fn renamex_np(
                 old_path: *const c_char,
@@ -105,6 +101,7 @@ cfg_select! {
     target_os = "windows" => {
         fn path_to_wide(path: &Path) -> io::Result<Vec<u16>> {
             let absolute = absolute(path)?;
+            let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
             let (extended_prefix, skipped_units) = match absolute.components().next() {
                 Some(Component::Prefix(component)) => match component.kind() {
                     Prefix::Disk(_) => (r"\\?\", 0_usize),
@@ -114,42 +111,25 @@ cfg_select! {
                     | Prefix::VerbatimDisk(_)
                     | Prefix::DeviceNS(_) => ("", 0_usize),
                 },
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Windows file path is not absolute",
-                    ));
-                }
+                _ => return Err(invalid("Windows file path is not absolute")),
             };
             let capacity = extended_prefix
                 .len()
                 .checked_add(absolute.as_os_str().len())
                 .and_then(|len| len.checked_add(1))
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Windows file path length overflow",
-                    )
-                })?;
+                .ok_or_else(|| invalid("Windows file path length overflow"))?;
             let mut wide = Vec::new();
             wide.try_reserve_exact(capacity).map_err(io::Error::other)?;
             wide.extend(extended_prefix.encode_utf16());
             let mut seen_units = 0_usize;
             for unit in absolute.as_os_str().encode_wide() {
-                (unit != 0).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Windows file path contains a NUL character",
-                    )
-                })?;
+                (unit != 0).ok_or_else(|| invalid("Windows file path contains a NUL character"))?;
                 if seen_units >= skipped_units {
                     wide.push(unit);
                 }
                 seen_units = seen_units.strict_add(1);
             }
-            (seen_units >= skipped_units).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Windows UNC path is invalid")
-            })?;
+            (seen_units >= skipped_units).ok_or_else(|| invalid("Windows UNC path is invalid"))?;
             wide.push(0);
             Ok(wide)
         }
@@ -159,11 +139,7 @@ cfg_select! {
             backup: &Path,
             rollback: bool,
         ) -> Result<(), ReplaceFilesError> {
-            let (incoming, backup_output) = if rollback {
-                (backup, temp)
-            } else {
-                (temp, backup)
-            };
+            let (incoming, backup_output) = if rollback { (backup, temp) } else { (temp, backup) };
             let target_wide = path_to_wide(target)?;
             let incoming_wide = path_to_wide(incoming)?;
             let backup_output_wide = path_to_wide(backup_output)?;
@@ -183,7 +159,7 @@ cfg_select! {
                 return Ok(());
             }
             let replace = io::Error::last_os_error();
-            if replace.raw_os_error() != Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
+            if replace.raw_os_error() != Some(1_177_i32) {
                 return Err(replace.into());
             }
             match fs::rename(backup, target) {
@@ -209,20 +185,12 @@ cfg_select! {
                 target_os = "linux" => {
                     // SAFETY: both paths are valid NUL-terminated byte strings and AT_FDCWD selects
                     // the current process path resolution context.
-                    unsafe {
-                        renameat2(
-                            AT_FDCWD,
-                            target_c.as_ptr(),
-                            AT_FDCWD,
-                            replacement_c.as_ptr(),
-                            RENAME_EXCHANGE,
-                        )
-                    }
+                    unsafe { renameat2(-100, target_c.as_ptr(), -100, replacement_c.as_ptr(), 2) }
                 }
                 target_os = "macos" => {
                     // SAFETY: both paths are valid NUL-terminated byte strings and RENAME_SWAP
                     // requests an atomic exchange of two existing paths.
-                    unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), RENAME_SWAP) }
+                    unsafe { renamex_np(target_c.as_ptr(), replacement_c.as_ptr(), 2) }
                 }
             };
             (status == 0_i32).ok_or_else(|| io::Error::last_os_error().into())

@@ -1,24 +1,35 @@
-use super::CellReference;
-use crate::diagnostic::{Result, err_fmt};
-use std::process;
-const MAX_A1_COLUMN_LETTERS: usize = 3;
-pub(super) const SINGLE_LETTER_COLUMNS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-const MAX_A1_COL: u32 = 0x4000;
+use crate::diagnostic::{Result, fmt_err, or_abort};
 pub(super) const MAX_A1_ROW: u32 = 0x0010_0000;
-pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
-    let bytes = reference.as_bytes();
-    let mut index = 0_usize;
-    let mut col_locked = false;
-    if bytes.get(index) == Some(&b'$') {
-        col_locked = true;
-        index = index.strict_add(1);
+pub(super) const SINGLE_LETTER_COLUMNS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+pub(super) fn col_name_into(mut col: u32, col_buffer: &mut [u8; 3]) -> Result<&str> {
+    (1..=0x4000_u32)
+        .contains(&col)
+        .ok_or_else(|| fmt_err!("Excel column 범위를 벗어났습니다: {col}"))?;
+    let single_index = col.strict_sub(1) as usize;
+    if let Some(single) = SINGLE_LETTER_COLUMNS.get(single_index..single_index.strict_add(1)) {
+        return Ok(single);
     }
-    let col_start = index;
-    let mut col = 0_u32;
+    let mut index = col_buffer.len();
+    while col > 0 {
+        let base = col.strict_sub(1);
+        index = index.strict_sub(1);
+        *or_abort(col_buffer.get_mut(index)) =
+            b'A'.strict_add(base.rem_euclid(26).to_le_bytes()[0]);
+        col = base.div_euclid(26);
+    }
+    Ok(or_abort(
+        str::from_utf8(or_abort(col_buffer.get(index..))).ok(),
+    ))
+}
+pub(super) fn parse_ref_with_locks(reference: &str) -> Option<(u32, u32, bool)> {
+    let bytes = reference.as_bytes();
+    let mut index = usize::from(bytes.first() == Some(&b'$'));
+    let col_locked = index != 0;
+    let (col_start, mut col) = (index, 0_u32);
     while let Some(&ch) = bytes.get(index)
         && ch.is_ascii_alphabetic()
     {
-        if index.strict_sub(col_start) >= MAX_A1_COLUMN_LETTERS {
+        if index.strict_sub(col_start) >= 3 {
             return None;
         }
         let letter = u32::from(ch.to_ascii_uppercase())
@@ -27,17 +38,11 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
         col = col.checked_mul(26)?.checked_add(letter)?;
         index = index.strict_add(1);
     }
-    if index == col_start {
+    if index == col_start || !(1..=0x4000_u32).contains(&col) {
         return None;
     }
-    if !(1..=MAX_A1_COL).contains(&col) {
-        return None;
-    }
-    let mut row_locked = false;
-    if bytes.get(index) == Some(&b'$') {
-        row_locked = true;
-        index = index.strict_add(1);
-    }
+    let row_locked = bytes.get(index) == Some(&b'$');
+    index = index.strict_add(usize::from(row_locked));
     let row = bytes.get(index..)?.iter().try_fold(0_u32, |row, &ch| {
         if !ch.is_ascii_digit() {
             return None;
@@ -47,36 +52,5 @@ pub(super) fn parse_ref_with_locks(reference: &str) -> Option<CellReference> {
             .strict_add(u32::from(ch.strict_sub(b'0')));
         (value <= MAX_A1_ROW).then_some(value)
     })?;
-    (row != 0).then_some(CellReference {
-        col,
-        col_locked,
-        row,
-        row_locked,
-    })
-}
-pub(super) fn col_name_into(
-    mut col: u32,
-    col_buffer: &mut [u8; MAX_A1_COLUMN_LETTERS],
-) -> Result<&str> {
-    (1..=MAX_A1_COL)
-        .contains(&col)
-        .ok_or_else(|| err_fmt(format_args!("Excel column 범위를 벗어났습니다: {col}")))?;
-    let single_index = col.strict_sub(1) as usize;
-    if let Some(single) = SINGLE_LETTER_COLUMNS.get(single_index..single_index.strict_add(1)) {
-        return Ok(single);
-    }
-    let mut index = col_buffer.len();
-    while col > 0 {
-        let base = col.strict_sub(1);
-        let [rem, ..] = base.rem_euclid(26).to_le_bytes();
-        index = index.strict_sub(1);
-        *col_buffer
-            .get_mut(index)
-            .unwrap_or_else(|| process::abort()) = b'A'.strict_add(rem);
-        col = base.div_euclid(26);
-    }
-    Ok(
-        str::from_utf8(col_buffer.get(index..).unwrap_or_else(|| process::abort()))
-            .unwrap_or_else(|_| process::abort()),
-    )
+    (row != 0).then_some((col, row, !col_locked && !row_locked))
 }

@@ -1,5 +1,5 @@
 extern crate alloc;
-use diagnostic::{Result, err, err_fmt, err_with_source};
+use diagnostic::{Result, bail_fmt, ensure_fmt, err, err_with_source};
 use excel::SaveVerification;
 use std::{
     env,
@@ -9,7 +9,7 @@ use std::{
 };
 cfg_select! {
     target_os = "windows" => {
-        use std::{fs::Metadata, os::windows::fs::OpenOptionsExt as _};
+        use std::os::windows::fs::OpenOptionsExt as _;
     }
     any(target_os = "linux", target_os = "macos") => {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -22,7 +22,6 @@ mod diagnostic;
 mod excel;
 mod master_sheet;
 mod region;
-mod sheet_util;
 mod source_download;
 mod temp_entry;
 mod update_run;
@@ -32,56 +31,35 @@ const HELP_TEXT: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " ",
     env!("CARGO_PKG_VERSION"),
-    "\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n",
-    "사용법:\n  ",
+    "\n주유소 가격/정보 현행화 (Excel 미설치 OK)\n\n사용법:\n  ",
     env!("CARGO_PKG_NAME"),
-    " [--verify]\n\n",
-    "고정 동작:\n",
-    "  마스터: fuel_cost_chungcheong.xlsx 직접 현행화\n",
-    "  소스: Opinet 현재 판매가격(주유소) 자동 다운로드 .xls\n",
-    "  변경내역 시트: 항상 갱신\n",
-    "  저장 검증: 기본 생략 (--verify 사용 시 수행)\n\n",
-    "옵션:\n",
-    "  -h, --help               도움말\n",
-    "  --verify                 저장 후 임시 XLSX를 재열어 검증한 뒤 승격\n",
-    "  --version                버전"
+    " [--verify]\n\n고정 동작:\n  마스터: fuel_cost_chungcheong.xlsx 직접 현행화\n  소스: Opinet 현재 판매가격(주유소) 자동 다운로드 .xls\n  변경내역 시트: 항상 갱신\n  저장 검증: 기본 생략 (--verify 사용 시 수행)\n\n옵션:\n  -h, --help               도움말\n  --verify                 저장 후 임시 XLSX를 재열어 검증한 뒤 승격\n  --version                버전"
 );
-const MASTER_PATH: &str = "fuel_cost_chungcheong.xlsx";
-const RUN_LOCK_PATH: &str = ".fcupdater.lock";
-#[cfg(target_os = "windows")]
-const RUN_LOCK_SHARE_MODE: u32 = 0x0000_0003;
 fn main() -> Result<()> {
     let mut out = stdout().lock();
     let mut raw_args = env::args_os().skip(1);
     let save_verification = match raw_args.next() {
         None => SaveVerification::Skip,
         Some(token) => {
-            let is_help = token == "-h" || token == "--help";
-            let is_version = token == "--version";
-            if !(is_help || token == "--verify" || is_version) {
-                return Err(err_fmt(format_args!(
-                    "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
-                    token.display()
-                )));
-            }
+            let (is_help, is_version) = (token == "-h" || token == "--help", token == "--version");
+            ensure_fmt!(
+                is_help || token == "--verify" || is_version,
+                "알 수 없는 옵션: {}\n\n{HELP_TEXT}",
+                token.display()
+            );
             if let Some(extra) = raw_args.next() {
                 let context = if is_version {
                     "알 수 없는 --version 옵션"
                 } else {
                     "알 수 없는 옵션"
                 };
-                return Err(err_fmt(format_args!(
-                    "{context}: {}\n\n{HELP_TEXT}",
-                    extra.display()
-                )));
+                bail_fmt!("{context}: {}\n\n{HELP_TEXT}", extra.display());
             }
             if is_help {
-                writeln!(&mut out, "{HELP_TEXT}")?;
-                return Ok(());
+                return writeln!(&mut out, "{HELP_TEXT}").map_err(Into::into);
             }
             if is_version {
-                writeln!(&mut out, "{APP_NAME} {APP_VERSION}")?;
-                return Ok(());
+                return writeln!(&mut out, "{APP_NAME} {APP_VERSION}").map_err(Into::into);
             }
             SaveVerification::Verify
         }
@@ -94,24 +72,19 @@ fn main() -> Result<()> {
         .truncate(false);
     configure_no_follow(&mut lock_options);
     cfg_select! {
-        target_os = "windows" => {
-            lock_options.share_mode(RUN_LOCK_SHARE_MODE);
-        }
-        any(target_os = "linux", target_os = "macos") => {
-            lock_options.mode(0o600);
-        }
+        target_os = "windows" => { lock_options.share_mode(0x0000_0003); }
+        any(target_os = "linux", target_os = "macos") => { lock_options.mode(0o600); }
     }
     let run_lock = lock_options
-        .open(Path::new(RUN_LOCK_PATH))
+        .open(Path::new(".fcupdater.lock"))
         .map_err(|source| err_with_source("실행 잠금 파일 열기 실패", source))?;
-    let (lock_metadata, _) = validate_regular_file(&run_lock)
+    let lock_validation = validate_regular_file(&run_lock)
         .map_err(|source| err_with_source("실행 잠금 파일 검증 실패", source))?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    (lock_metadata.mode() & 0o022 == 0).ok_or(err(
-        "실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.",
-    ))?;
+    (lock_validation.0.mode() & 0o022 == 0)
+        .ok_or("실행 잠금 파일은 group/other 쓰기 권한이 없어야 합니다.")?;
     #[cfg(target_os = "windows")]
-    let _: Metadata = lock_metadata;
+    let (_, _) = lock_validation;
     match run_lock.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Err(err("다른 fcupdater 실행이 진행 중입니다.")),
@@ -120,7 +93,7 @@ fn main() -> Result<()> {
         }
     }
     UpdateRun {
-        master_path: Path::new(MASTER_PATH),
+        master_path: Path::new("fuel_cost_chungcheong.xlsx"),
         out: &mut out,
         save_verification,
     }

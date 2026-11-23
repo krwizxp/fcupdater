@@ -1,6 +1,6 @@
 use crate::diagnostic::{
-    Result as DownloadResult, err_fmt, err_with_source as download_error_with_source,
-    parse_unsigned_u32, reserve_err, try_push_vec, try_string_with_capacity,
+    Result as DownloadResult, ensure, ensure_fmt, err_with_source as download_error_with_source,
+    fmt_err, parse_unsigned_u32, try_push_vec, try_string_with_capacity,
 };
 cfg_select! {
     any(target_os = "linux", target_os = "macos") => {
@@ -18,24 +18,7 @@ cfg_select! {
 mod http_client;
 const HTTP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HTTP_MAX_HEADER_BYTES: usize = 256 * 1024;
-const HTTP_ERROR_PREVIEW_BYTES: usize = 512;
-const OLE2_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-const OPINET_HOST: &str = "www.opinet.co.kr";
-const NETFUNNEL_HOST: &str = "nfl.opinet.co.kr";
-const OPDOWNLOAD_PATH: &str = "/user/opdown/opDownload.do";
-const OPDOWNLOAD_URL: &str = "https://www.opinet.co.kr/user/opdown/opDownload.do";
-const OPDOWNLOAD_LAYOUT_PATH: &str = "/user/main/main_move_price.do";
-const OPDOWNLOAD_EXCEL_PATH: &str = "/user/main/main_download_excel.do";
-const OIL_PRICE_DOWNLOAD_TAR_URL: &str = "/user/opdown/oil_price_download";
-const NETFUNNEL_SERVICE_ID: &str = "service_1";
-const NETFUNNEL_ENTRY_ACTION_ID: &str = "B1";
-const NETFUNNEL_DOWNLOAD_ACTION_ID: &str = "B7";
-const CURRENT_PRICE_PAGE_DIV: &str = "PAGE_DIV_2";
-const GAS_STATION_LPG_CODE: &str = "A";
-const GAS_STATION_API_GBN: &str = "A";
-const DEFAULT_REGION_LABEL: &str = "선택하세요.";
 const USER_AGENT: &str = concat!("fcupdater/", env!("CARGO_PKG_VERSION"));
-const NETFUNNEL_POLL_LIMIT: usize = 20;
 #[derive(Default)]
 pub(super) struct SourceDownload {
     cookie_header_buffer: String,
@@ -109,14 +92,15 @@ impl ResponseHeaders {
         )
     }
     fn set_content_length(&mut self, parsed: usize) -> DownloadResult<()> {
-        if parsed > HTTP_MAX_BODY_BYTES {
-            return Err(err_fmt(format_args!(
-                "HTTP Content-Length가 허용 한도({HTTP_MAX_BODY_BYTES} bytes)를 초과했습니다."
-            )));
-        }
-        self.content_length
-            .is_none_or(|previous| previous == parsed)
-            .ok_or("HTTP Content-Length 헤더 값이 서로 다릅니다.")?;
+        ensure_fmt!(
+            parsed <= HTTP_MAX_BODY_BYTES,
+            "HTTP Content-Length가 허용 한도({HTTP_MAX_BODY_BYTES} bytes)를 초과했습니다."
+        );
+        ensure(
+            self.content_length
+                .is_none_or(|previous| previous == parsed),
+            "HTTP Content-Length 헤더 값이 서로 다릅니다.",
+        )?;
         self.content_length = Some(parsed);
         Ok(())
     }
@@ -129,11 +113,10 @@ fn checked_http_buffer_len(
 ) -> DownloadResult<usize> {
     let next_len = current_len
         .checked_add(additional_len)
-        .ok_or_else(|| err_fmt(format_args!("HTTP 응답 {label} 크기 계산 실패")))?;
-    if next_len > limit {
-        return Err(err_fmt(format_args!(
-            "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
-        )));
-    }
+        .ok_or_else(|| fmt_err!("HTTP 응답 {label} 크기 계산 실패"))?;
+    ensure_fmt!(
+        next_len <= limit,
+        "HTTP 응답 {label} 크기가 허용 한도({limit} bytes)를 초과했습니다."
+    );
     Ok(next_len)
 }

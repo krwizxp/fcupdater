@@ -5,7 +5,35 @@ use core::{
     num::IntErrorKind,
     result::Result as CoreResult,
 };
-use std::{io::Error as IoError, path::Path};
+use std::{io::Error as IoError, path::Path, process};
+macro_rules! fmt_err {
+    ($($arg:tt)*) => {
+        $crate::diagnostic::err_fmt(::core::format_args!($($arg)*))
+    };
+}
+macro_rules! bail_fmt {
+    ($($arg:tt)*) => {
+        return ::core::result::Result::Err($crate::diagnostic::err_fmt(::core::format_args!($($arg)*)))
+    };
+}
+macro_rules! ensure_fmt {
+    ($cond:expr, $($arg:tt)*) => {
+        if !($cond) {
+            return ::core::result::Result::Err($crate::diagnostic::err_fmt(::core::format_args!($($arg)*)));
+        }
+    };
+}
+macro_rules! bail {
+    ($msg:expr) => {
+        return ::core::result::Result::Err($crate::diagnostic::err($msg))
+    };
+}
+macro_rules! fmt_src {
+    ($src:expr, $($arg:tt)*) => {
+        $crate::diagnostic::err_fmt_with_source(::core::format_args!($($arg)*), ($src).into())
+    };
+}
+pub(crate) use {bail, bail_fmt, ensure_fmt, fmt_err, fmt_src};
 type BoxError = Box<dyn Error + Send + Sync>;
 pub(super) type Result<T> = CoreResult<T, AppError>;
 pub(super) struct AppError {
@@ -14,21 +42,12 @@ pub(super) struct AppError {
 }
 struct ControlEscapingWriter<'formatter, 'output>(&'formatter mut fmt::Formatter<'output>);
 impl AppError {
-    fn context(context: impl Into<Cow<'static, str>>, source: impl Into<BoxError>) -> Self {
-        Self::context_boxed(context.into(), source.into())
-    }
     #[cold]
     #[inline(never)]
-    fn context_boxed(context: Cow<'static, str>, source: BoxError) -> Self {
+    fn context_boxed(message: Cow<'static, str>, source: BoxError) -> Self {
         Self {
-            message: context,
+            message,
             source: Some(source),
-        }
-    }
-    fn message(message: impl Into<Cow<'static, str>>) -> Self {
-        Self {
-            message: message.into(),
-            source: None,
         }
     }
     pub(super) fn update_message(&mut self, update: impl FnOnce(&str) -> String) {
@@ -64,32 +83,47 @@ impl Error for AppError {
 }
 impl From<String> for AppError {
     fn from(value: String) -> Self {
-        Self::message(value)
+        err(value)
     }
 }
 impl From<&'static str> for AppError {
     fn from(value: &'static str) -> Self {
-        Self::message(value)
+        err(value)
     }
 }
 impl From<IoError> for AppError {
     fn from(value: IoError) -> Self {
-        Self::context("I/O 오류", value)
+        err_with_source("I/O 오류", value)
     }
+}
+pub(super) fn add_row_offset(base_row: u32, offset: usize, context: &str) -> Result<u32> {
+    let offset_u32 = usize_to_u32(offset, context)?;
+    base_row.checked_add(offset_u32).ok_or_else(|| {
+        fmt_err!("{context} 계산 중 overflow가 발생했습니다. ({base_row} + {offset_u32})")
+    })
+}
+pub(super) fn append_fmt(target: &mut String, args: fmt::Arguments<'_>) {
+    assert!(
+        target.write_fmt(args).is_ok(),
+        "String formatting must be infallible"
+    );
 }
 #[inline]
 pub(super) fn ensure(condition: bool, message: &'static str) -> Result<()> {
     if condition { Ok(()) } else { Err(err(message)) }
 }
 pub(super) fn err(msg: impl Into<Cow<'static, str>>) -> AppError {
-    AppError::message(msg)
+    AppError {
+        message: msg.into(),
+        source: None,
+    }
 }
 #[cold]
 #[inline(never)]
 pub(super) fn err_fmt(args: fmt::Arguments<'_>) -> AppError {
     let mut message = String::new();
     append_fmt(&mut message, args);
-    AppError::message(message)
+    err(message)
 }
 #[cold]
 #[inline(never)]
@@ -102,52 +136,17 @@ pub(super) fn err_with_source(
     context: impl Into<Cow<'static, str>>,
     source: impl Into<BoxError>,
 ) -> AppError {
-    AppError::context(context, source)
+    AppError::context_boxed(context.into(), source.into())
 }
 pub(super) fn map_reserve(
     result: CoreResult<(), TryReserveError>,
     context: &'static str,
 ) -> Result<()> {
-    result.map_err(|source| reserve_err(context, source))
+    result.map_err(|source| err_with_source(context, source))
 }
-#[cold]
-#[inline(never)]
-pub(super) fn reserve_err(context: &'static str, source: TryReserveError) -> AppError {
-    AppError::context(context, source)
-}
-pub(super) fn try_string_with_capacity(capacity: usize, context: &'static str) -> Result<String> {
-    let mut value = String::new();
-    value
-        .try_reserve_exact(capacity)
-        .map_err(|source| reserve_err(context, source))?;
-    Ok(value)
-}
-pub(super) fn try_vec_with_capacity<T>(capacity: usize, context: &'static str) -> Result<Vec<T>> {
-    let mut value = Vec::new();
-    value
-        .try_reserve_exact(capacity)
-        .map_err(|source| reserve_err(context, source))?;
-    Ok(value)
-}
-pub(super) fn try_push_vec<T>(
-    vec: &mut Vec<T>,
-    value: T,
-    growth: usize,
-    context: &'static str,
-) -> Result<()> {
-    if vec.len() == vec.capacity() {
-        vec.try_reserve(growth)
-            .map_err(|source| reserve_err(context, source))?;
-    }
-    vec.push(value);
-    Ok(())
-}
-pub(super) fn path_err_with_source(
-    label: &str,
-    path: &Path,
-    source: impl Into<BoxError>,
-) -> AppError {
-    err_fmt_with_source(format_args!("{label}: {}", path.display()), source.into())
+#[inline]
+pub(super) fn or_abort<T>(value: Option<T>) -> T {
+    value.unwrap_or_else(|| process::abort())
 }
 pub(super) fn parse_unsigned_u32(
     value: &str,
@@ -165,11 +164,12 @@ pub(super) fn parse_unsigned_u32(
         }
     })
 }
-pub(super) fn append_fmt(target: &mut String, args: fmt::Arguments<'_>) {
-    assert!(
-        target.write_fmt(args).is_ok(),
-        "String formatting must be infallible"
-    );
+pub(super) fn path_err_with_source(
+    label: &str,
+    path: &Path,
+    source: impl Into<BoxError>,
+) -> AppError {
+    err_fmt_with_source(format_args!("{label}: {}", path.display()), source.into())
 }
 pub(super) const fn terminal_safe<T>(value: &T) -> impl Display + '_
 where
@@ -177,9 +177,34 @@ where
 {
     fmt::from_fn(move |formatter| write!(&mut ControlEscapingWriter(formatter), "{value}"))
 }
+pub(super) fn try_push_vec<T>(
+    vec: &mut Vec<T>,
+    value: T,
+    growth: usize,
+    context: &'static str,
+) -> Result<()> {
+    if vec.len() == vec.capacity() {
+        map_reserve(vec.try_reserve(growth), context)?;
+    }
+    vec.push(value);
+    Ok(())
+}
+pub(super) fn try_string_with_capacity(capacity: usize, context: &'static str) -> Result<String> {
+    let mut value = String::new();
+    map_reserve(value.try_reserve_exact(capacity), context)?;
+    Ok(value)
+}
+pub(super) fn try_vec_with_capacity<T>(capacity: usize, context: &'static str) -> Result<Vec<T>> {
+    let mut value = Vec::new();
+    map_reserve(value.try_reserve_exact(capacity), context)?;
+    Ok(value)
+}
+pub(super) fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|source| fmt_src!(source, "{context} 값이 너무 큽니다. (value={value})"))
+}
 fn write_control_escaped(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
-    let mut remaining = text;
-    let mut consumed = 0;
+    let (mut remaining, mut consumed) = (text, 0_usize);
     for (index, character) in text.char_indices() {
         if character.is_control()
             || matches!(

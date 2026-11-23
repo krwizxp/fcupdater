@@ -9,9 +9,9 @@ use super::{
     zip_archive::{ZIP_FINGERPRINT_BUFFER_BYTES, archive_file_len, crc32_update},
 };
 use crate::diagnostic::{
-    AppError, Result, append_fmt, ensure, err, err_fmt, err_fmt_with_source, err_with_source,
-    path_err_with_source, terminal_safe, try_push_vec, try_string_with_capacity,
-    try_vec_with_capacity,
+    AppError, Result, append_fmt, bail, bail_fmt, ensure, ensure_fmt, err, err_with_source,
+    fmt_err, fmt_src, or_abort, path_err_with_source, terminal_safe, try_push_vec,
+    try_string_with_capacity, try_vec_with_capacity,
 };
 #[cfg(target_os = "windows")]
 use crate::temp_entry::configure_replaceable_file;
@@ -20,8 +20,7 @@ use crate::temp_entry::{
     validate_regular_file,
 };
 use alloc::borrow::Cow;
-use core::fmt::Arguments;
-use core::{array, mem, ops::Range, str};
+use core::{array, fmt::Arguments, mem, ops::Range, str};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
@@ -32,35 +31,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 mod atomic_replace;
-macro_rules! rel_spec {
-    ($target:expr, $type_:expr) => {
-        RelationshipSpec {
-            optional_part: None,
-            target: $target,
-            type_: $type_,
-        }
-    };
-    ($optional_part:expr, $target:expr, $type_:expr) => {
-        RelationshipSpec {
-            optional_part: Some($optional_part),
-            target: $target,
-            type_: $type_,
-        }
-    };
-}
-const CONTENT_TYPES_NAMESPACE: &str =
-    "http://schemas.openxmlformats.org/package/2006/content-types";
 const OFFICE_DOCUMENT_REL_NAMESPACE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const OFFICE_DOCUMENT_REL_TYPE: &str =
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
-const PACKAGE_RELATIONSHIPS_NAMESPACE: &str =
-    "http://schemas.openxmlformats.org/package/2006/relationships";
-const WORKBOOK_REL_TARGET: &str = "xl/workbook.xml";
 const WORKSHEET_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
-const RICH_DATA2_NAMESPACE: &str =
-    "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata2";
 const CONTENT_TYPE_DEFAULTS: [(&str, &str, PartRole); 6] = [
     ("emf", "image/x-emf", PartRole::OptionalInput),
     (
@@ -74,50 +48,60 @@ const CONTENT_TYPE_DEFAULTS: [(&str, &str, PartRole); 6] = [
     ("png", "image/png", PartRole::InputOnly),
 ];
 const ROOT_RELATIONSHIPS: [RelationshipSpec; 5] = [
-    rel_spec!(
+    (
+        None,
         "docProps/core.xml",
-        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties"
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
     ),
-    rel_spec!(
+    (
+        Some("docProps/thumbnail.emf"),
         "docProps/thumbnail.emf",
-        "docProps/thumbnail.emf",
-        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail",
     ),
-    rel_spec!(WORKBOOK_REL_TARGET, OFFICE_DOCUMENT_REL_TYPE),
-    rel_spec!(
+    (
+        None,
+        "xl/workbook.xml",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+    ),
+    (
+        None,
         "docProps/app.xml",
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties"
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
     ),
-    rel_spec!(
+    (
+        Some("docProps/custom.xml"),
         "docProps/custom.xml",
-        "docProps/custom.xml",
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties"
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties",
     ),
 ];
 const WORKBOOK_RELATIONSHIPS: [RelationshipSpec; 6] = [
-    rel_spec!(
+    (
+        None,
         "theme/theme1.xml",
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
     ),
-    rel_spec!("worksheets/sheet2.xml", WORKSHEET_REL_TYPE),
-    rel_spec!("worksheets/sheet1.xml", WORKSHEET_REL_TYPE),
-    rel_spec!(
+    (None, "worksheets/sheet2.xml", WORKSHEET_REL_TYPE),
+    (None, "worksheets/sheet1.xml", WORKSHEET_REL_TYPE),
+    (
+        None,
         "sharedStrings.xml",
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings"
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
     ),
-    rel_spec!(
+    (
+        None,
         "styles.xml",
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
     ),
-    rel_spec!(
-        CALC_CHAIN_PATH,
+    (
+        Some(CALC_CHAIN_PATH),
         "calcChain.xml",
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain"
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain",
     ),
 ];
-const SHEET_RELATIONSHIPS: [RelationshipSpec; 1] = [rel_spec!(
+const SHEET_RELATIONSHIPS: [RelationshipSpec; 1] = [(
+    None,
     "../drawings/drawing1.xml",
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
 )];
 const EXCEL_STYLES_XML: &str = include_str!("excel_styles.xml");
 const EXCEL_THEME_XML: &str = include_str!("excel_theme.xml");
@@ -152,8 +136,6 @@ const LIBREOFFICE_CELL_XFS: [[u8; 6]; 26] = [
     [164, 0, 0, 10, 0, 175],
     [172, 7, 0, 10, 0, 79],
 ];
-const EXCEL_CANONICAL_STYLE_COUNT: u32 = 27;
-const LIBREOFFICE_UNMAPPED_STYLE_INDEX: usize = 7;
 const LIBREOFFICE_STYLE_MAP: [u8; 26] = [
     0, 3, 4, 24, 2, 1, 22, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 23, 18, 19, 20, 21,
 ];
@@ -168,13 +150,14 @@ const EXCEL_CORE_PROPERTIES: [(&str, &str); 9] = [
     ("dcterms:modified", " xsi:type=\"dcterms:W3CDTF\""),
     ("dc:language", ""),
 ];
-#[derive(Clone, Copy)]
-struct RelationshipSpec {
-    optional_part: Option<&'static str>,
-    target: &'static str,
-    type_: &'static str,
-}
+type RelationshipSpec = (Option<&'static str>, &'static str, &'static str);
 type PackageParts = [Option<Vec<u8>>; XLSX_PARTS.len()];
+type StyleResources<'text> = (
+    &'text [&'text str],
+    &'text [&'text str],
+    &'text [&'text str],
+    &'text [&'text str],
+);
 pub(crate) struct XlsxContainer {
     parts: PackageParts,
     source_fingerprint: ArchiveFingerprint,
@@ -189,12 +172,6 @@ struct ReservedTempArchive {
     remove_on_drop: bool,
 }
 impl ReservedTempArchive {
-    const fn disable_drop_cleanup(&mut self) {
-        self.remove_on_drop = false;
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
     fn remove_owned(&mut self) -> io::Result<()> {
         self.remove_on_drop = false;
         match open_regular(&self.path, false) {
@@ -215,55 +192,39 @@ impl ReservedTempArchive {
             path_err_with_source("xlsx 임시 파일 identity 검증 실패", &self.path, source)
         })?;
         (file.identity == self.identity).ok_or_else(|| {
-            err_fmt(format_args!(
+            fmt_err!(
                 "xlsx 임시 파일 identity가 실행 중 변경되었습니다: {}",
                 self.path.display()
-            ))
+            )
         })
     }
     fn verify_saved_archive(&mut self) -> Result<()> {
-        let mut saved_handle = self.file.take().unwrap_or_else(|| process::abort());
-        let saved_archive = self.path();
+        let mut saved_handle = or_abort(self.file.take());
+        let saved_archive = self.path.as_path();
         saved_handle.rewind().map_err(|source| {
             path_err_with_source("저장 검증용 xlsx seek 실패", saved_archive, source)
         })?;
-        let saved_container = (|| {
-            let saved_file = validate_open_file(saved_handle).map_err(|source_err| {
-                path_err_with_source("마스터 xlsx 파일 검증 실패", saved_archive, source_err)
+        let saved_container = validate_open_file(saved_handle)
+            .map_err(|source| {
+                path_err_with_source("마스터 xlsx 파일 검증 실패", saved_archive, source)
+            })
+            .and_then(|saved_file| XlsxContainer::from_validated_file(saved_file, saved_archive))
+            .map_err(|source| {
+                path_err_with_source(
+                    "저장 검증 실패: 저장 직후 ZIP package 점검에 실패했습니다",
+                    saved_archive,
+                    source,
+                )
             })?;
-            XlsxContainer::from_validated_file(saved_file, saved_archive)
-        })()
-        .map_err(|source_err| {
-            path_err_with_source(
-                "저장 검증 실패: 저장 직후 ZIP package 점검에 실패했습니다",
-                saved_archive,
-                source_err,
-            )
-        })?;
         super::writer::Workbook::from_container(saved_container)
             .map(|_| ())
-            .map_err(|source_err| {
+            .map_err(|source| {
                 path_err_with_source(
                     "저장 검증 실패: 저장 직후 재열기 점검에 실패했습니다",
                     saved_archive,
-                    source_err,
+                    source,
                 )
             })
-    }
-    fn write_archive_from(
-        &mut self,
-        parts: &[PackagePart],
-        #[cfg(any(target_os = "linux", target_os = "macos"))] permissions: fs::Permissions,
-    ) -> Result<()> {
-        let file = self.file.as_mut().unwrap_or_else(|| process::abort());
-        ZipArchiveBuilder {
-            archive_path: self.path.as_path(),
-            file,
-            parts,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            permissions,
-        }
-        .create()
     }
 }
 impl Drop for ReservedTempArchive {
@@ -272,11 +233,10 @@ impl Drop for ReservedTempArchive {
             && let Err(source) = self.remove_owned()
         {
             let mut error_output = stderr().lock();
-            let path_display = self.path.display();
             match writeln!(
                 &mut error_output,
                 "경고: xlsx 임시 저장 파일 정리 실패: {} ({})",
-                terminal_safe(&path_display),
+                terminal_safe(&self.path.display()),
                 terminal_safe(&source),
             ) {
                 Ok(()) | Err(_) => {}
@@ -295,15 +255,9 @@ struct TempArchivePromotion<'path> {
 impl TempArchivePromotion<'_> {
     fn displaced_original_path(&self) -> &Path {
         cfg_select! {
-            target_os = "windows" => {
-                self.backup_archive.path()
-            }
-            any(target_os = "linux", target_os = "macos") => {
-                self.temp_archive.path()
-            }
-            _ => {
-                compile_error!("fcupdater archive promotion supports only Windows, Linux, and macOS.")
-            }
+            target_os = "windows" => self.backup_archive.path.as_path(),
+            any(target_os = "linux", target_os = "macos") => self.temp_archive.path.as_path(),
+            _ => compile_error!("fcupdater archive promotion supports only Windows, Linux, and macOS."),
         }
     }
     fn preserve_recovery_archives(
@@ -312,18 +266,20 @@ impl TempArchivePromotion<'_> {
         source: atomic_replace::ReplaceFailure,
     ) -> Result<()> {
         let backup_suffix = cfg_select! {
-            target_os = "windows" => format!(", backup={}", self.backup_archive.path().display()),
+            target_os = "windows" => format!(", backup={}", self.backup_archive.path.display()),
             any(target_os = "linux", target_os = "macos") => "",
             _ => compile_error!("fcupdater archive promotion supports only Windows, Linux, and macOS."),
         };
         let message = format!(
             "{context}; 자동 복구 실패 후 수동 복구를 위해 현재 경로 상태를 보존했습니다: target={}, replacement={}{backup_suffix}",
             self.target_xlsx.display(),
-            self.temp_archive.path().display(),
+            self.temp_archive.path.display(),
         );
-        self.temp_archive.disable_drop_cleanup();
+        self.temp_archive.remove_on_drop = false;
         #[cfg(target_os = "windows")]
-        self.backup_archive.disable_drop_cleanup();
+        {
+            self.backup_archive.remove_on_drop = false;
+        }
         Err(err_with_source(message, source))
     }
     fn promote(mut self) -> Result<()> {
@@ -337,30 +293,28 @@ impl TempArchivePromotion<'_> {
                 source,
             )
         })?;
-        if target_file.identity != self.expected_identity {
-            return Err(err_fmt(format_args!(
-                "원본 xlsx identity가 실행 중 변경되어 저장을 중단했습니다: {}",
-                self.target_xlsx.display()
-            )));
-        }
+        ensure_fmt!(
+            target_file.identity == self.expected_identity,
+            "원본 xlsx identity가 실행 중 변경되어 저장을 중단했습니다: {}",
+            self.target_xlsx.display()
+        );
         #[cfg(target_os = "windows")]
         {
             drop(self.temp_archive.file.take());
             drop(self.backup_archive.file.take());
         }
-        let replace_result = atomic_replace::swap_files(
+        if let Err(replace_error) = atomic_replace::swap_files(
             self.target_xlsx,
-            self.temp_archive.path(),
+            &self.temp_archive.path,
             #[cfg(target_os = "windows")]
-            self.backup_archive.path(),
+            &self.backup_archive.path,
             #[cfg(target_os = "windows")]
             false,
-        );
-        if let Err(replace_error) = replace_result {
+        ) {
             let format_context = |label: &str| {
                 format!(
                     "{label}: {} -> {}",
-                    self.temp_archive.path().display(),
+                    self.temp_archive.path.display(),
                     self.target_xlsx.display(),
                 )
             };
@@ -374,16 +328,14 @@ impl TempArchivePromotion<'_> {
                     source,
                 )),
                 #[cfg(target_os = "windows")]
-                atomic_replace::ReplaceFilesError::RecoveryRequired(source) => {
-                    let context = format_context("xlsx 저장 중 원본 대상 파일 자동 복구 실패");
-                    self.preserve_recovery_archives(&context, source)
-                }
+                atomic_replace::ReplaceFilesError::RecoveryRequired(source) => self
+                    .preserve_recovery_archives(
+                        &format_context("xlsx 저장 중 원본 대상 파일 자동 복구 실패"),
+                        source,
+                    ),
             };
         }
-        if let Err(validation_error) = self.validate_displaced_original() {
-            return self.rollback_after_validation_failure(validation_error);
-        }
-        let saved_validation = (|| {
+        let saved_validation = self.validate_displaced_original().and_then(|()| {
             let saved_file = open_regular(self.target_xlsx, true).map_err(|source| {
                 path_err_with_source("저장된 xlsx identity 검증 실패", self.target_xlsx, source)
             })?;
@@ -396,13 +348,15 @@ impl TempArchivePromotion<'_> {
                     source,
                 )
             })
-        })();
+        });
         if let Err(validation_error) = saved_validation {
             return self.rollback_after_validation_failure(validation_error);
         }
-        self.temp_archive.disable_drop_cleanup();
+        self.temp_archive.remove_on_drop = false;
         #[cfg(target_os = "windows")]
-        self.backup_archive.disable_drop_cleanup();
+        {
+            self.backup_archive.remove_on_drop = false;
+        }
         let captured_original = self.displaced_original_path();
         fs::remove_file(captured_original).map_err(|source| {
             path_err_with_source("교체된 원본 xlsx 정리 실패", captured_original, source)
@@ -429,9 +383,9 @@ impl TempArchivePromotion<'_> {
     fn rollback_after_validation_failure(&mut self, validation_error: AppError) -> Result<()> {
         let replace_result = atomic_replace::swap_files(
             self.target_xlsx,
-            self.temp_archive.path(),
+            &self.temp_archive.path,
             #[cfg(target_os = "windows")]
-            self.backup_archive.path(),
+            &self.backup_archive.path,
             #[cfg(target_os = "windows")]
             true,
         );
@@ -451,17 +405,15 @@ impl TempArchivePromotion<'_> {
         let captured_file = open_regular(captured_original, false).map_err(|source| {
             path_err_with_source("교체된 원본 xlsx 열기 실패", captured_original, source)
         })?;
-        if captured_file.identity != self.expected_identity {
-            return Err(err_fmt(format_args!(
-                "교체된 원본 xlsx identity가 실행 시작 시점과 다릅니다: {}",
-                captured_original.display()
-            )));
-        }
+        ensure_fmt!(
+            captured_file.identity == self.expected_identity,
+            "교체된 원본 xlsx identity가 실행 시작 시점과 다릅니다: {}",
+            captured_original.display()
+        );
         let archive_len = archive_file_len(&captured_file.file, captured_original)?;
         let mut limited = (&captured_file.file).take((archive_len as u64).strict_add(1));
         let mut buffer = vec![0_u8; ZIP_FINGERPRINT_BUFFER_BYTES];
-        let mut crc = u32::MAX;
-        let mut bytes_read = 0_usize;
+        let (mut crc, mut bytes_read) = (u32::MAX, 0_usize);
         loop {
             let read_len = limited.read(buffer.as_mut()).map_err(|source| {
                 path_err_with_source("교체된 원본 xlsx 검증 실패", captured_original, source)
@@ -470,24 +422,22 @@ impl TempArchivePromotion<'_> {
                 break;
             }
             bytes_read = bytes_read.strict_add(read_len);
-            let (chunk, _) = buffer.split_at(read_len);
-            crc = crc32_update(crc, chunk);
+            crc = crc32_update(crc, buffer.split_at(read_len).0);
         }
-        if bytes_read != archive_len {
-            return Err(err_fmt(format_args!(
-                "교체된 원본 xlsx가 검증 중 변경되었습니다: {}",
-                captured_original.display()
-            )));
-        }
+        ensure_fmt!(
+            bytes_read == archive_len,
+            "교체된 원본 xlsx가 검증 중 변경되었습니다: {}",
+            captured_original.display()
+        );
         let fingerprint = ArchiveFingerprint {
             crc32: !crc,
             len: bytes_read,
         };
         (fingerprint == self.expected_fingerprint).ok_or_else(|| {
-            err_fmt(format_args!(
+            fmt_err!(
                 "원본 xlsx가 실행 중 변경되어 저장을 중단했습니다: {}",
                 self.target_xlsx.display()
-            ))
+            )
         })
     }
 }
@@ -507,8 +457,7 @@ impl XlsxContainer {
         let workbook_xml = workbook_text.as_str();
         let mut scanner = XmlScanner::new(workbook_xml);
         scanner.skip_to(root.end.strict_add(1));
-        let mut forbidden = None;
-        let mut empty_protection_seen = false;
+        let (mut forbidden, mut empty_protection_seen) = (None, false);
         while let Some(element) = scanner.next_direct_element_until(&root, "workbook.xml")? {
             let tag = element.opening;
             let candidate = match tag.local_name {
@@ -521,10 +470,9 @@ impl XlsxContainer {
                 }
                 "connections" => (2, "workbook.xml의 외부 데이터 연결은 지원하지 않습니다."),
                 "workbookProtection" => {
-                    let mut attributes = XmlAttrScanner::from_tag(&tag);
                     if tag.name == "workbookProtection"
                         && !empty_protection_seen
-                        && attributes.next()?.is_none()
+                        && XmlAttrScanner::from_tag(&tag).next()?.is_none()
                         && xml_misc_only(element.body, false)
                     {
                         empty_protection_seen = true;
@@ -547,9 +495,10 @@ impl XlsxContainer {
         self.take_workbook_dependencies(workbook_xml)?;
         let mut properties_scanner = XmlScanner::new(workbook_xml);
         if let Some(properties) = properties_scanner.next_element_named("workbookPr")? {
-            if properties.opening.name != "workbookPr" || !properties.body.trim().is_empty() {
-                return Err(err("workbookPr 요소가 올바르지 않습니다."));
-            }
+            ensure(
+                properties.opening.name == "workbookPr" && properties.body.trim().is_empty(),
+                "workbookPr 요소가 올바르지 않습니다.",
+            )?;
             let mut date_system = None;
             let mut attributes = XmlAttrScanner::from_tag(&properties.opening);
             while let Some((name, value)) = attributes.next()? {
@@ -558,12 +507,12 @@ impl XlsxContainer {
                     "workbookPr에 date1904 속성이 중복되었습니다.",
                 )?;
             }
-            if date_system
-                .as_deref()
-                .is_some_and(|value| !matches!(value, "0" | "false"))
-            {
-                return Err(err("workbookPr의 1904 날짜 체계는 지원하지 않습니다."));
-            }
+            ensure(
+                date_system
+                    .as_deref()
+                    .is_none_or(|value| matches!(value, "0" | "false")),
+                "workbookPr의 1904 날짜 체계는 지원하지 않습니다.",
+            )?;
             ensure(
                 properties_scanner.next_start_named("workbookPr").is_none(),
                 "workbook에 workbookPr 요소가 여러 개 있습니다.",
@@ -585,10 +534,10 @@ impl XlsxContainer {
         .read()?;
         let mut parts: PackageParts = array::repeat(None);
         for PackagePart { bytes, name } in source_parts {
-            let slot = parts
-                .get_mut(part_index(name))
-                .unwrap_or_else(|| process::abort());
-            if slot.replace(bytes).is_some() {
+            if or_abort(parts.get_mut(part_index(name)))
+                .replace(bytes)
+                .is_some()
+            {
                 process::abort();
             }
         }
@@ -636,30 +585,29 @@ impl XlsxContainer {
     }
     pub(super) fn package_prepare_excel_output(&mut self) -> Result<CanonicalStyleMap> {
         let source_styles = self.text("xl/styles.xml")?;
-        let static_styles = EXCEL_STYLES_XML.trim_suffix('\n');
-        let canonical_styles =
-            static_styles
-                .split_once('\n')
-                .is_some_and(|(declaration, style_sheet)| {
-                    source_styles
-                        .strip_prefix(declaration)
-                        .and_then(|tail| tail.strip_prefix("\r\n"))
-                        == Some(style_sheet)
-                });
+        let canonical_styles = EXCEL_STYLES_XML
+            .trim_suffix('\n')
+            .split_once('\n')
+            .is_some_and(|(declaration, style_sheet)| {
+                source_styles
+                    .strip_prefix(declaration)
+                    .and_then(|tail| tail.strip_prefix("\r\n"))
+                    == Some(style_sheet)
+            });
         let input_styles = if canonical_styles {
-            let mut mapping = try_vec_with_capacity(
-                EXCEL_CANONICAL_STYLE_COUNT as usize,
-                "입력 style mapping 메모리 확보 실패",
-            )?;
-            mapping.extend((0..EXCEL_CANONICAL_STYLE_COUNT).map(Some));
+            let mut mapping =
+                try_vec_with_capacity(27_u32 as usize, "입력 style mapping 메모리 확보 실패")?;
+            mapping.extend((0..27_u32).map(Some));
             mapping
         } else {
-            let excel_xfs = style_entries(EXCEL_STYLES_XML, "cellXfs", "xf")?;
-            let source_xfs = style_entries(source_styles, "cellXfs", "xf")?;
-            let source_fonts = style_entries(source_styles, "fonts", "font")?;
-            let source_borders = style_entries(source_styles, "borders", "border")?;
-            let excel_fonts = style_entries(EXCEL_STYLES_XML, "fonts", "font")?;
-            let excel_borders = style_entries(EXCEL_STYLES_XML, "borders", "border")?;
+            let (excel_xfs, source_xfs, source_fonts, source_borders, excel_fonts, excel_borders) = (
+                style_entries(EXCEL_STYLES_XML, "cellXfs", "xf")?,
+                style_entries(source_styles, "cellXfs", "xf")?,
+                style_entries(source_styles, "fonts", "font")?,
+                style_entries(source_styles, "borders", "border")?,
+                style_entries(EXCEL_STYLES_XML, "fonts", "font")?,
+                style_entries(EXCEL_STYLES_XML, "borders", "border")?,
+            );
             let mut libreoffice_xml =
                 try_string_with_capacity(8192, "LibreOffice style XML 메모리 확보 실패")?;
             libreoffice_xml.push_str("<cellXfs count=\"26\">");
@@ -685,11 +633,10 @@ impl XlsxContainer {
             }
             libreoffice_xml.push_str("</cellXfs>");
             let libreoffice_xfs = style_entries(&libreoffice_xml, "cellXfs", "xf")?;
-            if libreoffice_xfs.len() != LIBREOFFICE_STYLE_MAP.len() {
-                return Err(err(
-                    "내장 LibreOffice style mapping 수가 올바르지 않습니다.",
-                ));
-            }
+            ensure(
+                libreoffice_xfs.len() == LIBREOFFICE_STYLE_MAP.len(),
+                "내장 LibreOffice style mapping 수가 올바르지 않습니다.",
+            )?;
             let mut mapping =
                 try_vec_with_capacity(source_xfs.len(), "입력 style mapping 메모리 확보 실패")?;
             for source_xf in source_xfs {
@@ -697,21 +644,16 @@ impl XlsxContainer {
                     match find_equivalent_xf(
                         source_xf,
                         &excel_xfs,
-                        Some(&source_fonts),
-                        Some(&excel_fonts),
-                        Some(&source_borders),
-                        Some(&excel_borders),
+                        Some((&source_fonts, &excel_fonts, &source_borders, &excel_borders)),
                     )? {
                         Some(index) => Some(u32::try_from(index).map_err(|error| {
                             err_with_source("Excel style index 변환 실패", error)
                         })?),
-                        None => {
-                            find_equivalent_xf(source_xf, &libreoffice_xfs, None, None, None, None)?
-                                .filter(|&index| index != LIBREOFFICE_UNMAPPED_STYLE_INDEX)
-                                .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
-                                .copied()
-                                .map(u32::from)
-                        }
+                        None => find_equivalent_xf(source_xf, &libreoffice_xfs, None)?
+                            .filter(|&index| index != 7)
+                            .and_then(|index| LIBREOFFICE_STYLE_MAP.get(index))
+                            .copied()
+                            .map(u32::from),
                     };
                 mapping.push(canonical);
             }
@@ -732,33 +674,25 @@ impl XlsxContainer {
         let (mut core_scanner, core_root) =
             scan_xml_root(source_core_xml, "cp:coreProperties", "core.xml")?;
         while let Some(element) = core_scanner.next_direct_element_until(&core_root, "core.xml")? {
-            let Some((property, slot)) = EXCEL_CORE_PROPERTIES
+            let Some((&(qualified, _), slot)) = EXCEL_CORE_PROPERTIES
                 .iter()
                 .zip(&mut core_values)
-                .find(|item| element.opening.name == item.0.0)
+                .find(|&(&(name, _), _)| element.opening.name == name)
             else {
                 continue;
             };
-            let qualified = property.0;
-            if slot.is_some() {
-                return Err(err_fmt(format_args!(
-                    "core.xml에 {qualified} 요소가 여러 개 있습니다."
-                )));
-            }
-            let body = (!element.body.contains('<'))
-                .then_some(element.body)
-                .ok_or_else(|| {
-                    err_fmt(format_args!(
-                        "core.xml의 {qualified} 본문이 올바르지 않습니다."
-                    ))
-                })?;
-            decode_xml_entities(body).map_err(|source| {
-                err_with_source(
-                    format!("core.xml의 {qualified} 본문이 올바르지 않습니다."),
-                    source,
-                )
+            ensure_fmt!(
+                slot.is_none(),
+                "core.xml에 {qualified} 요소가 여러 개 있습니다."
+            );
+            ensure_fmt!(
+                !element.body.contains('<'),
+                "core.xml의 {qualified} 본문이 올바르지 않습니다."
+            );
+            decode_xml_entities(element.body).map_err(|source| {
+                fmt_src!(source, "core.xml의 {qualified} 본문이 올바르지 않습니다.")
             })?;
-            *slot = Some(body);
+            *slot = Some(element.body);
         }
         for ((name, extra), body_value) in EXCEL_CORE_PROPERTIES.into_iter().zip(core_values) {
             if let Some(body) = body_value {
@@ -769,15 +703,15 @@ impl XlsxContainer {
         *source_core = core_xml.into_bytes();
         let source_app = self.part_mut("docProps/app.xml");
         let source_app_xml = str::from_utf8(source_app)
-            .map_err(|source_error| err_with_source("app.xml UTF-8 해석 실패", source_error))?;
+            .map_err(|source| err_with_source("app.xml UTF-8 해석 실패", source))?;
         let (mut app_scanner, app_root) = scan_xml_root(source_app_xml, "Properties", "app.xml")?;
         let mut total_time_body = None;
         while let Some(element) = app_scanner.next_direct_element_until(&app_root, "app.xml")? {
-            if element.opening.name == "TotalTime"
-                && total_time_body.replace(element.body).is_some()
-            {
-                return Err(err("app.xml에 TotalTime 요소가 여러 개 있습니다."));
-            }
+            ensure(
+                element.opening.name != "TotalTime"
+                    || total_time_body.replace(element.body).is_none(),
+                "app.xml에 TotalTime 요소가 여러 개 있습니다.",
+            )?;
         }
         let mut app_xml = try_string_with_capacity(
             960_usize.strict_add(total_time_body.map_or(0, str::len)),
@@ -798,10 +732,7 @@ impl XlsxContainer {
         app_xml.extend(["<Application>", crate::APP_NAME, "</Application><HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>워크시트</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>유류비</vt:lpstr><vt:lpstr>변경내역</vt:lpstr></vt:vector></TitlesOfParts></Properties>"]);
         *source_app = app_xml.into_bytes();
         for (index, (name, role, _)) in XLSX_PARTS.into_iter().enumerate() {
-            let slot = self
-                .parts
-                .get_mut(index)
-                .unwrap_or_else(|| process::abort());
+            let slot = or_abort(self.parts.get_mut(index));
             if role == PartRole::InputOnly {
                 *slot = None;
                 continue;
@@ -814,19 +745,20 @@ impl XlsxContainer {
                 "xl/theme/theme1.xml" => Some(EXCEL_THEME_XML),
                 _ => None,
             };
-            let bytes = match canonical_xml {
-                Some(xml) => canonical_excel_fragment(xml)?.into_bytes(),
-                None => slot.take().unwrap_or_else(|| process::abort()),
-            };
-            *slot = Some(bytes);
+            match canonical_xml {
+                Some(xml) => *slot = Some(canonical_excel_fragment(xml)?.into_bytes()),
+                None if slot.is_none() => process::abort(),
+                None => {}
+            }
         }
         Ok(input_styles)
     }
     fn part_mut(&mut self, name: &str) -> &mut Vec<u8> {
-        self.parts
-            .get_mut(part_index(name))
-            .and_then(Option::as_mut)
-            .unwrap_or_else(|| process::abort())
+        or_abort(
+            self.parts
+                .get_mut(part_index(name))
+                .and_then(Option::as_mut),
+        )
     }
     pub(super) fn put_text(&mut self, name: &str, content: String) {
         *self.part_mut(name) = content.into_bytes();
@@ -843,17 +775,15 @@ impl XlsxContainer {
             .parent()
             .filter(|path| !path.is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let temp_archive_prefix = ".fuel_cost_chungcheong.xlsx.tmp_";
-        #[cfg(target_os = "windows")]
-        let backup_archive_prefix = ".fuel_cost_chungcheong.xlsx.backup_";
-        let reserve_archive = |prefix: &str| -> io::Result<ReservedTempArchive> {
-            const ATTEMPTS: u32 = 1024;
+        let reserve_archive = |prefix: &str, label: &str| -> Result<ReservedTempArchive> {
             let pid = process::id();
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(io::Error::other)?
+                .map_err(|source| {
+                    path_err_with_source(label, target_xlsx, io::Error::other(source))
+                })?
                 .as_nanos();
-            for sequence in 0..ATTEMPTS {
+            for sequence in 0_u32..1024_u32 {
                 let path = parent.join(format!("{prefix}{pid}_{nanos}_{sequence}"));
                 let mut options = fs::File::options();
                 options.read(true).write(true).create_new(true);
@@ -864,7 +794,8 @@ impl XlsxContainer {
                 options.mode(0o600);
                 match options.open(&path) {
                     Ok(file) => {
-                        let (_, identity) = validate_regular_file(&file)?;
+                        let (_, identity) = validate_regular_file(&file)
+                            .map_err(|source| path_err_with_source(label, target_xlsx, source))?;
                         return Ok(ReservedTempArchive {
                             file: Some(file),
                             identity,
@@ -873,35 +804,39 @@ impl XlsxContainer {
                         });
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(path_err_with_source(label, target_xlsx, error)),
                 }
             }
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "임시 항목 이름 충돌이 반복되었습니다. 잠시 후 다시 시도하세요.",
+            Err(path_err_with_source(
+                label,
+                target_xlsx,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "임시 항목 이름 충돌이 반복되었습니다. 잠시 후 다시 시도하세요.",
+                ),
             ))
         };
-        let mut tmp_archive = reserve_archive(temp_archive_prefix).map_err(|source| {
-            path_err_with_source("임시 저장 파일 생성 실패", target_xlsx, source)
-        })?;
+        let mut tmp_archive = reserve_archive(
+            ".fuel_cost_chungcheong.xlsx.tmp_",
+            "임시 저장 파일 생성 실패",
+        )?;
         #[cfg(target_os = "windows")]
-        let mut backup_archive = reserve_archive(backup_archive_prefix).map_err(|source| {
-            path_err_with_source("교체 예약 파일 생성 실패", target_xlsx, source)
-        })?;
+        let mut backup_archive = reserve_archive(
+            ".fuel_cost_chungcheong.xlsx.backup_",
+            "교체 예약 파일 생성 실패",
+        )?;
         let result = (|| -> Result<()> {
-            cfg_select! {
-                any(target_os = "linux", target_os = "macos") => {
-                    tmp_archive.write_archive_from(&archive_parts, self.source_permissions)?;
-                }
-                target_os = "windows" => {
-                    tmp_archive.write_archive_from(&archive_parts)?;
-                }
+            ZipArchiveBuilder {
+                archive_path: tmp_archive.path.as_path(),
+                file: or_abort(tmp_archive.file.as_mut()),
+                parts: &archive_parts,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                permissions: self.source_permissions,
             }
+            .create()?;
             match verification {
                 SaveVerification::Skip => {}
-                SaveVerification::Verify => {
-                    tmp_archive.verify_saved_archive()?;
-                }
+                SaveVerification::Verify => tmp_archive.verify_saved_archive()?,
             }
             TempArchivePromotion {
                 #[cfg(target_os = "windows")]
@@ -919,12 +854,10 @@ impl XlsxContainer {
         if tmp_archive.remove_on_drop
             && let Err(error) = tmp_archive.remove_owned()
         {
-            return Err(err_fmt_with_source(
-                format_args!(
-                    "xlsx 임시 저장 파일 삭제 실패: {} ({error})",
-                    tmp_archive.path().display(),
-                ),
-                source.into(),
+            return Err(fmt_src!(
+                source,
+                "xlsx 임시 저장 파일 삭제 실패: {} ({error})",
+                tmp_archive.path.display()
             ));
         }
         Err(source)
@@ -935,13 +868,8 @@ impl XlsxContainer {
         Ok(xml)
     }
     fn take_text(&mut self, name: &str) -> Result<String> {
-        let bytes = mem::take(self.part_mut(name));
-        String::from_utf8(bytes).map_err(|source| {
-            err_fmt_with_source(
-                format_args!("xlsx part UTF-8 해석 실패: {name}"),
-                source.into(),
-            )
-        })
+        String::from_utf8(mem::take(self.part_mut(name)))
+            .map_err(|source| fmt_src!(source, "xlsx part UTF-8 해석 실패: {name}"))
     }
     fn take_workbook_dependencies(&mut self, workbook_xml: &str) -> Result<()> {
         let workbook_relationships = self.take_text("xl/_rels/workbook.xml.rels")?;
@@ -992,16 +920,15 @@ impl XlsxContainer {
         ensure(
             workbook_scanner.next_start_named("sheet").is_none(),
             "workbook sheet 수가 고정 스키마의 2개보다 많습니다.",
-        )?;
-        Ok(())
+        )
     }
     pub(super) fn take_worksheet_text(&mut self, name: &str) -> Result<String> {
         let drawing_rid = if name == super::MASTER_SHEET_PATH {
             let has_relationships = self.has_part("xl/worksheets/_rels/sheet1.xml.rels");
-            let has_drawing = self.has_part("xl/drawings/drawing1.xml");
-            (has_relationships == has_drawing).ok_or(err(
+            ensure(
+                has_relationships == self.has_part("xl/drawings/drawing1.xml"),
                 "worksheet drawing 관계와 drawing part는 함께 존재해야 합니다.",
-            ))?;
+            )?;
             if has_relationships {
                 let relationships_xml = self.take_text("xl/worksheets/_rels/sheet1.xml.rels")?;
                 let mut relationships = [const { None }; SHEET_RELATIONSHIPS.len()];
@@ -1048,8 +975,7 @@ impl XlsxContainer {
             return Ok(xml);
         }
         let mut drawing_scanner = XmlScanner::new(&xml);
-        let drawing = drawing_scanner.next_start_named("drawing");
-        match (drawing_rid, drawing) {
+        match (drawing_rid, drawing_scanner.next_start_named("drawing")) {
             (Some(expected_rid), Some(tag)) if tag.name == "drawing" && tag.self_closing => {
                 validate_exact_attrs(
                     tag.raw,
@@ -1064,30 +990,18 @@ impl XlsxContainer {
                 )?;
                 xml.replace_range(span, "");
             }
-            (Some(_), None) => {
-                return Err(err("sheet1.xml의 빈 drawing 참조를 찾지 못했습니다."));
-            }
+            (Some(_), None) => bail!("sheet1.xml의 빈 drawing 참조를 찾지 못했습니다."),
             (None | Some(_), Some(_)) => {
-                return Err(err(
-                    "worksheet에 대응하는 drawing part 없는 참조가 있습니다.",
-                ));
+                bail!("worksheet에 대응하는 drawing part 없는 참조가 있습니다.");
             }
             (None, None) => {}
         }
         Ok(xml)
     }
     fn text(&self, name: &str) -> Result<&str> {
-        let bytes = self
-            .parts
-            .get(part_index(name))
-            .and_then(Option::as_deref)
-            .unwrap_or_else(|| process::abort());
-        str::from_utf8(bytes).map_err(|source| {
-            err_fmt_with_source(
-                format_args!("xlsx part UTF-8 해석 실패: {name}"),
-                source.into(),
-            )
-        })
+        let bytes = or_abort(self.parts.get(part_index(name)).and_then(Option::as_deref));
+        str::from_utf8(bytes)
+            .map_err(|source| fmt_src!(source, "xlsx part UTF-8 해석 실패: {name}"))
     }
     fn validate_content_types(&self) -> Result<()> {
         let content_types_xml = self.text("[Content_Types].xml")?;
@@ -1096,16 +1010,14 @@ impl XlsxContainer {
         visit_direct_xml_children(
             content_types_xml,
             "Types",
-            CONTENT_TYPES_NAMESPACE,
+            "http://schemas.openxmlformats.org/package/2006/content-types",
             "[Content_Types].xml",
             &mut |local_name, raw| {
                 let (is_default, key_name) = match local_name {
                     "Default" => (true, "Extension"),
                     "Override" => (false, "PartName"),
                     _ => {
-                        return Err(err_fmt(format_args!(
-                            "[Content_Types].xml에 알 수 없는 {local_name} 항목이 있습니다."
-                        )));
+                        bail_fmt!("[Content_Types].xml에 알 수 없는 {local_name} 항목이 있습니다.")
                     }
                 };
                 let mut entry_attrs = [None, None];
@@ -1117,9 +1029,7 @@ impl XlsxContainer {
                 )?;
                 let [key_attr, content_type_attr] = entry_attrs;
                 let key = key_attr.ok_or_else(|| {
-                    err_fmt(format_args!(
-                        "[Content_Types].xml entry에 {key_name} 속성이 없습니다."
-                    ))
+                    fmt_err!("[Content_Types].xml entry에 {key_name} 속성이 없습니다.")
                 })?;
                 let content_type = content_type_attr
                     .ok_or("[Content_Types].xml entry에 ContentType 속성이 없습니다.")?;
@@ -1140,119 +1050,45 @@ impl XlsxContainer {
                     )
                 };
                 let Some(seen_entry) = matching_entry else {
-                    return Err(err_fmt(format_args!(
+                    bail_fmt!(
                         "[Content_Types].xml에 지원하지 않는 {local_name} 항목이 있습니다: {key}"
-                    )));
+                    );
                 };
-                if !is_default
-                    && !key
-                        .strip_prefix('/')
-                        .is_some_and(|name| self.has_part(name))
-                {
-                    return Err(err_fmt(format_args!(
-                        "[Content_Types].xml Override 대상 part가 없습니다: {key}"
-                    )));
-                }
-                if mem::replace(seen_entry, true) {
-                    return Err(err_fmt(format_args!(
-                        "[Content_Types].xml 항목이 중복되었습니다: {key}"
-                    )));
-                }
+                ensure_fmt!(
+                    is_default
+                        || key
+                            .strip_prefix('/')
+                            .is_some_and(|name| self.has_part(name)),
+                    "[Content_Types].xml Override 대상 part가 없습니다: {key}"
+                );
+                ensure_fmt!(
+                    !mem::replace(seen_entry, true),
+                    "[Content_Types].xml 항목이 중복되었습니다: {key}"
+                );
                 Ok(())
             },
         )?;
         for (&(key, _, role), present) in CONTENT_TYPE_DEFAULTS.iter().zip(seen_defaults) {
             let required = role == PartRole::Required
                 || role == PartRole::OptionalInput && self.has_part("docProps/thumbnail.emf");
-            if required && !present {
-                return Err(err_fmt(format_args!(
-                    "[Content_Types].xml 필수 항목이 없습니다: {key}"
-                )));
-            }
+            ensure_fmt!(
+                !required || present,
+                "[Content_Types].xml 필수 항목이 없습니다: {key}"
+            );
         }
         for (&(part, _, content_type), present) in XLSX_PARTS.iter().zip(seen_overrides) {
-            if content_type.is_some() && self.has_part(part) && !present {
-                return Err(err_fmt(format_args!(
-                    "[Content_Types].xml 필수 항목이 없습니다: /{part}"
-                )));
-            }
+            ensure_fmt!(
+                content_type.is_none() || !self.has_part(part) || present,
+                "[Content_Types].xml 필수 항목이 없습니다: /{part}"
+            );
         }
         Ok(())
     }
 }
-fn part_index(name: &str) -> usize {
-    XLSX_PARTS
-        .iter()
-        .position(|&(candidate, _, _)| candidate == name)
-        .unwrap_or_else(|| process::abort())
-}
-fn style_entries<'text>(
-    styles_xml: &'text str,
-    group_name: &str,
-    entry_name: &str,
-) -> Result<Vec<&'text str>> {
-    let mut scanner = XmlScanner::new(styles_xml);
-    let element = scanner
-        .next_element_named(group_name)?
-        .filter(|element| element.opening.name == group_name && !element.opening.self_closing)
-        .ok_or_else(|| {
-            err_fmt(format_args!(
-                "styles.xml의 {group_name} 시작 태그가 올바르지 않습니다."
-            ))
-        })?;
-    let declared_count = required_xml_attr(element.opening.raw, "count", group_name)?
-        .parse::<usize>()
-        .map_err(|source| {
-            err_fmt_with_source(
-                format_args!("styles.xml {group_name} count 해석 실패"),
-                source.into(),
-            )
-        })?;
-    let capacity = declared_count.min(
-        element
-            .body
-            .len()
-            .div_euclid(entry_name.len().strict_add(3)),
-    );
-    let mut entries = try_vec_with_capacity(capacity, "styles.xml 항목 목록 메모리 확보 실패")?;
-    let mut child_scanner = XmlScanner::new(element.body);
-    while let Some(entry) = child_scanner.next_direct_element(group_name)? {
-        if entry.opening.name != entry_name {
-            return Err(err_fmt(format_args!(
-                "styles.xml {group_name}에 알 수 없는 {} 요소가 있습니다.",
-                entry.opening.name
-            )));
-        }
-        try_push_vec(
-            &mut entries,
-            element
-                .body
-                .get(entry.span)
-                .unwrap_or_else(|| process::abort()),
-            1,
-            "styles.xml 항목 목록 메모리 확보 실패",
-        )?;
-    }
-    if scanner.next_start_named(group_name).is_some() {
-        return Err(err_fmt(format_args!(
-            "styles.xml에 {group_name} 태그가 여러 개 있습니다."
-        )));
-    }
-    if entries.len() != declared_count {
-        return Err(err_fmt(format_args!(
-            "styles.xml {group_name} count가 실제 {entry_name} 수와 다릅니다: declared={declared_count}, actual={}",
-            entries.len()
-        )));
-    }
-    Ok(entries)
-}
 fn find_equivalent_xf(
     source: &str,
     catalog: &[&str],
-    source_fonts: Option<&[&str]>,
-    candidate_fonts: Option<&[&str]>,
-    source_borders: Option<&[&str]>,
-    candidate_borders: Option<&[&str]>,
+    resources: Option<StyleResources<'_>>,
 ) -> Result<Option<usize>> {
     const BOOLEAN_ATTRS: [&str; 13] = [
         "applyAlignment",
@@ -1274,19 +1110,24 @@ fn find_equivalent_xf(
     }
     let mut source_attrs = try_vec_with_capacity(4, "style source 속성 목록 메모리 확보 실패")?;
     'candidate: for (index, candidate) in catalog.iter().enumerate() {
-        let mut source_scanner = XmlScanner::new(source);
-        let mut candidate_scanner = XmlScanner::new(candidate);
+        let (mut source_scanner, mut candidate_scanner) =
+            (XmlScanner::new(source), XmlScanner::new(candidate));
         loop {
             let (source_tag, candidate_tag) =
                 match (source_scanner.next_tag(), candidate_scanner.next_tag()) {
-                    (Some(source_entry), Some(candidate_entry)) => (source_entry, candidate_entry),
+                    (Some(src), Some(cand)) => (src, cand),
                     (None, None) => return Ok(Some(index)),
                     (None | Some(_), None | Some(_)) => continue 'candidate,
                 };
-            if source_tag.is_start != candidate_tag.is_start
-                || source_tag.name != candidate_tag.name
-                || source_tag.self_closing != candidate_tag.self_closing
-            {
+            if (
+                source_tag.is_start,
+                source_tag.name,
+                source_tag.self_closing,
+            ) != (
+                candidate_tag.is_start,
+                candidate_tag.name,
+                candidate_tag.self_closing,
+            ) {
                 continue 'candidate;
             }
             if !source_tag.is_start {
@@ -1302,53 +1143,46 @@ fn find_equivalent_xf(
                     "style source 속성 목록 추가 메모리 확보 실패",
                 )?;
             }
-            let source_attr_count = source_attrs.len();
             let mut candidate_attr_count = 0_usize;
             let mut candidate_attrs = XmlAttrScanner::from_tag(&candidate_tag);
             while let Some((name, candidate_value)) = candidate_attrs.next()? {
                 candidate_attr_count = candidate_attr_count.strict_add(1);
                 let mut source_matches = source_attrs.iter().filter(|entry| entry.0 == name);
-                let Some(source_entry) = source_matches.next() else {
+                let (Some(source_entry), None) = (source_matches.next(), source_matches.next())
+                else {
                     continue 'candidate;
                 };
-                if source_matches.next().is_some() {
-                    continue 'candidate;
-                }
-                let source_value = &source_entry.1;
-                let indexed_resources = match name {
-                    "fontId" => source_fonts.zip(candidate_fonts),
-                    "borderId" => source_borders.zip(candidate_borders),
+                let source_value = source_entry.1.as_ref();
+                let indexed_resources = resources.and_then(|(sf, cf, sb, cb)| match name {
+                    "fontId" => Some((sf, cf)),
+                    "borderId" => Some((sb, cb)),
                     _ => None,
-                };
-                let values_match = if let Some((source_entries, candidate_entries)) =
-                    indexed_resources
-                {
+                });
+                let values_match = if let Some((src_list, cand_list)) = indexed_resources {
                     source_value
                         .parse::<usize>()
                         .ok()
-                        .and_then(|resource_index| source_entries.get(resource_index))
+                        .and_then(|idx| src_list.get(idx))
                         .zip(
                             candidate_value
                                 .parse::<usize>()
                                 .ok()
-                                .and_then(|resource_index| candidate_entries.get(resource_index)),
+                                .and_then(|idx| cand_list.get(idx)),
                         )
-                        .is_some_and(|(source_resource, candidate_resource)| {
-                            source_resource == candidate_resource
-                        })
+                        .is_some_and(|(lhs, rhs)| lhs == rhs)
                 } else if BOOLEAN_ATTRS.contains(&name) {
                     matches!(
-                        (source_value.as_ref(), candidate_value.as_ref()),
+                        (source_value, candidate_value.as_ref()),
                         ("0" | "false", "0" | "false") | ("1" | "true", "1" | "true")
                     )
                 } else {
-                    source_value.as_ref() == candidate_value.as_ref()
+                    source_value == candidate_value.as_ref()
                 };
                 if !values_match {
                     continue 'candidate;
                 }
             }
-            if source_attr_count != candidate_attr_count {
+            if source_attrs.len() != candidate_attr_count {
                 continue 'candidate;
             }
         }
@@ -1368,17 +1202,110 @@ fn parse_attrs_into<'tag>(
             .zip(values.iter_mut())
             .find(|&(candidate, _)| *candidate == name)
         else {
-            return Err(err_fmt(format_args!(
-                "{context}에 알 수 없는 {name} 속성이 있습니다."
-            )));
+            bail_fmt!("{context}에 알 수 없는 {name} 속성이 있습니다.");
         };
-        if slot.replace(value).is_some() {
-            return Err(err_fmt(format_args!(
-                "{context}에 {name} 속성이 중복되었습니다."
-            )));
-        }
+        ensure_fmt!(
+            slot.replace(value).is_none(),
+            "{context}에 {name} 속성이 중복되었습니다."
+        );
     }
     Ok(())
+}
+fn part_index(name: &str) -> usize {
+    or_abort(
+        XLSX_PARTS
+            .iter()
+            .position(|&(candidate, _, _)| candidate == name),
+    )
+}
+fn required_xml_attr<'tag>(
+    tag: &'tag str,
+    attr_name: &str,
+    context: &str,
+) -> Result<Cow<'tag, str>> {
+    let mut value = None;
+    let mut attributes = XmlAttrScanner::new(tag)?;
+    while let Some((name, attr_value)) = attributes.next()? {
+        ensure_fmt!(
+            name != attr_name || value.replace(attr_value).is_none(),
+            "{context}에 중복 {attr_name} 속성이 있습니다."
+        );
+    }
+    value.ok_or_else(|| fmt_err!("{context}에 {attr_name} 속성이 없습니다."))
+}
+fn scan_xml_root<'xml>(
+    xml: &'xml str,
+    expected_name: &str,
+    context: &str,
+) -> Result<(XmlScanner<'xml>, XmlTag<'xml>)> {
+    let mut scanner = XmlScanner::new(xml);
+    let root = scanner
+        .next_tag()
+        .filter(|tag| tag.is_start && tag.name == expected_name)
+        .ok_or_else(|| fmt_err!("{context}의 XML root 태그가 올바르지 않습니다."))?;
+    ensure_fmt!(
+        xml_misc_only(or_abort(xml.get(..root.start)), true),
+        "{context}의 XML root 앞 내용이 올바르지 않습니다."
+    );
+    Ok((scanner, root))
+}
+fn style_entries<'text>(
+    styles_xml: &'text str,
+    group_name: &str,
+    entry_name: &str,
+) -> Result<Vec<&'text str>> {
+    let mut scanner = XmlScanner::new(styles_xml);
+    let element = scanner
+        .next_element_named(group_name)?
+        .filter(|element| element.opening.name == group_name && !element.opening.self_closing)
+        .ok_or_else(|| fmt_err!("styles.xml의 {group_name} 시작 태그가 올바르지 않습니다."))?;
+    let declared_count = required_xml_attr(element.opening.raw, "count", group_name)?
+        .parse::<usize>()
+        .map_err(|source| fmt_src!(source, "styles.xml {group_name} count 해석 실패"))?;
+    let capacity = declared_count.min(
+        element
+            .body
+            .len()
+            .div_euclid(entry_name.len().strict_add(3)),
+    );
+    let mut entries = try_vec_with_capacity(capacity, "styles.xml 항목 목록 메모리 확보 실패")?;
+    let mut child_scanner = XmlScanner::new(element.body);
+    while let Some(entry) = child_scanner.next_direct_element(group_name)? {
+        ensure_fmt!(
+            entry.opening.name == entry_name,
+            "styles.xml {group_name}에 알 수 없는 {} 요소가 있습니다.",
+            entry.opening.name
+        );
+        try_push_vec(
+            &mut entries,
+            or_abort(element.body.get(entry.span)),
+            1,
+            "styles.xml 항목 목록 메모리 확보 실패",
+        )?;
+    }
+    ensure_fmt!(
+        scanner.next_start_named(group_name).is_none(),
+        "styles.xml에 {group_name} 태그가 여러 개 있습니다."
+    );
+    ensure_fmt!(
+        entries.len() == declared_count,
+        "styles.xml {group_name} count가 실제 {entry_name} 수와 다릅니다: declared={declared_count}, actual={}",
+        entries.len()
+    );
+    Ok(entries)
+}
+fn validate_empty_xml_root(
+    xml: &str,
+    expected_name: &str,
+    expected_attrs: &[(&str, &str)],
+    context: &str,
+) -> Result<()> {
+    let (mut scanner, root) = scan_xml_root(xml, expected_name, context)?;
+    validate_exact_attrs(root.raw, expected_attrs, format_args!("{context}"))?;
+    scanner
+        .next_direct_element_until(&root, context)?
+        .is_none()
+        .ok_or_else(|| fmt_err!("{context}의 XML root가 비어 있지 않습니다."))
 }
 fn validate_exact_attrs(
     tag: &str,
@@ -1393,31 +1320,23 @@ fn validate_exact_attrs(
             .enumerate()
             .find(|&(_, &(candidate, _))| candidate == name)
         else {
-            return Err(err_fmt(format_args!(
-                "{context}에 알 수 없는 {name} 속성이 있습니다."
-            )));
+            bail_fmt!("{context}에 알 수 없는 {name} 속성이 있습니다.");
         };
         let bit = 1_u32
             .checked_shl(u32::try_from(index).unwrap_or(u32::MAX))
             .unwrap_or(0);
-        if seen & bit != 0 {
-            return Err(err_fmt(format_args!(
-                "{context}에 {name} 속성이 중복되었습니다."
-            )));
-        }
+        ensure_fmt!(seen & bit == 0, "{context}에 {name} 속성이 중복되었습니다.");
         seen |= bit;
-        if value.as_ref() != expected_value {
-            return Err(err_fmt(format_args!(
-                "{context} 속성이 고정 스키마와 다릅니다."
-            )));
-        }
+        ensure_fmt!(
+            value.as_ref() == expected_value,
+            "{context} 속성이 고정 스키마와 다릅니다."
+        );
     }
     let expected_mask = 1_u32
         .checked_shl(u32::try_from(expected.len()).unwrap_or(u32::MAX))
         .unwrap_or(0)
         .strict_sub(1);
-    (seen == expected_mask)
-        .ok_or_else(|| err_fmt(format_args!("{context} 속성이 고정 스키마와 다릅니다.")))
+    (seen == expected_mask).ok_or_else(|| fmt_err!("{context} 속성이 고정 스키마와 다릅니다."))
 }
 fn validate_relationship_set<'xml>(
     xml: &'xml str,
@@ -1429,95 +1348,52 @@ fn validate_relationship_set<'xml>(
     visit_direct_xml_children(
         xml,
         "Relationships",
-        PACKAGE_RELATIONSHIPS_NAMESPACE,
+        "http://schemas.openxmlformats.org/package/2006/relationships",
         context,
         &mut |local_name, raw| {
-            if local_name != "Relationship" {
-                return Err(err_fmt(format_args!(
-                    "{context} 관계 태그가 올바르지 않습니다."
-                )));
-            }
+            ensure_fmt!(
+                local_name == "Relationship",
+                "{context} 관계 태그가 올바르지 않습니다."
+            );
             let mut rel_attrs = [None, None, None];
             parse_attrs_into(raw, &["Id", "Type", "Target"], &mut rel_attrs, context)?;
             let [id_attr, type_attr, target_attr] = rel_attrs;
-            let id =
-                id_attr.ok_or_else(|| err_fmt(format_args!("{context} 관계에 Id가 없습니다.")))?;
-            if id.is_empty() {
-                return Err(err_fmt(format_args!("{context} 관계 Id가 비어 있습니다.")));
-            }
-            let type_ = type_attr
-                .ok_or_else(|| err_fmt(format_args!("{context} 관계에 Type이 없습니다.")))?;
-            let target = target_attr
-                .ok_or_else(|| err_fmt(format_args!("{context} 관계에 Target이 없습니다.")))?;
-            if ids
-                .iter()
-                .flatten()
-                .any(|candidate| candidate == id.as_ref())
-            {
-                return Err(err_fmt(format_args!(
-                    "{context} 관계 Id가 중복되었습니다: {id}"
-                )));
-            }
-            let Some((candidate, slot)) = expected
+            let id = id_attr.ok_or_else(|| fmt_err!("{context} 관계에 Id가 없습니다."))?;
+            ensure_fmt!(!id.is_empty(), "{context} 관계 Id가 비어 있습니다.");
+            let type_ = type_attr.ok_or_else(|| fmt_err!("{context} 관계에 Type이 없습니다."))?;
+            let target =
+                target_attr.ok_or_else(|| fmt_err!("{context} 관계에 Target이 없습니다."))?;
+            ensure_fmt!(
+                !ids.iter()
+                    .flatten()
+                    .any(|candidate| candidate == id.as_ref()),
+                "{context} 관계 Id가 중복되었습니다: {id}"
+            );
+            let Some((&(optional_part, _, _), slot)) = expected
                 .iter()
                 .zip(ids.iter_mut())
-                .find(|item| type_ == item.0.type_ && target == item.0.target)
+                .find(|&(&(_, exp_target, exp_type), _)| type_ == exp_type && target == exp_target)
             else {
-                return Err(err_fmt(format_args!(
-                    "{context}에 지원하지 않는 관계가 있습니다: {type_} -> {target}"
-                )));
+                bail_fmt!("{context}에 지원하지 않는 관계가 있습니다: {type_} -> {target}");
             };
-            if candidate
-                .optional_part
-                .is_some_and(|part| !container.has_part(part))
-            {
-                return Err(err_fmt(format_args!(
-                    "{context} 관계 대상 part가 없습니다: {target}"
-                )));
-            }
-            if slot.replace(id).is_some() {
-                return Err(err_fmt(format_args!(
-                    "{context} 관계가 중복되었습니다: {target}"
-                )));
-            }
+            ensure_fmt!(
+                optional_part.is_none_or(|part| container.has_part(part)),
+                "{context} 관계 대상 part가 없습니다: {target}"
+            );
+            ensure_fmt!(
+                slot.replace(id).is_none(),
+                "{context} 관계가 중복되었습니다: {target}"
+            );
             Ok(())
         },
     )?;
-    for (candidate, id) in expected.iter().zip(ids.iter()) {
-        let required = candidate
-            .optional_part
-            .is_none_or(|part| container.has_part(part));
-        if required != id.is_some() {
-            return Err(err_fmt(format_args!(
-                "{context} 필수 관계 구성이 올바르지 않습니다: {}",
-                candidate.target
-            )));
-        }
+    for (&(optional_part, target, _), id) in expected.iter().zip(ids.iter()) {
+        ensure_fmt!(
+            optional_part.is_none_or(|part| container.has_part(part)) == id.is_some(),
+            "{context} 필수 관계 구성이 올바르지 않습니다: {target}"
+        );
     }
     Ok(())
-}
-
-fn scan_xml_root<'xml>(
-    xml: &'xml str,
-    expected_name: &str,
-    context: &str,
-) -> Result<(XmlScanner<'xml>, XmlTag<'xml>)> {
-    let mut scanner = XmlScanner::new(xml);
-    let root = scanner
-        .next_tag()
-        .filter(|tag| tag.is_start && tag.name == expected_name)
-        .ok_or_else(|| {
-            err_fmt(format_args!(
-                "{context}의 XML root 태그가 올바르지 않습니다."
-            ))
-        })?;
-    let leading = xml.get(..root.start).unwrap_or_else(|| process::abort());
-    if !xml_misc_only(leading, true) {
-        return Err(err_fmt(format_args!(
-            "{context}의 XML root 앞 내용이 올바르지 않습니다."
-        )));
-    }
-    Ok((scanner, root))
 }
 pub(super) fn validate_spreadsheet_xml_document<'xml>(
     xml: &'xml str,
@@ -1527,128 +1403,82 @@ pub(super) fn validate_spreadsheet_xml_document<'xml>(
     parsed_sheet_data: Option<&Range<usize>>,
 ) -> Result<XmlTag<'xml>> {
     let (mut scanner, root) = scan_xml_root(xml, expected_root, context)?;
-    if root.self_closing {
-        return Err(err_fmt(format_args!(
-            "{context}의 XML root 태그가 비어 있습니다."
-        )));
-    }
-    if required_xml_attr(root.raw, "xmlns", context)?.as_ref() != SPREADSHEETML_NAMESPACE {
-        return Err(err_fmt(format_args!(
-            "{context}의 root namespace가 올바르지 않습니다."
-        )));
-    }
+    ensure_fmt!(
+        !root.self_closing,
+        "{context}의 XML root 태그가 비어 있습니다."
+    );
+    ensure_fmt!(
+        required_xml_attr(root.raw, "xmlns", context)?.as_ref() == SPREADSHEETML_NAMESPACE,
+        "{context}의 root namespace가 올바르지 않습니다."
+    );
     let mut ancestors = [root.name; MAX_XML_NESTING_DEPTH];
-    let mut depth = 1_usize;
-    let mut sheet_data_seen = false;
+    let (mut depth, mut sheet_data_seen) = (1_usize, false);
     while let Some(tag) = scanner.next_tag() {
         if tag.is_start {
-            if !allow_extensions && tag.name != tag.local_name {
-                return Err(err_fmt(format_args!(
-                    "{context}의 prefixed core element는 지원하지 않습니다: {}",
-                    tag.name
-                )));
-            }
+            ensure_fmt!(
+                allow_extensions || tag.name == tag.local_name,
+                "{context}의 prefixed core element는 지원하지 않습니다: {}",
+                tag.name
+            );
             let mut attributes = XmlAttrScanner::from_tag(&tag);
             while let Some((name, value)) = attributes.next()? {
-                if name == "xmlns" || !allow_extensions && name.starts_with("xmlns:") {
-                    if tag.name == "sortState"
+                if (name == "xmlns" || !allow_extensions && name.starts_with("xmlns:"))
+                    && !(tag.name == "sortState"
                         && name == "xmlns:xlrd2"
-                        && value.as_ref() == RICH_DATA2_NAMESPACE
-                    {
-                        continue;
-                    }
-                    return Err(err_fmt(format_args!(
-                        "{context}의 descendant namespace 재정의는 지원하지 않습니다."
-                    )));
+                        && value.as_ref()
+                            == "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata2")
+                {
+                    bail_fmt!("{context}의 descendant namespace 재정의는 지원하지 않습니다.");
                 }
             }
             if expected_root == "worksheet" && tag.local_name == "sheetData" {
-                if depth != 1 || sheet_data_seen {
-                    return Err(err_fmt(format_args!(
-                        "{context}의 sheetData 위치 또는 개수가 올바르지 않습니다."
-                    )));
-                }
+                ensure_fmt!(
+                    depth == 1 && !sheet_data_seen,
+                    "{context}의 sheetData 위치 또는 개수가 올바르지 않습니다."
+                );
                 sheet_data_seen = true;
                 if let Some(parsed_span) = parsed_sheet_data {
-                    if tag.self_closing
-                        || tag.start != parsed_span.start
-                        || parsed_span.end <= tag.end
-                        || xml.get(parsed_span.start..parsed_span.end).is_none()
-                    {
-                        return Err(err_fmt(format_args!(
-                            "{context}의 사전 해석된 sheetData 범위가 올바르지 않습니다."
-                        )));
-                    }
+                    ensure_fmt!(
+                        !tag.self_closing
+                            && tag.start == parsed_span.start
+                            && parsed_span.end > tag.end
+                            && xml.get(parsed_span.start..parsed_span.end).is_some(),
+                        "{context}의 사전 해석된 sheetData 범위가 올바르지 않습니다."
+                    );
                     scanner.skip_to(parsed_span.end);
                     continue;
                 }
             }
             if !tag.self_closing {
-                let slot = ancestors.get_mut(depth).ok_or_else(|| {
-                    err_fmt(format_args!("{context}의 XML 중첩 깊이가 너무 큽니다."))
-                })?;
-                *slot = tag.name;
+                *ancestors
+                    .get_mut(depth)
+                    .ok_or_else(|| fmt_err!("{context}의 XML 중첩 깊이가 너무 큽니다."))? =
+                    tag.name;
                 depth = depth.strict_add(1);
             }
             continue;
         }
         depth = depth.strict_sub(1);
-        let open = ancestors
-            .get(depth)
-            .copied()
-            .unwrap_or_else(|| process::abort());
-        if open != tag.name {
-            return Err(err_fmt(format_args!(
-                "{context}의 XML 태그 쌍이 일치하지 않습니다: {open} / {}",
-                tag.name
-            )));
-        }
+        let open = or_abort(ancestors.get(depth).copied());
+        ensure_fmt!(
+            open == tag.name,
+            "{context}의 XML 태그 쌍이 일치하지 않습니다: {open} / {}",
+            tag.name
+        );
         if depth == 0 {
-            if expected_root == "worksheet" && !sheet_data_seen {
-                return Err(err_fmt(format_args!("{context}에 sheetData가 없습니다.")));
-            }
-            let document_end = tag.end.strict_add(1);
-            if !xml
-                .get(document_end..)
-                .is_some_and(|trailing| xml_misc_only(trailing, false))
-            {
-                return Err(err_fmt(format_args!(
-                    "{context}의 XML root 뒤 내용이 올바르지 않습니다."
-                )));
-            }
+            ensure_fmt!(
+                expected_root != "worksheet" || sheet_data_seen,
+                "{context}에 sheetData가 없습니다."
+            );
+            ensure_fmt!(
+                xml.get(tag.end.strict_add(1)..)
+                    .is_some_and(|trailing| xml_misc_only(trailing, false)),
+                "{context}의 XML root 뒤 내용이 올바르지 않습니다."
+            );
             return Ok(root);
         }
     }
-    Err(err_fmt(format_args!(
-        "{context}에 닫히지 않은 XML 요소가 있습니다."
-    )))
-}
-fn validate_empty_xml_root(
-    xml: &str,
-    expected_name: &str,
-    expected_attrs: &[(&str, &str)],
-    context: &str,
-) -> Result<()> {
-    let (mut scanner, root) = scan_xml_root(xml, expected_name, context)?;
-    validate_exact_attrs(root.raw, expected_attrs, format_args!("{context}"))?;
-    let empty = scanner.next_direct_element_until(&root, context)?.is_none();
-    empty.ok_or_else(|| err_fmt(format_args!("{context}의 XML root가 비어 있지 않습니다.")))
-}
-fn required_xml_attr<'tag>(
-    tag: &'tag str,
-    attr_name: &str,
-    context: &str,
-) -> Result<Cow<'tag, str>> {
-    let mut value = None;
-    let mut attributes = XmlAttrScanner::new(tag)?;
-    while let Some((name, attr_value)) = attributes.next()? {
-        if name == attr_name && value.replace(attr_value).is_some() {
-            return Err(err_fmt(format_args!(
-                "{context}에 중복 {attr_name} 속성이 있습니다."
-            )));
-        }
-    }
-    value.ok_or_else(|| err_fmt(format_args!("{context}에 {attr_name} 속성이 없습니다.")))
+    Err(fmt_err!("{context}에 닫히지 않은 XML 요소가 있습니다."))
 }
 fn visit_direct_xml_children<'xml>(
     xml: &'xml str,
@@ -1658,11 +1488,10 @@ fn visit_direct_xml_children<'xml>(
     visit: &mut dyn FnMut(&'xml str, &'xml str) -> Result<()>,
 ) -> Result<()> {
     let (mut scanner, root) = scan_xml_root(xml, root_local_name, context)?;
-    if root.self_closing {
-        return Err(err_fmt(format_args!(
-            "{context}의 XML root 태그가 비어 있습니다."
-        )));
-    }
+    ensure_fmt!(
+        !root.self_closing,
+        "{context}의 XML root 태그가 비어 있습니다."
+    );
     validate_exact_attrs(
         root.raw,
         &[("xmlns", expected_namespace)],
@@ -1670,17 +1499,15 @@ fn visit_direct_xml_children<'xml>(
     )?;
     while let Some(child) = scanner.next_direct_element_until(&root, context)? {
         let tag = child.opening;
-        if tag.name != tag.local_name {
-            return Err(err_fmt(format_args!(
-                "{context}의 prefixed child element는 지원하지 않습니다: {}",
-                tag.name
-            )));
-        }
-        if !xml_misc_only(child.body, false) {
-            return Err(err_fmt(format_args!(
-                "{context}의 XML child 태그는 중첩되거나 text를 포함할 수 없습니다."
-            )));
-        }
+        ensure_fmt!(
+            tag.name == tag.local_name,
+            "{context}의 prefixed child element는 지원하지 않습니다: {}",
+            tag.name
+        );
+        ensure_fmt!(
+            xml_misc_only(child.body, false),
+            "{context}의 XML child 태그는 중첩되거나 text를 포함할 수 없습니다."
+        );
         visit(tag.local_name, tag.raw)?;
     }
     Ok(())

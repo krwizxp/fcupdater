@@ -12,8 +12,6 @@ cfg_select! {
             fs::{MetadataExt as _, OpenOptionsExt as _},
             io::AsRawHandle as _,
         };
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         const _: () = assert!(
             size_of::<ByHandleFileInformation>() == 52,
             "Windows BY_HANDLE_FILE_INFORMATION size mismatch"
@@ -48,10 +46,6 @@ cfg_select! {
     }
     _ => {}
 }
-#[cfg(target_os = "linux")]
-const OPEN_NOFOLLOW: i32 = 0x0002_0000;
-#[cfg(target_os = "macos")]
-const OPEN_NOFOLLOW: i32 = 0x0000_0100;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct FileIdentity {
     index: u64,
@@ -65,21 +59,15 @@ pub(crate) struct ValidatedFile {
 }
 pub(crate) fn configure_no_follow(options: &mut OpenOptions) {
     cfg_select! {
-        target_os = "windows" => {
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        any(target_os = "linux", target_os = "macos") => {
-            options.custom_flags(OPEN_NOFOLLOW);
-        }
-        _ => {
-            compile_error!("Secure file opening supports only Windows, Linux, and macOS.");
-        }
+        target_os = "windows" => { options.custom_flags(0x0020_0000); }
+        target_os = "linux" => { options.custom_flags(0x0002_0000); }
+        target_os = "macos" => { options.custom_flags(0x0000_0100); }
+        _ => compile_error!("Secure file opening supports only Windows, Linux, and macOS."),
     }
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn configure_replaceable_file(options: &mut OpenOptions) {
-    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
-    options.share_mode(FILE_SHARE_READ_WRITE_DELETE);
+    options.share_mode(0x0000_0007);
 }
 pub(crate) fn open_regular(path: &Path, writable: bool) -> io::Result<ValidatedFile> {
     let mut options = File::options();
@@ -90,8 +78,7 @@ pub(crate) fn open_regular(path: &Path, writable: bool) -> io::Result<ValidatedF
         configure_replaceable_file(&mut options);
     }
     configure_no_follow(&mut options);
-    let file = options.open(path)?;
-    validate_open_file(file)
+    validate_open_file(options.open(path)?)
 }
 pub(crate) fn validate_open_file(file: File) -> io::Result<ValidatedFile> {
     let validation = validate_regular_file(&file)?;
@@ -104,38 +91,27 @@ pub(crate) fn validate_open_file(file: File) -> io::Result<ValidatedFile> {
 }
 pub(crate) fn validate_regular_file(file: &File) -> io::Result<(Metadata, FileIdentity)> {
     let metadata = file.metadata()?;
+    let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
     #[cfg(target_os = "windows")]
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "리파스 포인트는 허용되지 않습니다.",
-        ));
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(invalid("리파스 포인트는 허용되지 않습니다."));
     }
-    metadata.is_file().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "경로는 일반 파일이어야 합니다.",
-        )
-    })?;
+    metadata
+        .is_file()
+        .ok_or_else(|| invalid("경로는 일반 파일이어야 합니다."))?;
     let (link_count, identity) = cfg_select! {
         target_os = "windows" => {{
-            let mut information = ByHandleFileInformation::default();
-            // SAFETY: information is a writable BY_HANDLE_FILE_INFORMATION buffer and file is open.
+            let mut info = ByHandleFileInformation::default();
+            // SAFETY: info is a writable BY_HANDLE_FILE_INFORMATION buffer and file is open.
             let status = unsafe {
-                get_file_information_by_handle(
-                    file.as_raw_handle(),
-                    &raw mut information,
-                )
+                get_file_information_by_handle(file.as_raw_handle(), &raw mut info)
             };
             if status == 0_i32 {
                 return Err(io::Error::last_os_error());
             }
-            let index = u64::from(information.file_index_high)
-                .strict_shl(32)
-                | u64::from(information.file_index_low);
-            (u64::from(information.number_of_links), FileIdentity {
-                index,
-                volume: u64::from(information.volume_serial_number),
+            (u64::from(info.number_of_links), FileIdentity {
+                index: u64::from(info.file_index_high).strict_shl(32) | u64::from(info.file_index_low),
+                volume: u64::from(info.volume_serial_number),
             })
         }}
         any(target_os = "linux", target_os = "macos") => {
@@ -144,15 +120,8 @@ pub(crate) fn validate_regular_file(file: &File) -> io::Result<(Metadata, FileId
                 volume: metadata.dev(),
             })
         }
-        _ => {
-            compile_error!("File identity supports only Windows, Linux, and macOS.")
-        }
+        _ => compile_error!("File identity supports only Windows, Linux, and macOS.")
     };
-    (link_count == 1).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "파일의 하드 링크 수는 1이어야 합니다.",
-        )
-    })?;
+    (link_count == 1).ok_or_else(|| invalid("파일의 하드 링크 수는 1이어야 합니다."))?;
     Ok((metadata, identity))
 }

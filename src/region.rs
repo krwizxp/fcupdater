@@ -1,5 +1,10 @@
-use crate::diagnostic::{Result, err_fmt, reserve_err};
-use std::process;
+use crate::diagnostic::{Result, fmt_err, map_reserve, or_abort};
+const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
+    ("충청남도", "충남"),
+    ("충청북도", "충북"),
+    ("대전광역시", "대전"),
+    ("세종특별자치시", "세종"),
+];
 const CITY_REGIONS: [(TargetRegion, &str, &str); 5] = [
     (TargetRegion::Cheongju, "충북", "청주"),
     (TargetRegion::Gongju, "충남", "공주"),
@@ -7,8 +12,8 @@ const CITY_REGIONS: [(TargetRegion, &str, &str); 5] = [
     (TargetRegion::Asan, "충남", "아산"),
     (TargetRegion::Cheonan, "충남", "천안"),
 ];
-pub(super) const TARGET_REGION_COUNT: usize = 7;
 const DAEJEON_DISTRICT_KEYS: [&str; 5] = ["대덕구", "동구", "서구", "유성구", "중구"];
+pub(super) const TARGET_REGION_COUNT: usize = 7;
 pub(super) const TARGET_REGIONS: [TargetRegion; TARGET_REGION_COUNT] = [
     TargetRegion::Daejeon,
     TargetRegion::Sejong,
@@ -17,12 +22,6 @@ pub(super) const TARGET_REGIONS: [TargetRegion; TARGET_REGION_COUNT] = [
     TargetRegion::Boryeong,
     TargetRegion::Asan,
     TargetRegion::Cheonan,
-];
-const ADDRESS_KEY_REPLACEMENTS: [(&str, &str); 4] = [
-    ("충청남도", "충남"),
-    ("충청북도", "충북"),
-    ("대전광역시", "대전"),
-    ("세종특별자치시", "세종"),
 ];
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum TargetRegion {
@@ -71,19 +70,31 @@ impl TargetRegion {
     where
         T: Copy,
     {
-        *values.get(self.index()).unwrap_or_else(|| process::abort())
+        *or_abort(values.get(self.index()))
     }
     pub(super) fn value_mut<T>(self, values: &mut [T; TARGET_REGION_COUNT]) -> &mut T {
-        values
-            .get_mut(self.index())
-            .unwrap_or_else(|| process::abort())
+        or_abort(values.get_mut(self.index()))
     }
+}
+fn daejeon_region(district: &str) -> Option<TargetRegion> {
+    DAEJEON_DISTRICT_KEYS
+        .contains(&district)
+        .then_some(TargetRegion::Daejeon)
+}
+pub(super) fn increment_target_region_count(
+    counts: &mut [usize; TARGET_REGION_COUNT],
+    region: TargetRegion,
+) {
+    let count = region.value_mut(counts);
+    *count = count.strict_add(1);
 }
 pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result<()> {
     let trimmed = addr.trim();
     out.clear();
-    out.try_reserve(trimmed.len())
-        .map_err(|source| reserve_err("주소 key 정규화 메모리 확보 실패", source))?;
+    map_reserve(
+        out.try_reserve(trimmed.len()),
+        "주소 key 정규화 메모리 확보 실패",
+    )?;
     let mut run_start = 0_usize;
     for (idx, ch) in trimmed.char_indices() {
         let skip =
@@ -92,19 +103,12 @@ pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result
         if !skip && !check {
             continue;
         }
-        let end = if skip {
-            idx
-        } else {
-            idx.strict_add(ch.len_utf8())
-        };
+        let next = idx.strict_add(ch.len_utf8());
+        let end = if skip { idx } else { next };
         if run_start < end {
-            out.push_str(
-                trimmed
-                    .get(run_start..end)
-                    .unwrap_or_else(|| process::abort()),
-            );
+            out.push_str(or_abort(trimmed.get(run_start..end)));
         }
-        run_start = idx.strict_add(ch.len_utf8());
+        run_start = next;
         if check {
             for (from, to) in ADDRESS_KEY_REPLACEMENTS {
                 if out.ends_with(from) {
@@ -116,7 +120,7 @@ pub(super) fn normalize_address_key_into(addr: &str, out: &mut String) -> Result
         }
     }
     if run_start < trimmed.len() {
-        out.push_str(trimmed.get(run_start..).unwrap_or_else(|| process::abort()));
+        out.push_str(or_abort(trimmed.get(run_start..)));
     }
     Ok(())
 }
@@ -183,15 +187,15 @@ pub(super) fn target_region(
             (Some(region_match), Some(address_match)) if region_match == address_match => {
                 Ok(Some(address_match))
             }
-            (Some(_), Some(_)) => Err(err_fmt(format_args!(
+            (Some(_), Some(_)) => Err(fmt_err!(
                 "Opinet 소스의 지역 값과 주소가 서로 다른 대상 지역을 가리킵니다: region={region}, address={address}"
-            ))),
-            (Some(_), None) => Err(err_fmt(format_args!(
+            )),
+            (Some(_), None) => Err(fmt_err!(
                 "Opinet 소스의 지역 값은 대상 지역이지만 주소는 대상 지역이 아닙니다: region={region}, address={address}"
-            ))),
-            (None, Some(_)) => Err(err_fmt(format_args!(
+            )),
+            (None, Some(_)) => Err(fmt_err!(
                 "Opinet 소스의 주소는 대상 지역이지만 지역 값이 예상 형식과 다릅니다: region={region}, address={address}"
-            ))),
+            )),
             (None, None) => Ok(None),
         };
     }
@@ -202,37 +206,26 @@ pub(super) fn target_region(
         None => {
             normalize_address_key_into(trimmed_region, scratch)?;
             let is_daejeon = scratch.as_str() == "대전";
-            let matched = if is_daejeon {
-                None
-            } else {
-                target_region_from_normalized(scratch.as_str())
-            };
-            (is_daejeon, matched)
+            (
+                is_daejeon,
+                (!is_daejeon)
+                    .then(|| target_region_from_normalized(scratch.as_str()))
+                    .flatten(),
+            )
         }
     };
     normalize_address_key_into(address, scratch)?;
     if let Some(target) = region_match.or_else(|| target_region_from_normalized(scratch.as_str())) {
         return Ok(Some(target));
     }
-    if region_is_daejeon {
-        return Ok(DAEJEON_DISTRICT_KEYS
-            .iter()
-            .any(|district| scratch.starts_with(district))
-            .then_some(TargetRegion::Daejeon));
-    }
-    Ok(None)
-}
-fn daejeon_region(district: &str) -> Option<TargetRegion> {
-    DAEJEON_DISTRICT_KEYS
-        .contains(&district)
-        .then_some(TargetRegion::Daejeon)
-}
-pub(super) fn increment_target_region_count(
-    counts: &mut [usize; TARGET_REGION_COUNT],
-    region: TargetRegion,
-) {
-    let count = region.value_mut(counts);
-    *count = count.strict_add(1);
+    Ok(region_is_daejeon
+        .then(|| {
+            DAEJEON_DISTRICT_KEYS
+                .iter()
+                .any(|district| scratch.starts_with(district))
+                .then_some(TargetRegion::Daejeon)
+        })
+        .flatten())
 }
 fn target_region_from_normalized(text: &str) -> Option<TargetRegion> {
     if text.strip_prefix("대전").is_some_and(|tail| {
